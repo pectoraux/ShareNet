@@ -1,0 +1,342 @@
+[
+  {
+    "id": "manifest-00",
+    "type": "manifest",
+    "raw": {
+      "blobId": "b49b7b4fe5f5fa8fc9542e41c7628ee60433bb8cdf69b224695a5cd8d973b4ad",
+      "chunks": [
+        "922da85fae2c585b8422a55f667cb06d9fa52e88cccfe09530e588f23ae3c8dc",
+        "ffcc16a5490faf7f6065e0903aba84dc4a7aec2802438ea9b33d9651d661f455"
+      ],
+      "totalBytes": 7168,
+      "mimeType": "application/octet-stream",
+      "publisherId": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6",
+      "publishedAt": 1710000000,
+      "expiresAt": null
+    },
+    "cbor_hex": "e53799f026fe1d22ce43d6b2f9bb8f6918fd49008b17b83ea46320522fb75464",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6"
+  },
+  {
+    "id": "manifest-01",
+    "type": "manifest",
+    "raw": {
+      "blobId": "201e33b22aa4f55a98fc6b5b14c6ab2b99bccc1b1ca0a18af0454a047f6b0672",
+      "chunks": [
+        "d82805ff8256d0f03ac66ef0047d80abf88e87e6c43ede8c03526d25acc04d0a",
+        "a8c3bac2cf9481dc558536e13b659407a2612f705b7567c495acfc1dd09c3148"
+      ],
+      "totalBytes": 14336,
+      "mimeType": "application/octet-stream",
+      "publisherId": "eeef2392833ed96865d95a37ce4bd654b08904a9324063a5e675f2ec4ac384f7",
+      "publishedAt": 1710086400,
+      "expiresAt": 1712678400
+    },
+    "cbor_hex": "9f0211f17f7a0a4341a6f689d018759946ecc3fd675bffbfbab3dbcf36a50664",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "eeef2392833ed96865d95a37ce4bd654b08904a9324063a5e675f2ec4ac384f7"
+  },
+  {
+    "id": "manifest-02",
+    "type": "manifest",
+    "raw": {
+      "blobId": "90113fcf1fc0ef0a7211e08de474d6df04048d61f0a1dfc2c6d3869ffd9297f1",
+      "chunks": [
+        "2192812cf3bcbc5e5958491bc76cfdc7c7d192c390e8d7f0db25ca9e524b45f6",
+        "c5c90c1f7318c54d550209dacd3a067610fadbfe302c3aadf96bceeddbbacff4"
+      ],
+      "totalBytes": 21504,
+      "mimeType": "application/octet-stream",
+      "publisherId": "ac6711d3c5463562249ad50fc28ed78d124440c1a0e1d7784fba2de4037ab80e",
+      "publishedAt": 1710172800,
+      "expiresAt": null
+    },
+    "cbor_hex": "3bc573d870b84a30be135194254e2228f76f40044592fdfd889baa0e09a84fa3",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "ac6711d3c5463562249ad50fc28ed78d124440c1a0e1d7784fba2de4037ab80e"
+  },
+  {
+    "id": "manifest-03",
+    "type": "manifest",
+    "raw": {
+      "blobId": "b3468faee2f8770e096ed3345ecb5e59eaf2bba6cde77da85055f645f515f073",
+      "chunks": [
+        "7fb26d75cbb5610cc77fd55e4b9b68b208cfb19d82b26453bd2b2bd06748581f",
+        "b6abc0bfa034f639d0aefd7d1dbe07b077f1e2a0b6eb32981edd14d7fa145518"
+      ],
+      "totalBytes": 28672,
+      "mimeType": "application/octet-stream",
+      "publisherId": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6",
+      "publishedAt": 1710259200,
+      "expiresAt": 1712851200
+    },
+    "cbor_hex": "20e27b96724c5b9548990b2e0bb4800fc539d3a596be595a2de86ea3c9c28fa6",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6"
+  },
+  {
+    "id": "manifest-04",
+    "type": "manifest",
+    "raw": {
+      "blobId": "5d22454d901f157a75ceb9ffe218f47c35a42b23fa89ed488280ad0b29c64049",
+      "chunks": [
+        "f46a72d9cf4613e18a53373ba08294884569c247be032f638140fb40d413281f",
+        "9a6511f091ab1136180eda219473d5544e6e91db688f06fd1dedb2c1ecb6f7a0"
+      ],
+      "totalBytes": 35840,
+      "mimeType": "application/octet-stream",
+      "publisherId": "eeef2392833ed96865d95a37ce4bd654b08904a9324063a5e675f2ec4ac384f7",
+      "publishedAt": 1710345600,
+      "expiresAt": null
+    },
+    "cbor_hex": "797780fe88546693e646b6fda9d441fe970b87a0162e22af4105966db4ded66e",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "eeef2392833ed96865d95a37ce4bd654b08904a9324063a5e675f2ec4ac384f7"
+  },
+  {
+    "id": "manifest-05",
+    "type": "manifest",
+    "raw": {
+      "blobId": "39d26a4fb3724f113825c302cebf5130007d0c188401afb369f81ea458d1207f",
+      "chunks": [
+        "aef13bda3283612a3c8a85bc28dbf10a8cb548b4162bb9768f8650af040a4835",
+        "4cfe6ef5784bb73f703894885919b41d08ec4f0208a6d585430f89edb45a51bf"
+      ],
+      "totalBytes": 43008,
+      "mimeType": "application/octet-stream",
+      "publisherId": "ac6711d3c5463562249ad50fc28ed78d124440c1a0e1d7784fba2de4037ab80e",
+      "publishedAt": 1710432000,
+      "expiresAt": 1713024000
+    },
+    "cbor_hex": "260b8344171309a343547fa6da58e04d9ebcad2a5b4393866a5dff3e6f0349c1",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "ac6711d3c5463562249ad50fc28ed78d124440c1a0e1d7784fba2de4037ab80e"
+  },
+  {
+    "id": "manifest-06",
+    "type": "manifest",
+    "raw": {
+      "blobId": "8e786b89070e5672d6e82fc83293f6d9ea915e7035d734f8be00cdaf36c6e52b",
+      "chunks": [
+        "1084dde37f6ca83f14644f07380bd2aaf1771abee6e2ec5ca74e7ae4c194f1aa",
+        "fd8066b9f74c09463d6a81176b9708b6f4a3eb9b599a1829d5799ce2b0013639"
+      ],
+      "totalBytes": 50176,
+      "mimeType": "application/octet-stream",
+      "publisherId": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6",
+      "publishedAt": 1710518400,
+      "expiresAt": null
+    },
+    "cbor_hex": "3cc464f07ba099a35385aff9dd738d1877588e69240341eb1487d0e756f0510d",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "fc2aa0cdf757c52e238c92645b5bd2b46a423646ffdccbc54a3be1c633aee9c6"
+  },
+  {
+    "id": "receipt-00",
+    "type": "receipt",
+    "raw": {
+      "blobId": "319d5e986c2149869ffe5f978dddc5250d1a7772f19b7a81bfb41d5d3e2a774e",
+      "bytesDelivered": 1048576,
+      "senderId": "8ce6ca953ddba89182d53dcc75b74f80aa3d1c9f5efa79113dee45c0b8e7bf42",
+      "recipientId": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1",
+      "timestamp": 1710000000,
+      "nonce": "a8f5132cc64d5b484e02bbd9278204ad"
+    },
+    "cbor_hex": "3b4b66515aec1147e09862aa9852833ba9c4ef882d61b6bacdce40ed8152c9d8",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1"
+  },
+  {
+    "id": "receipt-01",
+    "type": "receipt",
+    "raw": {
+      "blobId": "237873134c439374fc3e1ae88fb71674272748e02e8581dd7fea86253c3d1c01",
+      "bytesDelivered": 2097152,
+      "senderId": "d8d27b433a7a60fcf5c788e0d73666e9c2b665073db215ccde07582d09e3983c",
+      "recipientId": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059",
+      "timestamp": 1710003600,
+      "nonce": "9e3f156324d42f0ea4b6f4fce81d56fb"
+    },
+    "cbor_hex": "4469d3027d0862347795ec4fb921687fa5249b906afffa3f8af54b735faad287",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059"
+  },
+  {
+    "id": "receipt-02",
+    "type": "receipt",
+    "raw": {
+      "blobId": "f3cdc7f67b02d8853e99cc1badf334639ffd6726fc35e7db2941b9e452a1697e",
+      "bytesDelivered": 3145728,
+      "senderId": "8ce6ca953ddba89182d53dcc75b74f80aa3d1c9f5efa79113dee45c0b8e7bf42",
+      "recipientId": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1",
+      "timestamp": 1710007200,
+      "nonce": "7474c1e7ed929af580fe66e460b06039"
+    },
+    "cbor_hex": "c7b4e27c0dedc3007e6dd490dc0f7b0d25dd8a27c31d9c42f73f157197cb6034",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1"
+  },
+  {
+    "id": "receipt-03",
+    "type": "receipt",
+    "raw": {
+      "blobId": "4187f4f285cd383a6417e6e0d74b2e2f7047f7e0d3d2fdcde54cc16cbcc871e4",
+      "bytesDelivered": 4194304,
+      "senderId": "d8d27b433a7a60fcf5c788e0d73666e9c2b665073db215ccde07582d09e3983c",
+      "recipientId": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059",
+      "timestamp": 1710010800,
+      "nonce": "f3ba9e408e06fcfc2340e086d1f128bc"
+    },
+    "cbor_hex": "41c4aa0c02335b89ebc704ee930568e3a03bf3ad4b3d85d4b3666a622e7cee74",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059"
+  },
+  {
+    "id": "receipt-04",
+    "type": "receipt",
+    "raw": {
+      "blobId": "6385852dc634ecc0b0ac7fe06f06aef92bf204a942c4fd9b83cd0926827c0ccd",
+      "bytesDelivered": 5242880,
+      "senderId": "8ce6ca953ddba89182d53dcc75b74f80aa3d1c9f5efa79113dee45c0b8e7bf42",
+      "recipientId": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1",
+      "timestamp": 1710014400,
+      "nonce": "799f2a3f604d80916f5740fdb1fca481"
+    },
+    "cbor_hex": "9ca617c97ac776e9e3e7135734d97ae206ea4777ded0915ccadf633daadb589b",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1"
+  },
+  {
+    "id": "receipt-05",
+    "type": "receipt",
+    "raw": {
+      "blobId": "ec74e036a0dcb6af7eee09e1351b57b90ab4f152b30b1556c826c407bd79ede3",
+      "bytesDelivered": 6291456,
+      "senderId": "d8d27b433a7a60fcf5c788e0d73666e9c2b665073db215ccde07582d09e3983c",
+      "recipientId": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059",
+      "timestamp": 1710018000,
+      "nonce": "b629ed66c7f4554af962a27a29db6994"
+    },
+    "cbor_hex": "6b4772c7bee70973509da0344b2784341126366a380fa02ea7e4b34c7746c589",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "98aa7d406756faae183a6826e372351ef5f1d8b2692a0675d7b04170f16e9059"
+  },
+  {
+    "id": "receipt-06",
+    "type": "receipt",
+    "raw": {
+      "blobId": "78b6e4596d0b0a2c8f94aed75d397be514445755bc6ad79e6a11ef6d00346805",
+      "bytesDelivered": 7340032,
+      "senderId": "8ce6ca953ddba89182d53dcc75b74f80aa3d1c9f5efa79113dee45c0b8e7bf42",
+      "recipientId": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1",
+      "timestamp": 1710021600,
+      "nonce": "2ac454ac1af404aa310306e026cce345"
+    },
+    "cbor_hex": "5bb18189cafbffef48770e13317807f6c10b0447ea54bb1e33b6a3bef7fbbe87",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "5aec153667b9499e35c4f3936c90d7599c5563c594130f3c2fc362d2f5f39bc1"
+  },
+  {
+    "id": "contribution-00",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46",
+      "sourceLang": "en",
+      "targetLang": "twi",
+      "sourceText": "Hello world variation 0",
+      "correctedText": "Corrected Twi 0",
+      "originalModelOutput": "Model output 0",
+      "modelVersion": null,
+      "capturedAt": 1710000000
+    },
+    "cbor_hex": "dcedbba00b6858b1bf494b7b191bc9bc830e9fb2c9093406c4860f16da52e780",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46"
+  },
+  {
+    "id": "contribution-01",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf",
+      "sourceLang": "en",
+      "targetLang": "ewe",
+      "sourceText": "Hello world variation 1",
+      "correctedText": "Corrected Twi 1",
+      "originalModelOutput": null,
+      "modelVersion": "gemma-3-1b-v1",
+      "capturedAt": 1710007200
+    },
+    "cbor_hex": "4b0459364da0b25eafeb012d038c28c7c5f256fb29d5060d94e9d8a1dd84a7c8",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf"
+  },
+  {
+    "id": "contribution-02",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46",
+      "sourceLang": "fr",
+      "targetLang": "gaa",
+      "sourceText": "Hello world variation 2",
+      "correctedText": "Corrected Twi 2",
+      "originalModelOutput": "Model output 2",
+      "modelVersion": "gemma-3-1b-v2",
+      "capturedAt": 1710014400
+    },
+    "cbor_hex": "7d621cfbc99176dc6cc5d9b50da05bade39c99f96e52d8a79eb0965e2566ded0",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46"
+  },
+  {
+    "id": "contribution-03",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf",
+      "sourceLang": "en",
+      "targetLang": "twi",
+      "sourceText": "Hello world variation 3",
+      "correctedText": "Corrected Twi 3",
+      "originalModelOutput": null,
+      "modelVersion": null,
+      "capturedAt": 1710021600
+    },
+    "cbor_hex": "915a40b65b8b56cda8ab63d0264f6db909b699934b8b185cde16f2d47750a2e5",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf"
+  },
+  {
+    "id": "contribution-04",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46",
+      "sourceLang": "en",
+      "targetLang": "twi",
+      "sourceText": "Hello world variation 4",
+      "correctedText": "Corrected Twi 4",
+      "originalModelOutput": "Model output 4",
+      "modelVersion": "gemma-3-1b-v1",
+      "capturedAt": 1710028800
+    },
+    "cbor_hex": "6555815f9b773a664ab909620f6c29c37863d1f7c9c1ff1ea8f9de798a7f82d5",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "8429a7d61b76a91512007404da4a6f95358b3ecc7007e4b9ac86dc1ac76d7f46"
+  },
+  {
+    "id": "contribution-05",
+    "type": "contribution",
+    "raw": {
+      "contributorId": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf",
+      "sourceLang": "en",
+      "targetLang": "ewe",
+      "sourceText": "Hello world variation 5",
+      "correctedText": "Corrected Twi 5",
+      "originalModelOutput": null,
+      "modelVersion": "gemma-3-1b-v2",
+      "capturedAt": 1710036000
+    },
+    "cbor_hex": "dd2643a1acbf466595f4affd26815102dcf88389901ec09050824567f95fa306",
+    "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "public_key_hex": "4f65d9df74f1c98bd8ea6f253774f10956eba83fc6515ab92a44798e76b71ccf"
+  }
+]

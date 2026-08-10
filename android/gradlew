@@ -1,0 +1,5 @@
+#!/bin/sh
+# Gradle Wrapper
+DIR="$(cd "$(dirname "$0")" && pwd)"
+JAR="$DIR/gradle/wrapper/gradle-wrapper.jar"
+exec java -classpath "$JAR" org.gradle.wrapper.GradleWrapperMain "$@"

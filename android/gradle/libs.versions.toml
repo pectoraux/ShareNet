@@ -1,0 +1,54 @@
+[versions]
+agp = "8.6.1"
+kotlin = "2.0.21"
+ksp = "2.0.21-1.0.28"
+compose-bom = "2024.12.01"
+room = "2.6.1"
+lifecycle = "2.8.7"
+navigation-compose = "2.8.5"
+tink = "1.15.0"
+sqlcipher = "4.6.1"
+nearby = "18.7.0"
+mediapipe = "0.10.14"
+onnx = "1.19.0"
+desugar = "2.0.4"
+detekt = "1.23.7"
+coroutines = "1.8.1"
+junit = "4.13.2"
+androidx-test = "1.6.1"
+truth = "1.4.4"
+kotlinx-serialization = "1.7.3"
+
+[libraries]
+androidx-core-ktx = { module = "androidx.core:core-ktx", version = "1.13.1" }
+androidx-lifecycle-runtime = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version = "1.9.3" }
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-material3 = { module = "androidx.compose.material3:material3", version = "1.3.1" }
+navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigation-compose" }
+room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
+room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
+sqlcipher = { module = "net.zetetic:sqlcipher-android", version.ref = "sqlcipher" }
+tink = { module = "com.google.crypto.tink:tink-android", version.ref = "tink" }
+nearby-connections = { module = "com.google.android.gms:play-services-nearby", version.ref = "nearby" }
+datastore = { module = "androidx.datastore:datastore-preferences", version = "1.1.1" }
+work-runtime = { module = "androidx.work:work-runtime-ktx", version = "2.9.1" }
+coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+desugar = { module = "com.android.tools:desugar_jdk_libs", version.ref = "desugar" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidx-test" }
+junit = { module = "junit:junit", version.ref = "junit" }
+truth = { module = "com.google.truth:truth", version.ref = "truth" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+androidx-room = { id = "androidx.room", version.ref = "room" }
+detekt = { id = "io.gitlab.arturbosch.detekt", version.ref = "detekt" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

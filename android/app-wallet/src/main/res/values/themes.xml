@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ShareNet.Wallet" parent="android:Theme.Material.Light.NoActionBar" />
+    <color name="seed">#1B4D6B</color>
+    <color name="primary">#1B4D6B</color>
+</resources>

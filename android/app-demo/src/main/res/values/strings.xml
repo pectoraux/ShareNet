@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ShareNet Demo</string>
+
+    <!-- Navigation -->
+    <string name="nav_catalog">Catalog</string>
+    <string name="nav_publish">Publish</string>
+    <string name="nav_detail">Detail</string>
+
+    <!-- CatalogScreen -->
+    <string name="catalog_title">Catalog</string>
+    <string name="catalog_empty">No content available. Pull to sync or wait for nearby peers.</string>
+    <string name="catalog_filter_all">All</string>
+    <string name="catalog_fetch">Fetch</string>
+    <string name="priority_high">High</string>
+    <string name="priority_normal">Normal</string>
+    <string name="priority_low">Low</string>
+    <string name="category_education">EDUCATION</string>
+    <string name="category_health">HEALTH</string>
+    <string name="category_app_update">APP_UPDATE</string>
+    <string name="category_model_weights">MODEL_WEIGHTS</string>
+    <string name="category_dataset">DATASET</string>
+
+    <!-- BlobDetailScreen -->
+    <string name="detail_title">Blob Detail</string>
+    <string name="detail_verify">Verify &amp; Render</string>
+    <string name="detail_fetching">Fetching… %1$d%%</string>
+    <string name="detail_verified">Verified ✓</string>
+    <string name="detail_failed">Verification failed</string>
+    <string name="detail_render_placeholder">Rendered content will appear here</string>
+    <string name="detail_progress_label">Progress</string>
+
+    <!-- PublishScreen -->
+    <string name="publish_title">Publish</string>
+    <string name="publish_pick_file">Pick File</string>
+    <string name="publish_no_file">No file selected</string>
+    <string name="publish_button">Publish to ShareNet</string>
+    <string name="publish_success">Published — blob %1$s</string>
+    <string name="publish_error">Publish failed: %1$s</string>
+    <string name="publish_category_label">Category</string>
+
+    <!-- Common -->
+    <string name="retry">Retry</string>
+    <string name="loading">Loading…</string>
+    <string name="error_generic">Something went wrong</string>
+</resources>

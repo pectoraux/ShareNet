@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ShareNet.Assistant" parent="android:Theme.Material.Light.NoActionBar" />
+    <color name="seed">#1B6B4A</color>
+    <color name="primary">#1B6B4A</color>
+</resources>

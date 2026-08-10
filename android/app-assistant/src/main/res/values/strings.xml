@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ShareNet Assistant</string>
+
+    <!-- Nav -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_contribution">Contribute</string>
+
+    <!-- ChatScreen -->
+    <string name="chat_title">Assistant</string>
+    <string name="chat_hint">Ask anything…</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_hold_to_talk">Hold to talk</string>
+    <string name="chat_listening">Listening…</string>
+    <string name="chat_transcribing">Transcribing…</string>
+    <string name="chat_thinking">Thinking…</string>
+    <string name="chat_streaming">Streaming…</string>
+    <string name="chat_audio_placeholder">🔊 Audio response (TTS placeholder)</string>
+    <string name="chat_new_conversation">New chat</string>
+    <string name="chat_empty">No messages yet. Type or hold to talk.</string>
+
+    <!-- SettingsScreen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_model">Model</string>
+    <string name="settings_model_auto">Auto (tiered by RAM)</string>
+    <string name="settings_model_1b">Gemma 1B (low RAM)</string>
+    <string name="settings_model_4b">Gemma 4B (high RAM)</string>
+    <string name="settings_model_status">Model: %1$s</string>
+    <string name="settings_language">Language</string>
+    <string name="settings_language_en">English</string>
+    <string name="settings_language_fr">Français</string>
+    <string name="settings_offline_weights">Model weights via ShareNet MODEL_WEIGHTS</string>
+
+    <!-- ContributionScreen -->
+    <string name="contribution_title">Contribute</string>
+    <string name="contribution_consent_title">Consent</string>
+    <string name="contribution_consent_body">Your corrections help improve the model. They are signed with your device key and queued for delivery when online. You can opt out at any time.</string>
+    <string name="contribution_consent_grant">I consent</string>
+    <string name="contribution_consent_revoke">Revoke consent</string>
+    <string name="contribution_correct_label">Correct the response</string>
+    <string name="contribution_submit">Submit correction</string>
+    <string name="contribution_queued">Queued (%1$d pending)</string>
+    <string name="contribution_dashboard_title">Contributor Dashboard</string>
+    <string name="contribution_dashboard_empty">No contributions yet.</string>
+    <string name="contribution_signed">Signed ✓</string>
+
+    <!-- Common -->
+    <string name="loading">Loading…</string>
+    <string name="error_generic">Something went wrong</string>
+    <string name="retry">Retry</string>
+</resources>

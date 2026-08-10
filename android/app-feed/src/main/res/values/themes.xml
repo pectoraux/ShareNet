@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ShareNet.Feed" parent="android:Theme.DeviceDefault.NoActionBar">
+    </style>
+    <color name="purple_500">#FF6200EE</color>
+</resources>
