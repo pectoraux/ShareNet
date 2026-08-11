@@ -48,6 +48,9 @@ import {
   sign,
   verify,
   bytesToHex,
+  aeadEncrypt,
+  aeadDecrypt,
+  aeadNonce,
 } from "../src/lib/snp/crypto";
 import { leafHash, nodeHash, merkleRoot, buildProof, verifyProof, StreamingMerkle } from "../src/lib/snp/merkle";
 import { chunkBoundaries, deterministicStream, buildGearTable } from "../src/lib/snp/chunking";
@@ -1080,6 +1083,15 @@ function suite14Negative(): VectorFile {
   });
 
   vectors.push({
+    id: "negative-route-stale-seq-after-expiry",
+    description:
+      "A RouteAdvert with seq=42 MUST be rejected even after all routes to that destination have expired, IF seq=100 was previously seen. The durable sequence floor (hardening audit Blocker C) prevents stale-advertisement attacks where a gateway disappears and an old low-seq advert becomes valid again. The seq floor is NOT cleared by removeStale() — only by explicit clearSequenceFloor() or a long TTL.",
+    input: { firstSeq: 100, afterExpirySeq: 42 },
+    expected: { mustReject: true },
+    mustReject: true,
+  });
+
+  vectors.push({
     id: "negative-gateway-connect-private-destination",
     description: "Gateway MUST reject CONNECT to 192.168.1.1:80 (RFC 1918). Without this, a gateway is an SSRF pivot (T9).",
     input: { host: "192.168.1.1", port: 80 },
@@ -1130,6 +1142,140 @@ function suite14Negative(): VectorFile {
   return { suite: "negative", specSection: "06 §A5", generatedBy: "snp-typescript-reference", generatedAt: now(), vectors };
 }
 
+// ─── Suite 15: AEAD (ChaCha20-Poly1305) ─────────────────────────────────────
+
+function suite15Aead(): VectorFile {
+  const vectors: Vector[] = [];
+
+  // RFC 8439 §2.8.2 test vector — the canonical ChaCha20-Poly1305 test
+  const rfcKey = hexToBytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+  const rfcNonce = hexToBytes("070000004041424344454647");
+  const rfcPlaintext = hexToBytes("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f66657220796f75206f6e65206164766963652c20697420776f756c6420626520746f20756e6465727374616e642074686520696d706f7274616e6365206f6620636172746f6772617068792e");
+  const rfcAad = hexToBytes("50515253c0c1c2c3c4c5c6c7");
+  const rfcSealed = aeadEncrypt(rfcKey, rfcNonce, rfcPlaintext, rfcAad);
+  vectors.push({
+    id: "aead-rfc8439-section-2.8.2",
+    description: "RFC 8439 §2.8.2 — the canonical ChaCha20-Poly1305 test vector. Proves our @noble/ciphers integration matches the RFC exactly. This is the AEAD that protects Class B transit frames and link-layer frames after the SNP-IK/0.1 handshake.",
+    input: {
+      keyHex: hex(rfcKey),
+      nonceHex: hex(rfcNonce),
+      plaintextHex: hex(rfcPlaintext),
+      aadHex: hex(rfcAad),
+    },
+    expected: {
+      ciphertextHex: hex(rfcSealed.ciphertext),
+      tagHex: hex(rfcSealed.tag),
+      // The RFC expects ciphertext||tag concatenated; verify our split matches
+      sealedHex: hex(rfcSealed.ciphertext) + hex(rfcSealed.tag),
+    },
+  });
+
+  // Round-trip: encrypt then decrypt
+  const roundKey = hexToBytes("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+  const roundNonce = hexToBytes("000000000000000000000001");
+  const roundPlain = new TextEncoder().encode("ShareNet transit frame payload — encrypted end-to-end");
+  const roundSealed = aeadEncrypt(roundKey, roundNonce, roundPlain);
+  const roundDecrypted = aeadDecrypt(roundKey, roundNonce, roundSealed.ciphertext, roundSealed.tag);
+  vectors.push({
+    id: "aead-encrypt-decrypt-roundtrip",
+    description: "Encrypt a plaintext, then decrypt the ciphertext. The decrypted output must match the original plaintext byte-for-byte.",
+    input: {
+      keyHex: hex(roundKey),
+      nonceHex: hex(roundNonce),
+      plaintextHex: hex(roundPlain),
+    },
+    expected: {
+      decryptsToSame: roundDecrypted !== null && bytesEqual(roundDecrypted, roundPlain),
+    },
+  });
+
+  // Wrong key rejection — AEAD authentication must fail
+  const wrongKey = hexToBytes("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+  const wrongKeyResult = aeadDecrypt(wrongKey, roundNonce, roundSealed.ciphertext, roundSealed.tag);
+  vectors.push({
+    id: "aead-wrong-key-rejection",
+    description: "Decryption with the wrong key MUST return null (authentication failure). AEAD never throws on auth failure — it returns null per I20.",
+    input: {
+      wrongKeyHex: hex(wrongKey),
+      nonceHex: hex(roundNonce),
+      ciphertextHex: hex(roundSealed.ciphertext),
+      tagHex: hex(roundSealed.tag),
+    },
+    expected: { returnsNull: wrongKeyResult === null },
+  });
+
+  // Tampered ciphertext rejection
+  const tamperedCiphertext = new Uint8Array(roundSealed.ciphertext);
+  tamperedCiphertext[0] ^= 0x01; // flip one bit
+  const tamperedResult = aeadDecrypt(roundKey, roundNonce, tamperedCiphertext, roundSealed.tag);
+  vectors.push({
+    id: "aead-tampered-ciphertext-rejection",
+    description: "A single-bit flip in the ciphertext MUST cause authentication failure (null return). This is the integrity guarantee — AEAD detects any modification.",
+    input: {
+      keyHex: hex(roundKey),
+      nonceHex: hex(roundNonce),
+      tamperedCiphertextHex: hex(tamperedCiphertext),
+      tagHex: hex(roundSealed.tag),
+    },
+    expected: { returnsNull: tamperedResult === null },
+  });
+
+  // Tampered tag rejection
+  const tamperedTag = new Uint8Array(roundSealed.tag);
+  tamperedTag[0] ^= 0x01;
+  const tamperedTagResult = aeadDecrypt(roundKey, roundNonce, roundSealed.ciphertext, tamperedTag);
+  vectors.push({
+    id: "aead-tampered-tag-rejection",
+    description: "A single-bit flip in the authentication tag MUST cause authentication failure.",
+    input: {
+      keyHex: hex(roundKey),
+      nonceHex: hex(roundNonce),
+      ciphertextHex: hex(roundSealed.ciphertext),
+      tamperedTagHex: hex(tamperedTag),
+    },
+    expected: { returnsNull: tamperedTagResult === null },
+  });
+
+  // Nonce derivation from fid + seq
+  const fid = hexToBytes("0102030405060708");
+  const nonce = aeadNonce(fid, 1);
+  vectors.push({
+    id: "aead-nonce-from-fid-seq",
+    description: "Nonce = fid(8 bytes) ‖ seq(4 bytes big-endian). Per spec §7.3: 'Nonce = fid ‖ seq; strictly monotonic.' seq=1 → last 4 bytes are 0x00000001.",
+    input: { fidHex: hex(fid), seq: 1 },
+    expected: {
+      nonceHex: hex(nonce),
+      nonceLength: 12,
+    },
+  });
+
+  // AAD authentication — changing AAD must fail
+  const aadPlain = new TextEncoder().encode("payload with AAD");
+  const aadSealed = aeadEncrypt(roundKey, roundNonce, aadPlain, hexToBytes("aabbcc"));
+  const wrongAadResult = aeadDecrypt(roundKey, roundNonce, aadSealed.ciphertext, aadSealed.tag, hexToBytes("aaddcc"));
+  vectors.push({
+    id: "aead-aad-mismatch-rejection",
+    description: "Decryption with wrong AAD MUST fail. AAD (additional authenticated data) is authenticated but not encrypted — e.g. the frame header for Class B transit. Changing it breaks authentication.",
+    input: {
+      keyHex: hex(roundKey),
+      nonceHex: hex(roundNonce),
+      ciphertextHex: hex(aadSealed.ciphertext),
+      tagHex: hex(aadSealed.tag),
+      originalAadHex: "aabbcc",
+      wrongAadHex: "aaddcc",
+    },
+    expected: { returnsNull: wrongAadResult === null },
+  });
+
+  return {
+    suite: "aead",
+    specSection: "SNP/0.1 §1.2, §7.3",
+    generatedBy: "snp-typescript-reference",
+    generatedAt: now(),
+    vectors,
+  };
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 function main(): void {
@@ -1155,6 +1301,7 @@ function main(): void {
     ["12-civic-points", suite12Civic()],
     ["13-revocation", suite13Revocation()],
     ["14-negative", suite14Negative()],
+    ["15-aead", suite15Aead()],
   ];
 
   let totalVectors = 0;

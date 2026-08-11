@@ -37,6 +37,9 @@ import {
   verify,
   verifyPreimage,
   bytesToHex,
+  aeadEncrypt,
+  aeadDecrypt,
+  aeadNonce,
 } from "./crypto";
 import { leafHash, nodeHash, merkleRoot, buildProof, verifyProof, StreamingMerkle } from "./merkle";
 import { chunkBoundaries, deterministicStream, buildGearTable } from "./chunking";
@@ -1038,6 +1041,35 @@ function runSuite14Negative(file: VectorFile): VectorResult[] {
         passed = containsLoop([nodeId], nodeId) === v.expected.containsLoop;
       } else if (v.id === "negative-route-advert-regressed-seq") {
         passed = isSeqRegression(v.input.newSeq, v.input.bestKnownSeq) === v.expected.isRegression;
+      } else if (v.id === "negative-route-stale-seq-after-expiry") {
+        // Hardening audit Blocker C: stale seq must be rejected even after route expiry.
+        // The durable sequence floor (RouteTable.bestSeq) is NOT cleared by
+        // removeStale() — only by explicit clearSequenceFloor() or a long TTL.
+        // Scenario: add seq=100, expire all routes, try to add seq=42 — MUST throw.
+        const gw = testKeypair("gateway");
+        const gwId = deriveNodeId(gw.publicKey);
+        const metric: RouteMetric = {
+          latency: 50, loss: 50, hopCount: 1, congestion: 100, reliability: 950,
+          bandwidthBps: 1_000_000, batteryState: "MAINS", gatewayCapacity: 1000,
+          reputation: 800, costHint: 10, scarcity: 1, stability: 900,
+        };
+        const table = new RouteTable();
+        // First: add a route with seq=100
+        const f1 = { destination: gwId, destType: "gateway" as const, seq: 100, pathVector: [] as Uint8Array[], hopCount: 1, metric, expiresAt: 1710001000 };
+        table.addRoute({ ...f1, originSig: signRouteAdvert(gw.secretKey, f1) });
+        // Verify the floor is 100
+        const floor1 = table.getSequenceFloor(gwId);
+        // Now expire all routes (time advances past expiresAt)
+        table.removeStale(1710002000);
+        // The floor MUST still be 100 (durable)
+        const floor2 = table.getSequenceFloor(gwId);
+        // Now try to add a route with seq=42 (stale) — MUST be rejected
+        let threw = false;
+        try {
+          const f2 = { destination: gwId, destType: "gateway" as const, seq: 42, pathVector: [] as Uint8Array[], hopCount: 1, metric, expiresAt: 1710003000 };
+          table.addRoute({ ...f2, originSig: signRouteAdvert(gw.secretKey, f2) });
+        } catch { threw = true; }
+        passed = floor1 === 100 && floor2 === 100 && threw === true;
       } else if (v.id === "negative-gateway-connect-private-destination") {
         passed = isPrivateDestination(v.input.host) === v.expected.isPrivate;
       } else if (v.id === "negative-mode-a-without-tls-termination") {
@@ -1113,12 +1145,90 @@ function runSuite14Negative(file: VectorFile): VectorResult[] {
   return results;
 }
 
+// ─── Suite 15: AEAD ────────────────────────────────────────────────────────
+
+function runSuite15Aead(file: VectorFile): VectorResult[] {
+  const results: VectorResult[] = [];
+  for (const v of file.vectors) {
+    const start = Date.now();
+    let passed = false;
+    let error: string | undefined;
+    try {
+      if (v.id === "aead-rfc8439-section-2.8.2") {
+        // Verify we can encrypt the RFC 8439 test vector and get the expected sealed output
+        const key = hexToBytes(v.input.keyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const plaintext = hexToBytes(v.input.plaintextHex);
+        const aad = hexToBytes(v.input.aadHex);
+        const sealed = aeadEncrypt(key, nonce, plaintext, aad);
+        const sealedHex = bytesToHex(sealed.ciphertext) + bytesToHex(sealed.tag);
+        passed = sealedHex === v.expected.sealedHex;
+      } else if (v.id === "aead-encrypt-decrypt-roundtrip") {
+        const key = hexToBytes(v.input.keyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const plaintext = hexToBytes(v.input.plaintextHex);
+        const sealed = aeadEncrypt(key, nonce, plaintext);
+        const decrypted = aeadDecrypt(key, nonce, sealed.ciphertext, sealed.tag);
+        passed = decrypted !== null && bytesEqual(decrypted, plaintext);
+      } else if (v.id === "aead-wrong-key-rejection") {
+        const wrongKey = hexToBytes(v.input.wrongKeyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const ciphertext = hexToBytes(v.input.ciphertextHex);
+        const tag = hexToBytes(v.input.tagHex);
+        const result = aeadDecrypt(wrongKey, nonce, ciphertext, tag);
+        passed = result === null && v.expected.returnsNull === true;
+      } else if (v.id === "aead-tampered-ciphertext-rejection") {
+        const key = hexToBytes(v.input.keyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const tampered = hexToBytes(v.input.tamperedCiphertextHex);
+        const tag = hexToBytes(v.input.tagHex);
+        const result = aeadDecrypt(key, nonce, tampered, tag);
+        passed = result === null && v.expected.returnsNull === true;
+      } else if (v.id === "aead-tampered-tag-rejection") {
+        const key = hexToBytes(v.input.keyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const ciphertext = hexToBytes(v.input.ciphertextHex);
+        const tamperedTag = hexToBytes(v.input.tamperedTagHex);
+        const result = aeadDecrypt(key, nonce, ciphertext, tamperedTag);
+        passed = result === null && v.expected.returnsNull === true;
+      } else if (v.id === "aead-nonce-from-fid-seq") {
+        const fid = hexToBytes(v.input.fidHex);
+        const nonce = aeadNonce(fid, v.input.seq);
+        passed = bytesToHex(nonce) === v.expected.nonceHex && nonce.length === v.expected.nonceLength;
+      } else if (v.id === "aead-aad-mismatch-rejection") {
+        const key = hexToBytes(v.input.keyHex);
+        const nonce = hexToBytes(v.input.nonceHex);
+        const ciphertext = hexToBytes(v.input.ciphertextHex);
+        const tag = hexToBytes(v.input.tagHex);
+        const wrongAad = hexToBytes(v.input.wrongAadHex);
+        const result = aeadDecrypt(key, nonce, ciphertext, tag, wrongAad);
+        passed = result === null && v.expected.returnsNull === true;
+      } else {
+        error = `No runner for ${v.id}`;
+      }
+    } catch (e: any) {
+      error = e.message;
+    }
+    results.push({
+      suiteId: "15-aead",
+      vectorId: v.id,
+      description: v.description,
+      specSection: file.specSection,
+      passed,
+      mustReject: v.mustReject === true,
+      error,
+      durationMs: Date.now() - start,
+    });
+  }
+  return results;
+}
+
 // ─── Main runner ───────────────────────────────────────────────────────────
 
 const SUITE_NAMES = [
   "01-cbor", "02-hashing", "03-identity", "04-chunking", "05-merkle",
   "06-manifest", "07-receipts", "08-frames", "09-descriptors", "10-routing",
-  "11-gateway", "12-civic-points", "13-revocation", "14-negative",
+  "11-gateway", "12-civic-points", "13-revocation", "14-negative", "15-aead",
 ] as const;
 
 const SUITE_META: Record<string, { name: string; specSection: string }> = {
@@ -1136,6 +1246,7 @@ const SUITE_META: Record<string, { name: string; specSection: string }> = {
   "12-civic-points": { name: "Civic Points value function", specSection: "05 §A5" },
   "13-revocation": { name: "Revocation monotonicity", specSection: "05 §C2, §C3" },
   "14-negative": { name: "Negative / MUST-REJECT vectors", specSection: "06 §A5" },
+  "15-aead": { name: "ChaCha20-Poly1305 AEAD", specSection: "SNP/0.1 §1.2, §7.3" },
 };
 
 const SUITE_RUNNERS: Record<string, (file: VectorFile) => VectorResult[]> = {
@@ -1153,6 +1264,7 @@ const SUITE_RUNNERS: Record<string, (file: VectorFile) => VectorResult[]> = {
   "12-civic-points": runSuite12Civic,
   "13-revocation": runSuite13Revocation,
   "14-negative": runSuite14Negative,
+  "15-aead": runSuite15Aead,
 };
 
 /**

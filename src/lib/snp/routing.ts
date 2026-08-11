@@ -849,11 +849,39 @@ export class RouteTable {
   /**
    * Best (highest) seq seen per destination, hex(NodeId) → seq.
    *
-   * Used by `addRoute` to reject seq regressions (spec §6.3: "a node MUST
-   * discard adverts whose seq is lower than the best known for that
-   * destination").
+   * This is the DURABLE SEQUENCE FLOOR — it survives route expiry.
+   *
+   * Per the hardening audit (Blocker C): "If route state expires or is
+   * garbage-collected and a lower sequence becomes acceptable again, you
+   * have a stale-advertisement problem. Gateway A seq=100 could disappear.
+   * Then later: old Gateway A advert seq=42 must NOT suddenly become valid
+   * just because local state forgot that 100 existed."
+   *
+   * `removeStale()` does NOT clear this map. The seq floor is only cleared
+   * by explicit `clearSequenceFloor()` (operator action, e.g. node restart
+   * with a fresh identity) or `clear()` (full table reset).
    */
   private readonly bestSeq = new Map<string, number>();
+
+  /**
+   * Optional TTL for the sequence floor (unix seconds). If set, a seq floor
+   * older than this is considered stale and MAY be cleared. Defaults to
+   * Infinity (never auto-clear). Production SHOULD set a conservative TTL
+   * (e.g. 7 days) so that a gateway that genuinely restarts with seq=0
+   * after a long outage can re-establish — but only after a long period,
+   * not a brief route expiry.
+   */
+  private readonly seqFloorTtlSeconds: number;
+
+  /**
+   * @param options.seqFloorTtlSeconds  Optional TTL for the durable sequence
+   *   floor. A seq floor older than this MAY be cleared by `removeStale()`.
+   *   Defaults to Infinity (never auto-clear). Production SHOULD set a
+   *   conservative value (e.g. 604800 = 7 days).
+   */
+  constructor(options?: { seqFloorTtlSeconds?: number }) {
+    this.seqFloorTtlSeconds = options?.seqFloorTtlSeconds ?? Number.POSITIVE_INFINITY;
+  }
 
   /**
    * Add or update a route for `advert.destination`.
@@ -905,9 +933,11 @@ export class RouteTable {
       );
     }
 
-    // Update best-known seq for this destination.
+    // Update best-known seq for this destination (durable sequence floor).
     if (advert.seq > bestKnown) {
       this.bestSeq.set(destHex, advert.seq);
+      // Track when we saw this floor, for TTL-based expiry.
+      this.seqFloorSeen.set(destHex, { seq: advert.seq, seenAt: Date.now() / 1000 });
     }
 
     // Add or update: replace if same pathVector exists, else append.
@@ -1025,8 +1055,13 @@ export class RouteTable {
    *
    * Routes with `expiresAt === now` are kept (the spec says "older than",
    * i.e. strictly less than). When all routes for a destination are
-   * removed, the destination entry (and its best-known seq) is deleted
-   * entirely, so a restarted gateway can re-establish with seq=0.
+   * removed, the destination entry is deleted — but the DURABLE SEQUENCE
+   * FLOOR is NOT cleared (hardening audit Blocker C). A stale advert with
+   * a lower seq will still be rejected even after all routes have expired.
+   *
+   * The seq floor MAY be cleared by `clearSequenceFloor()` (operator action)
+   * or auto-cleared if `seqFloorTtlSeconds` is set and the floor is older
+   * than that TTL.
    *
    * @param now  current time in unix seconds (passed in for testability)
    */
@@ -1035,15 +1070,53 @@ export class RouteTable {
       const fresh = routes.filter((r) => r.expiresAt >= now);
       if (fresh.length === 0) {
         this.routes.delete(destHex);
-        // Also forget the best-known seq: a gateway that restarted after
-        // all its routes expired should be able to re-advertise from seq=0.
-        // (If the gateway persisted seq across restarts, it will simply
-        // advertise a higher seq, which is accepted by isSeqRegression.)
-        this.bestSeq.delete(destHex);
+        // NOTE: We do NOT clear this.bestSeq here. The sequence floor is
+        // durable — it survives route expiry. This is the fix for the
+        // hardening audit's stale-advertisement finding.
+        // (Only clear if the seqFloorTtl has elapsed, which we track
+        // separately via the last-seen timestamp on the floor.)
       } else if (fresh.length !== routes.length) {
         this.routes.set(destHex, fresh);
       }
     }
+    // Auto-clear seq floors that have exceeded their TTL (if configured).
+    // This is separate from route expiry — the TTL is much longer (days,
+    // not minutes) so that a gateway restart after a genuine long outage
+    // can re-establish, but a brief route expiry cannot.
+    if (this.seqFloorTtlSeconds !== Number.POSITIVE_INFINITY) {
+      for (const [destHex, floor] of this.seqFloorSeen.entries()) {
+        if (now - floor.seenAt > this.seqFloorTtlSeconds) {
+          this.bestSeq.delete(destHex);
+          this.seqFloorSeen.delete(destHex);
+        }
+      }
+    }
+  }
+
+  /**
+   * The durable sequence floor per destination. Maps hex(NodeId) → {seq, seenAt}.
+   * `seenAt` is the unix time we last saw a advert with this seq — used for
+   * TTL-based expiry (only if `seqFloorTtlSeconds` is configured).
+   */
+  private readonly seqFloorSeen = new Map<string, { seq: number; seenAt: number }>();
+
+  /**
+   * Explicitly clear the durable sequence floor for a destination (operator
+   * action — e.g. after confirming a gateway has genuinely restarted with a
+   * fresh identity). Use sparingly; the floor exists to prevent stale adverts.
+   */
+  clearSequenceFloor(destination: Uint8Array): void {
+    const key = bytesToHex(destination);
+    this.bestSeq.delete(key);
+    this.seqFloorSeen.delete(key);
+  }
+
+  /**
+   * Get the current durable sequence floor for a destination, or 0 if none.
+   * Useful for diagnostics and tests.
+   */
+  getSequenceFloor(destination: Uint8Array): number {
+    return this.bestSeq.get(bytesToHex(destination)) ?? 0;
   }
 
   /**

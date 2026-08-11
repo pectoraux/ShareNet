@@ -1,9 +1,10 @@
 ---
 ADR: 0003
 Title: Simplified Noise_IK handshake structure (sandbox only — NOT production-safe)
-Status: 🟡 proposed (mandatory human security review before any merge to production)
+Status: superseded by ADR-0006
 Tier affected: 1
 Date: 2026-08-11
+Superseded by: ADR-0006 (2026-08-12)
 Deciders:
   - Owning agent: Z.ai (reference/ + L8 link layer)
   - Human reviewer (REQUIRED, Tier 1): PENDING
@@ -11,7 +12,26 @@ Deciders:
 
 # ADR-0003 — Simplified Noise_IK handshake structure
 
-> 🟡 **This ADR is `proposed`, not `accepted`.** Per
+> **SUPERSEDED**: This ADR is superseded by [ADR-0006](./0006-snp-ik-custom-handshake.md).
+> The handshake is now explicitly named **SNP-IK/0.1**, not Noise_IK.
+> The hardening audit (Blocker B) found that ADR-0003's framing of the
+> sandbox handshake as a "simplified Noise_IK structure" was misleading:
+> the construction performs three DH operations and HKDF, but does not
+> implement the Noise state machine (no chaining key, no transcript
+> hash, no prologue, no cipher state, no Noise message pattern). ADR-0006
+> renames the construction honestly to SNP-IK/0.1 and explicitly defines
+> it as a custom authenticated-DH handshake, NOT a Noise protocol.
+>
+> The construction itself is unchanged — the DH mix, the HKDF info
+> literal, the descriptor verification order, and the derived keys are
+> all byte-identical to what this ADR described. Only the naming and
+> documentation changed. See ADR-0006 for the current, authoritative
+> definition.
+>
+> The text below is preserved as an audit trail. It is no longer the
+> current statement of the sandbox's handshake design.
+
+> 🟡 **This ADR was `proposed`, not `accepted`.** Per
 > `04-THREAT-MODEL.md §4.2`, Noise_IK handshake integration is
 > 🟡 AI-implementable with **mandatory human security review before
 > merge**. The simplified structure described here is suitable for the

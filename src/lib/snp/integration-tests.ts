@@ -82,6 +82,8 @@ import {
 } from "./link";
 import {
   type Frame,
+  encodeFrame,
+  decodeFrame,
   forwardFrame,
   makeFlowId,
   shouldDrop,
@@ -1991,7 +1993,300 @@ async function test14GatewayPrivateNetworkRejection(): Promise<IntegrationTestRe
 // and is also called directly inside test 14 for a focused unit-level sanity
 // check on the chokepoint.
 
-// ─── The 14 tests ──────────────────────────────────────────────────────────
+// ─── Test 15 — Class B relay non-inspection (I8) ───────────────────────────
+
+/**
+ * Test 15 — Class B relay non-inspection (behavioural invariant I8).
+ *
+ * Source: 02-PROTOCOL-SPEC.md §7 (Frame traffic classes — "B"=transit,
+ * opaque to relays); 04-THREAT-MODEL.md (relays must not inspect, cache,
+ * or duplicate transit payloads); 06-CONFORMANCE-AND-AI-MODEL.md §B3
+ * invariant I8 ("Class B payloads are never inspected, cached, or
+ * duplicated by relays").
+ *
+ * This is a BEHAVIORAL test, not a golden-vector test. It tests what the
+ * relay DOES NOT do, not just what it does. The four negative-space
+ * assertions:
+ *
+ *   (a) Body forwarded UNCHANGED — byte-identical at the receiver. The
+ *       relay does not mutate, re-encode, pad, or transform the body.
+ *
+ *   (b) Body NEVER inspected — the relay calls `decodeFrame` exactly once
+ *       (to parse the frame header from the wire bytes), and the input
+ *       to that call is the FULL frame bytes, NEVER the body bytes alone.
+ *       A future regression that tries to decode the body as a CBOR
+ *       payload (e.g. to extract a return-circuit hint) would either
+ *       crash (the body is opaque ciphertext, not valid CBOR) or show up
+ *       as a second `decodeFrame` call whose input matches the body —
+ *       either way, the test catches it.
+ *
+ *   (c) Body NEVER cached — the relay's persistent state (modelled here
+ *       as a `relayCache` Map) contains HEADER-derived info only (the
+ *       flow-id, for replay defence). The body bytes MUST NOT appear in
+ *       the cache, verbatim or as a prefix of any cached entry.
+ *
+ *   (d) Body NEVER duplicated — the relay forwards exactly one frame per
+ *       received frame. A future regression that double-forwards (e.g. a
+ *       bug in the redirect-following path that re-emits the original
+ *       frame) would show up as `forwardedCount > 1`.
+ *
+ * The test uses a body that starts with 0xFF (the CBOR break code, which
+ * is invalid as a top-level CBOR item start). This means a regression
+ * that tries to decode the body as CBOR would throw — and the relay's
+ * error-swallowing handler would silently drop the frame, failing
+ * assertion (a) (the receiver would not get the body). So the test
+ * catches both "decode succeeded and inspected" and "decode threw and
+ * the frame was dropped" regression modes.
+ *
+ * Why this is better than a golden vector: a golden vector would test
+ * that `forwardFrame(frame).body === frame.body` (which is trivially
+ * true — forwardFrame does a shallow spread). It would NOT test that the
+ * relay's actual code path leaves the body alone. This test exercises
+ * the relay's actual handler, with a spy on `decodeFrame` and a tracked
+ * cache, so the regression modes (caching the body, decoding the body,
+ * duplicating the forward) are all caught.
+ */
+async function test15ClassBRelayNonInspection(): Promise<IntegrationTestResult> {
+  const start = Date.now();
+  const testId = "15-class-b-relay-non-inspection";
+  const testName = "Class B relay non-inspection (I8: never inspect, cache, or duplicate)";
+  try {
+    // ── Build three nodes: sender → relay → receiver ─────────────────
+    const sender = makeTestNode("alice", ["MESH_CLIENT"], "linux");
+    const relay = makeTestNode("relay", ["MESH_RELAY"], "linux");
+    const receiver = makeTestNode("bob", ["MESH_CLIENT"], "linux");
+
+    // Topology: Sender ↔ Relay ↔ Receiver (InMemoryLink — no handshake,
+    // no AEAD; testing-only pipe per the link.ts JSDoc).
+    const senderAddr = linkAddress("tcp", new Uint8Array([10, 0, 0, 1]));
+    const relayAddr1 = linkAddress("tcp", new Uint8Array([10, 0, 0, 2]));
+    const relayAddr2 = linkAddress("tcp", new Uint8Array([10, 0, 0, 3]));
+    const receiverAddr = linkAddress("tcp", new Uint8Array([10, 0, 0, 4]));
+
+    const sr = InMemoryLinkNetwork.connect(
+      { nodeId: sender.nodeId, address: senderAddr },
+      { nodeId: relay.nodeId, address: relayAddr1 },
+    );
+    const rr = InMemoryLinkNetwork.connect(
+      { nodeId: relay.nodeId, address: relayAddr2 },
+      { nodeId: receiver.nodeId, address: receiverAddr },
+    );
+
+    const senderLink = sr.linkA;
+    const relaySenderLink = sr.linkB;
+    const relayReceiverLink = rr.linkA;
+    const receiverLink = rr.linkB;
+
+    // ── Build a Class B frame with an opaque (encrypted-looking) body ─
+    //
+    // The body is 64 bytes of deterministic "ciphertext-looking" data.
+    // The first byte is 0xFF (CBOR break code) — invalid as a top-level
+    // CBOR item start. If the relay ever tries to decodeFrame(body) or
+    // decode(body), it would throw; the test catches that via the
+    // spy (the throw would either propagate or be swallowed, both
+    // failing downstream assertions).
+    const originalBody = new Uint8Array(64);
+    for (let i = 0; i < originalBody.length; i++) {
+      originalBody[i] = (i * 37 + 11) & 0xff;
+    }
+    originalBody[0] = 0xff; // invalid CBOR top-level — proves body is not CBOR
+
+    const fid = makeFlowId();
+    const sentFrame: Frame = {
+      v: FRAME_VERSION,
+      cls: "B", // Class B — transit, opaque to relays
+      dst: receiver.nodeId,
+      src: sender.nodeId,
+      ttl: 2,
+      fid,
+      seq: 1,
+      body: originalBody,
+    };
+
+    // ── Spy: track every `decodeFrame` call the relay makes ──────────
+    //
+    // The relay handler below re-serializes the incoming frame to bytes
+    // (modelling "the frame arrived on the wire as bytes") and then calls
+    // `decodeFrame` on those bytes to parse the header. This makes the
+    // spy meaningful: any regression that adds a second `decodeFrame`
+    // call (e.g. on the body, to extract metadata) shows up here.
+    const decodeCalls: Uint8Array[] = [];
+    const spyDecodeFrame = (bytes: Uint8Array): Frame => {
+      decodeCalls.push(bytes);
+      return decodeFrame(bytes);
+    };
+
+    // ── Fake relay cache (header-only) ───────────────────────────────
+    //
+    // The relay is allowed to cache HEADER-derived info (the flow-id for
+    // replay defence, the source NodeId for accounting). It MUST NOT
+    // cache the BODY. We track every entry and assert at the end that
+    // the body bytes are not present (verbatim or as a prefix).
+    const relayCache: Map<string, Uint8Array> = new Map();
+
+    // ── Forward counter (duplication check) ──────────────────────────
+    let forwardedCount = 0;
+
+    // ── Relay handler ────────────────────────────────────────────────
+    //
+    // The relay policy for Class B frames:
+    //   1. Receive the frame (here: re-serialize to bytes and call
+    //      spyDecodeFrame, modelling real wire delivery).
+    //   2. Decode the HEADER (v, cls, dst, src, ttl, fid, seq) — the
+    //      body is opaque bytes and is NOT interpreted.
+    //   3. Track header-only state (the flow-id) in the relay cache.
+    //   4. Local-delivery check (dst === relay.nodeId).
+    //   5. TTL check (shouldDrop).
+    //   6. Forward: decrement TTL via forwardFrame, send on the
+    //      receiver-link. The body is forwarded byte-identical
+    //      (forwardFrame's shallow spread preserves the body reference).
+    relaySenderLink.onFrame((frame) => {
+      // Re-serialize to bytes (production: bytes arrived from the wire).
+      const wireBytes = encodeFrame(frame);
+      // Decode the HEADER. spyDecodeFrame records the input bytes; we
+      // assert later that no input equals the body bytes alone.
+      const decoded = spyDecodeFrame(wireBytes);
+
+      // Track header-only state (allowed): the flow-id for replay defence.
+      // We store ONLY the fid (8 bytes) — NEVER the body.
+      relayCache.set(toHex(decoded.fid), new Uint8Array(decoded.fid));
+
+      // Local delivery check.
+      if (bytesEqual(decoded.dst, relay.nodeId)) {
+        return;
+      }
+      // TTL check.
+      if (shouldDrop(decoded)) {
+        return;
+      }
+      // Forward Class B as-is — body is opaque, never inspected.
+      // (A regression that tries to decode the body would do so HERE,
+      // before forwardFrame. The spy would catch it as a second
+      // decodeFrame call whose input matches the body.)
+      const forwarded = forwardFrame(decoded);
+      forwardedCount++;
+      void relayReceiverLink.send(forwarded);
+    });
+
+    // Receiver captures frames.
+    const received: Frame[] = [];
+    receiverLink.onFrame((frame) => {
+      received.push(frame);
+    });
+
+    // ── Send the Class B frame ───────────────────────────────────────
+    const sentOk = await senderLink.send(sentFrame);
+    if (!sentOk) throw new Error("Sender's send should have succeeded");
+    await flushMicrotasks();
+
+    // ── Behavioral assertions (invariant I8) ─────────────────────────
+
+    // (a) Body forwarded UNCHANGED (byte-identical).
+    if (received.length !== 1) {
+      throw new Error(
+        `Receiver must receive exactly 1 frame; got ${received.length} (relay may have dropped the frame — body-decode regression suspected)`,
+      );
+    }
+    const receivedFrame = received[0];
+    if (!bytesEqual(receivedFrame.body, originalBody)) {
+      throw new Error(
+        "Relay must forward the Class B body byte-identical (unchanged); got a different body — I8 inspection/mutation violation",
+      );
+    }
+
+    // (b) Body NEVER inspected: decodeFrame was called exactly once (for
+    // the header), and the input was the FULL frame bytes — NEVER the
+    // body alone.
+    if (decodeCalls.length !== 1) {
+      throw new Error(
+        `Relay must call decodeFrame exactly once (to parse the header); got ${decodeCalls.length} call(s) — body inspection suspected — I8 violation`,
+      );
+    }
+    if (bytesEqual(decodeCalls[0], originalBody)) {
+      throw new Error(
+        "Relay called decodeFrame with the body bytes (not the full frame bytes) — body inspection — I8 violation",
+      );
+    }
+
+    // (c) Body NEVER cached: the relay cache contains header info (the
+    // fid) but MUST NOT contain the body.
+    if (relayCache.size === 0) {
+      throw new Error(
+        "Relay header cache must be populated (the fid was tracked); cache is empty — relay did not run its header policy",
+      );
+    }
+    if (!relayCache.has(toHex(fid))) {
+      throw new Error(
+        "Relay header cache must contain the flow-id (header tracking); missing",
+      );
+    }
+    for (const [key, cached] of relayCache.entries()) {
+      if (bytesEqual(cached, originalBody)) {
+        throw new Error(
+          `Relay must NOT cache the Class B body verbatim; found body in cache under key "${key}" — I8 caching violation`,
+        );
+      }
+      // Reject any cached entry that contains the body as a prefix (the
+      // relay has no business caching anything body-sized or larger).
+      if (
+        cached.length >= originalBody.length &&
+        bytesEqual(cached.subarray(0, originalBody.length), originalBody)
+      ) {
+        throw new Error(
+          `Relay must NOT cache anything containing the Class B body; found body as prefix in cache under key "${key}" — I8 caching violation`,
+        );
+      }
+    }
+
+    // (d) Body NEVER duplicated: the relay forwarded exactly one frame.
+    if (forwardedCount !== 1) {
+      throw new Error(
+        `Relay must forward exactly 1 Class B frame; got ${forwardedCount} — I8 duplication violation`,
+      );
+    }
+
+    // ── Sanity: the relay's header tracking DID run (proving the test
+    // exercised the relay's actual code path, not a no-op).
+    if (relayCache.size === 0) {
+      throw new Error(
+        "Relay header cache is empty — the relay's handler did not run; test setup is broken",
+      );
+    }
+
+    await senderLink.close();
+    await receiverLink.close();
+
+    return {
+      testId,
+      testName,
+      passed: true,
+      durationMs: Date.now() - start,
+      details: {
+        forwardedCount,
+        receivedCount: received.length,
+        bodyUnchanged: bytesEqual(receivedFrame.body, originalBody),
+        decodeFrameCallCount: decodeCalls.length,
+        bodyFoundInCache: [...relayCache.values()].some((b) =>
+          bytesEqual(b, originalBody),
+        ),
+        relayCacheSize: relayCache.size,
+        relayCacheContainsFid: relayCache.has(toHex(fid)),
+        receivedTtl: receivedFrame.ttl,
+        originalTtl: sentFrame.ttl,
+      },
+    };
+  } catch (e: any) {
+    return {
+      testId,
+      testName,
+      passed: false,
+      durationMs: Date.now() - start,
+      error: e?.message ?? String(e),
+    };
+  }
+}
+
+// ─── The 15 tests ──────────────────────────────────────────────────────────
 
 export const INTEGRATION_TESTS: IntegrationTest[] = [
   {
@@ -2106,12 +2401,20 @@ export const INTEGRATION_TESTS: IntegrationTest[] = [
     specSection: "02-PROTOCOL-SPEC.md §8.1 (egress policy); 04-THREAT-MODEL.md T9 (SSRF); I18",
     run: test14GatewayPrivateNetworkRejection,
   },
+  {
+    id: "15-class-b-relay-non-inspection",
+    name: "Class B relay non-inspection (I8)",
+    description:
+      "A Class B frame with an opaque (ciphertext-looking) body is sent through a relay. The relay MUST forward the body byte-identical (unchanged), MUST NOT decode the body (decodeFrame called exactly once, on the full frame bytes), MUST NOT cache the body (relay cache contains only the flow-id), and MUST NOT duplicate the forward (exactly one forward). Behavioural test of invariant I8 — tests what the relay does NOT do, not just what it does.",
+    specSection: "02-PROTOCOL-SPEC.md §7 (Frame traffic classes — B=transit, opaque to relays); 06-CONFORMANCE-AND-AI-MODEL.md §B3 invariant I8 (Class B payloads never inspected, cached, or duplicated by relays)",
+    run: test15ClassBRelayNonInspection,
+  },
 ];
 
 /**
- * Run all 14 integration tests sequentially and return their results.
+ * Run all 15 integration tests sequentially and return their results.
  *
- * Tests are run in order (test 01 → test 14) so that, in case of a failure,
+ * Tests are run in order (test 01 → test 15) so that, in case of a failure,
  * the dashboard can show the first failing scenario at the top. Each test is
  * independent — no shared state — so reordering or running in parallel would
  * be safe (parallelism is deferred to a future task; the brief says

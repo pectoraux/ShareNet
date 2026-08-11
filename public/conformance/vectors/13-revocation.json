@@ -2,7 +2,7 @@
   "suite": "revocation",
   "specSection": "05 §C2, §C3",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T04:19:42.957Z",
+  "generatedAt": "2026-08-11T09:50:28.707Z",
   "vectors": [
     {
       "id": "revocation-monotone-un-revoke-rejected",

@@ -366,7 +366,8 @@ export function diversityFactor(distinctCounterparties: number): number {
  * computes its own scores.
  *
  * @param reputationScore  reputation in [0, 1000]
- * @returns                 factor in [0.5, 1.0]
+ * @returns                 factor in [0, 1] (per spec 05 §A5; was [0.5,1.0] —
+ *                          see ADR-0007 for the semantic-drift fix)
  */
 export function reputationFactor(reputationScore: number): number {
   if (
@@ -374,14 +375,17 @@ export function reputationFactor(reputationScore: number): number {
     reputationScore < 0 ||
     !Number.isFinite(reputationScore)
   ) {
-    // Fail closed: unknown reputation → floor (0.5). Do not zero out a node
-    // for a malformed input; the floor is the safe default.
-    return 0.5;
+    // Fail closed: unknown/malformed reputation → 0 (no reward multiplier).
+    // Per the hardening audit (Blocker E / ADR-0007): the spec says [0,1];
+    // a floor of 0.5 was a protocol semantic change made in implementation
+    // without an ADR. New nodes get reputation 0, which multiplies to 0
+    // points — they must build reputation through verified contributions
+    // before earning full rewards. This is the bootstrapping incentive.
+    return 0;
   }
-  // Clamp to [0, 1000] before computing — scores above 1000 are treated as
-  // fully trusted (1.0), scores below 0 are treated as new (0.5).
+  // Clamp to [0, 1000] → [0, 1]. Matches spec 05 §A5 exactly.
   const clamped = Math.max(0, Math.min(1000, reputationScore));
-  return 0.5 + 0.5 * (clamped / 1000);
+  return clamped / 1000;
 }
 
 // ─── Value computation ─────────────────────────────────────────────────────

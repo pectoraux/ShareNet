@@ -2,7 +2,8 @@
  * SNP L8 Link — platform-independent transport abstraction
  *
  * Source: 01-ARCHITECTURE.md §2.1 (L8 layer contract)
- * Source: 02-PROTOCOL-SPEC.md §7.2 (Noise_IK handshake)
+ * Source: 02-PROTOCOL-SPEC.md §7.2 (SNP-IK/0.1 handshake — a custom
+ *         authenticated-DH construction, NOT Noise_IK; see ADR-0003 and ADR-0006)
  * Source: 00-AUDIT.md §5.2 (the bug this replaces — EndpointId was
  *         "as issued by Nearby Connections", a Google Play Services API
  *         leaking Android into the protocol; NearbyTransport also
@@ -24,11 +25,11 @@
  * an opaque tag carried for diagnostics and MTU policy — never inspected
  * by the protocol itself.
  *
- * Every `Link` produced by this module is the output of a Noise_IK
- * handshake (02-PROTOCOL-SPEC.md §7.2). There is no unauthenticated link
- * path: `performNoiseIKHandshake` runs the handshake structure
- * (ephemeral X25519 exchange → DH → HKDF-SHA256 → descriptor exchange →
- * Ed25519 signature verification) and returns a `Link` whose `peerNodeId`
+ * Every `Link` produced by this module is the output of a SNP-IK/0.1
+ * handshake (02-PROTOCOL-SPEC.md §7.2; see ADR-0006). There is no
+ * unauthenticated link path: `performSnpIkHandshake` runs the handshake
+ * structure (ephemeral X25519 exchange → DH → HKDF-SHA256 → descriptor
+ * exchange → Ed25519 signature verification) and returns a `Link` whose `peerNodeId`
  * is bound to a verified `NodeDescriptor`. A `Link` whose peer's
  * descriptor signature does not verify NEVER enters the routing graph.
  *
@@ -41,31 +42,58 @@
  *         `./adapters/ble-android.ts`). The `Link` interface exported here
  *         is platform-independent: it mentions no platform SDK type.
  *
- * ## Reference-implementation caveats
+ * ## Reference-implementation status
  *
- * Production ShareNet is Rust. This TypeScript module is the structural
- * reference. Two caveats apply:
+ * Production ShareNet is Rust. This TypeScript module is the sandbox
+ * reference. The handshake implemented here is SNP-IK/0.1 — a custom
+ * authenticated-DH construction defined below. It is NOT Noise_IK.
+ * The spec (02-PROTOCOL-SPEC.md §7.2) names Noise_IK as the production
+ * target; this sandbox has not reached that target. Naming the
+ * implementation honestly (SNP-IK/0.1, not "Noise_IK") is the fix for
+ * the hardening audit's Blocker B. See ADR-0003 (superseded) and ADR-0006
+ * (this construction).
  *
- *   1. The Noise_IK handshake implemented here is a STRUCTURAL MODEL of
- *      the handshake (ephemeral DH → HKDF → signed descriptor exchange →
- *      signature verification). It is NOT a complete Noise_IK
- *      implementation per the Noise specification. In particular, the
- *      handshake messages are not encrypted (the initiator's static key
- *      is sent in the clear inside the NodeDescriptor, not under DH-protected
- *      encryption as real Noise_IK requires), and there is no rolling
- *      transcript hash. Production MUST use a vetted Noise library
- *      (e.g. `noise-lib`, `snowland`, or `libzkgroup`'s Noise impl).
- *      This is flagged 🟡 human-review per 04-THREAT-MODEL.md §4.2.
+ * ## SNP-IK/0.1 — ShareNet custom authenticated key agreement
  *
- *   2. The `Link` returned from `performNoiseIKHandshake` does NOT perform
- *      AEAD on frames after the handshake. The derived `LinkKeys`
- *      (`sendKey`, `recvKey`) are returned to the caller, who is responsible
- *      for applying AEAD (e.g., ChaCha20-Poly1305 with a per-frame nonce
- *      derived from `seq`) at a higher layer. The reference `EstablishedLink`
- *      sends raw `encodeFrame()` output so that the L7/L8 boundary is
- *      testable without depending on an AEAD primitive that doesn't exist
- *      in this sandbox yet. This is a documented TODO, not a security
- *      decision — production MUST AEAD-encrypt every frame.
+ * SNP-IK/0.1 is a custom authenticated-DH handshake, NOT a Noise protocol.
+ * It is defined here as a fixed construction; do not call it Noise_IK.
+ *
+ * Construction:
+ *   1. Initiator generates ephemeral X25519 keypair (e, E)
+ *   2. Initiator sends E + their signed NodeDescriptor to responder
+ *   3. Responder generates ephemeral X25519 keypair (e', E')
+ *   4. Responder sends E' + their signed NodeDescriptor to initiator
+ *   5. Both compute three DH operations:
+ *        dh1 = initiator_ephemeral × responder_static (rendezvousPub)
+ *        dh2 = initiator_static × responder_ephemeral
+ *        dh3 = initiator_ephemeral × responder_ephemeral
+ *   6. Both derive link keys via HKDF-SHA256(dh1 || dh2 || dh3, salt=empty,
+ *      info="SNP-IK/0.1 link keys")
+ *   7. Both verify the peer's NodeDescriptor signature BEFORE accepting
+ *      the link
+ *
+ * Security properties (vs real Noise_IK):
+ *   ✓ Mutual authentication (both NodeDescriptors are signature-verified)
+ *   ✓ Forward secrecy (ephemeral keys; compromise of long-term keys
+ *     doesn't reveal past sessions)
+ *   ✓ Key agreement (X25519 ECDH)
+ *   ✗ NO transcript binding (a real Noise protocol hashes every handshake
+ *     message into a chaining key)
+ *   ✗ NO handshake hash (no single hash binding the entire transcript)
+ *   ✗ NO prologue support
+ *   ✗ NOT a vetted Noise pattern (has not had the same scrutiny as Noise_IK)
+ *
+ * This is ADR-0006. Production SHOULD replace SNP-IK/0.1 with a vetted
+ * Noise_IK implementation (e.g. noise-lib, snowland) and update the spec
+ * to match. Until then, SNP-IK/0.1 is used HONESTLY — it is not called
+ * Noise_IK.
+ *
+ * NOTE: the HKDF `info` string used by this implementation is the legacy
+ * literal `"SNP/0.1 noise-ik link keys v1"` (see LINK_KEYS_HKDF_INFO
+ * below). It is NOT changed to `"SNP-IK/0.1 link keys"` because doing so
+ * would change the derived keys — a wire-breaking change. The literal
+ * string is an internal implementation detail, not the protocol name;
+ * the protocol name (SNP-IK/0.1) is what callers and reviewers see.
  *
  * @ invariant I9  — L8 never imports L6 (routing). Imports limited to
  *                   constants, identity, frames, crypto, hashing, cbor.
@@ -97,6 +125,9 @@ import {
   type X25519Keypair,
   generateX25519Keypair,
   x25519SharedSecret,
+  aeadEncrypt,
+  aeadDecrypt,
+  aeadNonce,
 } from "./crypto";
 import { hkdfSha256, deriveNodeId } from "./hashing";
 import { type CborValue, CborError, cborMap, encode as cborEncode, decode as cborDecode } from "./cbor";
@@ -184,11 +215,11 @@ export function linkAddressEqual(a: LinkAddress, b: LinkAddress): boolean {
 /**
  * One hop of authenticated transport. A `Link` represents a single
  * point-to-point connection between this node and one peer, AFTER the
- * Noise_IK handshake has completed. There is no such thing as an
+ * SNP-IK/0.1 handshake has completed. There is no such thing as an
  * unauthenticated `Link` in this codebase — the audit's NearbyTransport
  * "auto-accept every connection" pattern is structurally impossible here
  * because the only constructor path for a `Link` goes through
- * `performNoiseIKHandshake` (or, for tests, `InMemoryLinkNetwork.connect`,
+ * `performSnpIkHandshake` (or, for tests, `InMemoryLinkNetwork.connect`,
  * which is documented testing-only).
  *
  * The `Link` interface carries no routing semantics. It does not know
@@ -201,7 +232,7 @@ export function linkAddressEqual(a: LinkAddress, b: LinkAddress): boolean {
  *
  *   1. A `HandshakeChannel` is obtained from a platform adapter (BLE
  *      connection accepted, TCP connect() succeeded, etc.).
- *   2. `performNoiseIKHandshake(channel, opts)` runs the Noise_IK
+ *   2. `performSnpIkHandshake(channel, opts)` runs the SNP-IK/0.1
  *      structure. On success it returns `LinkHandshakeResult` whose
  *      `link` field is a live `Link` (an `EstablishedLink` wrapping the
  *      channel). On failure it closes the channel and throws.
@@ -215,7 +246,7 @@ export function linkAddressEqual(a: LinkAddress, b: LinkAddress): boolean {
  *
  * `peerNodeId` is the 32-byte SHA-256 NodeId of the peer's NodeIdentity
  * Ed25519 public key (I4). It is NOT the bare public key — the bare key
- * is disclosed only inside the Noise_IK handshake and is carried in the
+ * is disclosed only inside the SNP-IK/0.1 handshake and is carried in the
  * peer's `NodeDescriptor` (returned in `LinkHandshakeResult.peerDescriptor`).
  * L6 routing compares NodeIds for equality; it never needs the bare key.
  *
@@ -233,7 +264,7 @@ export interface Link {
   readonly peerAddress: LinkAddress;
   /**
    * Peer's 32-byte NodeId, cryptographically established during the
-   * Noise_IK handshake. This is `peerDescriptor.nodeId` for the descriptor
+   * SNP-IK/0.1 handshake. This is `peerDescriptor.nodeId` for the descriptor
    * verified during the handshake. L6 routing uses this as the
    * peer-identity key; it never uses the bare Ed25519 public key.
    */
@@ -302,7 +333,7 @@ export interface Link {
 
 /**
  * Listens on a `LinkAddress` for inbound connections. Each accepted
- * connection is run through `performNoiseIKHandshake` internally; only
+ * connection is run through `performSnpIkHandshake` internally; only
  * handshakes that SUCCEED are surfaced via `onLink`. Failed handshakes
  * are silently dropped (with diagnostic logging at the adapter level).
  *
@@ -315,7 +346,7 @@ export interface Link {
  * The audit found NearbyTransport auto-accepting every connection without
  * authentication (00-AUDIT.md §5.2). To make that bug structurally
  * impossible, `LinkListener` does NOT expose a "raw accepted channel"
- * callback. The ONLY callback is `onLink`, which fires AFTER the Noise_IK
+ * callback. The ONLY callback is `onLink`, which fires AFTER the SNP-IK/0.1
  * handshake has completed and the peer's descriptor signature has
  * verified. There is no way for adapter code to surface an unauthenticated
  * connection to the protocol layer.
@@ -328,7 +359,7 @@ export interface LinkListener {
 
   /**
    * Subscribe to newly-accepted, fully-handshaken Links. The handler is
-   * called once per successful inbound Noise_IK handshake. Returns an
+   * called once per successful inbound SNP-IK/0.1 handshake. Returns an
    * unsubscribe function.
    */
   onLink(handler: (link: Link) => void): () => void;
@@ -340,7 +371,7 @@ export interface LinkListener {
 // ─── LinkKeys — derived AEAD keys ─────────────────────────────────────────
 
 /**
- * The two AEAD keys derived from the Noise_IK handshake: one for frames
+ * The two AEAD keys derived from the SNP-IK/0.1 handshake: one for frames
  * this node sends, one for frames this node receives. They are distinct
  * (the initiator's `sendKey` equals the responder's `recvKey` and vice
  * versa) to prevent nonce-reuse across directions.
@@ -363,7 +394,7 @@ export interface LinkKeys {
 // ─── LinkHandshakeResult ──────────────────────────────────────────────────
 
 /**
- * The output of a successful `performNoiseIKHandshake`. Contains:
+ * The output of a successful `performSnpIkHandshake`. Contains:
  *   - `link`: a live `Link` whose `peerNodeId` matches `peerDescriptor.nodeId`
  *   - `peerDescriptor`: the verified peer `NodeDescriptor` (signature checked)
  *   - `linkKeys`: the derived AEAD keys (unused by the reference `Link`,
@@ -385,10 +416,10 @@ export interface LinkHandshakeResult {
 // ─── HandshakeChannel — pre-handshake raw byte transport ──────────────────
 
 /**
- * A raw byte channel to a peer, BEFORE the Noise_IK handshake. Platform
+ * A raw byte channel to a peer, BEFORE the SNP-IK/0.1 handshake. Platform
  * adapters produce a `HandshakeChannel` when they establish a TCP
  * connection, BLE GATT link, etc., and pass it to
- * `performNoiseIKHandshake` to upgrade it to an authenticated `Link`.
+ * `performSnpIkHandshake` to upgrade it to an authenticated `Link`.
  *
  * The `HandshakeChannel` interface is deliberately minimal: send bytes,
  * receive bytes, close. It does NOT carry Frames — the handshake itself
@@ -429,23 +460,23 @@ export interface HandshakeChannel {
 // ─── Handshake options ────────────────────────────────────────────────────
 
 /**
- * Inputs to `performNoiseIKHandshake`. The caller supplies:
+ * Inputs to `performSnpIkHandshake`. The caller supplies:
  *   - The local node's signed `NodeDescriptor` (already signed via
  *     `signNodeDescriptor` from identity.ts)
- *   - The Ed25519 secret key for `localDescriptor.nodePubKey` (for nothing
- *     in the simplified handshake — the descriptor is already signed — but
- *     required by the API for forward-compatibility with future
- *     handshake variants that re-sign transcript hashes)
+ *   - The Ed25519 secret key for `localDescriptor.nodePubKey` (unused by
+ *     SNP-IK/0.1 today — the descriptor is already signed — but required
+ *     by the API for forward-compatibility with a future vetted Noise_IK
+ *     implementation that re-signs transcript hashes)
  *   - The X25519 secret key for `localDescriptor.rendezvousPub` (used as
- *     the Noise static key in the DH operations)
+ *     the SNP-IK/0.1 static key in the DH operations)
  *   - The expected peer NodeId (if known) — for pinning / TOFU downgrade
  *     prevention. If null, any peer with a valid descriptor is accepted
  *     (trust-on-first-use)
- *   - Whether this side is the Noise initiator (true) or responder (false)
+ *   - Whether this side is the SNP-IK/0.1 initiator (true) or responder (false)
  *
- * The `localNodeSecretKey` is not used by the simplified handshake but is
- * required by the API so that a future full-Noise implementation can
- * re-sign the transcript without breaking callers.
+ * The `localNodeSecretKey` is not used by SNP-IK/0.1 but is required by
+ * the API so that a future vetted Noise_IK implementation can re-sign
+ * the transcript without breaking callers. See ADR-0006.
  */
 export interface LinkHandshakeOptions {
   /** Local NodeDescriptor (signed via `signNodeDescriptor`). Sent to peer. */
@@ -457,11 +488,12 @@ export interface LinkHandshakeOptions {
   /**
    * Expected peer NodeId (32 bytes), or null for trust-on-first-use.
    * If set, the handshake fails if the peer's descriptor.nodeId does not
-   * match. This is the "I" in Noise_IK: the initiator knows the
-   * responder's identity in advance.
+   * match. This is the "I"-style property of SNP-IK/0.1 (analogous to the
+   * "I" in Noise_IK's pattern naming): the initiator knows the responder's
+   * identity in advance.
    */
   readonly expectedPeerNodeId: Uint8Array | null;
-  /** True if this side is the Noise initiator (the one that opens the channel). */
+  /** True if this side is the SNP-IK/0.1 initiator (the one that opens the channel). */
   readonly isInitiator: boolean;
   /** Optional handshake timeout in milliseconds. Default 10000. */
   readonly timeoutMs?: number;
@@ -469,11 +501,12 @@ export interface LinkHandshakeOptions {
 
 // ─── Handshake message format ─────────────────────────────────────────────
 //
-// The simplified Noise_IK handshake exchanges two CBOR messages, one in
-// each direction. Each message carries the sender's ephemeral X25519
-// public key and the sender's signed NodeDescriptor. After both messages
-// are exchanged, both sides compute three DH operations (es, se, ee) and
-// derive the link keys via HKDF-SHA256.
+// The SNP-IK/0.1 handshake exchanges two CBOR messages, one in each
+// direction. Each message carries the sender's ephemeral X25519 public
+// key and the sender's signed NodeDescriptor. After both messages are
+// exchanged, both sides compute three DH operations (es, se, ee) and
+// derive the link keys via HKDF-SHA256. See the module-level "SNP-IK/0.1"
+// section above and ADR-0006 for the full construction definition.
 //
 // CDDL (simplified, NOT a frozen protocol constant — see module-level note):
 //
@@ -482,10 +515,11 @@ export interface LinkHandshakeOptions {
 //     descriptor: NodeDescriptor   ; sender's SIGNED NodeDescriptor
 //   }
 //
-// The descriptor's `rendezvousPub` field is used as the Noise static key.
+// The descriptor's `rendezvousPub` field is used as the SNP-IK/0.1 static
+// key (the long-term X25519 key the peer proves possession of via DH).
 // Because the descriptor is signed by `nodePubKey` (Ed25519) and contains
 // `rendezvousPub`, verifying the descriptor signature proves that the
-// peer's Noise static key is bound to a NodeIdentity the peer controls.
+// peer's static key is bound to a NodeIdentity the peer controls.
 // Combined with the NodeId-vs-pubkey hash check, this gives us:
 //
 //   - Possession of Ed25519 secret (signature verifies)
@@ -499,7 +533,7 @@ export interface LinkHandshakeOptions {
 //   - Confidentiality of the initiator's static key (sent in clear inside
 //     the descriptor, not under DH-protected encryption)
 //   - Transcript hash binding (no rolling hash across messages)
-//   - Replay protection (no nonces in the simplified message format)
+//   - Replay protection (no nonces in the SNP-IK/0.1 message format)
 //   - AEAD on post-handshake frames (see EstablishedLink note)
 
 interface HandshakeMessage {
@@ -509,7 +543,7 @@ interface HandshakeMessage {
 
 /**
  * Encode a `HandshakeMessage` to canonical CBOR bytes.
- * Used internally by `performNoiseIKHandshake`.
+ * Used internally by `performSnpIkHandshake`.
  */
 function encodeHandshakeMessage(msg: HandshakeMessage): Uint8Array {
   const map = cborMap([
@@ -522,7 +556,7 @@ function encodeHandshakeMessage(msg: HandshakeMessage): Uint8Array {
 /**
  * Decode a `HandshakeMessage` from CBOR bytes.
  * Throws `CborError(MALFORMED)` on any structural violation.
- * Used internally by `performNoiseIKHandshake`.
+ * Used internally by `performSnpIkHandshake`.
  */
 function decodeHandshakeMessage(bytes: Uint8Array): HandshakeMessage {
   const value = cborDecode(bytes);
@@ -730,23 +764,29 @@ function describeType(value: unknown): string {
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /**
- * HKDF `info` string for deriving Noise_IK link keys. This binds the
- * derived key material to the SNP/0.1 Noise_IK handshake context.
- * Changing this string is a protocol-breaking change.
+ * HKDF `info` string for deriving SNP-IK/0.1 link keys. This binds the
+ * derived key material to the SNP/0.1 SNP-IK/0.1 handshake context.
+ *
+ * NOTE: the literal string still reads `"SNP/0.1 noise-ik link keys v1"`
+ * for historical continuity — it was frozen before the SNP-IK/0.1 rename
+ * (ADR-0006). Changing the literal would change the derived keys, which
+ * is a wire-breaking change NOT authorised by this task. The literal is
+ * an implementation detail; the protocol name callers and reviewers see
+ * is SNP-IK/0.1.
  */
 const LINK_KEYS_HKDF_INFO = asciiBytes("SNP/0.1 noise-ik link keys v1");
 
 /** Total derived key material length (sendKey 32 + recvKey 32 = 64 bytes). */
 const LINK_KEYS_MATERIAL_LENGTH = AEAD_KEY_BYTES * 2;
 
-// ─── performNoiseIKHandshake ──────────────────────────────────────────────
+// ─── performSnpIkHandshake ─────────────────────────────────────────────────
 
 /**
- * Run the simplified Noise_IK handshake over a `HandshakeChannel` and
- * return an authenticated `Link` on success.
+ * Run the SNP-IK/0.1 handshake over a `HandshakeChannel` and return an
+ * authenticated `Link` on success.
  *
- * ## What this does (the STRUCTURE — see module-level note about why
- * this is NOT a full Noise_IK implementation)
+ * ## What this does (the STRUCTURE — see module-level note and ADR-0006:
+ * this is SNP-IK/0.1, NOT Noise_IK)
  *
  *   1. Generate an ephemeral X25519 keypair.
  *   2. Build a `HandshakeMessage` containing the ephemeral public key and
@@ -762,8 +802,8 @@ const LINK_KEYS_MATERIAL_LENGTH = AEAD_KEY_BYTES * 2;
  *      and throw.
  *   6. If `expectedPeerNodeId` was supplied, verify
  *      `peerDescriptor.nodeId == expectedPeerNodeId`. If mismatch, close
- *      and throw. (This is the "I" in Noise_IK: the initiator knows the
- *      responder's identity in advance.)
+ *      and throw. (This is the "I"-style property of SNP-IK/0.1: the
+ *      initiator knows the responder's identity in advance.)
  *   7. Compute three DH operations using the local and peer ephemeral
  *      and static (rendezvousPub) X25519 keys:
  *        - dh1 = DH(localEph, peerStatic)   [es or se depending on direction]
@@ -780,11 +820,11 @@ const LINK_KEYS_MATERIAL_LENGTH = AEAD_KEY_BYTES * 2;
  *
  * ## Failure modes
  *
- *   - Malformed peer message → throws `Error("Noise_IK: malformed peer handshake message")`
- *   - Invalid peer descriptor signature → throws `Error("Noise_IK: peer NodeDescriptor signature invalid")`
- *   - NodeId/pubKey mismatch → throws `Error("Noise_IK: peer nodeId does not match hash(nodePubKey)")`
- *   - Unexpected peer NodeId → throws `Error("Noise_IK: peer nodeId does not match expected")`
- *   - Timeout → throws `Error("Noise_IK: handshake timed out after Xms")`
+ *   - Malformed peer message → throws `Error("SNP-IK/0.1: malformed peer handshake message")`
+ *   - Invalid peer descriptor signature → throws `Error("SNP-IK/0.1: peer NodeDescriptor signature invalid")`
+ *   - NodeId/pubKey mismatch → throws `Error("SNP-IK/0.1: peer nodeId does not match hash(nodePubKey)")`
+ *   - Unexpected peer NodeId → throws `Error("SNP-IK/0.1: peer nodeId does not match expected")`
+ *   - Timeout → throws `Error("SNP-IK/0.1: handshake timed out after Xms")`
  *
  * In every failure case, the channel is closed BEFORE the throw, so the
  * caller does not need to clean up.
@@ -792,7 +832,7 @@ const LINK_KEYS_MATERIAL_LENGTH = AEAD_KEY_BYTES * 2;
  * @ invariant I20 — never returns a Link whose peer descriptor signature
  *                   does not verify. Failure throws (and closes channel).
  */
-export async function performNoiseIKHandshake(
+export async function performSnpIkHandshake(
   channel: HandshakeChannel,
   options: LinkHandshakeOptions,
 ): Promise<LinkHandshakeResult> {
@@ -806,21 +846,21 @@ export async function performNoiseIKHandshake(
   } = options;
 
   // Defensive: the localNodeSecretKey is part of the API for forward
-  // compatibility but unused by the simplified handshake. Validate its
-  // length so callers can't accidentally pass garbage that a future
-  // full-Noise implementation would silently misuse.
+  // compatibility but unused by SNP-IK/0.1. Validate its length so callers
+  // can't accidentally pass garbage that a future vetted Noise_IK
+  // implementation would silently misuse.
   if (!(localNodeSecretKey instanceof Uint8Array) || localNodeSecretKey.length !== 32) {
     await channel.close();
-    throw new Error("Noise_IK: localNodeSecretKey must be a 32-byte Uint8Array");
+    throw new Error("SNP-IK/0.1: localNodeSecretKey must be a 32-byte Uint8Array");
   }
   if (!(localRendezvousSecretKey instanceof Uint8Array) || localRendezvousSecretKey.length !== 32) {
     await channel.close();
-    throw new Error("Noise_IK: localRendezvousSecretKey must be a 32-byte Uint8Array");
+    throw new Error("SNP-IK/0.1: localRendezvousSecretKey must be a 32-byte Uint8Array");
   }
   if (expectedPeerNodeId !== null) {
     if (!(expectedPeerNodeId instanceof Uint8Array) || expectedPeerNodeId.length !== 32) {
       await channel.close();
-      throw new Error("Noise_IK: expectedPeerNodeId must be null or a 32-byte Uint8Array");
+      throw new Error("SNP-IK/0.1: expectedPeerNodeId must be null or a 32-byte Uint8Array");
     }
   }
 
@@ -828,10 +868,10 @@ export async function performNoiseIKHandshake(
   const ephemeral: X25519Keypair = generateX25519Keypair();
 
   // Step 2: build & send our handshake message.
-  //    We send the message BEFORE reading the peer's. In a real Noise_IK
-  //    the initiator sends first and the responder sends second; we don't
-  //    enforce ordering here (both sides send concurrently). This is OK
-  //    for the simplified structure — both messages carry independent
+  //    We send the message BEFORE reading the peer's. In real Noise_IK
+  //    (the spec target) the initiator sends first and the responder
+  //    sends second; we don't enforce ordering here (both sides send
+  //    concurrently). This is OK for SNP-IK/0.1 — both messages carry independent
   //    ephemeral keys and descriptors, and the DH outputs are the same
   //    regardless of ordering.
   const ourMessage: HandshakeMessage = {
@@ -843,7 +883,7 @@ export async function performNoiseIKHandshake(
     await channel.send(ourBytes);
   } catch (e) {
     await channel.close();
-    throw new Error(`Noise_IK: failed to send handshake message: ${(e as Error).message}`);
+    throw new Error(`SNP-IK/0.1: failed to send handshake message: ${(e as Error).message}`);
   }
 
   // Step 3: receive the peer's handshake message (with timeout).
@@ -861,7 +901,7 @@ export async function performNoiseIKHandshake(
     peerMessage = decodeHandshakeMessage(peerBytes);
   } catch {
     await channel.close();
-    throw new Error("Noise_IK: malformed peer handshake message");
+    throw new Error("SNP-IK/0.1: malformed peer handshake message");
   }
 
   const peerDescriptor = peerMessage.descriptor;
@@ -870,7 +910,7 @@ export async function performNoiseIKHandshake(
   // Step 5: verify the peer's descriptor signature (I20: returns false, never throws).
   if (!verifyNodeDescriptor(peerDescriptor)) {
     await channel.close();
-    throw new Error("Noise_IK: peer NodeDescriptor signature invalid");
+    throw new Error("SNP-IK/0.1: peer NodeDescriptor signature invalid");
   }
 
   // Step 6: verify the NodeId/pubKey binding (I4).
@@ -879,18 +919,18 @@ export async function performNoiseIKHandshake(
     peerNodeIdFromKey = deriveNodeId(peerDescriptor.nodePubKey);
   } catch {
     await channel.close();
-    throw new Error("Noise_IK: peer nodePubKey malformed during NodeId derivation");
+    throw new Error("SNP-IK/0.1: peer nodePubKey malformed during NodeId derivation");
   }
   if (!constantTimeEqual(peerNodeIdFromKey, peerDescriptor.nodeId)) {
     await channel.close();
-    throw new Error("Noise_IK: peer nodeId does not match hash(nodePubKey)");
+    throw new Error("SNP-IK/0.1: peer nodeId does not match hash(nodePubKey)");
   }
 
   // Step 7: if we expected a specific peer NodeId, verify the match.
   if (expectedPeerNodeId !== null) {
     if (!constantTimeEqual(expectedPeerNodeId, peerDescriptor.nodeId)) {
       await channel.close();
-      throw new Error("Noise_IK: peer nodeId does not match expected");
+      throw new Error("SNP-IK/0.1: peer nodeId does not match expected");
     }
   }
 
@@ -910,7 +950,7 @@ export async function performNoiseIKHandshake(
     dh3 = x25519SharedSecret(ephemeral.secretKey, peerEphPub);
   } catch (e) {
     await channel.close();
-    throw new Error(`Noise_IK: DH operation failed: ${(e as Error).message}`);
+    throw new Error(`SNP-IK/0.1: DH operation failed: ${(e as Error).message}`);
   }
 
   // Step 9: derive link keys via HKDF-SHA256.
@@ -939,31 +979,57 @@ export async function performNoiseIKHandshake(
   return { link, peerDescriptor, linkKeys };
 }
 
-// ─── EstablishedLink — Link returned by performNoiseIKHandshake ───────────
+// ─── performNoiseIKHandshake — DEPRECATED alias for backward compat ─────────
 
 /**
- * The `Link` implementation returned by `performNoiseIKHandshake`. Wraps a
+ * @deprecated Use {@link performSnpIkHandshake} instead. This alias is kept
+ *             ONLY for backward compatibility with existing callers
+ *             (notably `src/lib/snp/integration-tests.ts`). It calls
+ *             `performSnpIkHandshake` unchanged.
+ *
+ *             The handshake is SNP-IK/0.1 — a custom authenticated-DH
+ *             construction, NOT Noise_IK. The legacy function name is
+ *             preserved so existing code does not break, but new code MUST
+ *             call `performSnpIkHandshake` so the naming reflects the
+ *             actual protocol (see ADR-0006). The misleading `NoiseIK`
+ *             in this alias name refers to the historical — and now
+ *             corrected — claim that this construction was Noise_IK.
+ *
+ *             This alias will be removed in a future task that migrates
+ *             the remaining callers. Do NOT add new call sites.
+ */
+export async function performNoiseIKHandshake(
+  channel: HandshakeChannel,
+  options: LinkHandshakeOptions,
+): Promise<LinkHandshakeResult> {
+  return performSnpIkHandshake(channel, options);
+}
+
+// ─── EstablishedLink — Link returned by performSnpIkHandshake ──────────────
+
+/**
+ * The `Link` implementation returned by `performSnpIkHandshake`. Wraps a
  * `HandshakeChannel` and exposes the `Link` interface (send Frame, onFrame).
  *
- * ## IMPORTANT: no AEAD in the reference implementation
+ * ## AEAD-encrypted frames (hardened)
  *
- * The reference `EstablishedLink` sends encoded frames RAW on the underlying
- * channel — it does NOT apply AEAD with the derived `LinkKeys`. This is a
- * documented TODO, not a security decision. Production MUST:
+ * Each frame is AEAD-encrypted with ChaCha20-Poly1305 using the link keys
+ * derived during the handshake. The nonce is `fid ‖ seq` (4-byte big-endian
+ * seq in the low 4 bytes), per spec §7.3. The AAD is empty for link-layer
+ * encryption (the frame header is inside the AEAD); the AEAD authenticates
+ * the entire encoded frame.
  *
- *   - AEAD-encrypt each `encodeFrame(frame)` output with `linkKeys.sendKey`
- *     and a per-frame nonce derived from the sequence number
- *   - AEAD-decrypt incoming bytes with `linkKeys.recvKey` before
- *     `decodeFrame`
- *   - Drop the link on any AEAD failure (authentication tag mismatch,
- *     nonce reuse, etc.)
+ * On any AEAD authentication failure (tag mismatch), the link is KILLED —
+ * a bad tag indicates either nonce reuse, a malicious peer, or a network
+ * corruption that AEAD is specifically designed to detect. Per spec §7.3:
+ * "nonce reuse is fatal and detectable."
  *
- * The `linkKeys` are stored on the link (and returned in
- * `LinkHandshakeResult`) so that a future AEAD layer can use them without
- * re-running the handshake.
+ * This closes the hardening audit Blocker A: "No one should implement a
+ * real network adapter on top of EstablishedLink yet" — AEAD is now wired
+ * in, not a TODO.
  *
  * This class is not exported — callers receive it as a `Link` from
- * `performNoiseIKHandshake`. Tests that need a non-handshaked Link use
+ * `performSnpIkHandshake`. Tests that need a non-handshaked Link use
  * `InMemoryLink` (see below).
  */
 class EstablishedLink implements Link {
@@ -977,6 +1043,8 @@ class EstablishedLink implements Link {
   private readonly frameHandlers: Set<(frame: Frame) => void> = new Set();
   private alive = true;
   private readonly offBytes: () => void;
+  /** Outbound sequence counter — strictly monotonic per link direction. */
+  private sendSeq = 0;
 
   constructor(channel: HandshakeChannel, peerNodeId: Uint8Array, linkKeys: LinkKeys) {
     this.channel = channel;
@@ -986,16 +1054,41 @@ class EstablishedLink implements Link {
     this.peerNodeId = peerNodeId;
     this.linkKeys = linkKeys;
 
-    // Wire incoming bytes → decodeFrame → dispatch to handlers.
-    // NOTE: production would AEAD-decrypt bytes BEFORE decodeFrame.
+    // Wire incoming bytes → AEAD-decrypt → decodeFrame → dispatch.
     this.offBytes = channel.onBytes((bytes: Uint8Array) => {
+      // The on-wire format is: nonce(12) || ciphertext || tag(16).
+      // We recover the nonce from the first 12 bytes, the sealed payload
+      // from the rest, and AEAD-decrypt with recvKey.
+      if (bytes.length < 12 + 16) {
+        // Too short to be a valid AEAD frame. Kill the link — this is
+        // either a malformed peer or an attacker.
+        this.kill("frame too short for AEAD");
+        return;
+      }
+      const nonce = bytes.slice(0, 12);
+      const sealed = bytes.slice(12); // ciphertext || tag
+
+      // @noble/ciphers expects ciphertext || tag concatenated.
+      const plaintext = aeadDecrypt(
+        this.linkKeys.recvKey,
+        nonce,
+        sealed.slice(0, sealed.length - 16),
+        sealed.slice(sealed.length - 16),
+        new Uint8Array(), // no AAD at link layer — header is inside AEAD
+      );
+      if (plaintext === null) {
+        // AEAD authentication failure. This is fatal per spec §7.3.
+        this.kill("AEAD authentication failure");
+        return;
+      }
+
       let frame: Frame;
       try {
-        frame = decodeFrame(bytes);
+        frame = decodeFrame(plaintext);
       } catch {
-        // Malformed bytes on the wire. Drop silently — a single bad frame
-        // does not kill the link. (Production: AEAD failures SHOULD kill
-        // the link; malformed-after-decrypt indicates a peer bug.)
+        // Malformed frame AFTER successful AEAD decrypt. This indicates a
+        // peer bug (they encrypted garbage). Kill the link.
+        this.kill("malformed frame after AEAD decrypt");
         return;
       }
       // Dispatch asynchronously so handler exceptions don't break the read loop.
@@ -1014,23 +1107,49 @@ class EstablishedLink implements Link {
 
   async send(frame: Frame): Promise<boolean> {
     if (!this.alive) return false;
-    let bytes: Uint8Array;
+    let plaintext: Uint8Array;
     try {
-      bytes = encodeFrame(frame);
+      plaintext = encodeFrame(frame);
     } catch {
       // Caller-side contract violation (malformed Frame). Throw — this is
       // a bug in the caller, not a peer-side failure.
       throw new Error("EstablishedLink.send: failed to encode frame");
     }
+    // AEAD-encrypt with a per-frame nonce derived from the flow ID + sendSeq.
+    const nonce = aeadNonce(frame.fid, this.sendSeq);
+    this.sendSeq++; // strictly monotonic — nonce reuse would be fatal
+    const { ciphertext, tag } = aeadEncrypt(
+      this.linkKeys.sendKey,
+      nonce,
+      plaintext,
+      new Uint8Array(), // no AAD at link layer
+    );
+    // On-wire format: nonce(12) || ciphertext || tag(16)
+    const wire = new Uint8Array(12 + ciphertext.length + 16);
+    wire.set(nonce, 0);
+    wire.set(ciphertext, 12);
+    wire.set(tag, 12 + ciphertext.length);
     try {
-      // NOTE: production would AEAD-encrypt `bytes` with linkKeys.sendKey here.
-      await this.channel.send(bytes);
+      await this.channel.send(wire);
       return true;
     } catch {
       // Channel send failed — the link is effectively dead. Mark it closed.
       this.alive = false;
       return false;
     }
+  }
+
+  /** Kill the link on a security-critical failure (AEAD auth, malformed). */
+  private kill(reason: string): void {
+    if (!this.alive) return;
+    this.alive = false;
+    this.frameHandlers.clear();
+    try { this.offBytes(); } catch { /* ignore */ }
+    try { this.channel.close(); } catch { /* ignore */ }
+    // In production, log `reason` to the security audit log. For the
+    // reference implementation, the link silently dies — callers see
+    // isAlive() === false and route-migrate away.
+    void reason;
   }
 
   onFrame(handler: (frame: Frame) => void): () => void {
@@ -1067,7 +1186,7 @@ class EstablishedLink implements Link {
  *
  * ## ⚠️ TESTING ONLY — NEVER USE IN PRODUCTION
  *
- * `InMemoryLink` performs NO Noise_IK handshake, NO AEAD, and NO signature
+ * `InMemoryLink` performs NO SNP-IK/0.1 handshake, NO AEAD, and NO signature
  * verification. It is a direct byte pipe between two test nodes. It exists
  * so that L6 routing tests, L7 session tests, and conformance/integration
  * tests can simulate a two-node network without depending on a real
@@ -1212,7 +1331,7 @@ export class InMemoryLinkNetwork {
   }
 }
 
-// ─── InMemoryHandshakeChannel — for testing performNoiseIKHandshake ───────
+// ─── InMemoryHandshakeChannel — for testing performSnpIkHandshake ─────────
 
 /**
  * In-memory `HandshakeChannel` implementation for tests. Two instances
@@ -1222,7 +1341,7 @@ export class InMemoryLinkNetwork {
  *
  * ## ⚠️ TESTING ONLY — NEVER USE IN PRODUCTION
  *
- * This class exists so that `performNoiseIKHandshake` can be tested
+ * This class exists so that `performSnpIkHandshake` can be tested
  * end-to-end (real X25519 DH, real HKDF, real descriptor signature
  * verification) without depending on a real transport adapter. The
  * `InMemoryLink` shortcut (above) bypasses the handshake entirely; this
@@ -1323,7 +1442,7 @@ export class InMemoryHandshakeChannel implements HandshakeChannel {
 
 /**
  * Factory for paired `InMemoryHandshakeChannel`s. Tests use this to
- * exercise `performNoiseIKHandshake` end-to-end (real DH, real HKDF,
+ * exercise `performSnpIkHandshake` end-to-end (real DH, real HKDF,
  * real signature verification) without a real transport adapter.
  *
  * ## ⚠️ TESTING ONLY — NEVER USE IN PRODUCTION
@@ -1349,7 +1468,7 @@ export class InMemoryHandshakeChannelPair {
 
 /**
  * Tracks all active `Link`s for a single node. The node's link manager
- * (an L8/L9 component) registers every link that completes a Noise_IK
+ * (an L8/L9 component) registers every link that completes a SNP-IK/0.1
  * handshake and removes it when it closes. L6 routing queries the
  * registry to find links to specific peers (`toPeer`) or the best link
  * for bulk transfer (`bestByMtu`).
@@ -1516,7 +1635,7 @@ function copyBytes(src: Uint8Array): Uint8Array {
  * Receive a single byte message on a `HandshakeChannel` with a timeout.
  * Returns the first message received. Rejects on timeout or channel close.
  *
- * Used internally by `performNoiseIKHandshake`. The handshake only expects
+ * Used internally by `performSnpIkHandshake`. The handshake only expects
  * one message from the peer, so we subscribe, wait for the first bytes,
  * and unsubscribe.
  */
@@ -1534,7 +1653,7 @@ function receiveOnce(channel: HandshakeChannel, timeoutMs: number): Promise<Uint
       if (settled) return;
       settled = true;
       off();
-      reject(new Error(`Noise_IK: handshake timed out after ${timeoutMs}ms`));
+      reject(new Error(`SNP-IK/0.1: handshake timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
 }

@@ -2,7 +2,7 @@
   "suite": "descriptors",
   "specSection": "SNP/0.1 §4.4, §5.1",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T04:19:42.945Z",
+  "generatedAt": "2026-08-11T09:50:28.694Z",
   "vectors": [
     {
       "id": "node-descriptor-sign-and-verify",

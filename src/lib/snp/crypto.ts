@@ -21,7 +21,8 @@
 import * as ed25519 from "@noble/ed25519";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { randomBytes } from "@noble/hashes/utils.js";
-import { sha512 } from "@noble/hashes/sha2.js";
+import { sha512, sha256 } from "@noble/hashes/sha2.js";
+import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import {
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_BYTES,
@@ -171,6 +172,135 @@ export function x25519SharedSecret(
     throw new Error("X25519 keys must be 32 bytes");
   }
   return x25519.getSharedSecret(secretKey, peerPublicKey);
+}
+
+// ─── ChaCha20-Poly1305 AEAD (RFC 8439) ─────────────────────────────────────
+//
+// Source: 02-PROTOCOL-SPEC.md §1.2 — "AEAD: ChaCha20-Poly1305 (RFC 8439),
+// 12-byte nonce". Used for Class B transit frame encryption and link-layer
+// frame encryption after the handshake establishes keys.
+//
+// This is the AEAD that was previously a TODO in EstablishedLink. Per the
+// hardening audit (Blocker A): "No one should implement a real network
+// adapter on top of EstablishedLink yet" until AEAD is wired in. This module
+// provides the primitive; link.ts wires it into the frame path.
+
+export interface AeadSealed {
+  /** The ciphertext (same length as plaintext for ChaCha20). */
+  ciphertext: Uint8Array;
+  /** The 16-byte Poly1305 authentication tag, appended to ciphertext on the wire. */
+  tag: Uint8Array;
+}
+
+/**
+ * Encrypt plaintext under ChaCha20-Poly1305.
+ *
+ * @param key       32-byte AEAD key (from HKDF in the handshake)
+ * @param nonce     12-byte nonce — MUST be unique per key. For link frames,
+ *                  the nonce is `fid ‖ seq` (per spec §7.3). For circuits,
+ *                  the nonce is `fid ‖ seq` with rekey every 2^20 frames.
+ * @param plaintext the data to encrypt
+ * @param aad       additional authenticated data (authenticated but not encrypted;
+ *                  e.g. the frame header for Class B transit)
+ * @returns         ciphertext + 16-byte tag
+ */
+export function aeadEncrypt(
+  key: Uint8Array,
+  nonce: Uint8Array,
+  plaintext: Uint8Array,
+  aad: Uint8Array = new Uint8Array(),
+): AeadSealed {
+  if (key.length !== AEAD_KEY_BYTES) {
+    throw new Error(`AEAD key must be ${AEAD_KEY_BYTES} bytes; got ${key.length}`);
+  }
+  if (nonce.length !== AEAD_NONCE_BYTES) {
+    throw new Error(`AEAD nonce must be ${AEAD_NONCE_BYTES} bytes; got ${nonce.length}`);
+  }
+  // @noble/ciphers API: chacha20poly1305(key, nonce, aad?) returns a cipher
+  // object with .encrypt(plaintext). The AAD is passed at cipher creation.
+  const cipher = chacha20poly1305(key, nonce, aad);
+  // .encrypt() returns ciphertext || tag (16 bytes appended).
+  const sealed = cipher.encrypt(plaintext);
+  const ciphertext = sealed.slice(0, sealed.length - 16);
+  const tag = sealed.slice(sealed.length - 16);
+  return { ciphertext, tag };
+}
+
+/**
+ * Decrypt and authenticate a ChaCha20-Poly1305 ciphertext.
+ *
+ * Returns `null` on authentication failure (NEVER throws for a bad tag —
+ * per I20, security-critical verification must not throw on failure).
+ *
+ * @param key        32-byte AEAD key
+ * @param nonce      12-byte nonce
+ * @param ciphertext the ciphertext (without tag)
+ * @param tag        16-byte Poly1305 tag
+ * @param aad        additional authenticated data (must match encryption AAD)
+ * @returns          plaintext, or null if authentication fails
+ */
+export function aeadDecrypt(
+  key: Uint8Array,
+  nonce: Uint8Array,
+  ciphertext: Uint8Array,
+  tag: Uint8Array,
+  aad: Uint8Array = new Uint8Array(),
+): Uint8Array | null {
+  if (key.length !== AEAD_KEY_BYTES) return null;
+  if (nonce.length !== AEAD_NONCE_BYTES) return null;
+  if (tag.length !== 16) return null;
+  try {
+    // @noble/ciphers API: chacha20poly1305(key, nonce, aad?) returns a cipher
+    // object with .decrypt(ciphertext). The AAD is passed at cipher creation.
+    const cipher = chacha20poly1305(key, nonce, aad);
+    // Reconstruct ciphertext || tag for @noble/ciphers.
+    const sealed = new Uint8Array(ciphertext.length + tag.length);
+    sealed.set(ciphertext, 0);
+    sealed.set(tag, ciphertext.length);
+    return cipher.decrypt(sealed);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a 12-byte AEAD nonce from a flow ID and sequence number.
+ * Per spec §7.3: "Nonce = fid ‖ seq; strictly monotonic."
+ *
+ * The flow ID is 8 bytes; the sequence number is encoded as a 4-byte
+ * big-endian unsigned integer in the low 4 bytes of the nonce. This
+ * means seq can range 0..2^32-1 before rekeying is required (spec §7.3
+ * says rekey every 2^20 frames, well within this range).
+ */
+export function aeadNonce(fid: Uint8Array, seq: number): Uint8Array {
+  if (fid.length !== 8) {
+    throw new Error(`Flow ID must be 8 bytes for AEAD nonce; got ${fid.length}`);
+  }
+  if (seq < 0 || seq > 0xffffffff) {
+    throw new Error(`Sequence number must fit in uint32 for AEAD nonce; got ${seq}`);
+  }
+  const nonce = new Uint8Array(AEAD_NONCE_BYTES);
+  nonce.set(fid, 0);
+  // 4-byte big-endian seq in bytes [8..11]
+  nonce[8] = (seq >>> 24) & 0xff;
+  nonce[9] = (seq >>> 16) & 0xff;
+  nonce[10] = (seq >>> 8) & 0xff;
+  nonce[11] = seq & 0xff;
+  return nonce;
+}
+
+/**
+ * Constant-time comparison of two byte arrays. Used for tag comparison
+ * in AEAD verification (though @noble/ciphers already does this internally;
+ * this is exposed for callers that need to compare tags manually).
+ */
+export function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
 }
 
 // ─── Deterministic test keypairs ───────────────────────────────────────────

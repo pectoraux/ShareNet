@@ -2,7 +2,7 @@
   "suite": "negative",
   "specSection": "06 §A5",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T04:19:42.959Z",
+  "generatedAt": "2026-08-11T09:50:28.708Z",
   "vectors": [
     {
       "id": "negative-cbor-non-canonical-key-order",
@@ -145,14 +145,14 @@
           },
           "ttl": 0,
           "fid": {
-            "0": 10,
-            "1": 123,
-            "2": 190,
-            "3": 51,
-            "4": 154,
-            "5": 135,
-            "6": 26,
-            "7": 154
+            "0": 225,
+            "1": 55,
+            "2": 9,
+            "3": 42,
+            "4": 123,
+            "5": 172,
+            "6": 166,
+            "7": 56
           },
           "seq": 1,
           "body": {
@@ -190,6 +190,18 @@
       "expected": {
         "isRegression": true,
         "mustDiscard": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-route-stale-seq-after-expiry",
+      "description": "A RouteAdvert with seq=42 MUST be rejected even after all routes to that destination have expired, IF seq=100 was previously seen. The durable sequence floor (hardening audit Blocker C) prevents stale-advertisement attacks where a gateway disappears and an old low-seq advert becomes valid again. The seq floor is NOT cleared by removeStale() — only by explicit clearSequenceFloor() or a long TTL.",
+      "input": {
+        "firstSeq": 100,
+        "afterExpirySeq": 42
+      },
+      "expected": {
+        "mustReject": true
       },
       "mustReject": true
     },
