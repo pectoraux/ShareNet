@@ -9,6 +9,7 @@
 //! snp-node mesh-demo [--url https://example.com/]
 //! snp-node mesh-demo-multihop [--url https://example.com/]
 //! snp-node mesh-demo-failover [--url https://example.com/]
+//! snp-node mesh-session-demo [--url https://example.com/]
 //! ```
 
 use std::process::ExitCode;
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
         "mesh-demo" => cmd_mesh_demo(&args[2..]),
         "mesh-demo-multihop" => cmd_mesh_demo_multihop(&args[2..]),
         "mesh-demo-failover" => cmd_mesh_demo_failover(&args[2..]),
+        "mesh-session-demo" => cmd_mesh_session_demo(&args[2..]),
         "help" | "--help" | "-h" => {
             usage(&args[0]);
             return ExitCode::SUCCESS;
@@ -196,6 +198,25 @@ fn cmd_mesh_demo_failover(args: &[String]) -> snp_node::NodeResult<()> {
     snp_node::run_mesh_demo_failover(&url)
 }
 
+fn cmd_mesh_session_demo(args: &[String]) -> snp_node::NodeResult<()> {
+    let mut url = String::from("https://example.com/");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(snp_node::NodeError::Other("--url requires a value".into()));
+                }
+                url = args[i].clone();
+            }
+            other => return Err(snp_node::NodeError::Other(format!("unknown arg: {other}"))),
+        }
+        i += 1;
+    }
+    snp_node::node::run_mesh_session_demo(&url)
+}
+
 fn usage(prog: &str) {
     eprintln!("Usage: {prog} <subcommand> [options]");
     eprintln!();
@@ -206,11 +227,13 @@ fn usage(prog: &str) {
     eprintln!("  mesh-demo           Run all three roles in-process (N1.9 single-hop)");
     eprintln!("  mesh-demo-multihop  Run Client → Relay A → Relay B → Gateway → example.com (N2.0 multi-hop)");
     eprintln!("  mesh-demo-failover  Run failover demo: Gateway A killed, traffic continues via Gateway B");
+    eprintln!("  mesh-session-demo   N2.0.1: persistent sessions + gateway discovery + genuine failover");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {prog} mesh-demo");
     eprintln!("  {prog} mesh-demo-multihop");
     eprintln!("  {prog} mesh-demo-failover");
+    eprintln!("  {prog} mesh-session-demo");
     eprintln!("  {prog} mesh-demo --url https://example.com/");
     eprintln!("  {prog} gateway --listen-port 7003");
     eprintln!("  {prog} relay  --listen-port 7002 --gateway-port 7003");

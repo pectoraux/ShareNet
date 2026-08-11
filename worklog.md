@@ -1589,3 +1589,138 @@ Stage Summary:
 - 82 total Rust tests pass, 0 failed, 3 ignored
 - Dashboard shows multi-hop topology diagram + failover badge
 - N1.9.2 security fixes carry over to multi-hop unchanged
+
+---
+Task ID: 114-120
+Agent: Z.ai (subagent — N2.0.1 Real Session & Discovery Closure)
+Task: Node abstraction, persistent sessions, gateway discovery, genuine failover
+
+Work Log:
+- Read worklog Tasks 1-113 (N2.0 multi-hop mesh: Client → Relay A → Relay B → Gateway A/B with directional hop keys + end-to-end circuit encryption + replay protection + signature verification + reqId dedup, all proven). Read the five reference crates: snp-node/src/lib.rs (1385 lines, N1.9/N2.0 one-shot demo), snp-link/src/lib.rs (865 lines, directional LinkKeys + CircuitKeys + SeenNonceSet replay window), snp-gateway/src/lib.rs (1414 lines, PinnedConnector with DNS pin + TLS + SSRF defence), snp-frames/src/lib.rs (550 lines, Frame with TTL/cls/I7), snp-routing/src/lib.rs (218 lines, static RouteTable). Confirmed the N2.0 audit findings: the existing implementation is a "scripted proxy topology" — `run_client`, `run_relay`, `run_gateway` are separate functions with hardcoded keys, each serves ONE request then exits, `GatewayChoice::A/B` is hardcoded, failover restarts all nodes, gateways don't advertise themselves.
+- Confirmed baseline: `cargo build --workspace` clean (1 pre-existing snp-civic warning), `cargo test --workspace` → 82 passed, 0 failed, 3 ignored; `cargo run -p snp-node -- mesh-demo-multihop` → status=200, gateway verified.
+
+- Created `reference/snp-node/src/node.rs` (2122 lines) — the unified Node abstraction module. Key structures and methods:
+  - `NodeIdentity` — Ed25519 secret/public key + NodeId (SHA-256("SNP/0.1 node\0" || pk), I4). Constructors: `from_secret()`, `client()`, `gateway(gw)`.
+  - `Capability` enum — Client, Relay, Gateway (with string serialisation for advertisements).
+  - `GatewayAdvertisement` — signed gateway announcement: nodeId, publicKey, listenAddr, discoveryAddr, capabilities, egressPolicy, timestamp, expiry, signature. Methods: `sign(sk)` (Ed25519 under SIG_CONTEXT "gatewayAdvert", I2), `verify()` (returns false on any failure, I20), `is_expired(now)`, `encode_cbor()` / `decode_cbor()`, `for_gateway(gw, listen, discovery)` (constructs + signs).
+  - `Circuit` — active end-to-end circuit: gateway_node_id, gateway_public_key, circuit_keys (CircuitKeys), active flag. `for_gateway(gw)` uses the N2.0.1 deterministic client-side circuit keys (Ca/Cb).
+  - `PeerConnection` — persistent TCP connection (addr, Arc<Link>, hop_keys).
+  - `UpstreamPeer` — upstream peer for multi-upstream relays (dst_node_id, addr, hop_keys).
+  - `Node` struct — identity, capabilities, listen_addr, peers (Mutex<HashMap<String, PeerConnection>>), known_gateways (Mutex<Vec<GatewayAdvertisement>>), circuits (Mutex<HashMap<[u8;32], Circuit>>), seen_req_ids (Mutex<HashSet<[u8;16]>>), current_gateway (Mutex<Option<[u8;32]>>).
+  - `Node::serve_relay_persistent(listen, next_hop, prev_keys, next_keys)` — single-upstream relay that loops `recv → forward → recv response → forward back` until EOF/error (PERSISTENT, not one-shot).
+  - `Node::serve_relay_multi_upstream_persistent(listen, upstreams, prev_keys)` — multi-upstream relay that routes frames based on `frame.dst` to the matching upstream. On upstream failure, sends a Class C "upstream-failure" NACK to the prev hop and removes the dead upstream (keeps serving other upstreams).
+  - `Node::serve_gateway_persistent(listen, gw)` — gateway that loops serving transit requests (decrypt circuit → fetch URL → encrypt response → send) until EOF (PERSISTENT, not one-shot).
+  - `Node::serve_gateway_persistent_with_drop_after(listen, gw, max_requests)` — gateway that serves at most `max_requests` requests per connection, then shuts down the TCP stream (simulates a mid-session failure for the failover test/demo).
+  - `Node::serve_discovery_persistent(discovery_addr, gw, transit_listen_addr)` — discovery listener that responds to Class C "discovery-request" frames with a signed GatewayAdvertisement (CBOR-encoded as a Class C frame).
+  - `Node::discover_gateways(known_addrs)` — connects to each discovery address, requests an advertisement, verifies the signature, checks expiry, cross-checks nodeId == SHA-256("SNP/0.1 node\0" || publicKey) (I4), pre-populates the circuit for the gateway, adds to known_gateways.
+  - `Node::select_gateway()` — returns the first non-expired gateway with an active circuit (N2.0.1 simplification; production would rank by metric).
+  - `Node::send_request(url)` — uses the selected gateway; establishes (or reuses) a persistent TCP connection to Relay A via `get_or_connect_peer()`; encrypts body with circuit send_key; sends frame addressed to gateway NodeId; receives response; decrypts with circuit recv_key; verifies gateway signature.
+  - `Node::send_request_via_gateway(url, gateway_node_id)` — lower-level primitive targeting a specific gateway.
+  - `Node::send_request_with_failover(url)` — tries current gateway first; on failure (NACK or EOF), marks the circuit inactive, selects a different gateway, retries. NO NODE RESTART — the client handles failover internally. On `NodeError::UpstreamFailure` (NACK), the persistent connection to Relay A is kept alive (the relay sent a valid Class C frame); on real connection failures (EOF), the peer connection is dropped and re-established.
+  - `Node::get_or_connect_peer(addr, hop_keys)` — caches persistent TCP connections in `self.peers` for reuse across calls.
+  - `run_mesh_session_demo(url)` / `run_mesh_session_demo_with_failover(url)` — in-process demo that starts Gateway A (drop_after=2) + Gateway B + Relay B (multi-upstream) + Relay A, discovers gateways via signed advertisements, sends Request 1 + 2 via Gateway A (same persistent session), then Request 3 via Gateway B (genuine failover, no node restart).
+  - Discovery link keys: `discovery_link_keys_initiator()` / `discovery_link_keys_responder()` — derived from `DISCOVERY_LINK_SEED` (deterministic test value; production would use an anonymous X25519 ephemeral handshake).
+  - Constants: `DISCOVERY_LINK_SEED`, `ADVERTISEMENT_TTL_SECS` (1 hour), `UPSTREAM_FAILURE_MARKER` (Class C NACK body), `DISCOVERY_REQUEST_MARKER` (Class C discovery-request body).
+  - Unique-ID generation: `random_req_id()` and `random_fid()` use a static `AtomicU64` counter combined with the current timestamp, then SHA-256-hashed. This ensures the (fid, seq) pair differs across requests — CRITICAL for the N1.9.2 replay-protection window in `Link::recv_frame` to NOT reject legitimate persistent-session requests as replays. (The N1.9 `random_fid()` used only the timestamp in seconds, which produced the same fid for all requests within the same second — a bug that only manifests with persistent sessions.)
+  - Test helpers (public for integration tests): `spawn_relay_persistent_with_counter()` and `spawn_relay_multi_upstream_persistent_with_counter()` — wrap the relay serve loops with an `AtomicU64` connection counter so tests can verify "exactly 1 connection was accepted" (proving persistence).
+  - 11 in-module unit tests: advertisement signs+verifies, forged signature rejected, tampered field rejected, expired advertisement detected, CBOR round-trip, NodeIdentity matches N2.0 constants, Capability round-trip, Circuit for_gateway A/B uses correct keys (Ca ≠ Cb), Gateway A and B advertisements have distinct node_ids.
+
+- Added `pub mod node;` to `reference/snp-node/src/lib.rs` (line 99). Added `pub(crate) fn client_secret_key()` (line 462) so the `node` submodule can construct a `NodeIdentity` for the demo client. Added `NodeError::UpstreamFailure` variant (line 143) — distinguishes a NACK (connection still alive) from a real connection failure (EOF). All existing N1.9/N2.0 functions preserved unchanged for backward compat.
+
+- Created `reference/snp-node/tests/n201_sessions.rs` (886 lines) — 5 integration tests:
+  - Test 1 (`test_1_multiple_requests_one_session`) — Client sends 3 requests through the SAME relay+gateway connection. All succeed (status=200, verified=true). Asserts: Relay A accepted exactly 1 connection, Gateway accepted exactly 1 connection, Gateway served 3 requests. Proves the persistent session spans all 3 requests (no reconnection between requests).
+  - Test 2 (`test_2_gateway_discovery`) — Gateway A advertises itself via a signed advertisement on a discovery listener. Client discovers it via the advertisement (NOT hardcoded). Client verifies the advertisement signature (implicit in `discover_gateways`, explicitly re-verified). Client selects the gateway and sends a request. Asserts: 1 gateway discovered, nodeId/publicKey/listenAddr match Gateway A, signature verifies, request succeeds (status=200, verified=true).
+  - Test 3 (`test_3_genuine_failover`) — Two gateways (A and B) both advertise. Client discovers both. Client sends Request 1 via Gateway A (succeeds). Gateway A is configured with drop_after=1 — it drops its connection after serving 1 request (simulated failure). Client sends Request 2 via `send_request_with_failover`: tries Gateway A first, gets a NACK (Broken pipe → Class C upstream-failure NACK from Relay B), marks Gateway A's circuit inactive, fails over to Gateway B, succeeds. Asserts: Request 1 status=200 verified=true, Request 2 status=200 verified=true, Gateway A served 1 request, Gateway B served 1 request (the failover), client's current_gateway is now Gateway B, Gateway A's circuit is marked inactive. NO NODE RESTART — no threads are killed or re-spawned.
+  - Test 4 (`test_4_advertisement_security`) — 7 sub-cases: (4a) legitimately-signed advertisement verifies; (4b) forged signature (flipped bit) rejected; (4c) tampered listenAddr rejected; (4d) expired advertisement detected by `is_expired()` AND fails signature verification (expiry is part of the signed preimage); (4e) re-signed expired advertisement verifies signature but still rejected by `is_expired()`; (4f) advertisement signed by Gateway B's key does NOT verify against Gateway A's public_key; (4g) tampered nodeId (I4 violation) fails signature verification.
+  - Test 5 (`test_5_persistent_relay`) — Full multi-hop topology (Client → Relay A → Relay B → Gateway). Client sends 3 requests. Asserts: Relay A accepted 1 connection, Relay B accepted 1 connection, Gateway accepted 1 connection, Gateway served 3 requests. Proves the ENTIRE relay chain is persistent (not just the client→relay connection).
+  - Test helpers: `stub_gateway_persistent(listener, gw, drop_after, conns_counter, reqs_counter)` — mirrors the real gateway's wire format (decrypt circuit → decode TransitRequest → build signed TransitResponse → encrypt circuit → send frame), loops serving requests, optionally drops after N requests. `stub_discovery_persistent(listener, gw, transit_addr)` — responds to Class C discovery-request frames with a signed GatewayAdvertisement. `build_stub_response(gw, req_id, gateway_id, gateway_sk)` — builds a signed TransitResponse (status=200, fixed body).
+
+- Created `reference/snp-node/src/bin/mesh_session_demo.rs` (72 lines) — standalone binary wrapper that calls `snp_node::node::run_mesh_session_demo(url)`. Supports `--url URL` and `--help`.
+
+- Added `mesh-session-demo` subcommand to `reference/snp-node/src/main.rs` (line 30, 201) — calls `snp_node::node::run_mesh_session_demo(url)`. Updated usage text. Added `default-run = "snp-node"` to `reference/snp-node/Cargo.toml` so `cargo run -p snp-node -- mesh-session-demo` works unambiguously despite the package having two `[[bin]]` targets.
+
+- Build + test + run results:
+  - `cargo build --workspace` → success (1 pre-existing snp-civic warning, unrelated).
+  - `cargo test --workspace` → 98 passed, 0 failed, 3 ignored (Test 1 N2.0 real Internet + N1.9 HTTPS + N1.8 mesh demo). [82 pre-N2.0.1 + 5 N2.0.1 integration tests + 11 N2.0.1 in-module unit tests = 98]
+  - `cargo test --test n201_sessions` → 5 passed, 0 failed, 0 ignored.
+  - `cargo test -p snp-node --lib` → 11 passed (in-module unit tests).
+  - `cargo run -p snp-node -- mesh-session-demo` → "Request 1 OK: status=200, gateway-A verified=true, RTT=0.03s" / "Request 2 OK: status=200, gateway-A verified=true, RTT=0.03s (same TCP connection as Request 1)" / "Request 3 OK: status=200, verified=true, RTT=0.03s (FAILED OVER to Gateway B — no node restart)" / "FAILOVER CONFIRMED: client switched from Gateway A → Gateway B without restarting any node."
+  - `cargo run -p snp-node --bin mesh-session-demo` → same output (standalone binary).
+  - Existing N1.9/N2.0 tests unchanged: `cargo test -p snp-node --test n20_multihop` → 6 passed, 1 ignored; `cargo test -p snp-node --test n19_security` → 9 passed, 1 ignored; `cargo test -p snp-node --test n19_adversarial` → 3 passed.
+
+Stage Summary:
+- Files produced/modified:
+  - `reference/snp-node/src/node.rs` — NEW (2122 lines). The unified Node abstraction: NodeIdentity, Capability, GatewayAdvertisement (sign/verify/is_expired/encode_cbor/decode_cbor), Circuit, PeerConnection, UpstreamPeer, Node struct, serve_relay_persistent, serve_relay_multi_upstream_persistent, serve_gateway_persistent, serve_gateway_persistent_with_drop_after, serve_discovery_persistent, discover_gateways, select_gateway, send_request, send_request_via_gateway, send_request_with_failover, get_or_connect_peer, run_mesh_session_demo, run_mesh_session_demo_with_failover, discovery_link_keys_initiator/responder, spawn_relay_*_with_counter helpers, 11 in-module unit tests.
+  - `reference/snp-node/tests/n201_sessions.rs` — NEW (886 lines). 5 integration tests: persistent session (3 requests / 1 connection), gateway discovery (signed advertisement), genuine failover (Gateway A → Gateway B, no restart), advertisement security (7 sub-cases), persistent relay chain.
+  - `reference/snp-node/src/bin/mesh_session_demo.rs` — NEW (72 lines). Standalone binary wrapper.
+  - `reference/snp-node/src/lib.rs` — MODIFIED: added `pub mod node;` (line 99), `pub(crate) fn client_secret_key()` (line 462), `NodeError::UpstreamFailure` variant (line 143). All existing N1.9/N2.0 functions preserved unchanged.
+  - `reference/snp-node/src/main.rs` — MODIFIED: added `mesh-session-demo` subcommand (line 30, 201) + usage text.
+  - `reference/snp-node/Cargo.toml` — MODIFIED: added `default-run = "snp-node"` and `[[bin]] name = "mesh-session-demo"` target.
+- Key decisions:
+  - The Node struct holds Mutex-protected state (peers, known_gateways, circuits, seen_req_ids, current_gateway) so it can be shared across threads. The `peers` map caches persistent TCP connections — `get_or_connect_peer` returns the existing Arc<Link> if present, or establishes a new one.
+  - Persistent sessions are implemented as `loop { recv → forward → recv response → forward back }` at the relay, and `loop { recv → decrypt → fetch → encrypt → send }` at the gateway. The connection stays open across multiple requests (verified by connection counters in Tests 1 and 5).
+  - Gateway discovery uses a SEPARATE discovery link (seed `DISCOVERY_LINK_SEED`) from the transit link. The gateway has TWO active listeners: discovery (client → gateway) and transit (relay → gateway). The client connects to the discovery listener, sends a Class C "discovery-request" frame, receives a Class C frame containing the CBOR-encoded signed GatewayAdvertisement. The client verifies the signature against the advertisement's public_key, checks expiry, and cross-checks nodeId == SHA-256("SNP/0.1 node\0" || publicKey) (I4).
+  - Genuine failover is implemented in `send_request_with_failover`: tries current gateway first; on `NodeError::UpstreamFailure` (NACK), the persistent connection to Relay A is kept alive (the relay sent a valid Class C frame, not a connection reset); on real connection failures (EOF), the peer connection is dropped and re-established. The circuit is marked inactive so `select_gateway` skips it on the next call. NO NODE RESTART — the client, relays, and gateways all keep running.
+  - The multi-upstream relay (Relay B) has persistent connections to BOTH gateways and routes frames based on `frame.dst`. When Gateway A's connection drops, Relay B sends a NACK to Relay A, removes Gateway A from its upstream list, and continues serving. The client's next request (addressed to Gateway B) is routed to Gateway B via Relay B's still-alive connection.
+  - The `random_fid()` fix: the N1.9 version used only `now_unix().to_be_bytes()` (seconds since epoch), which produced the same fid for all requests within the same second. The N2.0.1 version combines `now_unix()` with a static `AtomicU64` counter, then SHA-256-hashes the combination. This ensures unique (fid, seq) pairs across requests — critical for the N1.9.2 replay-protection window in `Link::recv_frame` to NOT reject legitimate persistent-session requests as replays.
+  - The `NodeError::UpstreamFailure` variant distinguishes a NACK (connection still alive) from a real connection failure (EOF). This lets `send_request_with_failover` keep the persistent peer connection on NACK (avoiding an unnecessary reconnect) while dropping it on real failures.
+  - Gateway A's "drop after 2 requests" is implemented via `serve_gateway_persistent_with_drop_after(listen, gw, 2)` — the gateway explicitly shuts down the TCP stream after serving 2 requests, simulating a mid-session failure. The gateway PROCESS keeps running (its listener is still open), but the specific TCP connection to Relay B is closed. This is "genuine failover at the session level" — no process restart.
+- What IS production-ready (N2.0.1):
+  - **GatewayAdvertisement signing/verification** — real Ed25519 signatures under `SIG_CONTEXTS::GATEWAY_ADVERT` (I2). A forged advertisement is rejected by `verify()`. An expired advertisement is rejected by `is_expired()`. A tampered field (listenAddr, nodeId, expiry) fails signature verification (the field is part of the signed preimage). A wrong-key signature (Gateway B signs Gateway A's advertisement) does NOT verify against Gateway A's public_key. This is the "authenticated gateway discovery" the N2.0 audit requested.
+  - **Persistent TCP sessions** — `serve_relay_persistent`, `serve_gateway_persistent`, and `Node::send_request` all keep their TCP connections open across multiple requests. Verified by Test 1 (3 requests over 1 client→relay connection, 1 relay→relay connection, 1 relay→gateway connection) and Test 5 (full multi-hop chain, all connections persistent).
+  - **Genuine failover** — `send_request_with_failover` detects upstream failure (NACK or EOF), marks the circuit inactive, selects a different gateway, and retries — without restarting any node. Verified by Test 3 (Gateway A → Gateway B, no thread kill/re-spawn).
+- What is NOT production-ready (still test-only):
+  - **Hop keys are deterministic test seeds** — `CLIENT_RELAY_A_SEED`, `RELAY_A_RELAY_B_SEED`, `RELAY_B_GATEWAY_A_SEED`, etc. are published in the source code. Production derives fresh per-link keys from the SNP-IK/0.1 Noise-based handshake (X25519 ephemeral-static DH + transcript hash). The session-layer persistence is real; the key-establishment is not.
+  - **Circuit keys are deterministic test seeds** — `CIRCUIT_SEED_A`, `CIRCUIT_SEED_B`. Production derives the circuit seed from the SNP-IK/0.1 transcript between client and gateway.
+  - **Gateway discovery uses a pre-shared discovery-seed link** — `DISCOVERY_LINK_SEED` is a deterministic test value. Production would use an anonymous X25519 ephemeral handshake (the advertisement is signed, so the discovery link itself does not need to be authenticated — only the advertisement's signature matters).
+  - **The relay is single-threaded synchronous I/O** — production would use async I/O (tokio) for connection pooling and concurrent forwarding.
+  - **No connection pooling at the relay** — each client connection triggers a fresh upstream connection. Production would maintain a pool keyed by upstream NodeId.
+  - **`select_gateway` is "first non-expired"** — production would rank by metric (latency, capacity, cost).
+  - **Upstream failure sends a NACK but the single-upstream relay still `break`s its loop** — the client reconnects on the next attempt. Production would keep the client connection open and send an explicit Class C NACK so the client connection stays open during failover (the multi-upstream relay already does this correctly).
+- Test results:
+  - 5 N2.0.1 integration tests PASS (Tests 1-5).
+  - 11 N2.0.1 in-module unit tests PASS.
+  - 6 N2.0 multi-hop tests PASS (1 ignored — real Internet).
+  - 9 N1.9 security tests PASS (1 ignored — HTTPS).
+  - 3 N1.9.2 adversarial tests PASS.
+  - 1 N1.8 integration test PASS (1 ignored — mesh demo).
+  - 98 workspace tests PASS total; 0 failed; 3 ignored.
+- End-to-end:
+  - `cargo run -p snp-node -- mesh-session-demo` → "Request 1 OK: status=200, gateway-A verified=true, RTT=0.03s" / "Request 2 OK: status=200, gateway-A verified=true, RTT=0.03s (same TCP connection as Request 1)" / "Request 3 OK: status=200, verified=true, RTT=0.03s (FAILED OVER to Gateway B — no node restart)" / "FAILOVER CONFIRMED: client switched from Gateway A → Gateway B without restarting any node."
+  - The full chain works with REAL Internet: Client discovers Gateway A and Gateway B via signed advertisements → Client sends Request 1 (encrypted with circuit_a_send_key, frame addressed to Gateway A's NodeId, forwarded by Relay A → Relay B → Gateway A, fetched https://example.com/ via PinnedConnector, response signed by Gateway A, encrypted with circuit_a_send_key, returned through the relay chain, verified by client) → Request 2 over the SAME persistent TCP connection → Gateway A drops its connection after 2 requests → Request 3: client tries Gateway A, gets a NACK (Broken pipe → Class C upstream-failure NACK from Relay B), marks circuit A inactive, fails over to Gateway B (new circuit key Cb, frame addressed to Gateway B's NodeId, Relay B routes to Gateway B via its persistent connection), Gateway B fetches https://example.com/, signs response with Gateway B's key, client verifies against Gateway B's public_key. All without restarting any node.
+
+N2.0.1 STATUS: GREEN — the four findings of the N2.0 audit are addressed:
+1. **Node abstraction** ✓ — unified `Node` struct parameterised by `NodeIdentity` and `Capability`, with `serve_*` methods for relays/gateways and `send_*` methods for clients.
+2. **Persistent sessions** ✓ — `serve_relay_persistent`, `serve_gateway_persistent`, and `Node::send_request` all keep TCP connections open across multiple requests. Verified by Tests 1 and 5 (3 requests over 1 connection at every hop).
+3. **Gateway discovery** ✓ — `GatewayAdvertisement` is signed by the gateway's Ed25519 key under SIG_CONTEXT "gatewayAdvert" (I2). The client verifies the signature, checks expiry, and cross-checks nodeId (I4) before trusting the advertisement. Verified by Tests 2 and 4.
+4. **Genuine failover** ✓ — `send_request_with_failover` detects upstream failure (NACK or EOF), marks the circuit inactive, selects a different gateway, and retries — without restarting any node. Verified by Test 3 (Gateway A → Gateway B, no thread kill/re-spawn).
+
+The transition from "scripted proxy topology" to "real network" is demonstrated end-to-end. The remaining gaps (deterministic test keys, synchronous I/O, no connection pooling) are clearly documented in the module-level docs and the worklog — they are key-establishment and performance gaps, not correctness gaps.
+
+---
+Task ID: 121 (N2.0.1 dashboard + push)
+Agent: Z.ai (main — N2.0.1 push)
+
+Stage Summary:
+- N2.0.1 Node abstraction: Node struct with Identity, Capabilities, Peers, Circuits, KnownGateways
+- Persistent sessions: relay and gateway serve multiple requests over one TCP connection
+- Gateway discovery: GatewayAdvertisement signed by Ed25519, verified by client (7 security tests)
+- Genuine failover: Gateway A drops after 2 requests → client detects NACK → selects Gateway B → new circuit → request succeeds. NO NODE RESTART.
+- 3 requests over one session: Request 1 + 2 via Gateway A (same connection), Request 3 fails over to Gateway B
+- 98 Rust tests pass, 0 failed, 3 ignored
+- Conformance: 72/138, 0 disagreements
+
+What IS production-ready:
+- GatewayAdvertisement signing/verification (real Ed25519)
+- Persistent TCP sessions (multiple requests per connection)
+- Genuine failover (detect failure, select new gateway, new circuit, no restart)
+- Multi-upstream relay routing (frame.dst-based, NACK on failure)
+
+What is still test-only:
+- Hop keys (deterministic seeds, need SNP-IK/0.1)
+- Circuit keys (deterministic seeds, need SNP-IK/0.1)
+- Discovery link (pre-shared seed, need anonymous handshake)
+- Synchronous I/O (need tokio)
+- select_gateway (first non-expired, need metric-based ranking)
+
+N2.0.1 STATUS: The session-layer persistence, authenticated discovery, and failover logic are real and demonstrated end-to-end against the live Internet. The key-establishment gap (SNP-IK/0.1) remains the primary blocker for production.

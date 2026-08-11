@@ -96,6 +96,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod node;
+
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -138,6 +140,14 @@ pub enum NodeError {
     /// request — likely tampering at the relay, or a key-derivation bug).
     #[error("circuit payload AEAD decryption failed")]
     CircuitDecryptionFailed,
+    /// N2.0.1: An upstream peer (relay or gateway) failed to handle the
+    /// request. The relay sent a Class C "upstream-failure" NACK back to
+    /// the client. The client's persistent connection to the relay is
+    /// STILL ALIVE (the NACK was a valid frame, not a connection reset) —
+    /// the client can retry on the same connection with a different
+    /// gateway.
+    #[error("upstream failure (NACK received from relay — circuit marked inactive)")]
+    UpstreamFailure,
     /// Configuration or runtime error not covered above.
     #[error("{0}")]
     Other(String),
@@ -455,6 +465,15 @@ pub fn gateway_node_id() -> [u8; 32] {
 #[must_use]
 pub fn client_public_key() -> [u8; 32] {
     derive_public_key(&CLIENT_SECRET)
+}
+
+/// N2.0.1: The client's secret key (deterministic test value, NOT secret).
+/// Exposed `pub(crate)` so the `node` submodule can construct a
+/// [`node::NodeIdentity`] for the demo client without re-deriving the
+/// constant. Production would generate a fresh secret per node.
+#[must_use]
+pub(crate) fn client_secret_key() -> [u8; 32] {
+    CLIENT_SECRET
 }
 
 /// The client's NodeId.
