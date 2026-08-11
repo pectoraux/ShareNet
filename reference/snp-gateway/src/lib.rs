@@ -1,6 +1,6 @@
-//! SNP-GATEWAY — L7 Internet gateway: Mode A TransitRequest/Response + SSRF defence
+//! SNP-GATEWAY — L7 Internet gateway: Mode A TransitRequest/Response + SSRF defence + IP pinning
 //!
-//! For N1.8 (the Rust minimal Internet bridge), this crate implements:
+//! For N1.9 (Secure Rust Link + Gateway Boundary) this crate implements:
 //!
 //! - [`TransitRequest`] — a Mode A "please fetch this URL for me" bundle,
 //!   signed by the client under `SIG_CONTEXTS.transitRequest`. CBOR shape
@@ -10,30 +10,76 @@
 //! - [`is_private_destination`] — SSRF defence (invariant I18, threat T9).
 //!   Checks the literal host string AND every resolved IP against RFC 1918,
 //!   loopback, link-local, multicast, CGN, ULA, and other restricted ranges.
+//! - [`PinnedConnector`] — the N1.9 IP-pinning HTTP fetcher. Parses the URL,
+//!   resolves DNS, validates EVERY resolved IP via `is_private_destination`,
+//!   pins the first public IP, opens a `TcpStream::connect((ip, port))` to
+//!   that exact IP, and (for HTTPS) drives a rustls TLS handshake over the
+//!   pinned TCP stream with `server_name = original_hostname` for SNI and
+//!   certificate validation. The HTTP client never re-resolves DNS — the
+//!   TOCTOU gap present in N1.8 (`ureq::get(url)` re-resolved after
+//!   validation) is closed.
 //! - [`handle_transit_request`] — the gateway's request handler: validates
-//!   the URL, resolves DNS, checks EVERY resolved IP against
-//!   `is_private_destination`, fetches the URL via HTTP, caps the body at
-//!   `max_response_bytes`, computes `objectId = SHA-256(capped body)`, signs
-//!   the TransitResponse.
+//!   `tlsTermination`, builds a [`PinnedConnector`] (which validates the URL
+//!   + SSRF + DNS + IP pin), issues a single fetch via the connector, caps
+//!   the body at `max_response_bytes`, computes
+//!   `objectId = SHA-256(capped body)`, signs the TransitResponse.
+//!   Redirects are NOT followed (the connector returns the 3xx response
+//!   verbatim; the client decides what to do).
 //!
-//! ## What is NOT implemented here (out of scope for N1.8)
+//! ## What is NOT implemented here (out of scope for N1.9)
 //!
 //! - The full egress policy (allowed ports, per-peer quotas, max bytes per
-//!   window). N1.8 hardcodes "allow 80/443".
-//! - The full GatewayAdvert structure (capacity, cost hints). N1.8 uses a
+//!   window). N1.9 hardcodes "allow 80/443".
+//! - The full GatewayAdvert structure (capacity, cost hints). N1.9 uses a
 //!   static gateway identity.
 //! - Mode B (SOCKS5) and Mode C (TUN/VpnService).
-//! - The full TransitReceipt chain (contribution accounting). N1.8 just
+//! - The full TransitReceipt chain (contribution accounting). N1.9 just
 //!   signs the TransitResponse.
-//! - DNS-rebinding defence via custom ureq resolver (IP pinning). N1.8
-//!   validates every resolved IP via `std::net::ToSocketAddrs` BEFORE the
-//!   fetch, then ureq re-resolves internally. The TOCTOU gap is documented.
+//! - HTTP redirect-following. N1.9 returns the 3xx response to the client
+//!   (Test 5 verifies a redirect to a private IP is NOT followed).
+//!
+//! ## Production readiness
+//!
+//! **What IS production-ready in this crate (N1.9):**
+//!
+//! - The SSRF defence `is_private_destination` / `is_private_ipv4` /
+//!   `is_private_ipv6` — covers RFC 1918, loopback, link-local (incl. cloud
+//!   metadata 169.254.169.254), CGN 100.64/10, multicast, reserved, ULA
+//!   fc00::/7, IPv4-mapped IPv6, .local, localhost, metadata.google.internal.
+//! - The DNS-pinning fetcher [`PinnedConnector`]: resolves DNS ONCE,
+//!   validates EVERY resolved IP, opens `TcpStream::connect((ip, port))` to
+//!   the validated IP directly, and drives a rustls TLS handshake over the
+//!   pinned TCP stream. The HTTP client never re-resolves DNS — the N1.8
+//!   TOCTOU gap is closed.
+//! - The TransitRequest/TransitResponse CBOR wire format — byte-for-byte
+//!   match with the TypeScript reference (`/src/lib/snp/gateway.ts`).
+//! - The Ed25519 sign/verify under SIG_CONTEXT (invariant I2).
+//!
+//! **What is NOT production-ready (future tasks):**
+//!
+//! - The HTTP/1.1 response parser `parse_http_response` handles
+//!   `Content-Length` and read-to-EOF bodies but does NOT decode
+//!   `Transfer-Encoding: chunked`. Production should use a real HTTP client
+//!   (ureq, reqwest) configured with a custom resolver that pins the
+//!   validated IPs — or extend the N1.9 parser to handle chunked encoding.
+//! - The TLS stack uses `webpki-roots` (Mozilla CA bundle). Production
+//!   should consider a more frequent root-update mechanism + certificate
+//!   revocation (CRL/OCSP).
+//! - Redirect-following is DISABLED. Production MAY choose to follow
+//!   same-host redirects (re-running the SSRF check on the new URL), but
+//!   cross-host redirects MUST be returned to the client verbatim.
+//! - No egress-port policy: N1.9 allows 80/443 implicitly (the URL scheme
+//!   determines the port). Production should enforce an explicit allow-list.
+//! - No per-peer quotas or rate-limiting.
 
 #![warn(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use std::net::ToSocketAddrs;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::Duration;
 
 use snp_cbor::CborValue;
 use snp_crypto::{
@@ -58,6 +104,10 @@ pub enum GatewayError {
     /// The upstream fetch failed (DNS, TCP, TLS, HTTP).
     #[error("upstream error: {0}")]
     Upstream(String),
+    /// The HTTP response from the upstream was malformed (could not parse
+    /// status line, headers, or chunked body).
+    #[error("malformed HTTP response: {0}")]
+    MalformedHttp(String),
     /// CBOR (de)serialization failure.
     #[error("CBOR error: {0}")]
     Cbor(#[from] snp_cbor::CborError),
@@ -631,6 +681,362 @@ pub fn is_private_ip_str(ip: &str) -> bool {
     false
 }
 
+// ─── PinnedConnector (N1.9: DNS pinning — close the N1.8 TOCTOU gap) ─────────
+
+/// An HTTP response returned by [`PinnedConnector::fetch`].
+///
+/// N1.9 returns the full body inline (no chunked-decoding beyond what
+/// HTTP/1.1 requires; the body is what was read from the socket). The
+/// gateway caps it at `max_response_bytes` after the fetch returns.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    /// HTTP status code (e.g. 200, 301, 404).
+    pub status: u16,
+    /// Response headers, as `(name, value)` pairs in the order received.
+    pub headers: Vec<(String, String)>,
+    /// Response body bytes (already capped by the caller if needed).
+    pub body: Vec<u8>,
+}
+
+/// A connection pinning HTTP/1.1 client that resolves DNS ONCE, validates
+/// every resolved IP, and connects to the validated IP — never letting the
+/// HTTP client re-resolve DNS.
+///
+/// This closes the N1.8 TOCTOU (time-of-check-to-time-of-use) gap: N1.8
+/// validated every resolved IP via `std::net::ToSocketAddrs`, then called
+/// `ureq::get(url)` which re-resolved DNS internally — a determined attacker
+/// with control of the DNS server could return a different IP between the
+/// validation and the fetch. [`PinnedConnector`] pins the validated IP at
+/// construction time; [`PinnedConnector::fetch`] opens a `TcpStream` directly
+/// to that IP, so no re-resolution can occur.
+///
+/// For HTTPS the connector still validates the server certificate against the
+/// original hostname (rustls `server_name = hostname` for SNI + cert chain
+/// validation). The TCP connection goes to the pinned IP; the TLS handshake
+/// verifies the server holds a certificate for the original hostname.
+///
+/// ## Redirects
+///
+/// The connector does NOT follow HTTP 3xx redirects. A 301/302/307/308
+/// response is returned verbatim to the caller. This is a deliberate SSRF
+/// defence: a redirect from a public URL to a private IP cannot trick the
+/// gateway into connecting to the private IP. (See Test 5 in
+/// `snp-node/tests/n19_security.rs`.)
+#[derive(Debug, Clone)]
+pub struct PinnedConnector {
+    /// The validated public IP the TCP connection will go to.
+    pub resolved_ip: IpAddr,
+    /// The original hostname from the URL (used for the Host header and for
+    /// TLS SNI/cert validation).
+    pub hostname: String,
+    /// The destination port (80 for http, 443 for https by default).
+    pub port: u16,
+    /// URL scheme: `"http"` or `"https"`.
+    pub scheme: String,
+    /// The URL path + query (e.g. `"/"` or `"/foo?bar=baz"`).
+    pub path: String,
+}
+
+impl PinnedConnector {
+    /// Parse the URL, resolve DNS, validate EVERY resolved IP, and pin the
+    /// first public IP.
+    ///
+    /// # Errors
+    /// - [`GatewayError::MalformedUrl`] if the URL is malformed or uses an
+    ///   unsupported scheme.
+    /// - [`GatewayError::EgressBlocked`] if the literal host or ANY resolved
+    ///   IP is private/restricted (I18 SSRF defence).
+    /// - [`GatewayError::DnsEmpty`] if DNS resolution returns no addresses.
+    /// - [`GatewayError::Upstream`] if DNS resolution itself fails.
+    pub fn new(url: &str) -> GatewayResult<Self> {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| GatewayError::MalformedUrl(format!("URL parse: {e}")))?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(GatewayError::MalformedUrl(format!(
+                "URL scheme must be http or https; got \"{scheme}\""
+            )));
+        }
+        let host = parsed.host_str().ok_or_else(|| {
+            GatewayError::MalformedUrl(format!("URL has no host: {url}"))
+        })?;
+        if host.is_empty() {
+            return Err(GatewayError::MalformedUrl("URL host is empty".into()));
+        }
+        // Step 1: SSRF defence — literal host check.
+        if is_private_destination(host) {
+            return Err(GatewayError::EgressBlocked(format!(
+                "destination \"{host}\" is private/loopback/link-local/multicast (I18 SSRF defence)"
+            )));
+        }
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            GatewayError::MalformedUrl(format!("URL has no default port for scheme \"{scheme}\""))
+        })?;
+        // Step 2: SSRF defence — resolve DNS ONCE, check EVERY resolved IP.
+        // We collect all addresses and reject if ANY are private — this is
+        // the DNS-rebinding defence. The first PUBLIC IP becomes the pin.
+        let host_port = format!("{host}:{port}");
+        let addrs = host_port
+            .to_socket_addrs()
+            .map_err(|e| GatewayError::Upstream(format!("DNS resolution of {host}: {e}")))?;
+        let mut pinned_ip: Option<IpAddr> = None;
+        for addr in addrs {
+            let ip = addr.ip();
+            let ip_str = ip.to_string();
+            if is_private_ip_str(&ip_str) {
+                return Err(GatewayError::EgressBlocked(format!(
+                    "destination \"{host}\" resolves to private IP {ip_str} (I18 SSRF defence — DNS rebinding check)"
+                )));
+            }
+            if pinned_ip.is_none() {
+                pinned_ip = Some(ip);
+            }
+        }
+        let resolved_ip = pinned_ip.ok_or_else(|| GatewayError::DnsEmpty(host.to_string()))?;
+        // Build the path + query for the HTTP request line.
+        let path = match (parsed.path(), parsed.query()) {
+            ("", Some(q)) => format!("/?{q}"),
+            ("", None) => "/".to_string(),
+            (p, Some(q)) => format!("{p}?{q}"),
+            (p, None) => p.to_string(),
+        };
+        Ok(Self {
+            resolved_ip,
+            hostname: host.to_string(),
+            port,
+            scheme: scheme.to_string(),
+            path,
+        })
+    }
+
+    /// Construct a `PinnedConnector` from pre-validated parts.
+    ///
+    /// **Test-only escape hatch.** This bypasses the SSRF / DNS validation in
+    /// [`PinnedConnector::new`] so tests can pin the connector to a local
+    /// mock HTTP server (which lives on 127.0.0.1, an IP that `new()` would
+    /// reject). Production code MUST use [`PinnedConnector::new`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_parts(
+        resolved_ip: IpAddr,
+        hostname: String,
+        port: u16,
+        scheme: String,
+        path: String,
+    ) -> Self {
+        Self {
+            resolved_ip,
+            hostname,
+            port,
+            scheme,
+            path,
+        }
+    }
+
+    /// Issue a single HTTP/1.1 request to the pinned IP. The `Host` header is
+    /// always the original `hostname` (NOT the IP). For HTTPS, a rustls TLS
+    /// handshake is driven over the pinned `TcpStream` with
+    /// `server_name = hostname` for SNI and certificate validation.
+    ///
+    /// Redirects are NOT followed — a 3xx response is returned verbatim.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Upstream`] on TCP or TLS failure, or
+    /// [`GatewayError::MalformedHttp`] if the response cannot be parsed.
+    pub fn fetch(&self, method: &str, headers: &[(String, String)]) -> GatewayResult<HttpResponse> {
+        // Connect TCP to the EXACT validated IP. This is the core of the N1.9
+        // DNS pinning: the TCP connection goes to the IP we validated, NOT
+        // to a re-resolved hostname.
+        let sock_addr = SocketAddr::new(self.resolved_ip, self.port);
+        let mut tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(15))
+            .map_err(|e| GatewayError::Upstream(format!("TCP connect to {sock_addr}: {e}")))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| GatewayError::Upstream(format!("set_read_timeout: {e}")))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| GatewayError::Upstream(format!("set_write_timeout: {e}")))?;
+        tcp.set_nodelay(true).ok();
+
+        // Build the HTTP/1.1 request. The Host header is the original
+        // hostname (NOT the pinned IP) — this preserves virtual-host routing
+        // and is what the TLS certificate was issued for.
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {hostname}\r\n",
+            method = method,
+            path = self.path,
+            hostname = self.hostname,
+        );
+        let mut has_connection = false;
+        let mut has_user_agent = false;
+        let mut has_accept = false;
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+            let kl = k.to_ascii_lowercase();
+            if kl == "connection" {
+                has_connection = true;
+            } else if kl == "user-agent" {
+                has_user_agent = true;
+            } else if kl == "accept" {
+                has_accept = true;
+            }
+        }
+        if !has_connection {
+            // Connection: close — we read until EOF, no need for Content-Length.
+            req.push_str("Connection: close\r\n");
+        }
+        if !has_user_agent {
+            req.push_str("User-Agent: snp-gateway/0.1 (N1.9 pinned)\r\n");
+        }
+        if !has_accept {
+            req.push_str("Accept: */*\r\n");
+        }
+        req.push_str("\r\n");
+        let req_bytes = req.as_bytes();
+
+        // Send the request and read the response, over plain TCP (http) or
+        // over a TLS stream (https). For https the TLS handshake is driven
+        // over the pinned TcpStream; the certificate is validated against
+        // the original hostname (NOT the pinned IP).
+        let resp_bytes: Vec<u8> = if self.scheme == "https" {
+            self.fetch_https(tcp, req_bytes)?
+        } else {
+            tcp.write_all(req_bytes)
+                .map_err(|e| GatewayError::Upstream(format!("HTTP write: {e}")))?;
+            tcp.flush()
+                .map_err(|e| GatewayError::Upstream(format!("HTTP flush: {e}")))?;
+            let mut buf = Vec::new();
+            tcp.read_to_end(&mut buf)
+                .map_err(|e| GatewayError::Upstream(format!("HTTP read: {e}")))?;
+            buf
+        };
+
+        parse_http_response(&resp_bytes)
+    }
+
+    /// Drive a rustls TLS handshake over the pinned `TcpStream` and issue the
+    /// HTTP/1.1 request over the resulting TLS stream. Reads until EOF
+    /// (server-initiated close).
+    fn fetch_https(&self, tcp: TcpStream, req_bytes: &[u8]) -> GatewayResult<Vec<u8>> {
+        // Build a rustls ClientConfig with the Mozilla/webpki root CA bundle.
+        // This is the same CA set browsers use; it lets us verify the server
+        // certificate chain for any public CA-signed cert.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let config = Arc::new(config);
+
+        // SNI / cert-validation name = original hostname (NOT the pinned IP).
+        // This means the server MUST present a certificate valid for the
+        // original hostname — pinning the IP does NOT weaken cert validation.
+        let server_name = rustls::pki_types::ServerName::try_from(self.hostname.clone())
+            .map_err(|e| GatewayError::Upstream(format!("invalid SNI hostname \"{0}\": {e}", self.hostname)))?;
+        let conn = rustls::ClientConnection::new(config, server_name)
+            .map_err(|e| GatewayError::Upstream(format!("rustls ClientConnection: {e}")))?;
+
+        // StreamOwned takes ownership of both the connection and the
+        // underlying TcpStream. We drive the TLS handshake implicitly on the
+        // first write.
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        tls.write_all(req_bytes)
+            .map_err(|e| GatewayError::Upstream(format!("HTTPS write: {e}")))?;
+        tls.flush()
+            .map_err(|e| GatewayError::Upstream(format!("HTTPS flush: {e}")))?;
+        // Read until EOF (server-initiated close after Connection: close).
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf)
+            .map_err(|e| GatewayError::Upstream(format!("HTTPS read: {e}")))?;
+        Ok(buf)
+    }
+}
+
+/// Parse a raw HTTP/1.1 response into an [`HttpResponse`].
+///
+/// Handles:
+/// - Status line: `HTTP/1.1 <code> <reason>\r\n`
+/// - Headers (case-insensitive header names; values trimmed of trailing
+///   whitespace)
+/// - Body:
+///   - If `Content-Length: N` is present, takes the first N bytes after the
+///     header terminator.
+///   - Otherwise, takes everything after the header terminator (read-to-EOF
+///     semantics — the server is expected to close the connection).
+///   - `Transfer-Encoding: chunked` is NOT decoded in N1.9; if the response
+///     is chunked, the raw chunked body is returned and the caller will see
+///     chunk framing bytes. (The pinned mock servers in tests use plain
+///     Content-Length or Connection: close; the real example.com returns a
+///     Content-Length body.)
+fn parse_http_response(raw: &[u8]) -> GatewayResult<HttpResponse> {
+    // Find the header/body boundary (\r\n\r\n).
+    let boundary = find_subslice(raw, b"\r\n\r\n")
+        .ok_or_else(|| GatewayError::MalformedHttp("no \\r\\n\\r\\n header terminator".into()))?;
+    let header_bytes = &raw[..boundary];
+    let body_start = boundary + 4;
+    let body_bytes = &raw[body_start..];
+
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|e| GatewayError::MalformedHttp(format!("header not UTF-8: {e}")))?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| GatewayError::MalformedHttp("empty response".into()))?;
+    // Parse `HTTP/1.1 200 OK`.
+    let status_parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+    if status_parts.len() < 2 {
+        return Err(GatewayError::MalformedHttp(format!(
+            "bad status line: \"{status_line}\""
+        )));
+    }
+    let status: u16 = status_parts[1]
+        .parse()
+        .map_err(|e| GatewayError::MalformedHttp(format!("bad status code: {e}")))?;
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| GatewayError::MalformedHttp(format!("bad header line: \"{line}\"")))?;
+        let name = name.trim().to_string();
+        let value = value.trim().to_string();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().ok();
+        }
+        headers.push((name, value));
+    }
+
+    // Determine the body slice.
+    let body: Vec<u8> = match content_length {
+        Some(n) if n <= body_bytes.len() => body_bytes[..n].to_vec(),
+        Some(_) => {
+            // Server sent fewer bytes than Content-Length declared. N1.9
+            // takes what was received and continues — the caller caps at
+            // max_response_bytes anyway.
+            body_bytes.to_vec()
+        }
+        None => body_bytes.to_vec(),
+    };
+
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
 // ─── TransitRequest handling (the gateway request handler) ──────────────────
 
 /// The result of a successful Mode A fetch: the response plus the capped body
@@ -638,133 +1044,62 @@ pub fn is_private_ip_str(ip: &str) -> bool {
 pub struct FetchedResponse {
     /// The signed TransitResponse.
     pub response: TransitResponse,
-    /// The capped response body. For N1.8 the body is returned inline (no
+    /// The capped response body. For N1.9 the body is returned inline (no
     /// CAS). `object_id = SHA-256(capped body)`.
     pub body: Vec<u8>,
 }
 
-/// Validate the request's URL and egress policy. Returns the parsed URL and
-/// the (host, port) for fetch.
-fn validate_request(req: &TransitRequest) -> GatewayResult<url::Url> {
+/// Handle a TransitRequest: validate, fetch via the pinned connector, sign
+/// the response.
+///
+/// Steps:
+/// 1. Validate `tlsTermination` (I17 — fail-closed on downgrade).
+/// 2. Build a [`PinnedConnector`] from the request URL — this performs the
+///    URL parse, literal-host SSRF check, DNS resolution, per-IP SSRF check,
+///    and IP pinning in ONE step (closing the N1.8 TOCTOU gap).
+/// 3. Issue a single HTTP fetch via the connector. Redirects are NOT
+///    followed (3xx is returned to the client as-is).
+/// 4. Cap the response body at `max_response_bytes`.
+/// 5. `objectId = SHA-256(capped body)` per ADR-0009 (N1.9 simplified form).
+/// 6. Sign the TransitResponse with the gateway's Ed25519 key.
+///
+/// # Errors
+/// Returns [`GatewayError`] on any failure: blocked egress, malformed URL,
+/// DNS failure, HTTP failure, etc.
+pub fn handle_transit_request(
+    req: &TransitRequest,
+    gateway_secret_key: &SymmetricKey,
+) -> GatewayResult<FetchedResponse> {
     if req.tls_termination != "GATEWAY_PLAINTEXT" && req.tls_termination != "PAYLOAD_E2E" {
         return Err(GatewayError::MalformedRequest(format!(
             "tlsTermination must be GATEWAY_PLAINTEXT or PAYLOAD_E2E; got \"{}\" (I17)",
             req.tls_termination
         )));
     }
-    let parsed = url::Url::parse(&req.url)
-        .map_err(|e| GatewayError::MalformedUrl(format!("URL parse: {e}")))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(GatewayError::MalformedUrl(format!(
-            "URL scheme must be http or https; got \"{scheme}\""
-        )));
-    }
-    let host = parsed.host_str().ok_or_else(|| {
-        GatewayError::MalformedUrl(format!("URL has no host: {}", req.url))
-    })?;
-    if host.is_empty() {
-        return Err(GatewayError::MalformedUrl("URL host is empty".into()));
-    }
-    // Step 1: SSRF defence — literal host check.
-    if is_private_destination(host) {
-        return Err(GatewayError::EgressBlocked(format!(
-            "destination \"{host}\" is private/loopback/link-local/multicast (I18 SSRF defence)"
-        )));
-    }
-    // Step 2: SSRF defence — resolve DNS and check EVERY resolved IP.
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        GatewayError::MalformedUrl(format!("URL has no default port for scheme \"{scheme}\""))
-    })?;
-    let host_port = format!("{host}:{port}");
-    let addrs = host_port
-        .to_socket_addrs()
-        .map_err(|e| GatewayError::Upstream(format!("DNS resolution of {host}: {e}")))?;
-    let mut resolved: Vec<std::net::SocketAddr> = addrs.collect();
-    if resolved.is_empty() {
-        return Err(GatewayError::DnsEmpty(host.to_string()));
-    }
-    for addr in &resolved {
-        let ip_str = addr.ip().to_string();
-        if is_private_ip_str(&ip_str) {
-            return Err(GatewayError::EgressBlocked(format!(
-                "destination \"{host}\" resolves to private IP {ip_str} (I18 SSRF defence — DNS rebinding check)"
-            )));
-        }
-    }
-    let _ = &mut resolved; // silence unused-mut
-    Ok(parsed)
-}
-
-/// Handle a TransitRequest: validate, fetch, sign the response.
-///
-/// Steps:
-/// 1. Validate URL scheme + tlsTermination (I17 — fail-closed on downgrade).
-/// 2. SSRF literal-host check.
-/// 3. Resolve DNS, check EVERY resolved IP (DNS-rebinding defence).
-/// 4. Fetch the URL via `ureq` (HTTP GET for N1.8; method is honoured but
-///    body is not sent).
-/// 5. Cap the response body at `max_response_bytes`.
-/// 6. `objectId = SHA-256(capped body)`.
-/// 7. Sign the TransitResponse with the gateway's Ed25519 key.
-///
-/// # Errors
-/// Returns [`GatewayError`] on any failure: blocked egress, malformed URL,
-/// DNS failure, HTTP failure, etc.
-///
-/// # Known limitation
-/// After validating every resolved IP, this function calls `ureq::get(url)`
-/// which re-resolves DNS internally. A determined attacker with control of
-/// the DNS server could return a different IP between the validation and the
-/// fetch (TOCTOU). The production target is a custom `ureq` resolver that
-/// pins the validated IPs; this is documented as a known gap (N1.6 finding).
-pub fn handle_transit_request(
-    req: &TransitRequest,
-    gateway_secret_key: &SymmetricKey,
-) -> GatewayResult<FetchedResponse> {
-    let parsed = validate_request(req)?;
+    // Build the pinned connector — this validates the URL + SSRF + DNS + IP
+    // pin in ONE step. After this returns Ok, the connector holds a validated
+    // public IP; the fetch below connects to that exact IP, NOT a re-resolved
+    // hostname. The N1.8 TOCTOU gap is closed.
+    let connector = PinnedConnector::new(&req.url)?;
 
     // Determine the gateway's NodeId from its secret key.
     let gateway_public = derive_public_key(gateway_secret_key);
     let gateway_id = derive_node_id(&gateway_public);
 
-    // Fetch the URL via ureq. ureq handles TLS via rustls by default.
-    let response = ureq::get(parsed.as_str())
-        .call()
-        .map_err(|e| GatewayError::Upstream(format!("ureq GET {}: {e}", parsed)))?;
-    let status = response.status();
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for h in response.headers_names() {
-        if let Some(val) = response.header(&h) {
-            headers.push((h, val.to_string()));
-        }
-    }
+    // Single fetch via the pinned connector. No redirect-following.
+    let http_response = connector.fetch(req.method.as_str(), &[])?;
+    let status = http_response.status;
+    let headers = http_response.headers;
 
-    // Read the body, capping at max_response_bytes.
+    // Cap the response body at max_response_bytes.
     let cap = usize::try_from(req.max_response_bytes).unwrap_or(usize::MAX);
-    let mut body = Vec::new();
-    let mut reader = response.into_reader();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| GatewayError::Upstream(format!("read body: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        let remaining = cap.saturating_sub(body.len());
-        if remaining == 0 {
-            // Cap reached — discard the rest but mark as capped.
-            break;
-        }
-        let take = n.min(remaining);
-        body.extend_from_slice(&buf[..take]);
-        if body.len() >= cap {
-            break;
-        }
-    }
+    let body: Vec<u8> = if http_response.body.len() <= cap {
+        http_response.body
+    } else {
+        http_response.body[..cap].to_vec()
+    };
 
-    // objectId = SHA-256(capped body) per ADR-0009 (N1.8 simplified form).
+    // objectId = SHA-256(capped body) per ADR-0009 (N1.9 simplified form).
     let object_id = sha256(&body);
 
     let fetched_at = std::time::SystemTime::now()
@@ -904,8 +1239,8 @@ fn b(bytes: &[u8]) -> CborValue {
     CborValue::ByteString(bytes.to_vec())
 }
 
-// Re-export `Read` for the body-reading loop.
-use std::io::Read as _;
+// (Read+Write are imported at the top of the file — they're used by both the
+// PinnedConnector HTTP path and the circuit-payload helpers.)
 
 #[cfg(test)]
 mod tests {

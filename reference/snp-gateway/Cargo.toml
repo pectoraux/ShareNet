@@ -16,6 +16,8 @@ snp-frames.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 url.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

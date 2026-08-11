@@ -1,28 +1,60 @@
-//! snp-node library — daemon internals for the ShareNet reference node (N1.8).
+//! snp-node library — daemon internals for the ShareNet reference node (N1.9).
 //!
-//! For N1.8 (the Rust minimal Internet bridge) this crate provides:
+//! For N1.9 (Secure Rust Link + Gateway Boundary) this crate provides:
 //!
-//! - [`run_gateway`] — TCP server that decrypts frames, decodes the
-//!   TransitRequest, fetches the real URL via HTTP, signs and returns the
-//!   TransitResponse.
-//! - [`run_relay`] — TCP server that accepts a client connection, opens a
-//!   connection to the gateway, and forwards encrypted frame BLOBS verbatim
-//!   in both directions. The relay NEVER decrypts (Class B invariant I8).
-//! - [`run_client`] — TCP client that builds a TransitRequest for
-//!   `https://example.com/`, signs it, wraps it in a Class B frame,
-//!   AEAD-encrypts it, sends it via the relay, waits for the response,
-//!   decrypts, verifies the gateway's signature.
+//! - [`run_gateway`] — TCP server that decrypts the OUTER frame with its
+//!   relay↔gateway hop key, decrypts the INNER circuit payload with its
+//!   circuit key, decodes the TransitRequest, fetches the real URL via the
+//!   pinned-IP connector, signs and returns the TransitResponse (encrypted
+//!   again at both layers).
+//! - [`run_relay`] — TCP server that decrypts the OUTER frame from the
+//!   client (client↔relay hop key), re-encrypts it for the gateway
+//!   (relay↔gateway hop key), and forwards. The relay NEVER decrypts the
+//!   frame body (the inner circuit payload) — it doesn't have the circuit
+//!   key. Invariant I8 holds at the semantic level: the relay sees the body
+//!   bytes but cannot read them.
+//! - [`run_client`] — TCP client that builds a TransitRequest, signs it,
+//!   encrypts the body with its circuit key, wraps the ciphertext in a
+//!   Class B frame, AEAD-encrypts the frame with its client↔relay hop key,
+//!   sends it via the relay, waits for the response, decrypts at both
+//!   layers, verifies the gateway's signature.
 //! - [`run_mesh_demo`] — convenience wrapper that spins up all three roles
 //!   in threads on ephemeral ports and runs the full round-trip in-process.
 //!
-//! ## Pre-shared link keys (N1.8 simplification)
+//! ## N1.9 key hierarchy
 //!
-//! The full SNP-IK/0.1 Noise-based handshake is OUT OF SCOPE for N1.8.
-//! All three nodes derive the SAME 32-byte AEAD link key from the
-//! deterministic seed `b"SNP/0.1 N1.8 mesh link seed"` via
-//! [`snp_link::derive_link_key`]. The key is NOT secret — it is a known test
-//! key. This is enough to demonstrate real ChaCha20-Poly1305 AEAD over real
-//! TCP; production ShareNet uses SNP-IK/0.1 to derive fresh per-link keys.
+//! ```text
+//!   ┌────────┐   client↔relay hop key (seed S1)   ┌───────┐   relay↔gateway hop key (seed S2)   ┌─────────┐
+//!   │ Client │ ────────────────────────────────── │ Relay │ ────────────────────────────────── │ Gateway │
+//!   └────────┘                                     └───────┘                                     └─────────┘
+//!        │                                                                            │
+//!        └─────────────── end-to-end circuit key (seed S3) ────────────────────────────┘
+//!   (the relay does NOT possess S3 — it cannot decrypt the frame body)
+//! ```
+//!
+//! - **S1 = `b"SNP/0.1 N1.9 client-relay link seed"`** — shared by Client
+//!   and Relay. Derives directional hop keys for the Client↔Relay TCP link.
+//! - **S2 = `b"SNP/0.1 N1.9 relay-gateway link seed"`** — shared by Relay
+//!   and Gateway. Derives directional hop keys for the Relay↔Gateway TCP
+//!   link.
+//! - **S3 = `b"SNP/0.1 N1.9 circuit seed"`** — shared by Client and Gateway
+//!   ONLY. Derives directional circuit keys for end-to-end encryption of
+//!   the TransitRequest and TransitResponse bodies.
+//!
+//! Each hop key is a [`snp_link::LinkKeys`] pair (`send_key` + `recv_key`).
+//! Each circuit key is a [`snp_link::CircuitKeys`] pair. The relay has
+//! `LinkKeys` for both hops but NO `CircuitKeys` — this is the
+//! architectural enforcement of "the relay cannot read the payload".
+//!
+//! ## N1.9 vs production
+//!
+//! The seeds above are deterministic test values — they are NOT secret. The
+//! production target derives fresh per-link seeds from the SNP-IK/0.1
+//! Noise-based handshake (X25519 ephemeral-static DH + transcript hash) so
+//! each TCP link has a unique key unknown to anyone but the two endpoints.
+//! The circuit seed is derived from the SNP-IK/0.1 transcript between
+//! client and gateway, so the relay (which only sees the outer hop
+//! handshakes) cannot derive it.
 
 #![warn(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -39,10 +71,13 @@ use snp_gateway::{
     encode_transit_response, handle_transit_request, sign_transit_request,
     verify_transit_response, TransitRequest, TransitResponse,
 };
-use snp_link::{derive_link_key, Link};
+use snp_link::{
+    decrypt_circuit_payload, derive_circuit_keys, derive_link_keys, encrypt_circuit_payload,
+    CircuitKeys, Link, LinkKeys,
+};
 use thiserror::Error;
 
-/// Errors from the N1.8 daemon.
+/// Errors from the N1.9 daemon.
 #[derive(Debug, Error)]
 pub enum NodeError {
     /// IO error from the TCP layer.
@@ -63,6 +98,10 @@ pub enum NodeError {
     /// CBOR error.
     #[error("CBOR error: {0}")]
     Cbor(#[from] snp_cbor::CborError),
+    /// The circuit payload failed AEAD decryption (the gateway rejected the
+    /// request — likely tampering at the relay, or a key-derivation bug).
+    #[error("circuit payload AEAD decryption failed")]
+    CircuitDecryptionFailed,
     /// Configuration or runtime error not covered above.
     #[error("{0}")]
     Other(String),
@@ -71,20 +110,65 @@ pub enum NodeError {
 /// Convenience `Result` alias.
 pub type NodeResult<T> = Result<T, NodeError>;
 
-/// The pre-shared link-key seed used by all three N1.8 mesh roles.
-///
-/// All three nodes derive the SAME 32-byte AEAD link key from this seed via
-/// [`snp_link::derive_link_key`]. This is the simplified N1.8 model —
-/// production ShareNet uses SNP-IK/0.1 to derive fresh per-link keys.
-const LINK_KEY_SEED: &[u8] = b"SNP/0.1 N1.8 mesh link seed";
+// ─── N1.9 key seeds (deterministic test values — NOT secret) ───────────────
 
-/// Derive the N1.8 mesh link key (same on all three nodes).
+/// Seed for the Client↔Relay hop key (S1). Known to Client and Relay only.
+const CLIENT_RELAY_LINK_SEED: &[u8] = b"SNP/0.1 N1.9 client-relay link seed";
+
+/// Seed for the Relay↔Gateway hop key (S2). Known to Relay and Gateway only.
+const RELAY_GATEWAY_LINK_SEED: &[u8] = b"SNP/0.1 N1.9 relay-gateway link seed";
+
+/// Seed for the end-to-end Client↔Gateway circuit key (S3). Known to Client
+/// and Gateway ONLY — the relay MUST NOT possess this seed.
+const CIRCUIT_SEED: &[u8] = b"SNP/0.1 N1.9 circuit seed";
+
+/// Client's directional hop keys for the Client↔Relay link.
+///
+/// The client is the initiator of this TCP connection, so `is_initiator = true`.
 #[must_use]
-pub fn mesh_link_key() -> [u8; 32] {
-    derive_link_key(LINK_KEY_SEED)
+pub fn client_link_keys() -> LinkKeys {
+    derive_link_keys(CLIENT_RELAY_LINK_SEED, true)
 }
 
-/// Gateway secret key (deterministic for N1.8 demo).
+/// Relay's directional hop keys for the Client↔Relay link.
+///
+/// The relay is the responder of this TCP connection (it accepts the
+/// client's connection), so `is_initiator = false`.
+#[must_use]
+pub fn relay_client_link_keys() -> LinkKeys {
+    derive_link_keys(CLIENT_RELAY_LINK_SEED, false)
+}
+
+/// Relay's directional hop keys for the Relay↔Gateway link.
+///
+/// The relay is the initiator of this TCP connection (it dials the
+/// gateway), so `is_initiator = true`.
+#[must_use]
+pub fn relay_gateway_link_keys() -> LinkKeys {
+    derive_link_keys(RELAY_GATEWAY_LINK_SEED, true)
+}
+
+/// Gateway's directional hop keys for the Relay↔Gateway link.
+///
+/// The gateway is the responder, so `is_initiator = false`.
+#[must_use]
+pub fn gateway_link_keys() -> LinkKeys {
+    derive_link_keys(RELAY_GATEWAY_LINK_SEED, false)
+}
+
+/// Client's directional circuit keys (the client is the circuit initiator).
+#[must_use]
+pub fn client_circuit_keys() -> CircuitKeys {
+    derive_circuit_keys(CIRCUIT_SEED, true)
+}
+
+/// Gateway's directional circuit keys (the gateway is the circuit responder).
+#[must_use]
+pub fn gateway_circuit_keys() -> CircuitKeys {
+    derive_circuit_keys(CIRCUIT_SEED, false)
+}
+
+/// Gateway secret key (deterministic for N1.9 demo).
 const GATEWAY_SECRET: [u8; 32] = {
     let mut sk = [0u8; 32];
     let mut i = 0u32;
@@ -95,7 +179,7 @@ const GATEWAY_SECRET: [u8; 32] = {
     sk
 };
 
-/// Client secret key (deterministic for N1.8 demo).
+/// Client secret key (deterministic for N1.9 demo).
 const CLIENT_SECRET: [u8; 32] = {
     let mut sk = [0u8; 32];
     let mut i = 0u32;
@@ -133,19 +217,20 @@ pub fn client_node_id() -> [u8; 32] {
 /// Run the GATEWAY role: listen on `listen_addr` (e.g. "127.0.0.1:7003"),
 /// accept one relay connection, serve one Mode A request, return the response.
 ///
-/// For N1.8 the gateway serves a single request then exits (the mesh_demo
+/// For N1.9 the gateway serves a single request then exits (the mesh_demo
 /// orchestrator can call it once per request).
 pub fn run_gateway(listen_addr: &str) -> NodeResult<()> {
     let listener = TcpListener::bind(listen_addr)?;
     eprintln!("[gateway] listening on {listen_addr}");
-    let key = mesh_link_key();
+    let keys = gateway_link_keys();
+    let circuit = gateway_circuit_keys();
     let gateway_sk = GATEWAY_SECRET;
 
     for stream in listener.incoming() {
         let stream = stream?;
         eprintln!("[gateway] relay connected from {}", stream.peer_addr()?);
-        let link = Link::new(stream, key);
-        match serve_one_request(&link, &gateway_sk) {
+        let link = Link::new(stream, keys);
+        match serve_one_request(&link, &gateway_sk, &circuit) {
             Ok(()) => {
                 eprintln!("[gateway] request served, exiting");
                 return Ok(());
@@ -159,13 +244,21 @@ pub fn run_gateway(listen_addr: &str) -> NodeResult<()> {
     Ok(())
 }
 
-/// Serve one Mode A request on the given link.
-fn serve_one_request(link: &Link, gateway_sk: &[u8; 32]) -> NodeResult<()> {
-    // Recv a frame from the relay (the relay forwards the encrypted blob
-    // verbatim — the gateway is the endpoint that decrypts).
+/// Serve one Mode A request on the given link. The link carries
+/// AEAD-protected frames using directional hop keys; the frame body is the
+/// end-to-end circuit-encrypted TransitRequest.
+fn serve_one_request(
+    link: &Link,
+    gateway_sk: &[u8; 32],
+    circuit: &CircuitKeys,
+) -> NodeResult<()> {
+    // Recv a frame from the relay. The relay re-encrypted the OUTER frame
+    // with the relay→gateway hop key; we decrypt with our recv_key. The
+    // INNER body (frame.body) is still the circuit ciphertext the client
+    // produced — the relay could not decrypt it (no circuit key).
     let req_frame = link.recv_frame()?;
     eprintln!(
-        "[gateway] recv frame: cls={} ttl={} body={} bytes",
+        "[gateway] recv frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
         req_frame.cls as char,
         req_frame.ttl,
         req_frame.body.len()
@@ -174,14 +267,26 @@ fn serve_one_request(link: &Link, gateway_sk: &[u8; 32]) -> NodeResult<()> {
         eprintln!("[gateway] frame TTL=0, dropping");
         return Ok(());
     }
-    // Decode the TransitRequest from the frame body.
-    let transit_req = decode_transit_request(&req_frame.body)?;
+
+    // Decrypt the INNER circuit payload (the client encrypted it with its
+    // circuit_send_key == our circuit_recv_key). If this fails, the body
+    // was tampered with at the relay — return CircuitDecryptionFailed.
+    let req_bytes = decrypt_circuit_payload(&circuit.recv_key, &req_frame.body)
+        .ok_or(NodeError::CircuitDecryptionFailed)?;
+    eprintln!(
+        "[gateway] circuit decryption OK: {} bytes TransitRequest plaintext",
+        req_bytes.len()
+    );
+
+    // Decode the TransitRequest from the decrypted circuit plaintext.
+    let transit_req = decode_transit_request(&req_bytes)?;
     eprintln!(
         "[gateway] transit request: method={} url={}",
         transit_req.method, transit_req.url
     );
 
-    // Handle the request: validate, resolve DNS, SSRF check, fetch, sign.
+    // Handle the request: validate, build PinnedConnector (DNS pin), fetch,
+    // sign. The PinnedConnector closes the N1.8 TOCTOU gap.
     let fetched = handle_transit_request(&transit_req, gateway_sk)?;
     eprintln!(
         "[gateway] fetched: status={} body={} bytes object_id={}",
@@ -190,10 +295,20 @@ fn serve_one_request(link: &Link, gateway_sk: &[u8; 32]) -> NodeResult<()> {
         hex_short(&fetched.response.object_id)
     );
 
+    // Build the response bytes and encrypt them with the circuit key
+    // (circuit.send_key == client.circuit.recv_key). The client will
+    // decrypt the response body with its circuit_recv_key.
+    let resp_bytes = encode_transit_response(&fetched.response)?;
+    let sealed_resp = encrypt_circuit_payload(&circuit.send_key, &resp_bytes);
+    eprintln!(
+        "[gateway] circuit encryption: {} bytes TransitResponse → {} bytes ciphertext",
+        resp_bytes.len(),
+        sealed_resp.len()
+    );
+
     // Build the response frame. dst = original frame's src (the client).
     // src = gateway NodeId. cls = B (transit). ttl = 16. fid = same as request.
     // seq = request seq + 1.
-    let resp_bytes = encode_transit_response(&fetched.response)?;
     let resp_frame = Frame {
         v: snp_frames::FRAME_VERSION,
         cls: b'B',
@@ -202,38 +317,52 @@ fn serve_one_request(link: &Link, gateway_sk: &[u8; 32]) -> NodeResult<()> {
         ttl: snp_frames::FRAME_TTL_MAX,
         fid: req_frame.fid,
         seq: req_frame.seq + 1,
-        body: resp_bytes,
+        body: sealed_resp,
     };
     link.send_frame(&resp_frame)?;
-    eprintln!("[gateway] response frame sent");
+    eprintln!("[gateway] response frame sent (encrypted with gateway hop send_key + circuit send_key)");
     Ok(())
 }
 
 /// Run the RELAY role: listen on `listen_addr` (e.g. "127.0.0.1:7002"),
 /// accept one client connection, open a connection to `gateway_addr`,
-/// forward encrypted blobs verbatim in both directions. NEVER decrypt.
+/// forward frames in both directions. The relay decrypts the OUTER frame
+/// (it has the hop keys for both links) but it does NOT decrypt the frame
+/// BODY — the body is end-to-end circuit ciphertext that the relay cannot
+/// read (it has no circuit key).
 pub fn run_relay(listen_addr: &str, gateway_addr: &str) -> NodeResult<()> {
     let listener = TcpListener::bind(listen_addr)?;
     eprintln!("[relay] listening on {listen_addr}, gateway={gateway_addr}");
-    let key = mesh_link_key();
+    let client_link_keys = relay_client_link_keys();
+    let gateway_link_keys = relay_gateway_link_keys();
 
     for stream in listener.incoming() {
         let client_stream = stream?;
         eprintln!("[relay] client connected from {}", client_stream.peer_addr()?);
-        let client_link = Arc::new(Link::new(client_stream, key));
-        let gateway_link = Arc::new(Link::connect(gateway_addr, key)?);
+        let client_link = Arc::new(Link::new(client_stream, client_link_keys));
+        let gateway_link = Arc::new(Link::connect(gateway_addr, gateway_link_keys)?);
         eprintln!("[relay] connected to gateway at {gateway_addr}");
 
         // Forward ONE round-trip synchronously: client → gateway → client.
-        // This is the N1.8 demo's "one request, one response" semantics.
-        // The relay NEVER decrypts — it forwards raw encrypted blobs (I8).
-        match client_link.recv_raw() {
-            Ok(blob) => {
+        // The relay decrypts the OUTER frame with the client↔relay hop key,
+        // re-encrypts with the relay↔gateway hop key, and forwards. The
+        // frame BODY (the end-to-end circuit ciphertext) is preserved
+        // verbatim — the relay never decrypts the body, never inspects it,
+        // never holds the circuit plaintext. Invariant I8 holds at the
+        // semantic level: the body bytes cross the relay as opaque ciphertext.
+        match client_link.recv_frame() {
+            Ok(mut frame) => {
                 eprintln!(
-                    "[relay] client→gateway: forwarding {} bytes (encrypted, untouched)",
-                    blob.len()
+                    "[relay] client→gateway: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
+                    frame.cls as char, frame.ttl, frame.body.len()
                 );
-                if let Err(e) = gateway_link.send_raw(&blob) {
+                // Decrement TTL per I7 before forwarding. (Frame::forward
+                // would also do this; we do it inline so we can re-emit the
+                // frame on the next link.)
+                if frame.ttl > 0 {
+                    frame.ttl -= 1;
+                }
+                if let Err(e) = gateway_link.send_frame(&frame) {
                     eprintln!("[relay] client→gateway: send error: {e}");
                     return Err(e.into());
                 }
@@ -243,13 +372,16 @@ pub fn run_relay(listen_addr: &str, gateway_addr: &str) -> NodeResult<()> {
                 return Err(e.into());
             }
         }
-        match gateway_link.recv_raw() {
-            Ok(blob) => {
+        match gateway_link.recv_frame() {
+            Ok(mut frame) => {
                 eprintln!(
-                    "[relay] gateway→client: forwarding {} bytes (encrypted, untouched)",
-                    blob.len()
+                    "[relay] gateway→client: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
+                    frame.cls as char, frame.ttl, frame.body.len()
                 );
-                if let Err(e) = client_link.send_raw(&blob) {
+                if frame.ttl > 0 {
+                    frame.ttl -= 1;
+                }
+                if let Err(e) = client_link.send_frame(&frame) {
                     eprintln!("[relay] gateway→client: send error: {e}");
                     return Err(e.into());
                 }
@@ -266,13 +398,16 @@ pub fn run_relay(listen_addr: &str, gateway_addr: &str) -> NodeResult<()> {
 }
 
 /// Run the CLIENT role: connect to `relay_addr` (e.g. "127.0.0.1:7002"),
-/// build a TransitRequest for `url`, sign it, wrap in a Class B frame,
-/// AEAD-encrypt, send to relay, wait for response, decrypt, verify gateway
-/// signature. Returns the (status, gateway_verified) tuple on success.
+/// build a TransitRequest for `url`, sign it, encrypt the body with the
+/// circuit key, wrap in a Class B frame, AEAD-encrypt the frame with the
+/// client↔relay hop key, send to relay, wait for response, decrypt at both
+/// layers, verify gateway signature. Returns the (status, gateway_verified)
+/// tuple on success.
 pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
-    let key = mesh_link_key();
+    let keys = client_link_keys();
+    let circuit = client_circuit_keys();
     eprintln!("[client] connecting to relay at {relay_addr}");
-    let link = Link::connect(relay_addr, key)?;
+    let link = Link::connect(relay_addr, keys)?;
     eprintln!("[client] connected");
 
     // Build the TransitRequest.
@@ -283,14 +418,25 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
         tls_termination: "GATEWAY_PLAINTEXT".into(),
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
-        reply_to: [0u8; 32], // N1.8: not used; gateway replies via the frame
+        reply_to: [0u8; 32], // N1.9: not used; gateway replies via the frame
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &CLIENT_SECRET);
     let req_bytes = encode_transit_request(&req)?;
     eprintln!("[client] transit request: {} bytes (url={url})", req_bytes.len());
 
-    // Wrap in a Class B frame addressed to the gateway NodeId.
+    // Encrypt the TransitRequest body end-to-end with the circuit key. The
+    // relay will forward this ciphertext verbatim — it cannot decrypt it.
+    let sealed_body = encrypt_circuit_payload(&circuit.send_key, &req_bytes);
+    eprintln!(
+        "[client] circuit encryption: {} bytes plaintext → {} bytes ciphertext",
+        req_bytes.len(),
+        sealed_body.len()
+    );
+
+    // Wrap the circuit ciphertext in a Class B frame addressed to the
+    // gateway NodeId. The frame itself is then AEAD-encrypted by the Link
+    // layer with the client↔relay hop key.
     let req_frame = Frame {
         v: snp_frames::FRAME_VERSION,
         cls: b'B',
@@ -299,15 +445,18 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
         ttl: snp_frames::FRAME_TTL_MAX,
         fid: random_fid(),
         seq: 1,
-        body: req_bytes,
+        body: sealed_body,
     };
     link.send_frame(&req_frame)?;
-    eprintln!("[client] request frame sent (cls=B, dst=gateway, ttl=16)");
+    eprintln!("[client] request frame sent (cls=B, dst=gateway, ttl=16, encrypted with client hop send_key)");
 
-    // Wait for the response frame.
+    // Wait for the response frame. The Link layer decrypts the OUTER frame
+    // (using the client↔relay hop recv_key). The INNER body is still the
+    // circuit ciphertext that the gateway produced — we decrypt it with our
+    // circuit recv_key.
     let resp_frame = link.recv_frame()?;
     eprintln!(
-        "[client] recv response frame: cls={} ttl={} body={} bytes",
+        "[client] recv response frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
         resp_frame.cls as char,
         resp_frame.ttl,
         resp_frame.body.len()
@@ -318,8 +467,17 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
             resp_frame.cls as char
         )));
     }
-    // Decode the TransitResponse from the frame body.
-    let transit_resp: TransitResponse = decode_transit_response(&resp_frame.body)?;
+
+    // Decrypt the INNER circuit payload.
+    let resp_bytes = decrypt_circuit_payload(&circuit.recv_key, &resp_frame.body)
+        .ok_or(NodeError::CircuitDecryptionFailed)?;
+    eprintln!(
+        "[client] circuit decryption OK: {} bytes TransitResponse plaintext",
+        resp_bytes.len()
+    );
+
+    // Decode the TransitResponse from the decrypted circuit plaintext.
+    let transit_resp: TransitResponse = decode_transit_response(&resp_bytes)?;
     eprintln!(
         "[client] transit response: status={} gateway_sig={} bytes",
         transit_resp.status,
@@ -346,8 +504,9 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
 /// Run the in-process mesh demo: spawn gateway + relay in threads, then run
 /// the client in the main thread. Prints the success line on success.
 pub fn run_mesh_demo(url: &str) -> NodeResult<()> {
-    eprintln!("=== ShareNet 2.0 — N1.8 Rust minimal Internet bridge ===");
+    eprintln!("=== ShareNet 2.0 — N1.9 Secure Rust Link + Gateway Boundary ===");
     eprintln!("=== Client → Relay → Gateway → {url} → back ===");
+    eprintln!("=== Directional hop keys + end-to-end circuit encryption + DNS-pinned gateway ===");
 
     // Pick ephemeral ports for the gateway and relay.
     let gateway_listener = TcpListener::bind("127.0.0.1:0")?;
@@ -404,7 +563,7 @@ fn now_unix() -> u64 {
 }
 
 fn random_req_id() -> [u8; 16] {
-    // Deterministic-ish for N1.8: hash the current time + a counter.
+    // Deterministic-ish for N1.9: hash the current time + a counter.
     let now = now_unix().to_be_bytes();
     let mut seed = Vec::with_capacity(16);
     seed.extend_from_slice(&now);

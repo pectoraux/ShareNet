@@ -57,6 +57,15 @@ tracing = "0.1"
 ureq = "2"
 # URL parsing for the gateway egress policy
 url = "2"
+# TLS + CA roots for the gateway's pinned-IP HTTPS fetcher (N1.9). rustls is
+# also a transitive dep of ureq; we declare it directly so snp-gateway can
+# drive a TLS handshake over a TcpStream that we connected ourselves (IP
+# pinning — the connection goes to a validated IP, not a re-resolved host).
+# The `ring` feature selects the crypto provider; without it
+# `ClientConfig::builder()` cannot start a handshake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { package = "rustls-pki-types", version = "1" }
+webpki-roots = "0.26"
 
 # Internal crates (declared here so siblings can depend on each other via
 # `dep.workspace = true` style relative paths without re-stating versions).

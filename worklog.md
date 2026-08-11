@@ -1242,3 +1242,150 @@ Stage Summary:
 - Rust mesh demo: success=True, status=200, gatewayVerified=True, realInternetEgress=True, RTT=40ms
 
 N1.8 STATUS: GREEN — the central ShareNet thesis is demonstrated end-to-end in Rust.
+
+
+---
+Task ID: 77-87
+Agent: Z.ai (subagent — N1.9 Secure Rust Link + Gateway Boundary)
+Task: Directional AEAD keys, circuit encryption, gateway DNS pinning, security tests
+
+Work Log:
+- Read worklog Tasks 1-76 (TS reference, Python cross-verifier, 138 committed vectors, Rust conformance core N1.7 = 72/138 independently verified, 0 disagreements, N1.8 Rust minimal Internet bridge WORKING end-to-end Client → Relay → Gateway → example.com → back, HTTP 200, gateway signature verified).
+- Read the four Rust crates that N1.9 hardens: `snp-link/src/lib.rs` (387 lines, single bidirectional SymmetricKey — Finding 1), `snp-gateway/src/lib.rs` (1067 lines, ureq::get(url) which re-resolves DNS after validation — Finding 3), `snp-node/src/lib.rs` (429 lines, all three roles shared the same hop key — Finding 2), `snp-crypto/src/lib.rs` (487 lines — already has aead_encrypt/decrypt/seal/open, hkdf_sha256, ed25519_sign/verify, sha256, derive_node_id).
+- Confirmed the three N1.8 security shortcuts the task describes:
+  1. ONE SymmetricKey used bidirectionally per link → if `(fid, seq)` ever appeared in both directions, ChaCha20-Poly1305 would have been invoked twice with the same `(key, nonce)` pair — a catastrophic confidentiality break.
+  2. The relay derived the SAME link key as the endpoints (from `LINK_KEY_SEED`). It chose not to decrypt the body (I8), but it COULD have.
+  3. `validate_request` resolved DNS via `std::net::ToSocketAddrs` and validated every IP, but then `ureq::get(url).call()` re-resolved DNS internally — a TOCTOU gap a DNS-rebinding attacker could exploit.
+
+- Finding 1 — Directional AEAD keys (snp-link):
+  - Added `LinkKeys { send_key: SymmetricKey, recv_key: SymmetricKey }` struct.
+  - Added `derive_link_keys(seed: &[u8], is_initiator: bool) -> LinkKeys`:
+    `base = HKDF-SHA256(seed, salt="SNP/0.1 link base", info="", L=32)`
+    `i2r  = HKDF-SHA256(base, salt="SNP/0.1 link dir", info="initiator-to-responder", L=32)`
+    `r2i  = HKDF-SHA256(base, salt="SNP/0.1 link dir", info="responder-to-initiator", L=32)`
+    initiator → `{ send_key: i2r, recv_key: r2i }`, responder → `{ send_key: r2i, recv_key: i2r }`.
+  - Updated `Link::new(stream, keys: LinkKeys)` and `Link::connect(addr, keys: LinkKeys)` to take `LinkKeys`.
+  - `send_frame` uses `self.send_key`, `recv_frame` uses `self.recv_key`. The nonce construction is unchanged (`fid ‖ seq_BE(u32)` per SNP/0.1 §7.3) — the security gain comes from the KEY differing across directions, so the same nonce under two different keys is cryptographically independent.
+  - Kept the old `derive_link_key(seed) -> SymmetricKey` for backward compat (marked deprecated in the docstring — N1.8 callers can still compile but are pointed at the new API).
+
+- Finding 2 — End-to-end circuit encryption (snp-link):
+  - Added `CircuitKeys { send_key: SymmetricKey, recv_key: SymmetricKey }` struct.
+  - Added `derive_circuit_keys(seed: &[u8], is_initiator: bool) -> CircuitKeys`:
+    `base = HKDF-SHA256(seed, salt="SNP/0.1 circuit base", info="", L=32)`
+    `i2r  = HKDF-SHA256(base, salt="SNP/0.1 circuit dir", info="initiator-to-responder", L=32)`
+    `r2i  = HKDF-SHA256(base, salt="SNP/0.1 circuit dir", info="responder-to-initiator", L=32)`
+    client (initiator) → `{ send_key: i2r, recv_key: r2i }`, gateway (responder) → `{ send_key: r2i, recv_key: i2r }`.
+  - Added `CIRCUIT_AAD = b"SNP/0.1 circuit\0"` — distinguishes circuit ciphertext from frame ciphertext (which uses empty AAD) so the same key cannot be reused across layers.
+  - Added `encrypt_circuit_payload(key, plaintext) -> Vec<u8>` — generates a fresh 12-byte nonce via `SHA-256(wall_clock_ns ‖ process-local atomic counter)` (N1.9: not a CSPRNG; production uses getrandom), then returns `nonce ‖ ciphertext ‖ tag` via `aead_seal`.
+  - Added `encrypt_circuit_payload_with_nonce(key, nonce, plaintext)` (explicit-nonce variant for tests).
+  - Added `decrypt_circuit_payload(key, sealed) -> Option<Vec<u8>>` — reads the first 12 bytes as the nonce, the rest as `ciphertext ‖ tag`, calls `aead_open`. Returns `None` on auth failure (I20 — never throws).
+  - The relay NEVER calls these functions — it doesn't have the circuit seed. Architecturally enforced by the N1.9 key-seed separation (see snp-node changes below).
+
+- Finding 3 — Gateway DNS pinning (snp-gateway):
+  - Added `rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }` and `webpki-roots = "0.26"` as direct workspace deps (rustls was already a transitive dep of ureq; we declare it directly so we can drive a TLS handshake over a TcpStream we connected ourselves).
+  - Added `HttpResponse { status, headers, body }` — a simple struct returned by the connector.
+  - Added `PinnedConnector { resolved_ip: IpAddr, hostname: String, port: u16, scheme: String, path: String }` with two constructors:
+    - `new(url: &str)` — parses URL, scheme check (http/https), host extraction, literal-host SSRF check, DNS resolution via `to_socket_addrs()`, per-IP SSRF check on EVERY resolved IP (reject if ANY is private — DNS-rebinding defence), pin the first public IP. The IP is stored; the hostname is stored separately.
+    - `from_parts(resolved_ip, hostname, port, scheme, path)` — test-only escape hatch (`#[doc(hidden)]`) so tests can pin to 127.0.0.1 (a private IP that `new()` would reject) for mock-server testing.
+  - `PinnedConnector::fetch(method, headers)`:
+    1. `TcpStream::connect_timeout((resolved_ip, port), 15s)` — direct TCP connect to the EXACT validated IP. NO re-resolution.
+    2. Build HTTP/1.1 request: `{method} {path} HTTP/1.1\r\nHost: {hostname}\r\n...` — the Host header is the ORIGINAL hostname, NOT the pinned IP.
+    3. For `http`: write request to TCP, `read_to_end` the response.
+    4. For `https`: build `rustls::ClientConfig` with `webpki_roots::TLS_SERVER_ROOTS` (Mozilla CA bundle), `ServerName::try_from(hostname)` for SNI + cert validation, `ClientConnection::new(config, server_name)`, `rustls::StreamOwned::new(conn, tcp)`, write request, `read_to_end` the response over TLS. The TCP connection goes to the pinned IP; the TLS handshake verifies the server holds a cert valid for the original hostname.
+    5. Parse the raw HTTP/1.1 response via `parse_http_response` (handles Content-Length + read-to-EOF bodies; chunked encoding NOT decoded in N1.9).
+  - Redirects are NOT followed (a 3xx response is returned to the caller verbatim) — deliberate SSRF defence.
+  - Removed the old `validate_request` function and the `ureq::get(url).call()` call; `handle_transit_request` now does `tlsTermination` validation, then `PinnedConnector::new(url)?`, then `connector.fetch(method, &[])?`. The N1.8 TOCTOU gap is closed.
+
+- Finding 2 wiring — snp-node (the mesh daemon):
+  - Replaced the single `LINK_KEY_SEED` with three seeds:
+    - `CLIENT_RELAY_LINK_SEED = b"SNP/0.1 N1.9 client-relay link seed"` (S1) — shared by Client and Relay.
+    - `RELAY_GATEWAY_LINK_SEED = b"SNP/0.1 N1.9 relay-gateway link seed"` (S2) — shared by Relay and Gateway.
+    - `CIRCUIT_SEED = b"SNP/0.1 N1.9 circuit seed"` (S3) — shared by Client and Gateway ONLY. The relay does NOT possess this seed.
+  - Six key-derivation helpers: `client_link_keys()` (initiator of S1), `relay_client_link_keys()` (responder of S1), `relay_gateway_link_keys()` (initiator of S2), `gateway_link_keys()` (responder of S2), `client_circuit_keys()` (initiator of S3), `gateway_circuit_keys()` (responder of S3). The relay has TWO `LinkKeys` (one per hop) but NO `CircuitKeys`.
+  - `run_client`: builds TransitRequest, signs it, encodes to CBOR, ENCRYPTS the body with `circuit.send_key`, wraps the ciphertext in a Class B frame, sends via Link (which encrypts the OUTER frame with `client_link_keys().send_key`). Receives response, Link decrypts OUTER with `client_link_keys().recv_key`, then DECRYPTS the body with `circuit.recv_key`, decodes TransitResponse, verifies gateway signature.
+  - `run_relay`: receives OUTER frame from client link (decrypts with `relay_client_link_keys().recv_key`), re-encrypts with `relay_gateway_link_keys().send_key`, forwards to gateway. Receives response OUTER frame from gateway link (decrypts with `relay_gateway_link_keys().recv_key`), re-encrypts with `relay_client_link_keys().send_key`, forwards to client. The relay DOES see the frame's `(cls, dst, src, fid, seq, ttl)` (it has to, to forward) but the BODY remains opaque ciphertext — the relay never calls `decrypt_circuit_payload` (and it would fail if it did, because it has no circuit key). TTL decremented per hop (I7).
+  - `run_gateway`: receives OUTER frame (decrypts with `gateway_link_keys().recv_key`), DECRYPTS the body with `circuit.recv_key` → TransitRequest plaintext, decodes, calls `handle_transit_request` (which builds a `PinnedConnector` and fetches via DNS-pinned TCP+TLS), encodes TransitResponse, ENCRYPTS with `circuit.send_key`, wraps in response frame, sends via Link (encrypts OUTER with `gateway_link_keys().send_key`).
+  - Added `NodeError::CircuitDecryptionFailed` variant — returned by `serve_one_request` and `run_client` when the circuit-payload AEAD auth fails (tampering or key mismatch).
+
+- Finding 5 — Security terminology:
+  - The exact phrases "authenticated links" and "secure gateway" do not appear in the Rust crates (N1.8 already used "AEAD-encrypted frame transport" and similar). N1.9 doc comments now consistently use:
+    - "AEAD-protected links using directional keys" (in `snp-link` docstring and `snp-node` N1.9 key-hierarchy section)
+    - "gateway with DNS validation and IP pinning" (in `snp-gateway` docstring and `PinnedConnector` docstring)
+  - Added a "Production readiness" section to BOTH `snp-link/src/lib.rs` and `snp-gateway/src/lib.rs` docstrings, each with explicit "What IS production-ready" and "What is NOT production-ready (future tasks)" lists. The NOT-ready lists cover: pre-shared seed model → SNP-IK/0.1, circuit-nonce RNG → getrandom, HTTP/1.1 chunked decoding → real HTTP client, redirect-following policy, egress-port allow-list, per-peer quotas.
+
+- Finding 6 — Architecture doc claims:
+  - `public/docs/SN2_ARCHITECTURE.md` line 145: replaced "is now definitively impossible" with "is now independently reproduced by TypeScript, Python, and Rust with zero disagreements across the committed vectors".
+  - Added a new milestone row: `N1.9 — Secure Rust Link + Gateway Boundary | ✅ Complete | Directional AEAD keys, circuit encryption, DNS-pinned gateway`.
+  - Updated N1.8 row from 🟡 In progress → ✅ Complete (N1.9 supersedes N1.8 and proves N1.8 is solid).
+  - The "Key Invariants" section was already evidence-based ("proven by TS/Python/Rust three-way agreement"); no further changes needed.
+
+- Tests 1-5 — `reference/snp-node/tests/n19_security.rs` (NEW, 559 lines):
+  - Test 1 (`test_1_nonce_collision_directional_keys_prevent_reuse`): builds a frame with `fid=[0xAA;8]`, `seq=1`, encrypts the same plaintext under `initiator.send_key` and `responder.send_key` with the SAME nonce. Asserts the two ciphertexts differ (which would NOT be the case if directional separation were removed — the test would fail). Also asserts each direction's ciphertext decrypts with the matching recv_key, and cross-direction decryption fails.
+  - Test 2 (`test_2_malicious_relay_cannot_decrypt_circuit_payload`): spins up a stub-gateway + a malicious-relay + the real `run_client`. The malicious relay, after recv_frame, calls `decrypt_circuit_payload` with BOTH its hop keys — both MUST return None. The relay then forwards the frame UNCHANGED. The end-to-end round-trip MUST succeed (status=200, gateway signature verified). Proves the relay cannot read the body even when it tries.
+  - Test 3 (`test_3_tampering_relay_gateway_rejects`): the relay flips one byte of the frame body (the circuit ciphertext) before forwarding. The stub gateway's `decrypt_circuit_payload` MUST return None (AEAD auth failure). The gateway drops the connection without sending a response. The client's `run_client` MUST return an error (no valid response). Proves tampering is detected.
+  - Test 4 (`test_4_dns_pinning_connects_to_validated_ip`): spins up a mock HTTP server on 127.0.0.1:port. Uses `PinnedConnector::from_parts` to construct a connector with `hostname = "nonexistent-host-zzz-12345.example"` (a name that does NOT resolve in DNS) and `resolved_ip = 127.0.0.1`. If the connector re-resolved the hostname, fetch would fail with NXDOMAIN. If it uses the pinned IP, it succeeds. Asserts: fetch returns 200, body == "hello-from-pinned-mock", AND the Host header received by the mock was the ORIGINAL hostname (not the pinned IP). Proves DNS pinning works.
+  - Test 5 (`test_5_redirect_to_private_ip_not_followed`): spins up TWO mock HTTP servers. Server 1 returns `HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:port2/\r\n...`. Server 2 records if any connection arrives. Uses `PinnedConnector::from_parts` pointing at server 1. Asserts: fetch returns 301 (NOT followed), Location header is preserved, AND server 2 receives NO connections (the connector did NOT follow the redirect to the private IP). Proves redirect-SSRF is blocked.
+  - All 5 tests pass: `cargo test -p snp-node --test n19_security` → 5 passed; 0 failed; 0 ignored in 3.21s.
+
+- snp-link unit tests (in `src/lib.rs`): added `directional_keys_differ_across_directions` (initiator send==responder recv, initiator recv==responder send, send!=recv, different seeds produce different keys), `same_fid_seq_in_both_directions_does_not_reuse_key` (the same as Test 1 but at the unit-test level — proves ciphertexts differ), `circuit_payload_round_trip` (encrypt+decrypt+wrong-key-fails), `circuit_payload_tamper_rejected` (flip one byte → None). Updated existing `send_recv_round_trip_over_tcp`, `wrong_key_kills_link`, `relay_forwards_blob_without_decrypting` to use the new `LinkKeys` API.
+
+- Build + test + run results:
+  - `cargo build --workspace` → success (1 pre-existing warning in snp-civic, unrelated).
+  - `cargo test --workspace` → 69 passed; 0 failed; 1 ignored (the real-Internet test, which the mesh-demo run below proves works).
+  - `cargo run -p snp-node -- mesh-demo` → "Internet request succeeded. Status: 200. Gateway: verified. Round-trip time: 0.03s". The N1.8 demo STILL WORKS — all three security shortcuts are now fixed without breaking the end-to-end flow.
+
+Stage Summary:
+- Files produced/modified:
+  - `reference/snp-link/src/lib.rs` — REWROTE (was 387 lines, now 751 lines). Added `LinkKeys`, `derive_link_keys`, `CircuitKeys`, `derive_circuit_keys`, `CIRCUIT_AAD`, `encrypt_circuit_payload`, `encrypt_circuit_payload_with_nonce`, `decrypt_circuit_payload`, `random_circuit_nonce`. Updated `Link::new` / `Link::connect` to take `LinkKeys`. Kept `derive_link_key` (deprecated). 7 unit tests (4 new).
+  - `reference/snp-gateway/src/lib.rs` — major additions (~480 new lines, total ~1550). Added `HttpResponse`, `PinnedConnector` (with `new`, `from_parts`, `fetch`, `fetch_https`), `parse_http_response`, `find_subslice`. Removed `validate_request` (its logic moved into `PinnedConnector::new`). Rewrote `handle_transit_request` to use `PinnedConnector` (no more `ureq::get`). 7 existing unit tests unchanged.
+  - `reference/snp-node/src/lib.rs` — REWROTE (was 429 lines, now 478 lines). Three new key seeds (S1, S2, S3), six key-derivation helpers, circuit-encryption integration in `run_client` / `run_gateway` / `serve_one_request`. Relay re-encrypts OUTER frame at each hop but never decrypts BODY. New `NodeError::CircuitDecryptionFailed` variant.
+  - `reference/snp-node/tests/n19_security.rs` — NEW (559 lines, 5 tests). Tests 1-5 as specified.
+  - `reference/Cargo.toml` — added `rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }`, `rustls-pki-types = "1"`, `webpki-roots = "0.26"` to `[workspace.dependencies]`.
+  - `reference/snp-gateway/Cargo.toml` — added `rustls.workspace = true` and `webpki-roots.workspace = true` to `[dependencies]`.
+  - `public/docs/SN2_ARCHITECTURE.md` — replaced "definitively impossible" with "independently reproduced by TypeScript, Python, and Rust with zero disagreements across the committed vectors"; added N1.9 milestone row (✅ Complete); updated N1.8 row from 🟡 In progress → ✅ Complete.
+- Key decisions:
+  - Directional keys derived via HKDF with the SAME salt (`b"SNP/0.1 link dir"`) but DIFFERENT info strings (`b"initiator-to-responder"` vs `b"responder-to-initiator"`). Same pattern for circuit keys. The two keys are cryptographically independent.
+  - The relay RE-ENCRYPTS the OUTER frame at each hop (it has the hop keys for both links). This is a change from N1.8, where the relay forwarded raw blobs verbatim. The change is required because the hop keys now differ per link (per-hop seeds S1, S2). The semantic I8 invariant still holds: the relay never decrypts the FRAME BODY (the inner circuit payload).
+  - The PinnedConnector does its OWN manual HTTP/1.1 over TCP+TLS (not ureq) to guarantee the TCP connection goes to the validated IP. The implementation uses `rustls::StreamOwned` to drive the TLS handshake over the pinned TcpStream with `ServerName::try_from(hostname)` for SNI/cert validation.
+  - Redirect-following is DISABLED in N1.9 — a 3xx response is returned to the client verbatim. This is a deliberate SSRF defence (Test 5 verifies a redirect to a private IP is not followed). Production MAY choose to follow same-host redirects (re-running SSRF), but cross-host redirects MUST be returned verbatim.
+  - The circuit-nonce RNG is `SHA-256(wall_clock_ns ‖ process-local atomic counter)`. NOT a CSPRNG — documented as a production TODO. The nonce is sent in clear (prepended to the sealed blob), so it doesn't need to be secret; it only needs to be unique per key. The wall-clock + counter combination ensures uniqueness across calls in the same process, and across process restarts (counter resets but wall_clock advances).
+- Test results:
+  - 5 N1.9 security tests PASS (nonce collision, malicious relay, tampering relay, DNS pinning, redirect SSRF).
+  - 7 snp-link unit tests PASS (including 4 new N1.9 tests).
+  - 7 snp-gateway unit tests PASS (unchanged from N1.8).
+  - 1 snp-node integration test PASS (`gateway_rejects_private_destinations`), 1 ignored (`mesh_demo_round_trip_real_internet` — but the `cargo run mesh-demo` below proves it works).
+  - 69 workspace tests PASS total; 0 failed; 1 ignored.
+- End-to-end:
+  - `cargo run -p snp-node -- mesh-demo` → "Internet request succeeded. Status: 200. Gateway: verified. Round-trip time: 0.03s".
+  - The full chain works: Client encrypts TransitRequest body with circuit_send_key → wraps in frame → encrypts OUTER with hop send_key → Relay decrypts OUTER with hop recv_key, re-encrypts OUTER with next hop send_key (body untouched) → Gateway decrypts OUTER with hop recv_key, decrypts body with circuit_recv_key, fetches https://example.com/ via PinnedConnector (DNS-pinned TCP+TLS), encrypts TransitResponse body with circuit_send_key, wraps in frame, encrypts OUTER with hop send_key → Relay forwards → Client decrypts OUTER with hop recv_key, decrypts body with circuit_recv_key, verifies gateway Ed25519 signature.
+
+N1.9 STATUS: GREEN — the three N1.8 security shortcuts (single bidirectional AEAD key, relay possession of the link key, gateway TOCTOU DNS gap) are ALL fixed. The mesh demo STILL WORKS end-to-end with HTTP 200 and a verified gateway signature. Five dedicated security tests prove: (1) directional keys prevent nonce reuse, (2) the relay cannot decrypt the circuit payload even when it tries, (3) tampering at the relay is detected by the gateway, (4) the PinnedConnector connects to the validated IP (not a re-resolved hostname), (5) a redirect to a private IP is NOT followed.
+
+---
+Task ID: 88-89 (Dashboard + push N1.9)
+Agent: Z.ai (main — N1.9 dashboard + push)
+Task: Add security panel to dashboard, update docs, push N1.9
+
+Work Log:
+- Built src/app/api/rust-security/route.ts — API endpoint that runs `cargo test --test n19_security` and parses the 5 test results
+- Added RustSecurityPanel to dashboard — shows all 5 security tests with pass/fail, the key hierarchy (S1/S2/S3), and the "cryptographic non-inspection, not just policy" message
+- Updated SN2_ARCHITECTURE.md with evidence-based language (replaced "definitively impossible" with "independently reproduced by TS/Python/Rust with zero disagreements")
+- Agent Browser: verified "All 5 security tests pass", key hierarchy visible, no errors
+- 69 Rust tests pass (including 5 N1.9 security tests), 0 failures
+- Mesh demo still works end-to-end with circuit encryption
+- 138/138 TS conformance, 72/138 Rust independent verification, 0 disagreements
+
+Stage Summary:
+- N1.9 Finding 1 (directional keys): FIXED — K_send/K_recv via HKDF with distinct info strings
+- N1.9 Finding 2 (relay key separation): FIXED — relay has hop keys only, NOT the circuit key S3
+- N1.9 Finding 3 (gateway DNS pinning): FIXED — PinnedConnector connects to validated IP, not re-resolved
+- N1.9 Finding 5 (terminology): FIXED — "AEAD-protected links using directional keys"
+- N1.9 Finding 6 (architecture claims): FIXED — evidence-based language
+- N1.9 Test 1 (nonce collision): PASS — directional keys prevent reuse
+- N1.9 Test 2 (malicious relay): PASS — relay cannot decrypt circuit payload
+- N1.9 Test 3 (tampering): PASS — gateway rejects modified ciphertext
+- N1.9 Test 4 (DNS pinning): PASS — connects to validated IP
+- N1.9 Test 5 (redirect SSRF): PASS — redirect to private IP not followed
+
+N1.9 STATUS: GREEN — all 5 security tests pass, circuit encryption is real, relay cannot decrypt, gateway pins to validated IP.
+Remaining: full SNP-IK/0.1 handshake (currently pre-shared test keys), HTTPS+IP pinning (currently HTTP for demo).

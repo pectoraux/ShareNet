@@ -142,7 +142,8 @@ with zero disagreements:
 | Gear Chunking | 6/6 | 1/6 | 6/6 |
 
 **Zero disagreements.** The original ShareNet CBOR bug (Kotlin vs Python
-disagreeing on key ordering) is now definitively impossible.
+disagreeing on key ordering) is now independently reproduced by TypeScript,
+Python, and Rust with zero disagreements across the committed vectors.
 
 ---
 
@@ -173,7 +174,8 @@ disagreeing on key ordering) is now definitively impossible.
 | N1.6 — Adversarial conformance | ✅ Complete | Honest classification, SSRF defence |
 | N1.7 — Rust conformance core | ✅ Complete | 72/138 Rust, 0 disagreements |
 | N1.7.1 — Spec findings | ✅ Complete | Merkle streaming fix, ADR-0010 |
-| N1.8 — Rust minimal Internet bridge | 🟡 In progress | Client → Relay → Gateway → Internet |
+| N1.8 — Rust minimal Internet bridge | ✅ Complete | Client → Relay → Gateway → Internet |
+| N1.9 — Secure Rust Link + Gateway Boundary | ✅ Complete | Directional AEAD keys, circuit encryption, DNS-pinned gateway |
 | N2 — Crypto correction | ✅ Complete | (folded into N1.5) |
 | N3 — Reference node | 🟡 In progress | (Rust conformance core done; networking next) |
 | N4 — Routing | 🟡 Partial | (TS implementation + integration tests) |

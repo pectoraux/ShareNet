@@ -833,6 +833,7 @@ dependencies = [
 name = "snp-gateway"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "serde_json",
  "snp-cbor",
  "snp-crypto",
@@ -842,6 +843,7 @@ dependencies = [
  "thiserror",
  "ureq",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

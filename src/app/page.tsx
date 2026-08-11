@@ -1882,6 +1882,146 @@ function RustMeshPanel() {
   )
 }
 
+// ─── Rust security tests panel (N1.9) ──────────────────────────────────────
+
+interface SecurityTest {
+  name: string
+  passed: boolean
+  description: string
+}
+
+interface SecurityResult {
+  allPassed: boolean
+  totalTests: number
+  passed: number
+  failed: number
+  tests: SecurityTest[]
+  timestamp: string
+  error?: string
+}
+
+function RustSecurityPanel() {
+  const [result, setResult] = useState<SecurityResult | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const runTests = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/rust-security', { cache: 'no-store' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setResult(data as SecurityResult)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void runTests()
+  }, [runTests])
+
+  return (
+    <section aria-label="Rust security tests">
+      <Card className="p-0">
+        <CardHeader className="gap-1 p-4 sm:p-6">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
+              <CardTitle className="text-base sm:text-lg">
+                N1.9 Security tests — directional keys, circuit encryption, SSRF pinning
+              </CardTitle>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void runTests()}
+              disabled={loading}
+              className="shrink-0"
+            >
+              {loading ? (
+                <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1.5 size-3.5" />
+              )}
+              Re-run
+            </Button>
+          </div>
+          <CardDescription className="text-xs sm:text-sm">
+            Five security regression tests proving: (1) directional AEAD keys prevent nonce reuse, (2) the relay cannot decrypt the circuit payload, (3) tampering is detected, (4) the gateway connects to the validated IP, (5) redirect-to-private SSRF is rejected. These are the N1.9 audit findings made executable.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-4 pt-0 sm:p-6 sm:pt-0">
+          {error ? (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-300">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="size-4 shrink-0" />
+                <span>Security tests unavailable: {error}</span>
+              </div>
+            </div>
+          ) : loading && !result ? (
+            <div className="space-y-2">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <Skeleton key={i} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : result ? (
+            <>
+              <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+                <Badge
+                  variant="outline"
+                  className={
+                    result.allPassed
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                  }
+                >
+                  {result.allPassed ? '✓ All 5 security tests pass' : `${result.failed} failing`}
+                </Badge>
+                <span className="text-muted-foreground">
+                  {result.passed}/{result.totalTests} passed
+                </span>
+              </div>
+
+              <div className="space-y-1.5">
+                {result.tests.map((t, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2 text-sm"
+                  >
+                    {t.passed ? (
+                      <CheckCircle2 className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : (
+                      <XCircle className="size-4 shrink-0 text-rose-600 dark:text-rose-400" />
+                    )}
+                    <span className="flex-1 text-sm">{t.description}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Key hierarchy */}
+              <div className="mt-3 rounded-md border border-border/40 bg-muted/20 p-3 text-xs text-muted-foreground">
+                <strong className="text-foreground">Key hierarchy (N1.9):</strong>
+                <div className="mt-1 font-mono">
+                  <div>Client ↔ Relay: hop key S1 (directional: send/recv)</div>
+                  <div>Relay ↔ Gateway: hop key S2 (directional: send/recv)</div>
+                  <div>Client ↔ Gateway: circuit key S3 (relay does NOT possess)</div>
+                </div>
+                <div className="mt-2">
+                  The relay has hop keys only. The circuit payload is encrypted end-to-end with a key the relay never sees. This is cryptographic non-inspection, not just policy.
+                </div>
+              </div>
+            </>
+          ) : null}
+        </CardContent>
+      </Card>
+    </section>
+  )
+}
+
 function AuditFindingsPanel() {
   return (
     <section aria-label="Audit findings fixed by this foundation">
@@ -2381,6 +2521,7 @@ export default function Home() {
             <CrossVerificationPanel />
             <ThreeWayComparisonPanel />
             <RustMeshPanel />
+            <RustSecurityPanel />
             <AuditFindingsPanel />
             <ArchitectureLayers />
             <Roadmap />
