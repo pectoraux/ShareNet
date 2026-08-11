@@ -2,7 +2,7 @@
   "suite": "negative",
   "specSection": "06 §A5",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T09:50:28.708Z",
+  "generatedAt": "2026-08-11T11:58:49.391Z",
   "vectors": [
     {
       "id": "negative-cbor-non-canonical-key-order",
@@ -145,14 +145,14 @@
           },
           "ttl": 0,
           "fid": {
-            "0": 225,
-            "1": 55,
-            "2": 9,
-            "3": 42,
-            "4": 123,
-            "5": 172,
-            "6": 166,
-            "7": 56
+            "0": 190,
+            "1": 242,
+            "2": 124,
+            "3": 80,
+            "4": 8,
+            "5": 102,
+            "6": 79,
+            "7": 96
           },
           "seq": 1,
           "body": {

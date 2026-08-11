@@ -19,7 +19,7 @@
 
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -104,6 +104,30 @@ pub fn domain_hash(domain: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 // === Ed25519 ===
+
+/// Sign a message with an Ed25519 secret key. Returns the 64-byte signature.
+///
+/// Per I2, signed structures in SNP are over `SIG_CONTEXT || CBOR(payload)`.
+/// The caller is responsible for prefixing the context — this function signs
+/// the raw `message` bytes.
+///
+/// # Panics
+/// Never panics for a 32-byte secret key. (ed25519-dalek `SigningKey::sign`
+/// is infallible.)
+#[must_use]
+pub fn ed25519_sign(secret_key: &SecretKey, message: &[u8]) -> SignatureBytes {
+    let sk = SigningKey::from_bytes(secret_key);
+    let sig = sk.sign(message);
+    sig.to_bytes()
+}
+
+/// Derive the 32-byte Ed25519 public key from a 32-byte secret key.
+#[must_use]
+pub fn derive_public_key(secret_key: &SecretKey) -> PublicKey {
+    let sk = SigningKey::from_bytes(secret_key);
+    let pk = sk.verifying_key();
+    pk.to_bytes()
+}
 
 /// Verify an Ed25519 signature. Returns `true` iff the signature is valid
 /// under RFC 8032 verification (strict, no batch, no malleability leniency).

@@ -2,7 +2,7 @@
   "suite": "frames",
   "specSection": "SNP/0.1 §7",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T09:50:28.689Z",
+  "generatedAt": "2026-08-11T11:58:49.355Z",
   "vectors": [
     {
       "id": "frame-encode-decode-roundtrip",
@@ -81,14 +81,14 @@
           },
           "ttl": 16,
           "fid": {
-            "0": 231,
-            "1": 244,
-            "2": 251,
-            "3": 54,
-            "4": 96,
-            "5": 138,
-            "6": 43,
-            "7": 36
+            "0": 65,
+            "1": 246,
+            "2": 67,
+            "3": 179,
+            "4": 210,
+            "5": 197,
+            "6": 193,
+            "7": 140
           },
           "seq": 1,
           "body": {
@@ -100,7 +100,7 @@
         }
       },
       "expected": {
-        "encodedHex": "a861760163636c7361426364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d46366696448e7f4fb36608a2b2463736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
+        "encodedHex": "a861760163636c7361426364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d4636669644841f643b3d2c5c18c63736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
         "decodesToSame": true
       }
     },
@@ -181,14 +181,14 @@
           },
           "ttl": 16,
           "fid": {
-            "0": 231,
-            "1": 244,
-            "2": 251,
-            "3": 54,
-            "4": 96,
-            "5": 138,
-            "6": 43,
-            "7": 36
+            "0": 65,
+            "1": 246,
+            "2": 67,
+            "3": 179,
+            "4": 210,
+            "5": 197,
+            "6": 193,
+            "7": 140
           },
           "seq": 1,
           "body": {
@@ -281,14 +281,14 @@
           },
           "ttl": 0,
           "fid": {
-            "0": 231,
-            "1": 244,
-            "2": 251,
-            "3": 54,
-            "4": 96,
-            "5": 138,
-            "6": 43,
-            "7": 36
+            "0": 65,
+            "1": 246,
+            "2": 67,
+            "3": 179,
+            "4": 210,
+            "5": 197,
+            "6": 193,
+            "7": 140
           },
           "seq": 1,
           "body": {
@@ -311,7 +311,7 @@
         "cls": "A"
       },
       "expected": {
-        "encodedHex": "a861760163636c7361416364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d46366696448e7f4fb36608a2b2463736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
+        "encodedHex": "a861760163636c7361416364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d4636669644841f643b3d2c5c18c63736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
         "decodedCls": "A"
       }
     },
@@ -322,7 +322,7 @@
         "cls": "B"
       },
       "expected": {
-        "encodedHex": "a861760163636c7361426364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d46366696448e7f4fb36608a2b2463736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
+        "encodedHex": "a861760163636c7361426364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d4636669644841f643b3d2c5c18c63736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
         "decodedCls": "B"
       }
     },
@@ -333,7 +333,7 @@
         "cls": "C"
       },
       "expected": {
-        "encodedHex": "a861760163636c7361436364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d46366696448e7f4fb36608a2b2463736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
+        "encodedHex": "a861760163636c7361436364737458200f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d4636669644841f643b3d2c5c18c63736571016373726358204ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b4149136374746c1064626f647944deadbeef",
         "decodedCls": "C"
       }
     },

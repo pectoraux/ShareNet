@@ -15,6 +15,7 @@ members = [
     "snp-crypto",
     "snp-object",
     "snp-identity",
+    "snp-frames",
     "snp-link",
     "snp-discovery",
     "snp-sync",
@@ -52,6 +53,10 @@ serde_json = "1"
 thiserror = "1"
 # Logging
 tracing = "0.1"
+# HTTP client (synchronous, simple — used by snp-gateway for Mode A fetches)
+ureq = "2"
+# URL parsing for the gateway egress policy
+url = "2"
 
 # Internal crates (declared here so siblings can depend on each other via
 # `dep.workspace = true` style relative paths without re-stating versions).
@@ -59,6 +64,7 @@ snp-cbor = { path = "snp-cbor" }
 snp-crypto = { path = "snp-crypto" }
 snp-object = { path = "snp-object" }
 snp-identity = { path = "snp-identity" }
+snp-frames = { path = "snp-frames" }
 snp-link = { path = "snp-link" }
 snp-discovery = { path = "snp-discovery" }
 snp-sync = { path = "snp-sync" }

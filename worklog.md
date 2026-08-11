@@ -1143,3 +1143,102 @@ N1.7 STATUS: YELLOW (not GREEN — 66 unsupported vectors, 1 spec finding to res
 - Rust does NOT yet verify protocol STRUCTURES (receipts, frames, routing, gateway, civic)
 - Zero disagreements prove the primitives are genuinely language-independent
 - The remaining 66 are future Rust work, not correctness issues
+
+---
+Task ID: 66-67 (N1.7.1 Spec Findings)
+Agent: Z.ai (main — Merkle streaming fix + SplitMix64 ADR)
+Task: Resolve the two N1.7 specification findings
+
+Work Log:
+- Investigated Merkle batch vs streaming discrepancy: the TypeScript StreamingMerkle used a Merkle Mountain Range (MMR) fold approach that produces a DIFFERENT tree structure than RFC 6962's split-at-largest-power-of-two rule. For 7 leaves: batch splits at k=4 (root = nodeHash(MT[1-4], MT[5-7])), but MMR folds peaks right-to-left (root = nodeHash(MT[1-4], nodeHash(MT[5-6], leaf 7))). These are different trees.
+- Finding: B (streaming implementation is wrong). The batch implementation is correct per RFC 6962. Fixed StreamingMerkle to use the same merkleRoot algorithm as batch — stores leaf hashes and computes root via merkleRootRec. This is O(n) memory but correct; a future optimization can do incremental RFC 6962.
+- Regenerated vectors: streamingRootHex now equals batchRootHex (both 5e932791...). The vector description "Streaming Merkle builder produces the same root as the batch builder" is now TRUE.
+- Created ADR-0010: SplitMix64 deterministic stream generation promoted to normative spec. Documents the exact splitmix64 counter-mode procedure for generating test streams. Rust independently derived this by brute-force search; the ADR makes the implicit dependency explicit.
+- Created docs/SN2_ARCHITECTURE.md: the new hierarchy document showing Protocol/Specification, Reference Implementation, Conformance Verifiers, Rust Conformance Core, Network Runtime, Dashboard, Platform Adapters (future), Economic Layer (future), and Legacy. Includes ownership table, three-way conformance matrix, ADR index, and milestone status.
+- Verified: 138/138 TS conformance passing, 0 Rust disagreements, streaming root now matches batch root.
+
+Stage Summary:
+- Merkle streaming bug: FIXED (StreamingMerkle now matches batch per RFC 6962)
+- SplitMix64: normative spec via ADR-0010
+- SN2_ARCHITECTURE.md: created, makes the 2.0 hierarchy unambiguous
+- 138/138 TS conformance, 0 Rust disagreements
+
+---
+Task ID: 68-73
+Agent: Z.ai (subagent — Rust minimal Internet bridge)
+Task: Build Rust Client → Relay → Gateway → real Internet → back
+
+Work Log:
+- Read worklog Tasks 1-67 (TS reference, Python cross-verifier, 138 committed vectors, Rust conformance core N1.7 = 72/138 independently verified, 0 disagreements).
+- Read existing Rust workspace at /home/z/my-project/reference/: snp-cbor (full impl, 522 lines), snp-crypto (full impl, 462 lines — ed25519_verify but no ed25519_sign), snp-identity (NodeId + verify_signed + skeleton stubs), snp-object (Merkle + Gear chunking + skeleton stubs), snp-conformance (harness binary).
+- Read /public/conformance/vectors/08-frames.json (13 frame vectors) + /src/lib/snp/frames.ts (681 lines) + /src/lib/snp/gateway.ts (1527 lines, esp. isPrivateDestination + TransitRequest/Response CBOR + sign/verify).
+- Confirmed the wire format for the Frame CBOR map: canonical (length-first) sort yields key order `v, cls, dst, fid, seq, src, ttl, body` — verified against the `frame-encode-decode-roundtrip` committed vector's encodedHex.
+- Step 1 — snp-crypto: added `ed25519_sign(secret_key, message) -> SignatureBytes` (uses `ed25519_dalek::SigningKey::sign`) and `derive_public_key(secret_key) -> PublicKey` (uses `SigningKey::verifying_key()`). No regressions to existing 7 unit tests.
+- Step 2 — snp-frames (NEW crate, 550 lines): `Frame` struct (v/cls/dst/src/ttl/fid/seq/body), `encode_cbor` / `decode_cbor` (canonical CBOR map with string keys, exactly 8 keys closed CDDL, rejects extra/missing keys, validates v=1, cls in {A,B,C}, ttl in [0,16]), `forward(frame)` (decrements ttl, errors at ttl=0 per I7), `should_drop(frame)` (true at ttl=0), constants FRAME_VERSION=1 / FRAME_TTL_MAX=16 / FRAME_FLOW_ID_BYTES=8. 9 unit tests, all pass — including `roundtrip_matches_committed_vector` which byte-for-byte matches the committed `frame-encode-decode-roundtrip` expectedHex `a8617601...deadbeef`.
+- Step 3 — snp-link (REPLACED skeleton, 387 lines): `Link` struct wraps `Mutex<TcpStream>` + 32-byte AEAD key. `send_frame(frame)` CBOR-encodes the frame, AEAD-encrypts with ChaCha20-Poly1305 nonce=fid||seq_BE(4), writes `[4-byte BE length][12-byte nonce][ciphertext][16-byte tag]`. `recv_frame()` reads length-prefixed blob, AEAD-decrypts, decodes Frame. Returns `LinkError::DecryptionFailed` on AEAD auth failure (caller MUST kill the link). `recv_raw()` / `send_raw()` move the still-encrypted blob WITHOUT decrypting — this is the relay's I8 path: the relay never holds the plaintext, never calls AEAD decrypt, never inspects the body. `derive_link_key(seed)` = HKDF-SHA256 with documented N1.8 pre-shared-key derivation (NOT the production SNP-IK/0.1 handshake). 3 unit tests pass: TCP round-trip, wrong-key kills link, relay forwards blob without decrypting.
+- Step 4 — snp-routing (REPLACED skeleton, 218 lines): simple static `RouteTable` (destination → RouteAdvert). `add_route` installs (replaces only on strictly lower metric). `best_gateway()` returns lowest-metric destination. `next_hop(destination)` returns the next-hop NodeId. `RoutingTable` type alias kept for backward compat with the snp-node skeleton. 5 unit tests pass.
+- Step 5 — snp-gateway (REPLACED skeleton, 1067 lines): `TransitRequest` (reqId/method/url/tlsTermination/maxResponseBytes/deadline/replyTo/clientSig), `TransitResponse` (reqId/status/headers/objectId/fetchedAt/gatewayId/gatewaySig). CBOR encoding matches the TS reference byte-for-byte (10-key preimage map for TransitRequest — including empty headers map, null body, "any" acceptGateways; 6-key preimage map for TransitResponse). `sign_transit_request` / `verify_transit_request` use SIG_CONTEXT `"SNP/0.1 transit-request\0" ‖ CBOR(preimage)`. `sign_transit_response` / `verify_transit_response` use SIG_CONTEXT `"SNP/0.1 transit-response\0" ‖ CBOR(preimage)`. `is_private_destination(host)` implements the full SSRF defence (I18): IPv4 (RFC 1918, loopback, link-local, multicast, reserved, CGN 100.64/10), IPv6 (::1, ::, fe80::/10, fc00::/7, ff00::/8, IPv4-mapped), hostnames (localhost, .local, metadata.google.internal, metadata). `is_private_ipv4` / `is_private_ipv6` exported for testing. `handle_transit_request(req, gateway_secret_key)` is the gateway request handler: validates tlsTermination (I17 fail-closed), parses URL (scheme must be http/https), SSRF literal-host check, resolves DNS via `std::net::ToSocketAddrs`, SSRF check on EVERY resolved IP (DNS-rebinding defence), fetches via `ureq::get(url).call()` (HTTP+HTTPS with rustls), caps body at max_response_bytes, `object_id = SHA-256(capped body)` (ADR-0009 N1.8 simplified form), signs the TransitResponse. TOCTOU gap documented: ureq re-resolves DNS internally after validation; production target is a custom ureq resolver that pins the validated IPs. 7 unit tests pass: private IPv4 ranges, private IPv6 ranges, hostname checks, TransitRequest sign/verify round-trip + tamper rejection, TransitResponse sign/verify round-trip + tamper rejection, TransitRequest/Response CBOR round-trip.
+- Step 6 — snp-node (REPLACED skeleton main + lib, 600 lines): `main.rs` is a thin CLI dispatcher with subcommands `client`, `relay`, `gateway`, `mesh-demo`, `help`. `lib.rs` exports `run_gateway(listen_addr)`, `run_relay(listen_addr, gateway_addr)`, `run_client(relay_addr, url)`, `run_mesh_demo(url)`. All three roles share the same pre-shared AEAD link key derived from the deterministic seed `b"SNP/0.1 N1.8 mesh link seed"` (N1.8 simplification — production uses SNP-IK/0.1). The client uses a deterministic Ed25519 keypair; the gateway uses a deterministic Ed25519 keypair; NodeIds are derived per I4 = SHA-256("SNP/0.1 node\0" || pk). The relay forwards ONE round-trip synchronously (client→gateway→client) — the relay NEVER decrypts, only forwards raw encrypted blobs (I8 enforced in code: `recv_raw` + `send_raw`). The gateway decrypts, decodes TransitRequest, calls `handle_transit_request`, encodes TransitResponse, wraps in a Class B frame (dst=original src=client NodeId, src=gateway NodeId, fid=same as request, seq=request.seq+1), AEAD-encrypts, sends. The client decrypts, decodes TransitResponse, verifies the gateway's Ed25519 signature under SIG_CONTEXT `"transitResponse"`. Gateway and client deterministic keypairs are derived via `const fn` so they're stable across runs.
+- Step 7 — Integration test: `reference/snp-node/tests/integration.rs` (113 lines). Two tests: (a) `gateway_rejects_private_destinations` (no Internet required) — asserts the SSRF defence rejects 9 private-IP/hostname literals (127.0.0.1, localhost, 10.0.0.1, 192.168.1.1, 172.16.5.5, 169.254.169.254, ::1, fe80::1, metadata.google.internal) with `GatewayError::EgressBlocked`. (b) `mesh_demo_round_trip_real_internet` (ignored — requires Internet) — spawns gateway + relay in threads on ephemeral ports, runs the client in the test thread, asserts `status == 200` and `gateway_verified == true`.
+- Final test counts: 60 tests pass across the workspace, 0 fail, 1 ignored (the real-Internet test). snp-conformance harness still reports 72/138 independently verified, 0 disagreements with committed vectors (no regression from the snp-crypto additions).
+- Verified end-to-end BOTH ways:
+  - In-process mesh-demo: `cargo run -p snp-node -- mesh-demo` → "Internet request succeeded. Status: 200. Gateway: verified." Round-trip 0.03s.
+  - Three-process mesh: separate `snp-node gateway`, `snp-node relay`, `snp-node client` processes on ports 7003/7002/7002, all three TCP-exchange the AEAD-encrypted frames, end-to-end success: status=200, gateway=verified.
+
+Stage Summary:
+- Files produced/modified:
+  - reference/snp-crypto/src/lib.rs (+25 lines: `ed25519_sign`, `derive_public_key`, Signer/SigningKey imports)
+  - reference/snp-frames/Cargo.toml + src/lib.rs (NEW, 550 lines, 9 unit tests pass)
+  - reference/snp-link/Cargo.toml + src/lib.rs (REPLACED skeleton, 387 lines, 3 unit tests pass)
+  - reference/snp-routing/src/lib.rs (REPLACED skeleton, 218 lines, 5 unit tests pass)
+  - reference/snp-gateway/Cargo.toml + src/lib.rs (REPLACED skeleton, 1067 lines, 7 unit tests pass)
+  - reference/snp-node/Cargo.toml + src/lib.rs + src/main.rs + tests/integration.rs (REPLACED skeleton, 713 lines total, 1 SSRF test + 1 ignored real-Internet test)
+  - reference/snp-sync/src/lib.rs (1-line fix: `&impl snp_link::Link` → `&snp_link::Link` because Link is now a struct, not a trait)
+  - reference/Cargo.toml (added snp-frames to workspace members + workspace deps for `ureq = "2"`, `url = "2"`, snp-frames)
+- End-to-end mesh demo WORKS:
+  - Client (Rust) → Relay (Rust) → Gateway (Rust) → example.com (real HTTPS) → back.
+  - Gateway signature: VERIFIED (client verifies gateway's Ed25519 sig over SIG_CONTEXT ‖ CBOR(TransitResponse preimage)).
+  - HTTP status: 200 (real Internet — fetched 559-byte body from https://example.com/).
+  - objectId = SHA-256(capped body) = ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d.
+  - Round-trip time: ~0.03s in-process, ~0.33s with real HTTPS fetch.
+- Invariants exercised end-to-end:
+  - I1 (canonical CBOR, length-first key ordering) — every Frame, TransitRequest, TransitResponse is encoded via `snp_cbor::encode` which sorts map keys by encoded bytes.
+  - I2 (every signature is over SIG_CONTEXT ‖ CBOR(payload)) — `sign_transit_request` / `sign_transit_response` build the preimage, CBOR-encode it, prepend the SIG_CONTEXT, then sign.
+  - I3 (raw 32-byte Ed25519 public keys on the wire) — public keys are passed as `[u8; 32]`, never wrapped.
+  - I4 (NodeId = SHA-256("SNP/0.1 node\0" || pk)) — `derive_node_id` is called for both gateway and client NodeIds.
+  - I7 (Frame TTL ≤ 16, decremented per hop) — `Frame::validate` enforces the range; `forward` decrements.
+  - I8 (Class B payloads never inspected/cached/dedup'd by relays) — the relay uses `recv_raw` / `send_raw` and never calls AEAD decrypt. Verified in code AND in a unit test (`relay_forwards_blob_without_decrypting`).
+  - I13 (Civic Points never minted by the claimant) — TransitRequest is signed by the client, TransitResponse is signed by the gateway. Different parties, different keys.
+  - I17 (Mode/tlsTermination downgrade is fail-closed) — `validate_request` rejects any tlsTermination not in {GATEWAY_PLAINTEXT, PAYLOAD_E2E}.
+  - I18 (gateways reject private egress by default) — `is_private_destination` checks the literal host, then `validate_request` resolves DNS and checks EVERY resolved IP. 9 private destinations tested in the integration test.
+  - I20 (verify returns false on bad input, never throws) — `verify_transit_request` / `verify_transit_response` return `bool`, never `Result`. The client treats `false` as a hard error.
+- Known limitations (documented for future tasks):
+  - Pre-shared link keys (N1.8 simplification). Production target: full SNP-IK/0.1 Noise-based handshake (snp-link Initiator/Responder are still `todo!()` stubs).
+  - TOCTOU DNS-rebinding gap: `validate_request` resolves DNS via `std::net::ToSocketAddrs`, validates every IP, but `ureq::get(url).call()` re-resolves DNS internally. Production target: a custom `ureq::Resolver` that pins the validated IPs.
+  - Single-request relay: the relay forwards one round-trip then exits. Production target: a long-running relay that handles multiple clients with a proper connection pool.
+  - objectId = SHA-256(capped body) per ADR-0009 N1.8 simplified form. Production target: `merkle_root(chunk(capped body))` — the Rust `snp-object` crate has the Merkle + Gear chunking code already.
+  - No TransitRequest client_sig verification at the gateway (the gateway just fetches and signs; it does not check that the client really signed the request). Production target: `verify_transit_request(&req, &client_public_key)` before fetching.
+
+N1.8 STATUS: GREEN — the central ShareNet thesis ("two Rust nodes establish an authenticated encrypted session, route through an intermediate node, reach a gateway, fetch a real Internet resource, and return the authenticated response to the originating node") is demonstrated end-to-end in Rust. The first Rust-native Client → Relay → Gateway → real-Internet → back round-trip succeeds with HTTP 200 and a verified gateway signature.
+
+---
+Task ID: 74-76 (Dashboard + push)
+Agent: Z.ai (main — Rust mesh dashboard + N1.8 push)
+Task: Add Rust mesh panel to dashboard, create SN2_ARCHITECTURE.md, push N1.7.1 + N1.8
+
+Work Log:
+- Built src/app/api/rust-mesh/route.ts — API endpoint that runs `cargo run -p snp-node -- mesh-demo` and parses the output
+- Added RustMeshPanel to dashboard — shows the Rust Client → Relay → Gateway → example.com topology, stage-by-stage results, objectId, gateway signature verification, RTT
+- Created public/docs/SN2_ARCHITECTURE.md — the new hierarchy document showing Protocol/Specification, Reference Implementation, Conformance Verifiers, Rust Conformance Core, Network Runtime, Dashboard, Platform Adapters (future), Economic Layer (future), and Legacy. Includes ownership table, three-way conformance matrix, ADR index, and milestone status.
+- Updated ADR README to include ADR-0010
+- Agent Browser: verified "✓ Internet request succeeded", "Gateway signature verified", topology diagram visible, no errors
+
+Stage Summary:
+- N1.7.1: Merkle streaming bug FIXED (streaming now matches batch per RFC 6962), ADR-0010 (SplitMix64) created
+- N1.8: Rust minimal Internet bridge WORKING end-to-end (Client → Relay → Gateway → example.com → back)
+- Dashboard: Rust mesh panel shows real Internet egress with gateway signature verification
+- SN2_ARCHITECTURE.md: makes the 2.0 hierarchy unambiguous for future Gemini/Android work
+- 138/138 TS conformance, 16/16 integration tests, 72/138 Rust independent verification, 0 disagreements
+- Rust mesh demo: success=True, status=200, gatewayVerified=True, realInternetEgress=True, RTT=40ms
+
+N1.8 STATUS: GREEN — the central ShareNet thesis is demonstrated end-to-end in Rust.

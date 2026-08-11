@@ -205,51 +205,37 @@ export function buildAllProofs(leafHashes: Uint8Array[]): MerkleProof[] {
  * total work, identical to the batch construction.
  */
 export class StreamingMerkle {
-  // peaks[i] is the hash of a subtree of size 2^i, or undefined if that
-  // bit is not set in the leaf count. This is the classic "Merkle mountain
-  // range" but reconstructed under RFC 6962 split rules.
-  private peaks: Uint8Array[] = [];
-  private leafCount = 0;
+  /**
+   * Streaming Merkle builder that produces the SAME root as the batch
+   * `merkleRoot` function for the same leaf sequence.
+   *
+   * N1.7.1 FIX: The previous implementation used a "Merkle mountain range"
+   * (MMR) approach that folded peaks right-to-left. This produces a DIFFERENT
+   * tree structure than RFC 6962's split-at-largest-power-of-two rule for
+   * non-power-of-two leaf counts. The batch and streaming implementations
+   * MUST produce identical roots — that's the whole point of the
+   * `merkle-streaming-matches-batch` conformance vector.
+   *
+   * The fix: store all leaf hashes as they arrive, then compute the root
+   * using the same `merkleRootRec` function as the batch builder. This is
+   * O(n) memory (not O(log n) like a true MMR), but it's correct. A future
+   * optimization can implement an incremental RFC 6962 builder that matches
+   * the batch root without storing all leaves — but correctness first.
+   */
+  private leafHashes: Uint8Array[] = [];
 
   append(leaf: Uint8Array): void {
-    let current = leafHash(leaf);
-    let i = 0;
-    // Carry: whenever there are two hashes at the same level, combine them.
-    while (i < this.peaks.length && this.peaks[i] !== undefined) {
-      const left = this.peaks[i];
-      current = nodeHash(left, current);
-      this.peaks[i] = undefined as unknown as Uint8Array;
-      i++;
-    }
-    // Place the carried hash at level i.
-    if (i === this.peaks.length) {
-      this.peaks.push(current);
-    } else {
-      this.peaks[i] = current;
-    }
-    this.leafCount++;
+    this.leafHashes.push(leafHash(leaf));
   }
 
-  /** Compute the root from the current set of peaks. */
+  /** Compute the root using the same algorithm as the batch builder. */
   root(): Uint8Array {
-    if (this.leafCount === 0) return merkleEmptyRoot();
-    // Collect defined peaks and fold right-to-left per RFC 6962.
-    const defined = this.peaks.filter((p) => p !== undefined);
-    // RFC 6962 fold: acc = rightmost, then nodeHash(prev, acc) leftwards.
-    // This matches the split-at-largest-power-of-two rule because the
-    // peaks are stored left-to-right in decreasing size order... actually
-    // they're stored left-to-right in increasing size order (peak[i] has
-    // 2^i leaves). The reduction: the leftmost peak is the largest, so we
-    // fold from the right.
-    let acc = defined[defined.length - 1];
-    for (let j = defined.length - 2; j >= 0; j--) {
-      acc = nodeHash(defined[j], acc);
-    }
-    return acc;
+    if (this.leafHashes.length === 0) return merkleEmptyRoot();
+    return merkleRoot(this.leafHashes);
   }
 
   get size(): number {
-    return this.leafCount;
+    return this.leafHashes.length;
   }
 }
 

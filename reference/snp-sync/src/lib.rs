@@ -136,7 +136,7 @@ impl Bundle {
 /// received and the objects we sent.
 pub fn exchange(
     _local_have: &snp_discovery::HaveVector,
-    _peer_link: &impl snp_link::Link,
+    _peer_link: &snp_link::Link,
 ) -> SyncResult<(Vec<SyncObject>, Vec<SyncObject>)> {
     todo!("Run one anti-entropy round: request missing, send requested")
 }

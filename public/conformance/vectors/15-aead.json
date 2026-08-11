@@ -2,7 +2,7 @@
   "suite": "aead",
   "specSection": "SNP/0.1 §1.2, §7.3",
   "generatedBy": "snp-typescript-reference",
-  "generatedAt": "2026-08-11T09:50:28.711Z",
+  "generatedAt": "2026-08-11T11:58:49.394Z",
   "vectors": [
     {
       "id": "aead-rfc8439-section-2.8.2",

@@ -1707,6 +1707,181 @@ function ThreeWayComparisonPanel() {
   )
 }
 
+// ─── Rust mesh demo panel ──────────────────────────────────────────────────
+
+interface RustMeshStage {
+  stage: string
+  status: 'pass' | 'fail' | 'info'
+  detail: string
+}
+
+interface RustMeshResult {
+  language: string
+  success: boolean
+  status: number | null
+  gatewayVerified: boolean
+  realInternetEgress: boolean
+  rttMs: number | null
+  objectId: string | null
+  url: string | null
+  stages: RustMeshStage[]
+  timestamp: string
+  error?: string
+}
+
+function RustMeshPanel() {
+  const [result, setResult] = useState<RustMeshResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const runDemo = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/rust-mesh', { cache: 'no-store' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setResult(data as RustMeshResult)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void runDemo()
+  }, [runDemo])
+
+  return (
+    <section aria-label="Rust mesh demo">
+      <Card className="p-0">
+        <CardHeader className="gap-1 p-4 sm:p-6">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Globe className="size-4 text-sky-600 dark:text-sky-400" />
+              <CardTitle className="text-base sm:text-lg">
+                Rust Internet bridge — Client → Relay → Gateway → real Internet
+              </CardTitle>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void runDemo()}
+              disabled={loading}
+              className="shrink-0"
+            >
+              {loading ? (
+                <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1.5 size-3.5" />
+              )}
+              Run demo
+            </Button>
+          </div>
+          <CardDescription className="text-xs sm:text-sm">
+            The central ShareNet thesis demonstrated end-to-end in Rust: a Rust client sends a TransitRequest through a Rust relay (which never inspects the body) to a Rust gateway, which fetches a real URL from the Internet, signs the response, and the client verifies the gateway's Ed25519 signature. This is NOT a simulation — it's real TCP sockets, real HTTP, real crypto.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-4 pt-0 sm:p-6 sm:pt-0">
+          {error ? (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-300">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="size-4 shrink-0" />
+                <span>Rust mesh demo unavailable: {error}</span>
+              </div>
+            </div>
+          ) : loading && !result ? (
+            <div className="space-y-2">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <Skeleton key={i} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : result ? (
+            <>
+              <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+                <Badge
+                  variant="outline"
+                  className={
+                    result.success
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                  }
+                >
+                  {result.success ? '✓ Internet request succeeded' : '✗ Failed'}
+                </Badge>
+                {result.gatewayVerified && (
+                  <Badge variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">
+                    <ShieldCheck className="mr-1 size-3" />
+                    Gateway signature verified
+                  </Badge>
+                )}
+                {result.realInternetEgress && (
+                  <Badge variant="outline" className="border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300">
+                    <Globe className="mr-1 size-3" />
+                    Real Internet egress
+                  </Badge>
+                )}
+                {result.status && (
+                  <span className="text-muted-foreground">HTTP {result.status}</span>
+                )}
+                {result.rttMs !== null && (
+                  <span className="text-muted-foreground">{result.rttMs} ms RTT</span>
+                )}
+              </div>
+
+              {/* Topology diagram */}
+              <div className="mb-3 rounded-md border border-sky-500/30 bg-sky-500/5 p-3">
+                <div className="flex items-center justify-center gap-2 text-xs font-mono">
+                  <span className="rounded bg-sky-500/20 px-2 py-1 text-sky-700 dark:text-sky-300">Rust Client</span>
+                  <ArrowRight className="size-3 text-muted-foreground" />
+                  <span className="rounded bg-sky-500/20 px-2 py-1 text-sky-700 dark:text-sky-300">Rust Relay</span>
+                  <ArrowRight className="size-3 text-muted-foreground" />
+                  <span className="rounded bg-sky-500/20 px-2 py-1 text-sky-700 dark:text-sky-300">Rust Gateway</span>
+                  <ArrowRight className="size-3 text-muted-foreground" />
+                  <span className="rounded bg-emerald-500/20 px-2 py-1 text-emerald-700 dark:text-emerald-300">example.com</span>
+                </div>
+                <p className="mt-2 text-center text-xs text-muted-foreground">
+                  All three nodes are Rust processes. Frames are AEAD-encrypted on the wire. The relay never inspects the body.
+                </p>
+              </div>
+
+              {/* Stages */}
+              <div className="space-y-1.5">
+                {result.stages.map((s, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2 text-sm"
+                  >
+                    {s.status === 'pass' ? (
+                      <CheckCircle2 className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : s.status === 'fail' ? (
+                      <XCircle className="size-4 shrink-0 text-rose-600 dark:text-rose-400" />
+                    ) : (
+                      <CircleDashed className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="flex-1 text-sm">{s.stage}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{s.detail}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Object ID */}
+              {result.objectId && (
+                <div className="mt-3 rounded-md border border-border/40 bg-muted/20 p-3 font-mono text-xs text-muted-foreground">
+                  <div>objectId: {result.objectId}</div>
+                  <div>url:      {result.url}</div>
+                  <div>gatewaySig: verified ✓</div>
+                </div>
+              )}
+            </>
+          ) : null}
+        </CardContent>
+      </Card>
+    </section>
+  )
+}
+
 function AuditFindingsPanel() {
   return (
     <section aria-label="Audit findings fixed by this foundation">
@@ -2205,6 +2380,7 @@ export default function Home() {
             <MeshSimulatorPanel />
             <CrossVerificationPanel />
             <ThreeWayComparisonPanel />
+            <RustMeshPanel />
             <AuditFindingsPanel />
             <ArchitectureLayers />
             <Roadmap />
