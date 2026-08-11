@@ -1474,3 +1474,118 @@ reaches handle_transit_request().
 N1.9.2 STATUS: The three attacks were REAL. They are now FIXED with executable
 proofs. The link layer has replay protection. The gateway verifies client
 signatures. The gateway deduplicates reqIds.
+
+
+---
+Task ID: 106-111
+Agent: Z.ai (subagent — N2.0 multi-hop secure node)
+Task: Multi-hop Rust mesh (Client → Relay A → Relay B → Gateway), failover, adversarial tests
+
+Work Log:
+- Read worklog Tasks 1-105 (N1.9.2 audit: directional keys, circuit encryption, replay protection, signature verification, reqId dedup all proven). Read the four reference crates that N2.0 extends: snp-node/src/lib.rs (597 lines, N1.9 single-hop Client → Relay → Gateway), snp-link/src/lib.rs (865 lines, directional LinkKeys + CircuitKeys + SeenNonceSet replay window), snp-gateway/src/lib.rs (1414 lines, PinnedConnector with DNS pin + TLS + SSRF defence), snp-frames/src/lib.rs (550 lines, Frame with TTL/cls/I7), snp-routing/src/lib.rs (218 lines, static RouteTable).
+- Confirmed baseline: `cargo build --workspace` clean (1 pre-existing snp-civic warning), `cargo test --workspace` → 76 passed, 0 failed, 2 ignored; `cargo run -p snp-node -- mesh-demo` → status=200, gateway verified.
+
+- N2.0 key hierarchy (six new seeds + ten new derivation helpers in snp-node/src/lib.rs):
+  - S1 = `b"SNP/0.1 N2.0 client-relayA link seed"` — Client ↔ Relay A
+  - S2 = `b"SNP/0.1 N2.0 relayA-relayB link seed"` — Relay A ↔ Relay B
+  - S3a = `b"SNP/0.1 N2.0 relayB-gatewayA link seed"` — Relay B ↔ Gateway A
+  - S3b = `b"SNP/0.1 N2.0 relayB-gatewayB link seed"` — Relay B ↔ Gateway B (failover)
+  - Ca = `b"SNP/0.1 N2.0 circuit seed gatewayA"` — Client ↔ Gateway A end-to-end circuit
+  - Cb = `b"SNP/0.1 N2.0 circuit seed gatewayB"` — Client ↔ Gateway B end-to-end circuit (failover)
+  - Helpers: `client_relay_a_link_keys` (initiator), `relay_a_client_link_keys` (responder), `relay_a_relay_b_link_keys` (initiator), `relay_b_relay_a_link_keys` (responder), `relay_b_gateway_a_link_keys` (initiator), `gateway_a_relay_b_link_keys` (responder), `relay_b_gateway_b_link_keys` (initiator), `gateway_b_relay_b_link_keys` (responder), `client_circuit_keys_a/b`, `gateway_a/b_circuit_keys`. Plus `_for(GatewayChoice)` selectors for relay-b-gateway, gateway hop, circuit, secret, public key, NodeId.
+  - New `GatewayChoice { A, B }` enum parameterises every gateway-aware function so the same code path serves both gateways (failover is just switching the choice).
+  - New `GATEWAY_A_SECRET` and `GATEWAY_B_SECRET` constants (deterministic, distinct from each other and from the N1.9 GATEWAY_SECRET).
+
+- `run_relay_multiHop(listen_addr, next_hop_addr, prev_hop_keys, next_hop_keys) -> NodeResult<()>` — a relay that:
+  1. Listens on `listen_addr` for an incoming connection from the previous hop.
+  2. Opens a connection to `next_hop_addr` (next relay or gateway).
+  3. Recv frame from prev link (decrypts OUTER with `prev_hop_keys.recv_key`).
+  4. N2.0 TTL handling: decrements TTL on receipt; if TTL hits 0 after decrement, DROPS the frame (returns Ok — the relay exits, the prev link sees EOF, the client gets an error). This is stricter than the N1.9 single-hop relay (which forwarded even ttl=0 frames) and is required for Test 4 (TTL=2 must drop at Relay B in a 3-hop path, never reaching the gateway).
+  5. Forwards frame to next link (re-encrypts OUTER with `next_hop_keys.send_key`).
+  6. Recv response frame from next link, decrement TTL, forward to prev link.
+  7. The frame BODY (circuit ciphertext) is preserved verbatim — the relay never decrypts it (and could not — it has no circuit key).
+
+- `run_gateway_named(listen_addr, gw: GatewayChoice)` — gateway that uses the named gateway's hop keys + circuit keys + identity secret. Mirrors the N1.9 `run_gateway` but parameterised. Calls `serve_one_request_named` which carries over the N1.9.2 fixes: reqId dedup (HashSet<[u8;16]>), signature verification (via `handle_transit_request`'s built-in `verify_transit_request` call), DNS-pinned PinnedConnector fetch.
+
+- `run_client_to_gateway(relay_a_addr, url, gw: GatewayChoice) -> NodeResult<(u16, bool)>` — multi-hop client. Connects to Relay A using `client_relay_a_link_keys()`, encrypts body with `client_circuit_keys_for(gw)`, addresses frame to `gateway_node_id_for(gw)`, verifies response signature against `gateway_public_key_for(gw)`.
+
+- `run_mesh_demo_multihop(url)` — in-process demo:
+  1. Allocates ephemeral ports for gateway_a, relay_b, relay_a.
+  2. Spawns Gateway A (using `run_gateway_named(_, GatewayChoice::A)`).
+  3. Spawns Relay B → connects to Gateway A (using `relay_b_relay_a_link_keys` + `relay_b_gateway_a_link_keys`).
+  4. Spawns Relay A → connects to Relay B (using `relay_a_client_link_keys` + `relay_a_relay_b_link_keys`).
+  5. Runs the client in the main thread (via `run_client_to_gateway(_, _, GatewayChoice::A)`).
+  6. Joins all threads. Prints "Multi-hop Internet request succeeded. Status: 200. Gateway: verified." plus the path string.
+
+- `run_mesh_demo_failover(url)` — two-phase in-process demo:
+  - Phase 1: Start Gateway A + Relay B (→ Gateway A) + Relay A (→ Relay B). Client sends with `GatewayChoice::A` → succeeds. All Phase-1 threads exit (Gateway A is "killed" — it served one request and exited).
+  - Phase 2: Start Gateway B + new Relay B (→ Gateway B, using `relay_b_gateway_b_link_keys`) + new Relay A (→ new Relay B, same S2 keys). Client sends with `GatewayChoice::B` → succeeds. The response is signed by Gateway B's key (different from Gateway A's). The circuit key changed Ca → Cb (asserted statically in Test 5: `client_circuit_keys_a().send_key != client_circuit_keys_b().send_key`).
+
+- CLI (snp-node/src/main.rs): added `mesh-demo-multihop` and `mesh-demo-failover` subcommands (both take optional `--url`). Updated usage text.
+
+- Tests in `reference/snp-node/tests/n20_multihop.rs` (NEW, ~1000 lines, 7 tests):
+  - Test 1 (`test_1_multihop_end_to_end_real_internet`, #[ignore]) — Real Internet: spawns Gateway A + Relay B + Relay A in threads, runs client → https://example.com/ → back. Asserts status==200, verified==true. PASSES when run with `--ignored`.
+  - Test 2 (`test_2_relay_a_cannot_decrypt_circuit_payload`) — Malicious Relay A attempts to decrypt the frame body using all four of its hop keys (S1.send, S1.recv, S2.send, S2.recv); every attempt returns None. The relay then forwards the frame UNCHANGED; the end-to-end round-trip succeeds (status=200, verified=true). Proves Relay A cannot read the body even when it tries.
+  - Test 3 (`test_3_relay_b_cannot_decrypt_circuit_payload`) — Same as Test 2 but for Relay B (which has S2 + S3a). All four hop keys fail.
+  - Test 4 (`test_4_ttl_exhaustion_drops_at_relay_b`) — Custom client sends a frame with TTL=2 through a 3-hop path. Trace: Relay A receives TTL=2, decrements to 1, forwards. Relay B receives TTL=1, decrements to 0, DROPS (does not forward). The stub gateway records whether it received a frame via a shared AtomicBool. Asserts: (a) the client's `send_client_request_with_ttl` returned an error (no response), AND (b) the gateway's AtomicBool stayed false (no frame arrived). Proves TTL exhaustion drops at Relay B, not at the gateway.
+  - Test 5 (`test_5_gateway_failover`) — Two-phase: Phase 1 via Gateway A (stub) succeeds, Phase 2 via Gateway B (stub) succeeds. Static assertion: `client_circuit_keys_a().send_key != client_circuit_keys_b().send_key` (Ca ≠ Cb). Static assertion: `gateway_public_key_for(A) != gateway_public_key_for(B)` (Gateway A ≠ Gateway B). Runtime assertions: both stubs' "received" AtomicBools are true after their phase.
+  - Test 6 (`test_6_frame_integrity_across_hops`) — The test manually builds the client's sealed_body using `encrypt_circuit_payload_with_nonce` with a FIXED nonce (deterministic). Sends through Relay A → Relay B → stub gateway. The stub gateway captures the exact `frame.body` bytes it received (via `Arc<Mutex<Option<Vec<u8>>>>`). Asserts the captured bytes are byte-identical to the sealed_body the client encrypted. Proves no relay modified the body in transit.
+  - Sanity test (`n20_mesh_demo_multihop_function_is_callable`) — verifies the function pointers exist with the right signatures.
+
+- Helper functions in the test file:
+  - `stub_gateway_round_trip(listener, gw)` — accept one connection, decrypt OUTER with hop recv_key, decrypt INNER with circuit recv_key (verify circuit encryption works), build fixed TransitResponse signed with the named gateway's secret, encrypt with circuit send_key, send response.
+  - `stub_gateway_record_received(listener, gw, &AtomicBool)` — non-blocking accept with 5-second timeout; sets the AtomicBool if a frame is received. Used by Test 4 (TTL) and Test 5 (failover).
+  - `stub_gateway_capture_body(listener, gw, &Mutex<Option<Vec<u8>>>)` — captures the exact body bytes received. Used by Test 6.
+  - `malicious_relay_a_round_trip(listener, next_hop_addr)` — Relay A that tries all four hop keys (S1.send/recv, S2.send/recv) to decrypt the body; asserts every attempt fails; forwards unchanged.
+  - `malicious_relay_b_round_trip(listener, next_hop_addr)` — Relay B that tries all four hop keys (S2.send/recv, S3.send/recv) to decrypt the body; asserts every attempt fails; forwards unchanged.
+  - `send_client_request_with_ttl(relay_a_addr, url, gw, ttl)` — custom client that overrides the initial TTL (used by Test 4 with TTL=2). Sets a 3-second read timeout so the test doesn't hang when the frame is dropped.
+  - `build_stub_response(gw, req_id)` — builds a signed TransitResponse with status=200, fixed body, named gateway's identity key. Mirrors the stub-gateway pattern in n19_security.rs.
+
+- Build + test + run results:
+  - `cargo build --workspace` → success (1 pre-existing snp-civic warning, unrelated).
+  - `cargo test --workspace` → 82 passed, 0 failed, 3 ignored (Test 1 + N1.9 HTTPS test + N1.8 mesh demo). [76 pre-N2.0 + 6 new N2.0 offline tests]
+  - `cargo test -p snp-node --test n20_multihop` → 6 passed, 1 ignored.
+  - `cargo test -p snp-node --test n20_multihop -- --ignored` → 1 passed (Test 1 real Internet).
+  - `cargo run -p snp-node -- mesh-demo-multihop` → "Multi-hop Internet request succeeded. Status: 200. Gateway: verified. Path: Client → Relay A → Relay B → Gateway A → https://example.com/ → back. Round-trip time: 0.03s".
+  - `cargo run -p snp-node -- mesh-demo-failover` → Phase 1 (Gateway A) status=200 verified=true; Phase 2 (Gateway B) status=200 verified=true; "Failover succeeded. ... Circuit key changed: Ca → Cb."
+  - `cargo test -p snp-node --test n19_security` → 9 passed, 1 ignored (unchanged from N1.9.2).
+  - `cargo test -p snp-node --test n19_adversarial` → 3 passed (unchanged from N1.9.2).
+
+Stage Summary:
+- Files produced/modified:
+  - `reference/snp-node/src/lib.rs` — REWROTE the module docstring (added N2.0 multi-hop section above the N1.9 section); added six N2.0 key seeds + ten derivation helpers + GatewayChoice enum + GATEWAY_A/B_SECRET constants + gateway_secret/public_key/node_id_for(gw) selectors; added `run_gateway_named`, `serve_one_request_named`, `run_relay_multiHop`, `run_client_to_gateway`, `run_mesh_demo_multihop`, `run_mesh_demo_failover`. (Was 597 lines, now ~1100 lines.) All N1.9 functions (`run_gateway`, `run_relay`, `run_client`, `run_mesh_demo`) preserved unchanged for backward compat.
+  - `reference/snp-node/src/main.rs` — added `mesh-demo-multihop` and `mesh-demo-failover` subcommands; updated usage text.
+  - `reference/snp-node/tests/n20_multihop.rs` — NEW (~1000 lines, 7 tests). Tests 1-6 as specified plus a sanity test. 6 offline + 1 ignored (real Internet).
+- Key decisions:
+  - Each relay has TWO `LinkKeys` pairs (one per adjacent hop) and NO `CircuitKeys`. The circuit key (Ca or Cb) is shared ONLY between Client and Gateway — the relays see the body bytes as opaque ciphertext and cannot decrypt it (Tests 2 and 3 prove this with all four hop keys per relay).
+  - `run_relay_multiHop` is agnostic to whether its next hop is a relay or a gateway — it just forwards based on the link keys it's given. This is the right abstraction for production (the relay doesn't need to know the topology, only its two adjacent peers).
+  - N2.0 TTL handling is STRICTER than N1.9: the relay decrements TTL on receipt and DROPS the frame if TTL reaches 0 (rather than forwarding ttl=0 frames and letting the gateway drop them). This makes multi-hop TTL exhaustion work correctly: a TTL=2 frame drops at Relay B in a 3-hop path, never reaching the gateway (Test 4).
+  - Gateway failover uses TWO distinct circuit keys (Ca, Cb) and TWO distinct gateway identity keys (GATEWAY_A_SECRET, GATEWAY_B_SECRET). The client must explicitly choose which gateway to target via `GatewayChoice`. In production this choice would be driven by the routing layer (snp-routing's `best_gateway()`), but N2.0 simplifies by passing the choice explicitly.
+  - The failover demo "kills" Gateway A by letting its thread exit (it serves one request then returns). For Phase 2, new Relay B and Relay A threads are spawned (with the S3b hop key for Relay B → Gateway B). In production, Relay B would maintain a connection pool and switch active upstream on failure detection — N2.0 simplifies by re-instantiating the relay.
+  - The N1.9.2 security fixes (replay protection via SeenNonceSet, signature verification via handle_transit_request's verify_transit_request call, reqId dedup via HashSet) all carry over to N2.0 unchanged. `serve_one_request_named` mirrors `serve_one_request` exactly, just parameterised by `GatewayChoice`.
+  - Test 6 (frame integrity) uses `encrypt_circuit_payload_with_nonce` with a FIXED nonce so the test knows exactly what sealed_body bytes should arrive at the gateway. The stub gateway captures the exact body bytes via `Arc<Mutex<Option<Vec<u8>>>>` and the test asserts byte-equality. This proves no relay modified the body in transit (the body crossed two relay hops and arrived byte-identical).
+- Test results:
+  - 6 N2.0 offline tests PASS (Tests 2-6 + sanity). Test 1 (real Internet) PASS when run explicitly.
+  - 9 N1.9 security tests PASS (unchanged).
+  - 3 N1.9.2 adversarial tests PASS (unchanged).
+  - 1 N1.8 integration test PASS (unchanged).
+  - 82 workspace tests PASS total; 0 failed; 3 ignored (Test 1 + N1.9 HTTPS + N1.8 mesh demo).
+- End-to-end:
+  - `cargo run -p snp-node -- mesh-demo-multihop` → "Multi-hop Internet request succeeded. Status: 200. Gateway: verified. Path: Client → Relay A → Relay B → Gateway A → https://example.com/ → back. Round-trip time: 0.03s".
+    - The full chain works: Client encrypts TransitRequest body with circuit_a_send_key → wraps in frame (ttl=16) → encrypts OUTER with client_relay_a_send_key → Relay A decrypts OUTER with relay_a_client_recv_key, re-encrypts OUTER with relay_a_relay_b_send_key (body untouched, ttl→15) → Relay B decrypts OUTER with relay_b_relay_a_recv_key, re-encrypts OUTER with relay_b_gateway_a_send_key (body untouched, ttl→14) → Gateway A decrypts OUTER with gateway_a_relay_b_recv_key, decrypts body with circuit_a_recv_key, fetches https://example.com/ via PinnedConnector (DNS-pinned TCP+TLS), encrypts TransitResponse body with circuit_a_send_key, wraps in response frame (ttl=16), encrypts OUTER with gateway_a_relay_b_send_key → Relay B forwards (ttl→15) → Relay A forwards (ttl→14) → Client decrypts OUTER with client_relay_a_recv_key, decrypts body with circuit_a_recv_key, verifies Gateway A's Ed25519 signature.
+  - `cargo run -p snp-node -- mesh-demo-failover` → Phase 1 (Gateway A) status=200 verified=true RTT=0.02s; Phase 2 (Gateway B) status=200 verified=true RTT=0.03s; "Failover succeeded. Gateway A: status=200 verified=true. Gateway B: status=200 verified=true. Circuit key changed: Ca → Cb."
+
+N2.0 STATUS: GREEN — the multi-hop thesis ("Two Rust nodes establish an authenticated encrypted ShareNet session, route a request through TWO intermediate relay nodes, reach a gateway, fetch a real Internet resource, and return the authenticated response to the originating node") is demonstrated end-to-end in Rust. Gateway failover (Gateway A killed, traffic continues via Gateway B with a different circuit key) is also demonstrated. Six dedicated multi-hop tests prove: (1) end-to-end real-Internet success, (2) Relay A cannot decrypt the circuit payload, (3) Relay B cannot decrypt the circuit payload, (4) TTL=2 drops at Relay B (not the gateway), (5) gateway failover with circuit-key change, (6) the circuit body arrives at the gateway byte-identical to what the client sent. The N1.9.2 security fixes (replay protection, signature verification, reqId dedup) continue to work across multiple hops unchanged.
+
+---
+Task ID: 112-113 (N2.0 dashboard + push)
+Agent: Z.ai (main — N2.0 dashboard + push)
+Task: Add multi-hop panel to dashboard, push N2.0
+
+Stage Summary:
+- N2.0 multi-hop mesh: Client → Relay A → Relay B → Gateway A → example.com → back — WORKS
+- Gateway failover: Gateway A → Gateway B with circuit key change (Ca → Cb) — WORKS
+- 6 adversarial tests pass (relay cannot decrypt, TTL exhaustion, failover, frame integrity)
+- 82 total Rust tests pass, 0 failed, 3 ignored
+- Dashboard shows multi-hop topology diagram + failover badge
+- N1.9.2 security fixes carry over to multi-hop unchanged

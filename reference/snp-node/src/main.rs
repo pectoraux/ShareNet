@@ -1,4 +1,4 @@
-//! snp-node — the ShareNet N1.8 reference daemon.
+//! snp-node — the ShareNet reference daemon.
 //!
 //! Subcommands:
 //!
@@ -7,6 +7,8 @@
 //! snp-node relay    --listen-addr 127.0.0.1:7002 --gateway-addr 127.0.0.1:7003
 //! snp-node gateway  --listen-addr 127.0.0.1:7003
 //! snp-node mesh-demo [--url https://example.com/]
+//! snp-node mesh-demo-multihop [--url https://example.com/]
+//! snp-node mesh-demo-failover [--url https://example.com/]
 //! ```
 
 use std::process::ExitCode;
@@ -22,6 +24,8 @@ fn main() -> ExitCode {
         "relay" => cmd_relay(&args[2..]),
         "gateway" => cmd_gateway(&args[2..]),
         "mesh-demo" => cmd_mesh_demo(&args[2..]),
+        "mesh-demo-multihop" => cmd_mesh_demo_multihop(&args[2..]),
+        "mesh-demo-failover" => cmd_mesh_demo_failover(&args[2..]),
         "help" | "--help" | "-h" => {
             usage(&args[0]);
             return ExitCode::SUCCESS;
@@ -154,17 +158,59 @@ fn cmd_mesh_demo(args: &[String]) -> snp_node::NodeResult<()> {
     snp_node::run_mesh_demo(&url)
 }
 
+fn cmd_mesh_demo_multihop(args: &[String]) -> snp_node::NodeResult<()> {
+    let mut url = String::from("https://example.com/");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(snp_node::NodeError::Other("--url requires a value".into()));
+                }
+                url = args[i].clone();
+            }
+            other => return Err(snp_node::NodeError::Other(format!("unknown arg: {other}"))),
+        }
+        i += 1;
+    }
+    snp_node::run_mesh_demo_multihop(&url)
+}
+
+fn cmd_mesh_demo_failover(args: &[String]) -> snp_node::NodeResult<()> {
+    let mut url = String::from("https://example.com/");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(snp_node::NodeError::Other("--url requires a value".into()));
+                }
+                url = args[i].clone();
+            }
+            other => return Err(snp_node::NodeError::Other(format!("unknown arg: {other}"))),
+        }
+        i += 1;
+    }
+    snp_node::run_mesh_demo_failover(&url)
+}
+
 fn usage(prog: &str) {
     eprintln!("Usage: {prog} <subcommand> [options]");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  client      Run as client: send a TransitRequest via the relay");
-    eprintln!("  relay       Run as relay: forward encrypted frame blobs (never decrypts)");
-    eprintln!("  gateway     Run as gateway: fetch the real URL and sign the response");
-    eprintln!("  mesh-demo   Run all three roles in-process (simplest demo)");
+    eprintln!("  client              Run as client: send a TransitRequest via the relay");
+    eprintln!("  relay               Run as relay: forward encrypted frame blobs (never decrypts)");
+    eprintln!("  gateway             Run as gateway: fetch the real URL and sign the response");
+    eprintln!("  mesh-demo           Run all three roles in-process (N1.9 single-hop)");
+    eprintln!("  mesh-demo-multihop  Run Client → Relay A → Relay B → Gateway → example.com (N2.0 multi-hop)");
+    eprintln!("  mesh-demo-failover  Run failover demo: Gateway A killed, traffic continues via Gateway B");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {prog} mesh-demo");
+    eprintln!("  {prog} mesh-demo-multihop");
+    eprintln!("  {prog} mesh-demo-failover");
     eprintln!("  {prog} mesh-demo --url https://example.com/");
     eprintln!("  {prog} gateway --listen-port 7003");
     eprintln!("  {prog} relay  --listen-port 7002 --gateway-port 7003");
