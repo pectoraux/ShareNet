@@ -790,6 +790,8 @@ dependencies = [
  "serde_json",
  "snp-cbor",
  "snp-crypto",
+ "snp-frames",
+ "snp-gateway",
  "snp-identity",
  "snp-object",
 ]

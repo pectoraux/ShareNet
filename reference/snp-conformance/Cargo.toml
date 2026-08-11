@@ -16,4 +16,6 @@ snp-cbor.workspace = true
 snp-crypto.workspace = true
 snp-identity.workspace = true
 snp-object.workspace = true
+snp-frames.workspace = true
+snp-gateway.workspace = true
 serde_json.workspace = true
