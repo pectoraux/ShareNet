@@ -984,3 +984,41 @@ Remaining for full GREEN (requires Rust toolchain, not available in this sandbox
 - [ ] Human review of ADR-0006, ADR-0007, ADR-0008
 
 The foundation is now at GREEN for everything achievable in this TypeScript/Python sandbox. The only remaining items require a Rust toolchain, which is the next environment.
+
+---
+Task ID: 44-51 (N1.6 Adversarial Conformance & Gateway Boundary)
+Agent: Z.ai (main — N1.6 honest verification + gateway SSRF)
+Task: Fix overstated verification claims + gateway DNS rebinding defence
+
+Work Log:
+- Audited Python verifier: found 56 expectation-only checks (checking expected field) out of 138 vectors — 40% were NOT independently verified despite the "138/138 independently verified" claim.
+- Rewrote scripts/verify-vectors-python.py with honest classification: INDEPENDENT (Python computes from input), EXPECTATION_ONLY (checks expected field), NOT_VERIFIED (no verifier). Every vector is now classified.
+- Result: 106/138 INDEPENDENT, 0 PARSED, 30 EXPECTATION_ONLY, 2 NOT_VERIFIED. 106/106 independent agreement. The dashboard now shows this breakdown honestly.
+- Fixed Python routing verification: independently implemented containsLoop, isSeqRegression, selectAlternateGateway in Python — no longer just checking expected booleans.
+- Fixed Python negative verification: actually tests CBOR rejection (duplicate keys, trailing bytes, indefinite length), signature rejection (PyNaCl verify with wrong key, wrong context, wrong length), AEAD rejection (wrong key, tampered ciphertext, tampered tag, AAD mismatch).
+- Fixed gateway SSRF: added DNS resolution (dns.resolve4/resolve6) before fetch, validates ALL resolved addresses against isPrivateDestination, rejects if ANY address is private. Documents the remaining gap: Node fetch() re-resolves DNS; production needs http.request with lookup callback for full IP pinning.
+- Added RFC 6598 CGN range (100.64.0.0/10) to isPrivateIPv4.
+- Added cloud metadata hostnames (metadata.google.internal, metadata) to isPrivateDestination.
+- Created ADR-0009: response object hashing semantics — objectId = SHA-256(capped response body) in simulator, production target = merkle_root(chunk(capped body)).
+- Added 16th integration test: SSRF defence — tests 18 private hosts (RFC 1918, loopback, link-local, multicast, CGN, IPv6 ULA/link-local/multicast, cloud metadata), 4 public hosts, IPv4-mapped IPv6.
+- Updated dashboard: CrossVerificationPanel now shows INDEPENDENT/EXPECTATION-ONLY/NOT-VERIFIED breakdown, per-suite I/E/N counts, and an honest claim line.
+- Updated cross-verify API to return the classification data.
+- All 16/16 integration tests passing, 138/138 conformance vectors passing.
+
+Stage Summary:
+- Independent verification: 106/138 (honestly classified, up from overstated 138/138)
+- Expectation-only: 30/138 (documented, not counted as independent)
+- Not verified: 2/138 (chunking boundary logic not ported to Python)
+- Gateway SSRF: DNS resolution + IP validation before fetch, documents remaining IP-pinning gap
+- SSRF test: 16th integration test, 18 private hosts + 4 public hosts all correct
+- ADR-0009: response object hashing semantics resolved
+- Dashboard: honest breakdown visible, no overstated claims
+- Agent Browser: verified, no errors
+
+N1.6 STATUS: YELLOW (not GREEN — 30 expectation-only vectors and the fetch() IP-pinning gap remain)
+
+Remaining for GREEN:
+- Port the 30 expectation-only vectors to independent Python verification (receipts, descriptors, manifest tamper, etc.)
+- Implement http.request with lookup callback for full IP pinning (not just DNS validation)
+- Rust implementation consuming the committed vectors
+- Human review of ADR-0006, ADR-0007, ADR-0008, ADR-0009

@@ -1306,19 +1306,26 @@ function MeshSimulatorPanel() {
 
 interface CrossVerifySuite {
   suite: string
-  agreed: number
   total: number
-  status: 'pass' | 'fail'
+  independent: number
+  parsed: number
+  expectation_only: number
+  not_verified: number
+  agreed: number
 }
 
 interface CrossVerifyResult {
   language: string
   pythonBin: string
   libraries: string[]
-  suites: CrossVerifySuite[]
-  totalAgreed: number
   totalVectors: number
+  independent: number
+  parsed: number
+  expectationOnly: number
+  notVerified: number
+  totalAgreed: number
   allAgreed: boolean
+  suites: CrossVerifySuite[]
   timestamp: string
   error?: string
 }
@@ -1355,7 +1362,7 @@ function CrossVerificationPanel() {
             <div className="flex items-center gap-2">
               <CheckCircle2 className="size-4 text-emerald-600 dark:text-emerald-400" />
               <CardTitle className="text-base sm:text-lg">
-                Cross-language verification — TypeScript ↔ Python
+                Cross-language verification — TypeScript ↔ Python (honest)
               </CardTitle>
             </div>
             <Button
@@ -1374,7 +1381,7 @@ function CrossVerificationPanel() {
             </Button>
           </div>
           <CardDescription className="text-xs sm:text-sm">
-            Python independently consumes the TypeScript-generated golden vectors using PyNaCl (Ed25519), cbor2 (CBOR), and cryptography (AEAD). This proves the protocol is language-independent — the original ShareNet CBOR bug (Kotlin vs Python disagreeing on key ordering) cannot recur. This is the cross-language interop proof the GREEN gate requires.
+            Python independently consumes the TypeScript-generated golden vectors. Per N1.6 audit, vectors are classified INDEPENDENT (Python computes from input), EXPECTATION_ONLY (checks expected field), or NOT_VERIFIED. The dashboard does NOT count expectation-only as independent verification.
           </CardDescription>
         </CardHeader>
         <CardContent className="p-4 pt-0 sm:p-6 sm:pt-0">
@@ -1393,6 +1400,39 @@ function CrossVerificationPanel() {
             </div>
           ) : result ? (
             <>
+              {/* Honest breakdown */}
+              <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3">
+                  <div className="text-xs text-muted-foreground">INDEPENDENT</div>
+                  <div className="text-xl font-bold text-emerald-600 dark:text-emerald-400">
+                    {result.independent}
+                  </div>
+                  <div className="text-xs text-muted-foreground">of {result.totalVectors}</div>
+                </div>
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+                  <div className="text-xs text-muted-foreground">EXPECTATION-ONLY</div>
+                  <div className="text-xl font-bold text-amber-600 dark:text-amber-400">
+                    {result.expectationOnly}
+                  </div>
+                  <div className="text-xs text-muted-foreground">not independent</div>
+                </div>
+                <div className="rounded-md border border-rose-500/30 bg-rose-500/5 p-3">
+                  <div className="text-xs text-muted-foreground">NOT VERIFIED</div>
+                  <div className="text-xl font-bold text-rose-600 dark:text-rose-400">
+                    {result.notVerified}
+                  </div>
+                  <div className="text-xs text-muted-foreground">no Python verifier</div>
+                </div>
+                <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+                  <div className="text-xs text-muted-foreground">PARSED</div>
+                  <div className="text-xl font-bold text-muted-foreground">
+                    {result.parsed}
+                  </div>
+                  <div className="text-xs text-muted-foreground">structural only</div>
+                </div>
+              </div>
+
+              {/* Overall status */}
               <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
                 <Badge
                   variant="outline"
@@ -1402,16 +1442,17 @@ function CrossVerificationPanel() {
                       : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
                   }
                 >
-                  {result.allAgreed ? '✓ All vectors agree' : '✗ Disagreement detected'}
+                  {result.allAgreed ? '✓ All checked vectors agree' : '✗ Disagreement detected'}
                 </Badge>
                 <span className="text-muted-foreground">
-                  {result.totalAgreed}/{result.totalVectors} vectors verified by {result.language}
+                  {result.totalAgreed}/{result.totalVectors} total agreement
                 </span>
                 <span className="text-muted-foreground">
                   via {result.pythonBin}
                 </span>
               </div>
 
+              {/* Libraries */}
               <div className="mb-3 flex flex-wrap gap-2">
                 {result.libraries.map((lib) => (
                   <Badge key={lib} variant="outline" className="border-border/60 text-xs text-muted-foreground">
@@ -1420,31 +1461,39 @@ function CrossVerificationPanel() {
                 ))}
               </div>
 
+              {/* Per-suite breakdown */}
               <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
                 {result.suites.map((s) => (
                   <div
                     key={s.suite}
-                    className="flex items-center gap-2 rounded-md border border-border/60 bg-background/40 px-3 py-1.5 text-xs"
+                    className="rounded-md border border-border/60 bg-background/40 px-3 py-1.5 text-xs"
                   >
-                    {s.status === 'pass' ? (
-                      <CheckCircle2 className="size-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                    ) : (
-                      <XCircle className="size-3 shrink-0 text-rose-600 dark:text-rose-400" />
-                    )}
-                    <span className="font-mono text-muted-foreground">{s.suite}</span>
-                    <span className="ml-auto text-foreground/80">
-                      {s.agreed}/{s.total}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-muted-foreground">{s.suite}</span>
+                      <span className="ml-auto text-foreground/80">
+                        {s.agreed}/{s.total}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
+                      <span className="text-emerald-600 dark:text-emerald-400">I:{s.independent}</span>
+                      {s.expectation_only > 0 && (
+                        <span className="text-amber-600 dark:text-amber-400">E:{s.expectation_only}</span>
+                      )}
+                      {s.not_verified > 0 && (
+                        <span className="text-rose-600 dark:text-rose-400">N:{s.not_verified}</span>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
 
-              {result.allAgreed && (
-                <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs text-emerald-700 dark:text-emerald-300">
-                  <CheckCircle2 className="mr-1.5 inline size-3" />
-                  TypeScript and Python AGREE on all {result.totalVectors} vectors. The protocol is language-independent.
-                </div>
-              )}
+              {/* Honest claim */}
+              <div className="mt-3 rounded-md border border-border/40 bg-muted/20 p-3 text-xs text-muted-foreground">
+                <strong className="text-foreground">Honest claim:</strong> TypeScript and Python independently agree on {result.independent} of {result.totalVectors} vectors.
+                {result.expectationOnly > 0 && ` ${result.expectationOnly} vectors are expectation-only (not independently verified).`}
+                {result.notVerified > 0 && ` ${result.notVerified} vectors have no Python verifier.`}
+                {' '}Full protocol interoperability requires Rust/Kotlin implementations covering the complete protocol surface.
+              </div>
             </>
           ) : null}
         </CardContent>

@@ -1109,9 +1109,12 @@ function isPrivateIPv4(b: Uint8Array): boolean {
   if (b[0] === 0) return true;
   // 10.0.0.0/8 — RFC 1918 private
   if (b[0] === 10) return true;
+  // 100.64.0.0/10 — RFC 6598 Carrier-Grade NAT (shared address space)
+  // N1.6: added per SSRF test — this range is not globally reachable
+  if (b[0] === 100 && b[1] >= 64 && b[1] <= 127) return true;
   // 127.0.0.0/8 — loopback
   if (b[0] === 127) return true;
-  // 169.254.0.0/16 — link-local
+  // 169.254.0.0/16 — link-local (includes 169.254.169.254 cloud metadata)
   if (b[0] === 169 && b[1] === 254) return true;
   // 172.16.0.0/12 — RFC 1918 private (172.16.0.0 – 172.31.255.255)
   if (b[0] === 172 && b[1] >= 16 && b[1] <= 31) return true;
@@ -1207,6 +1210,12 @@ export function isPrivateDestination(host: string): boolean {
   // Hostname checks (case-insensitive).
   if (h === "localhost") return true;
   if (h.endsWith(".local")) return true;
+  // N1.6: Cloud metadata endpoints — these expose instance credentials
+  // and MUST be blocked. AWS/GCP/Azure all use link-local IPs, but some
+  // cloud providers also expose metadata via hostnames.
+  if (h === "metadata.google.internal") return true;
+  if (h === "metadata") return true;
+  if (h === "169.254.169.254") return true; // numeric, but caught by IPv4 check below
 
   // IPv4 literal.
   const v4 = parseIPv4(h);
