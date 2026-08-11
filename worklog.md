@@ -902,3 +902,28 @@ Remaining for GREEN gate (per audit):
 - [ ] Real Rust node on real sockets
 - [ ] Real gateway implementation (N5)
 - [ ] Human review of ADR-0003 (superseded), ADR-0006, ADR-0007, ADR-0008
+
+---
+Task ID: 34-38 (Real TCP networking)
+Agent: Z.ai (main — real TCP mesh simulator)
+Task: Build independent vector verifier + three-process TCP mesh simulator + Mode A end-to-end demo
+
+Work Log:
+- Built scripts/verify-vectors.ts — an INDEPENDENT vector verifier that loads JSON vectors and re-derives expected values from scratch (not by calling the conformance runner). All 138/138 vectors independently verified. Proves vectors are consumable as DATA.
+- Built mini-services/mesh-simulator/node.ts — a single script that runs as Gateway, Relay, or Client depending on MESH_ROLE env var. Each role is a separate OS process with its own TCP server.
+- Built mini-services/mesh-simulator/index.ts — the orchestrator that spawns the three processes and reports results (used for standalone testing).
+- Built src/app/api/mesh-simulator/route.ts — an in-process API route that spawns the three child processes, runs the Mode A simulation, and returns the result. This is more reliable than the mini-service approach in the sandbox.
+- Mode A end-to-end demo: Client (:7001) builds a TransitRequest, sends it via real TCP to Relay (:7002), Relay forwards to Gateway (:7003) WITHOUT inspecting the body (I8), Gateway "fetches" (simulated), signs a TransitResponse, sends it back through the Relay, Client verifies the Gateway's Ed25519 signature. gatewayVerified: true, responseStatus: 200.
+- Added MeshSimulatorPanel to the dashboard — shows the topology diagram, stage-by-stage results, and the verified response details. "Run simulation" button triggers a fresh run.
+- Updated dashboard: 138 reference conformance vectors, 15 suites, 15 integration tests, real TCP mesh simulator.
+
+Stage Summary:
+- Independent vector verification: 138/138 vectors independently verified (scripts/verify-vectors.ts)
+- Real TCP mesh: Client → Relay → Gateway over 127.0.0.1:7001-7003
+- Mode A end-to-end: TransitRequest → forward → fetch → sign → verify ✓
+- gatewayVerified: true (Ed25519 signature verified by Client)
+- totalDurationMs: ~1800ms (including process spawn)
+- Dashboard shows mesh simulator panel with live results
+- Agent Browser: verified — 138 vectors, 15 suites, 15 integration tests, mesh simulation "✓ Mode A success", no errors
+
+This is the first proof that ShareNet routes a packet through a REAL TCP network — not just in-memory links. The next step (when Rust is available) is to add a Rust node as a 4th process in the same topology.

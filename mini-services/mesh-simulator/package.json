@@ -1,0 +1,10 @@
+{
+  "name": "sharenet-mesh-simulator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot run index.ts",
+    "start": "bun run index.ts"
+  }
+}

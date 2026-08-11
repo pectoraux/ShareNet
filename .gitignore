@@ -39,6 +39,8 @@ server.log
 /upload/
 /tests/
 /examples/
-/mini-services/
+# NOTE: mini-services/mesh-simulator is NOT ignored (it's part of the
+# ShareNet 2.0 real-network proof). Only ignore the .gitkeep placeholder.
+/mini-services/.gitkeep
 /db/
 /sharenet-*.png
