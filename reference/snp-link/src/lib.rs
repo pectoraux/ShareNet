@@ -112,8 +112,11 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 
+use snp_cbor::CborValue;
 use snp_crypto::{
-    aead_decrypt, aead_encrypt, aead_nonce, aead_open, aead_seal, hkdf_sha256, SymmetricKey,
+    aead_decrypt, aead_encrypt, aead_nonce, aead_open, aead_seal, derive_node_id, ed25519_sign,
+    ed25519_verify, hkdf_sha256, sha256, sig_contexts, x25519_dh, x25519_ephemeral_keypair,
+    x25519_public_from_bytes, SymmetricKey, X25519PubKey, X25519Secret,
 };
 use snp_frames::Frame;
 use thiserror::Error;
@@ -142,6 +145,26 @@ pub enum LinkError {
     /// a valid Frame — should not happen for well-behaved peers).
     #[error("CBOR error: {0}")]
     Cbor(#[from] snp_cbor::CborError),
+    /// SNP-IK/0.1 handshake failed: the peer's NodeDescriptor signature did
+    /// NOT verify under the peer's claimed Ed25519 public key. The link is
+    /// rejected; no further I/O occurs on the stream.
+    #[error("SNP-IK/0.1: peer NodeDescriptor signature verification FAILED")]
+    HandshakeBadSignature,
+    /// SNP-IK/0.1 handshake failed: the peer's NodeId does NOT match
+    /// `SHA-256("SNP/0.1 node\0" || peer_pubKey)` (invariant I4 violation).
+    /// The peer attempted to name-squat a NodeId it does not own.
+    #[error("SNP-IK/0.1: peer NodeId does not match SHA-256(...||peer_pubKey) (I4 violation)")]
+    HandshakeNodeIdMismatch,
+    /// SNP-IK/0.1 handshake failed: the peer's NodeId does not match the
+    /// `expected_peer_node_id` supplied by the caller ("I"-style pinning).
+    /// The peer is NOT the node the caller intended to connect to.
+    #[error("SNP-IK/0.1: peer NodeId does not match expected_peer_node_id (I-style pinning failed)")]
+    HandshakeUnexpectedPeer,
+    /// SNP-IK/0.1 handshake failed: the peer sent a malformed handshake
+    /// message (missing field, wrong length, wrong CBOR shape, …). The
+    /// handshake aborts before any DH computation.
+    #[error("SNP-IK/0.1: malformed handshake message: {0}")]
+    HandshakeMalformed(String),
 }
 
 /// Convenience `Result` alias.
@@ -249,6 +272,483 @@ pub fn derive_link_key(seed: &[u8]) -> SymmetricKey {
     key
 }
 
+// ─── SNP-IK/0.1 — custom authenticated key agreement (N2.0.2) ───────────────
+//
+// Implements the construction defined in ADR-0006:
+//
+//   1. Initiator generates ephemeral X25519 keypair (e, E)
+//   2. Initiator sends E + their signed NodeDescriptor to responder
+//   3. Responder generates ephemeral X25519 keypair (e', E')
+//   4. Responder sends E' + their signed NodeDescriptor to initiator
+//   5. Both compute three DH operations:
+//        dh1 = initiator_ephemeral × responder_static (rendezvousPub)
+//        dh2 = initiator_static × responder_ephemeral
+//        dh3 = initiator_ephemeral × responder_ephemeral
+//   6. Both derive link keys via HKDF-SHA256(dh1 || dh2 || dh3,
+//        salt=empty, info="SNP-IK/0.1 link keys")
+//   7. Both verify the peer's NodeDescriptor signature BEFORE accepting the link
+//
+// The "static" X25519 keypair is the node's persistent rendezvous key (passed
+// in as `my_x25519_*`). The "ephemeral" X25519 keypair is generated FRESH
+// inside [`perform_snp_ik_handshake`] per session — this provides forward
+// secrecy (compromising both static keys after the handshake does NOT recover
+// the derived link keys, because the ephemeral secrets are erased).
+//
+// Each node therefore needs BOTH an Ed25519 identity keypair (signs the
+// NodeDescriptor) AND an X25519 rendezvous keypair (participates in the DH).
+// The Ed25519 key signs; the X25519 key agrees.
+
+/// HKDF `info` literal for SNP-IK/0.1 link-key derivation. Per ADR-0006, this
+/// is the construction's binding info string. A future ADR that adopts a
+/// vetted Noise_IK library will replace the entire key derivation (and this
+/// literal will be deleted at that time).
+pub const SNP_IK_LINK_KEYS_INFO: &[u8] = b"SNP-IK/0.1 link keys";
+
+/// HKDF `salt` literal for the directional link-key derivation step.
+pub const SNP_IK_LINK_DIR_SALT: &[u8] = b"SNP/0.1 link dir";
+
+/// HKDF `info` literal for the initiator→responder directional key.
+pub const SNP_IK_LINK_DIR_I2R: &[u8] = b"initiator-to-responder";
+
+/// HKDF `info` literal for the responder→initiator directional key.
+pub const SNP_IK_LINK_DIR_R2I: &[u8] = b"responder-to-initiator";
+
+/// The result of a successful SNP-IK/0.1 handshake.
+///
+/// Contains the freshly-derived directional AEAD [`LinkKeys`] and the peer's
+/// authenticated identity (NodeId + Ed25519 public key). The peer's identity
+/// has been signature-verified by the time this struct is returned; the
+/// caller MAY trust it without further verification.
+#[derive(Debug, Clone)]
+pub struct HandshakeResult {
+    /// Directional AEAD link keys derived from the SNP-IK/0.1 DH computations.
+    /// The initiator's `send_key` equals the responder's `recv_key`, and vice
+    /// versa (same directional-inversion rule as N1.9 [`derive_link_keys`]).
+    pub link_keys: LinkKeys,
+    /// The peer's NodeId (`SHA-256("SNP/0.1 node\0" || peer_public_key)`).
+    pub peer_node_id: [u8; 32],
+    /// The peer's Ed25519 public key (32 bytes, raw wire form per I3).
+    pub peer_public_key: [u8; 32],
+    /// The peer's static X25519 rendezvous public key (32 bytes). The caller
+    /// MAY cache this to recognise the same peer in future sessions.
+    pub peer_x25519_public: [u8; 32],
+    /// The peer's ephemeral X25519 public key for THIS session (32 bytes).
+    /// Fresh per handshake; included for transcript-hashing by callers that
+    /// want to derive additional keys bound to this session.
+    pub peer_ephemeral_public: [u8; 32],
+    /// The session id: `SHA-256(initiator_eph || responder_eph || dh3)`.
+    /// This is the closest analogue to Noise's handshake hash that
+    /// SNP-IK/0.1 provides (ADR-0006 acknowledges the absence of a true
+    /// transcript hash; this `session_id` is the per-session binding value).
+    pub session_id: [u8; 32],
+}
+
+/// Derive directional AEAD link keys from the three SNP-IK/0.1 DH outputs.
+///
+/// Per ADR-0006 step 6: `HKDF-SHA256(dh1 || dh2 || dh3, salt=empty,
+/// info="SNP-IK/0.1 link keys")` produces a 32-byte base key. The base key
+/// is then HKDF-expanded twice with directional `info` strings to produce
+/// the initiator→responder and responder→initiator keys, following the
+/// same pattern as N1.9 [`derive_link_keys`].
+///
+/// The `is_initiator` parameter controls which directional key becomes
+/// `send_key` vs `recv_key` — the side that opened the TCP connection
+/// passes `true`; the side that accepted passes `false`.
+///
+/// # Panics
+/// Never panics (HKDF-SHA256 32-byte expand is infallible for valid IKM).
+#[must_use]
+pub fn derive_link_keys_from_dh(
+    dh1: &[u8; 32],
+    dh2: &[u8; 32],
+    dh3: &[u8; 32],
+    is_initiator: bool,
+) -> LinkKeys {
+    let mut ikm = Vec::with_capacity(96);
+    ikm.extend_from_slice(dh1);
+    ikm.extend_from_slice(dh2);
+    ikm.extend_from_slice(dh3);
+    let base = hkdf_sha256(&ikm, b"", SNP_IK_LINK_KEYS_INFO, 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let i2r = hkdf_sha256(&base, SNP_IK_LINK_DIR_SALT, SNP_IK_LINK_DIR_I2R, 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let r2i = hkdf_sha256(&base, SNP_IK_LINK_DIR_SALT, SNP_IK_LINK_DIR_R2I, 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let mut i2r_arr = [0u8; 32];
+    i2r_arr.copy_from_slice(&i2r);
+    let mut r2i_arr = [0u8; 32];
+    r2i_arr.copy_from_slice(&r2i);
+    if is_initiator {
+        LinkKeys { send_key: i2r_arr, recv_key: r2i_arr }
+    } else {
+        LinkKeys { send_key: r2i_arr, recv_key: i2r_arr }
+    }
+}
+
+/// Build the CBOR preimage of a NodeDescriptor for signing/verifying.
+///
+/// Per ADR-0006 the descriptor contains:
+/// - `nodeId`: SHA-256("SNP/0.1 node\0" || ed25519_pub) (invariant I4)
+/// - `pubKey`: Ed25519 identity public key (32 bytes, raw — invariant I3)
+/// - `ephPub`: ephemeral X25519 public key for THIS session (32 bytes)
+/// - `staticPub`: static X25519 rendezvous public key (32 bytes)
+///
+/// The signature is over `SIG_CONTEXTS.NODE_DESCRIPTOR || CBOR(preimage)` (I2).
+///
+/// The `ephPub` field is included in the signed preimage (NOT just sent
+/// alongside the descriptor) so that an active attacker cannot strip the
+/// ephemeral key and substitute their own — the signature binds all four
+/// fields together.
+fn node_descriptor_preimage(
+    node_id: &[u8; 32],
+    pub_key: &[u8; 32],
+    eph_pub: &[u8; 32],
+    static_pub: &[u8; 32],
+) -> CborValue {
+    CborValue::Map(vec![
+        (CborValue::TextString("nodeId".into()), CborValue::ByteString(node_id.to_vec())),
+        (CborValue::TextString("pubKey".into()), CborValue::ByteString(pub_key.to_vec())),
+        (CborValue::TextString("ephPub".into()), CborValue::ByteString(eph_pub.to_vec())),
+        (CborValue::TextString("staticPub".into()), CborValue::ByteString(static_pub.to_vec())),
+    ])
+}
+
+/// Encode a full SNP-IK/0.1 handshake message (descriptor + signature).
+fn encode_handshake_message(
+    node_id: &[u8; 32],
+    pub_key: &[u8; 32],
+    eph_pub: &[u8; 32],
+    static_pub: &[u8; 32],
+    sig: &[u8; 64],
+) -> LinkResult<Vec<u8>> {
+    let msg = CborValue::Map(vec![
+        (CborValue::TextString("nodeId".into()), CborValue::ByteString(node_id.to_vec())),
+        (CborValue::TextString("pubKey".into()), CborValue::ByteString(pub_key.to_vec())),
+        (CborValue::TextString("ephPub".into()), CborValue::ByteString(eph_pub.to_vec())),
+        (CborValue::TextString("staticPub".into()), CborValue::ByteString(static_pub.to_vec())),
+        (CborValue::TextString("sig".into()), CborValue::ByteString(sig.to_vec())),
+    ]);
+    Ok(snp_cbor::encode(&msg)?)
+}
+
+/// Decode a SNP-IK/0.1 handshake message. Returns the five fields in order.
+fn decode_handshake_message(
+    bytes: &[u8],
+) -> LinkResult<([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 64])> {
+    let value = snp_cbor::decode(bytes)?;
+    let entries = match value {
+        CborValue::Map(e) => e,
+        other => {
+            return Err(LinkError::HandshakeMalformed(format!(
+                "handshake message must be a CBOR map; got {other:?}"
+            )));
+        }
+    };
+    let mut node_id: Option<[u8; 32]> = None;
+    let mut pub_key: Option<[u8; 32]> = None;
+    let mut eph_pub: Option<[u8; 32]> = None;
+    let mut static_pub: Option<[u8; 32]> = None;
+    let mut sig: Option<[u8; 64]> = None;
+    for (k, v) in entries {
+        let key = match k {
+            CborValue::TextString(s) => s,
+            other => {
+                return Err(LinkError::HandshakeMalformed(format!(
+                    "handshake key must be text; got {other:?}"
+                )));
+            }
+        };
+        let bytes_val = match v {
+            CborValue::ByteString(b) => b,
+            other => {
+                return Err(LinkError::HandshakeMalformed(format!(
+                    "handshake value for \"{key}\" must be a byte string; got {other:?}"
+                )));
+            }
+        };
+        match key.as_str() {
+            "nodeId" => {
+                if bytes_val.len() != 32 {
+                    return Err(LinkError::HandshakeMalformed(format!(
+                        "nodeId must be 32 bytes; got {}",
+                        bytes_val.len()
+                    )));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&bytes_val);
+                node_id = Some(a);
+            }
+            "pubKey" => {
+                if bytes_val.len() != 32 {
+                    return Err(LinkError::HandshakeMalformed(format!(
+                        "pubKey must be 32 bytes; got {}",
+                        bytes_val.len()
+                    )));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&bytes_val);
+                pub_key = Some(a);
+            }
+            "ephPub" => {
+                if bytes_val.len() != 32 {
+                    return Err(LinkError::HandshakeMalformed(format!(
+                        "ephPub must be 32 bytes; got {}",
+                        bytes_val.len()
+                    )));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&bytes_val);
+                eph_pub = Some(a);
+            }
+            "staticPub" => {
+                if bytes_val.len() != 32 {
+                    return Err(LinkError::HandshakeMalformed(format!(
+                        "staticPub must be 32 bytes; got {}",
+                        bytes_val.len()
+                    )));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&bytes_val);
+                static_pub = Some(a);
+            }
+            "sig" => {
+                if bytes_val.len() != 64 {
+                    return Err(LinkError::HandshakeMalformed(format!(
+                        "sig must be 64 bytes; got {}",
+                        bytes_val.len()
+                    )));
+                }
+                let mut a = [0u8; 64];
+                a.copy_from_slice(&bytes_val);
+                sig = Some(a);
+            }
+            other => {
+                return Err(LinkError::HandshakeMalformed(format!(
+                    "unknown handshake field \"{other}\""
+                )));
+            }
+        }
+    }
+    let node_id = node_id.ok_or_else(|| LinkError::HandshakeMalformed("nodeId missing".into()))?;
+    let pub_key = pub_key.ok_or_else(|| LinkError::HandshakeMalformed("pubKey missing".into()))?;
+    let eph_pub = eph_pub.ok_or_else(|| LinkError::HandshakeMalformed("ephPub missing".into()))?;
+    let static_pub =
+        static_pub.ok_or_else(|| LinkError::HandshakeMalformed("staticPub missing".into()))?;
+    let sig = sig.ok_or_else(|| LinkError::HandshakeMalformed("sig missing".into()))?;
+    Ok((node_id, pub_key, eph_pub, static_pub, sig))
+}
+
+/// Write a length-prefixed handshake message to the stream.
+///
+/// The wire format is `[4-byte BE length][CBOR handshake message]`. The
+/// length is capped at 8 KiB — handshake messages are tiny (~190 bytes), so
+/// any larger value indicates a corrupted stream or an attacker.
+fn write_handshake_message(stream: &mut TcpStream, bytes: &[u8]) -> LinkResult<()> {
+    if bytes.len() > 8 * 1024 {
+        return Err(LinkError::AbsurdLength(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+    }
+    let len = u32::try_from(bytes.len()).map_err(|_| LinkError::AbsurdLength(u32::MAX))?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|e| LinkError::Io(e.to_string()))?;
+    stream
+        .write_all(bytes)
+        .map_err(|e| LinkError::Io(e.to_string()))?;
+    stream.flush().map_err(|e| LinkError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a length-prefixed handshake message from the stream.
+fn read_handshake_message(stream: &mut TcpStream) -> LinkResult<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| LinkError::Io(e.to_string()))?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > 8 * 1024 {
+        return Err(LinkError::AbsurdLength(len));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| LinkError::Io(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Perform the SNP-IK/0.1 handshake over an already-connected TCP stream.
+///
+/// Per ADR-0006, the construction is:
+/// 1. Both sides generate a fresh ephemeral X25519 keypair.
+/// 2. The initiator sends `E + signed NodeDescriptor` first.
+/// 3. The responder sends `E' + signed NodeDescriptor` second.
+/// 4. Both compute dh1, dh2, dh3 and derive `LinkKeys`.
+/// 5. Both verify the peer's NodeDescriptor signature BEFORE accepting the link.
+///
+/// The function returns a [`HandshakeResult`] containing the freshly-derived
+/// link keys and the peer's authenticated identity.
+///
+/// # Parameters
+/// - `stream`: the connected TCP stream. The caller MAY set a read timeout
+///   on the stream before calling this function.
+/// - `is_initiator`: `true` for the side that opened the TCP connection,
+///   `false` for the side that accepted.
+/// - `my_ed25519_secret`/`my_ed25519_public`: the node's Ed25519 identity
+///   keypair. Signs the NodeDescriptor.
+/// - `my_x25519_secret`/`my_x25519_public`: the node's STATIC X25519
+///   rendezvous keypair. Used in dh1 and dh2 (the static DH operations).
+/// - `expected_peer_node_id`: if `Some`, the handshake fails if the peer's
+///   verified NodeId does not match. This is the "I"-style pinning
+///   (initiator knows the responder's identity in advance).
+///
+/// # Errors
+/// Returns [`LinkError::HandshakeBadSignature`] if the peer's signature
+/// does not verify; [`LinkError::HandshakeNodeIdMismatch`] if the peer's
+/// NodeId does not match `SHA-256("SNP/0.1 node\0" || peer_pubKey)`;
+/// [`LinkError::HandshakeUnexpectedPeer`] if `expected_peer_node_id` is set
+/// and does not match the peer's NodeId; [`LinkError::HandshakeMalformed`]
+/// if the peer sent an invalid CBOR message; [`LinkError::Io`] on transport
+/// failure.
+///
+/// # Forward secrecy
+/// The ephemeral X25519 secrets are dropped when this function returns
+/// (Rust's drop semantics handle this). An attacker who compromises both
+/// static keys AFTER the handshake cannot recover the link keys.
+///
+/// # Panics
+/// Never panics for well-formed inputs.
+pub fn perform_snp_ik_handshake(
+    stream: &mut TcpStream,
+    is_initiator: bool,
+    my_ed25519_secret: &[u8; 32],
+    my_ed25519_public: &[u8; 32],
+    my_x25519_secret: &X25519Secret,
+    my_x25519_public: &X25519PubKey,
+    expected_peer_node_id: Option<&[u8; 32]>,
+) -> LinkResult<HandshakeResult> {
+    // 1. Generate a fresh ephemeral X25519 keypair for this session.
+    let (eph_secret, eph_public) = x25519_ephemeral_keypair();
+    let eph_pub_bytes: [u8; 32] = eph_public.to_bytes();
+    let static_pub_bytes: [u8; 32] = my_x25519_public.to_bytes();
+    let my_node_id = derive_node_id(my_ed25519_public);
+
+    // 2. Build + sign our NodeDescriptor.
+    let preimage = node_descriptor_preimage(&my_node_id, my_ed25519_public, &eph_pub_bytes, &static_pub_bytes);
+    let preimage_bytes = snp_cbor::encode(&preimage)?;
+    let mut signed_msg = Vec::with_capacity(sig_contexts::NODE_DESCRIPTOR.len() + preimage_bytes.len());
+    signed_msg.extend_from_slice(sig_contexts::NODE_DESCRIPTOR);
+    signed_msg.extend_from_slice(&preimage_bytes);
+    let sig = ed25519_sign(my_ed25519_secret, &signed_msg);
+
+    // 3. Encode the handshake message.
+    let my_msg = encode_handshake_message(
+        &my_node_id,
+        my_ed25519_public,
+        &eph_pub_bytes,
+        &static_pub_bytes,
+        &sig,
+    )?;
+
+    // 4. Exchange messages: initiator sends first, then receives;
+    //    responder receives first, then sends.
+    let peer_msg_bytes = if is_initiator {
+        write_handshake_message(stream, &my_msg)?;
+        read_handshake_message(stream)?
+    } else {
+        let received = read_handshake_message(stream)?;
+        write_handshake_message(stream, &my_msg)?;
+        received
+    };
+
+    // 5. Decode + verify the peer's handshake message.
+    let (peer_node_id, peer_pub_key, peer_eph_pub, peer_static_pub, peer_sig) =
+        decode_handshake_message(&peer_msg_bytes)?;
+
+    // 5a. Verify the peer's signature over its NodeDescriptor.
+    let peer_preimage = node_descriptor_preimage(&peer_node_id, &peer_pub_key, &peer_eph_pub, &peer_static_pub);
+    let peer_preimage_bytes = snp_cbor::encode(&peer_preimage)?;
+    let mut peer_signed = Vec::with_capacity(sig_contexts::NODE_DESCRIPTOR.len() + peer_preimage_bytes.len());
+    peer_signed.extend_from_slice(sig_contexts::NODE_DESCRIPTOR);
+    peer_signed.extend_from_slice(&peer_preimage_bytes);
+    if !ed25519_verify(&peer_pub_key, &peer_signed, &peer_sig) {
+        return Err(LinkError::HandshakeBadSignature);
+    }
+
+    // 5b. Verify I4: peer's NodeId == SHA-256("SNP/0.1 node\0" || peer_pubKey).
+    let derived_peer_node_id = derive_node_id(&peer_pub_key);
+    if peer_node_id != derived_peer_node_id {
+        return Err(LinkError::HandshakeNodeIdMismatch);
+    }
+
+    // 5c. Verify "I"-style pinning: peer's NodeId matches expected (if set).
+    if let Some(expected) = expected_peer_node_id {
+        if &peer_node_id != expected {
+            return Err(LinkError::HandshakeUnexpectedPeer);
+        }
+    }
+
+    // 6. Compute the three DH operations.
+    //
+    //    The IKM order MUST be the same on both sides (initiator and
+    //    responder). We use the canonical order:
+    //      dh1 = DH(initiator_eph,  responder_static)
+    //      dh2 = DH(initiator_static, responder_eph)
+    //      dh3 = DH(initiator_eph,  responder_eph)
+    //
+    //    X25519 DH is symmetric: DH(a, B) == DH(b, A). So:
+    //    - The initiator computes dh1 = DH(my_eph, peer_static), dh2 = DH(my_static, peer_eph), dh3 = DH(my_eph, peer_eph).
+    //    - The responder computes the SAME dh1 = DH(peer_eph, my_static) = DH(my_static, peer_eph) — note the swap!
+    //      To produce the same dh1, the responder uses my_static × peer_eph (NOT my_eph × peer_static).
+    //      Similarly, the responder's dh2 = DH(peer_static, my_eph) = DH(my_eph, peer_static).
+    //
+    //    Concretely:
+    //    - initiator: dh1 = DH(my_eph, peer_static), dh2 = DH(my_static, peer_eph), dh3 = DH(my_eph, peer_eph)
+    //    - responder: dh1 = DH(my_static, peer_eph), dh2 = DH(my_eph, peer_static), dh3 = DH(my_eph, peer_eph)
+    //
+    //    dh3 is the same on both sides (DH is symmetric).
+    let peer_eph_pub_key = x25519_public_from_bytes(&peer_eph_pub);
+    let peer_static_pub_key = x25519_public_from_bytes(&peer_static_pub);
+    let (dh1, dh2, dh3) = if is_initiator {
+        let dh1 = x25519_dh(&eph_secret, &peer_static_pub_key);
+        let dh2 = x25519_dh(my_x25519_secret, &peer_eph_pub_key);
+        let dh3 = x25519_dh(&eph_secret, &peer_eph_pub_key);
+        (dh1, dh2, dh3)
+    } else {
+        // Responder: swap dh1 and dh2 to match the initiator's IKM order.
+        let dh1 = x25519_dh(my_x25519_secret, &peer_eph_pub_key);
+        let dh2 = x25519_dh(&eph_secret, &peer_static_pub_key);
+        let dh3 = x25519_dh(&eph_secret, &peer_eph_pub_key);
+        (dh1, dh2, dh3)
+    };
+
+    // 7. Derive link keys.
+    let link_keys = derive_link_keys_from_dh(&dh1, &dh2, &dh3, is_initiator);
+
+    // 8. Compute the session_id: SHA-256(initiator_eph || responder_eph || dh3).
+    //    This is the closest analogue to Noise's handshake hash that
+    //    SNP-IK/0.1 provides. The session_id is bound to the ephemeral
+    //    keys (fresh per session) AND to dh3 (the ephemeral-ephemeral DH),
+    //    so it differs across sessions even between the same pair of nodes.
+    let mut session_id_input = Vec::with_capacity(96);
+    if is_initiator {
+        session_id_input.extend_from_slice(&eph_pub_bytes);
+        session_id_input.extend_from_slice(&peer_eph_pub);
+    } else {
+        session_id_input.extend_from_slice(&peer_eph_pub);
+        session_id_input.extend_from_slice(&eph_pub_bytes);
+    }
+    session_id_input.extend_from_slice(&dh3);
+    let session_id = sha256(&session_id_input);
+
+    Ok(HandshakeResult {
+        link_keys,
+        peer_node_id,
+        peer_public_key: peer_pub_key,
+        peer_x25519_public: peer_static_pub,
+        peer_ephemeral_public: peer_eph_pub,
+        session_id,
+    })
+}
+
 // ─── Circuit keys (N1.9 — end-to-end client↔gateway) ────────────────────────
 
 /// A pair of AEAD keys for the end-to-end client↔gateway circuit.
@@ -315,6 +815,166 @@ pub fn derive_circuit_keys(seed: &[u8], is_initiator: bool) -> CircuitKeys {
             recv_key: i2r_arr,
         }
     }
+}
+
+// ─── N2.0.2 — Fresh circuit keys via client↔gateway X25519 DH ────────────────
+//
+// Per ADR-0011 Layer 2, the circuit key MUST be end-to-end (client ↔ gateway)
+// and MUST NOT be derivable by any relay. The N1.9 `derive_circuit_keys`
+// function above uses a pre-shared seed — production derives the seed from
+// a CLIENT ↔ GATEWAY key agreement that the relay does not participate in.
+//
+// The N2.0.2 construction (this block) uses a fresh X25519 ephemeral-static
+// DH between the client and the gateway. The gateway holds a STATIC X25519
+// "circuit" keypair (separate from its SNP-IK/0.1 link keypair); the client
+// generates a fresh EPHEMERAL X25519 keypair per request. The client sends
+// its ephemeral pub in the first 32 bytes of the request frame body; the
+// gateway derives the circuit keys from `DH(client_eph, gateway_static)`.
+//
+// Two requests to the same gateway produce DIFFERENT circuit keys (because
+// the client's ephemeral is fresh per request). The relay sees the frame
+// body (including the client's eph pub) but cannot derive the DH output
+// (it lacks the gateway's static secret). This satisfies ADR-0011 Layer 2
+// for N2.0.2.
+
+/// HKDF `salt` literal for the N2.0.2 fresh-DH circuit-key derivation.
+pub const CIRCUIT_DH_BASE_SALT: &[u8] = b"SNP/0.1 circuit-dh base";
+
+/// HKDF `info` literal for the N2.0.2 fresh-DH circuit-key derivation.
+pub const CIRCUIT_DH_BASE_INFO: &[u8] = b"SNP/0.1 N2.0.2 circuit-from-dh";
+
+/// Derive directional end-to-end circuit keys from a single X25519 DH output.
+///
+/// Used by the N2.0.2 fresh-circuit-key construction (see module docs above).
+/// Both the client and the gateway pass the SAME 32-byte DH output (computed
+/// independently via `DH(client_eph, gateway_static)`); the `is_initiator`
+/// parameter distinguishes them (client = initiator, gateway = responder).
+///
+/// # Derivation
+/// ```text
+///   base  = HKDF-SHA256(dh, salt="SNP/0.1 circuit-dh base",
+///                        info="SNP/0.1 N2.0.2 circuit-from-dh", L=32)
+///   i2r   = HKDF-SHA256(base, salt="SNP/0.1 circuit dir",
+///                        info="initiator-to-responder", L=32)
+///   r2i   = HKDF-SHA256(base, salt="SNP/0.1 circuit dir",
+///                        info="responder-to-initiator", L=32)
+///   client:  CircuitKeys { send_key: i2r, recv_key: r2i }
+///   gateway: CircuitKeys { send_key: r2i, recv_key: i2r }
+/// ```
+///
+/// # Panics
+/// Never panics (HKDF-SHA256 32-byte expand is infallible for valid IKM).
+#[must_use]
+pub fn derive_circuit_keys_from_dh(dh: &[u8; 32], is_initiator: bool) -> CircuitKeys {
+    let base = hkdf_sha256(dh, CIRCUIT_DH_BASE_SALT, CIRCUIT_DH_BASE_INFO, 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let i2r = hkdf_sha256(&base, b"SNP/0.1 circuit dir", b"initiator-to-responder", 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let r2i = hkdf_sha256(&base, b"SNP/0.1 circuit dir", b"responder-to-initiator", 32)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    let mut i2r_arr = [0u8; 32];
+    i2r_arr.copy_from_slice(&i2r);
+    let mut r2i_arr = [0u8; 32];
+    r2i_arr.copy_from_slice(&r2i);
+    if is_initiator {
+        CircuitKeys { send_key: i2r_arr, recv_key: r2i_arr }
+    } else {
+        CircuitKeys { send_key: r2i_arr, recv_key: i2r_arr }
+    }
+}
+
+/// Length of the X25519 public key prefix on a circuit-frame body.
+pub const CIRCUIT_EPH_PUB_LEN: usize = 32;
+
+/// Seal a TransitRequest payload with a FRESH client X25519 ephemeral key.
+///
+/// Generates a fresh X25519 keypair, computes `DH(client_eph, gateway_static)`,
+/// derives `CircuitKeys` (initiator role), encrypts the `plaintext` with
+/// `send_key`, and returns the frame body:
+///
+/// ```text
+///   frame_body = client_eph_pub (32 bytes) || sealed_payload
+/// ```
+///
+/// The gateway reads the first 32 bytes to recover `client_eph_pub`, computes
+/// the same DH (using its static secret), derives the same `CircuitKeys`
+/// (responder role), and decrypts with `recv_key` via
+/// [`open_circuit_payload_with_fresh_eph`].
+///
+/// Returns `(circuit_keys, client_eph_pub, frame_body)`. The caller uses
+/// `circuit_keys.recv_key` to decrypt the gateway's response (which is sealed
+/// with the responder's `send_key`, equal to the initiator's `recv_key`).
+///
+/// The fresh `eph_secret` is dropped at the end of this function — it is NOT
+/// returned to the caller. This provides forward secrecy: a later compromise
+/// of the caller's memory cannot recover the ephemeral secret.
+///
+/// # Panics
+/// Never panics for a 32-byte `gateway_static_pub` (X25519 + AEAD are
+/// infallible for valid inputs).
+#[must_use]
+pub fn seal_circuit_payload_with_fresh_eph(
+    gateway_static_pub: &X25519PubKey,
+    plaintext: &[u8],
+) -> (CircuitKeys, X25519PubKey, Vec<u8>) {
+    let (eph_secret, eph_pub) = x25519_ephemeral_keypair();
+    let dh = x25519_dh(&eph_secret, gateway_static_pub);
+    let keys = derive_circuit_keys_from_dh(&dh, true);
+    let sealed = encrypt_circuit_payload(&keys.send_key, plaintext);
+    let mut body = Vec::with_capacity(CIRCUIT_EPH_PUB_LEN + sealed.len());
+    body.extend_from_slice(&eph_pub.to_bytes());
+    body.extend_from_slice(&sealed);
+    // eph_secret is dropped here — forward secrecy.
+    drop(eph_secret);
+    (keys, eph_pub, body)
+}
+
+/// Open a circuit-frame body that was sealed with
+/// [`seal_circuit_payload_with_fresh_eph`].
+///
+/// Extracts `client_eph_pub` from the first 32 bytes of `body`, computes
+/// `DH(gateway_static_secret, client_eph_pub)`, derives `CircuitKeys`
+/// (responder role), and decrypts the remainder of `body` with `recv_key`.
+///
+/// Returns `Some((client_eph_pub, plaintext))` on success, or `None` on AEAD
+/// authentication failure (I20 — never throws).
+#[must_use]
+pub fn open_circuit_payload_with_fresh_eph(
+    gateway_static_secret: &X25519Secret,
+    body: &[u8],
+) -> Option<(X25519PubKey, Vec<u8>)> {
+    if body.len() < CIRCUIT_EPH_PUB_LEN {
+        return None;
+    }
+    let mut eph_pub_arr = [0u8; 32];
+    eph_pub_arr.copy_from_slice(&body[..CIRCUIT_EPH_PUB_LEN]);
+    let eph_pub = x25519_public_from_bytes(&eph_pub_arr);
+    let dh = x25519_dh(gateway_static_secret, &eph_pub);
+    let keys = derive_circuit_keys_from_dh(&dh, false);
+    let sealed = &body[CIRCUIT_EPH_PUB_LEN..];
+    let plaintext = decrypt_circuit_payload(&keys.recv_key, sealed)?;
+    Some((eph_pub, plaintext))
+}
+
+/// Derive the gateway's response-direction circuit key from the SAME
+/// `DH(client_eph, gateway_static)` used to open the request.
+///
+/// After the gateway has opened the request (via
+/// [`open_circuit_payload_with_fresh_eph`]), it uses this function to derive
+/// the `send_key` for encrypting the response. The response frame body is
+/// just the sealed TransitResponse (NO eph-pub prefix — the gateway's static
+/// key is already known to the client, and the client derived `recv_key`
+/// alongside `send_key` in [`seal_circuit_payload_with_fresh_eph`]).
+///
+/// Returns the `CircuitKeys` (in responder role) so the gateway can call
+/// `encrypt_circuit_payload(&keys.send_key, ...)` for the response.
+#[must_use]
+pub fn derive_gateway_response_keys(
+    gateway_static_secret: &X25519Secret,
+    client_eph_pub: &X25519PubKey,
+) -> CircuitKeys {
+    let dh = x25519_dh(gateway_static_secret, client_eph_pub);
+    derive_circuit_keys_from_dh(&dh, false)
 }
 
 /// AAD used for circuit-layer AEAD. Distinguishes circuit ciphertext from

@@ -21,8 +21,14 @@ use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+// X25519 primitives for the SNP-IK/0.1 handshake (ADR-0006). We import the
+// `StaticSecret` (used for both static AND ephemeral X25519 secrets in
+// SNP-IK/0.1 — see `x25519_ephemeral_keypair` for why `EphemeralSecret` is
+// not suitable) and the corresponding `PublicKey`.
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 /// Errors from SNP cryptographic operations.
 #[derive(Debug, Error)]
@@ -309,6 +315,80 @@ pub const NODE_ID_DOMAIN: &[u8] = b"SNP/0.1 node\0";
 #[must_use]
 pub fn derive_node_id(public_key: &PublicKey) -> [u8; 32] {
     domain_hash(NODE_ID_DOMAIN, public_key)
+}
+
+// === X25519 (Curve25519 ECDH) — SNP-IK/0.1 handshake primitive ===
+
+/// Re-export of `x25519_dalek::StaticSecret` so downstream callers (snp-link's
+/// SNP-IK/0.1 handshake) can construct and hold static X25519 rendezvous keys
+/// without depending on `x25519-dalek` directly. The "static" key is the
+/// persistent rendezvous keypair advertised in a node's `NodeDescriptor`.
+pub type X25519Secret = X25519StaticSecret;
+
+/// Re-export of `x25519_dalek::PublicKey` (X25519 public key, 32 bytes on the
+/// wire per I3).
+pub type X25519PubKey = X25519PublicKey;
+
+/// Generate an X25519 static keypair for the SNP-IK/0.1 handshake.
+///
+/// Per ADR-0006, each node holds an X25519 "rendezvous" keypair that is
+/// advertised in its signed `NodeDescriptor`. The secret never leaves the
+/// node; the public key is published. The SNP-IK/0.1 handshake uses this
+/// static keypair in combination with a fresh ephemeral X25519 keypair
+/// (generated inside [`x25519_ephemeral_keypair`]) to derive directional AEAD
+/// link keys via three DH operations.
+///
+/// # Panics
+/// Panics if the OS CSPRNG is unavailable (`OsRng` failure). In practice this
+/// cannot fail on any supported platform (Linux 3.17+, Windows, macOS,
+/// Android, iOS).
+#[must_use]
+pub fn x25519_static_keypair() -> (X25519StaticSecret, X25519PublicKey) {
+    let secret = X25519StaticSecret::random_from_rng(&mut OsRng);
+    let public = X25519PublicKey::from(&secret);
+    (secret, public)
+}
+
+/// Generate an ephemeral X25519 keypair for the SNP-IK/0.1 handshake.
+///
+/// Per ADR-0006, each side generates a FRESH ephemeral X25519 keypair per
+/// handshake — this provides forward secrecy (compromising both static keys
+/// after the handshake does not recover the derived link keys, because the
+/// ephemeral secrets are erased after the DH computation).
+///
+/// The `StaticSecret` type is used to hold the ephemeral secret because the
+/// SNP-IK/0.1 construction needs to perform MULTIPLE DH operations with the
+/// SAME ephemeral secret (dh1 = eph × peer_static, dh3 = eph × peer_eph).
+/// The `EphemeralSecret` type from x25519-dalek consumes itself on the first
+/// `diffie_hellman` call, which would prevent computing dh3 after dh1.
+///
+/// # Panics
+/// Panics if the OS CSPRNG is unavailable.
+#[must_use]
+pub fn x25519_ephemeral_keypair() -> (X25519StaticSecret, X25519PublicKey) {
+    let secret = X25519StaticSecret::random_from_rng(&mut OsRng);
+    let public = X25519PublicKey::from(&secret);
+    (secret, public)
+}
+
+/// Compute the X25519 shared secret from a secret key and a peer's public key.
+///
+/// Returns the raw 32-byte DH output. The caller is responsible for feeding
+/// this into HKDF (with appropriate salt/info) to derive AEAD keys — see
+/// [`snp_link::derive_link_keys_from_dh`](../snp_link/fn.derive_link_keys_from_dh.html).
+#[must_use]
+pub fn x25519_dh(secret: &X25519StaticSecret, peer_public: &X25519PublicKey) -> [u8; 32] {
+    secret.diffie_hellman(peer_public).to_bytes()
+}
+
+/// Convert a 32-byte X25519 public key (raw wire form, per I3) into an
+/// `x25519_dalek::PublicKey`. x25519-dalek accepts any 32 bytes (Curve25519
+/// public keys are elements of GF(2^255 - 19), and any 32-byte string is a
+/// valid representative of such an element via the standard little-endian
+/// decoding), so this conversion never fails in practice.
+#[must_use]
+pub fn x25519_public_from_bytes(bytes: &[u8; 32]) -> X25519PublicKey {
+    X25519PublicKey::from(*bytes)
 }
 
 /// Domain-separation tag for the Merkle empty-tree root.
