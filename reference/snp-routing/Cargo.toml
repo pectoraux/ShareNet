@@ -1,0 +1,20 @@
+[package]
+name = "snp-routing"
+description = "L6 gateway-anchored routing, path-vector loop detection, metrics, migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+snp-identity.workspace = true
+snp-discovery.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

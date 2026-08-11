@@ -1,0 +1,198 @@
+{
+  "suite": "gateway",
+  "specSection": "SNP/0.1 §8",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.957Z",
+  "vectors": [
+    {
+      "id": "transit-request-mode-a-e2e",
+      "description": "Mode A TransitRequest with tlsTermination=PAYLOAD_E2E.",
+      "input": {
+        "clientPublicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      },
+      "expected": {
+        "verifies": true
+      }
+    },
+    {
+      "id": "transit-response-mode-a",
+      "description": "TransitResponse body is a content-addressed ObjectId — reuses CAS, chunking, Merkle verification.",
+      "input": {
+        "gatewayPublicKeyHex": "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+      },
+      "expected": {
+        "verifies": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-10_0_0_1",
+      "description": "Gateway MUST reject egress to '10.0.0.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "10.0.0.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-172_16_0_1",
+      "description": "Gateway MUST reject egress to '172.16.0.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "172.16.0.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-192_168_1_1",
+      "description": "Gateway MUST reject egress to '192.168.1.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "192.168.1.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-127_0_0_1",
+      "description": "Gateway MUST reject egress to '127.0.0.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "127.0.0.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-169_254_1_1",
+      "description": "Gateway MUST reject egress to '169.254.1.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "169.254.1.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-224_0_0_1",
+      "description": "Gateway MUST reject egress to '224.0.0.1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "224.0.0.1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-localhost",
+      "description": "Gateway MUST reject egress to 'localhost' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "localhost"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-internal_local",
+      "description": "Gateway MUST reject egress to 'internal.local' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "internal.local"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-__1",
+      "description": "Gateway MUST reject egress to '::1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "::1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-fe80__1",
+      "description": "Gateway MUST reject egress to 'fe80::1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "fe80::1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-fc00__1",
+      "description": "Gateway MUST reject egress to 'fc00::1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "fc00::1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-reject-private-ff02__1",
+      "description": "Gateway MUST reject egress to 'ff02::1' (I18, T9 SSRF defence).",
+      "input": {
+        "host": "ff02::1"
+      },
+      "expected": {
+        "isPrivate": true
+      }
+    },
+    {
+      "id": "gateway-allow-public-example_com",
+      "description": "Public destination 'example.com' must NOT be flagged as private.",
+      "input": {
+        "host": "example.com"
+      },
+      "expected": {
+        "isPrivate": false
+      }
+    },
+    {
+      "id": "gateway-allow-public-1_1_1_1",
+      "description": "Public destination '1.1.1.1' must NOT be flagged as private.",
+      "input": {
+        "host": "1.1.1.1"
+      },
+      "expected": {
+        "isPrivate": false
+      }
+    },
+    {
+      "id": "gateway-allow-public-8_8_8_8",
+      "description": "Public destination '8.8.8.8' must NOT be flagged as private.",
+      "input": {
+        "host": "8.8.8.8"
+      },
+      "expected": {
+        "isPrivate": false
+      }
+    },
+    {
+      "id": "gateway-allow-public-2606_4700_4700__1111",
+      "description": "Public destination '2606:4700:4700::1111' must NOT be flagged as private.",
+      "input": {
+        "host": "2606:4700:4700::1111"
+      },
+      "expected": {
+        "isPrivate": false
+      }
+    },
+    {
+      "id": "gateway-reject-mode-a-without-tls-termination",
+      "description": "Mode A TransitRequest without tlsTermination MUST be rejected. Silent plaintext forbidden (I17).",
+      "input": {
+        "tlsTermination": null
+      },
+      "expected": {
+        "mustReject": true
+      }
+    }
+  ]
+}

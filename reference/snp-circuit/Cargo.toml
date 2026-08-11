@@ -1,0 +1,20 @@
+[package]
+name = "snp-circuit"
+description = "L6/L7 circuit abstraction, E2E AEAD, replay windows for ShareNet 2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+snp-identity.workspace = true
+snp-routing.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

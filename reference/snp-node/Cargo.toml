@@ -1,0 +1,31 @@
+[package]
+name = "snp-node"
+description = "ShareNet 2.0 reference daemon — ties all SNP crates together"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "snp-node"
+path = "src/main.rs"
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+snp-object.workspace = true
+snp-identity.workspace = true
+snp-link.workspace = true
+snp-discovery.workspace = true
+snp-sync.workspace = true
+snp-routing.workspace = true
+snp-circuit.workspace = true
+snp-gateway.workspace = true
+snp-civic.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

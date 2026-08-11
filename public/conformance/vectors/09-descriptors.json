@@ -1,0 +1,45 @@
+{
+  "suite": "descriptors",
+  "specSection": "SNP/0.1 §4.4, §5.1",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.945Z",
+  "vectors": [
+    {
+      "id": "node-descriptor-sign-and-verify",
+      "description": "NodeDescriptor signed by the node's Ed25519 key.",
+      "input": {
+        "nodePublicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      },
+      "expected": {
+        "verifies": true,
+        "isExpired": false
+      }
+    },
+    {
+      "id": "gateway-advert-sign-and-verify",
+      "description": "GatewayAdvert signed by the gateway's key. Includes egress policy, capacity, remainingQuota (metered-SIM protection).",
+      "input": {
+        "gatewayPublicKeyHex": "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+      },
+      "expected": {
+        "verifies": true,
+        "hasModeC": true,
+        "supportsE2E": true
+      }
+    },
+    {
+      "id": "capability-platform-ios-no-relay",
+      "description": "iOS MUST NOT advertise MESH_RELAY or INTERNET_GATEWAY (03-PLATFORM-MATRIX.md §4). I12.",
+      "input": {
+        "platform": "ios",
+        "capabilities": [
+          "MESH_CLIENT",
+          "MESH_RELAY"
+        ]
+      },
+      "expected": {
+        "mustReject": true
+      }
+    }
+  ]
+}

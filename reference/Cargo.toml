@@ -1,0 +1,77 @@
+# ShareNet 2.0 — Rust reference implementation workspace.
+#
+# This workspace contains the canonical Rust crates per
+# /public/spec/07-MIGRATION-AND-ROADMAP.md §3 (Deliverable 22). The crate
+# layout is the authoritative structure for the production reference
+# implementation. See README.md for status and build instructions.
+#
+# SKELETON — crates are stubs. See the TypeScript reference in /src/lib/snp/
+# for the working implementation (ADR-0001) until Rust reaches parity.
+
+[workspace]
+resolver = "2"
+members = [
+    "snp-cbor",
+    "snp-crypto",
+    "snp-object",
+    "snp-identity",
+    "snp-link",
+    "snp-discovery",
+    "snp-sync",
+    "snp-routing",
+    "snp-circuit",
+    "snp-gateway",
+    "snp-civic",
+    "snp-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pectoraux/ShareNet"
+authors = ["ShareNet contributors"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+# CBOR
+ciborium = "0.2"
+# Async
+tokio = { version = "1", features = ["full"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Errors
+thiserror = "1"
+# Logging
+tracing = "0.1"
+
+# Internal crates (declared here so siblings can depend on each other via
+# `dep.workspace = true` style relative paths without re-stating versions).
+snp-cbor = { path = "snp-cbor" }
+snp-crypto = { path = "snp-crypto" }
+snp-object = { path = "snp-object" }
+snp-identity = { path = "snp-identity" }
+snp-link = { path = "snp-link" }
+snp-discovery = { path = "snp-discovery" }
+snp-sync = { path = "snp-sync" }
+snp-routing = { path = "snp-routing" }
+snp-circuit = { path = "snp-circuit" }
+snp-gateway = { path = "snp-gateway" }
+snp-civic = { path = "snp-civic" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+debug = true

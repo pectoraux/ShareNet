@@ -1,0 +1,15 @@
+[package]
+name = "snp-cbor"
+description = "Canonical CBOR per RFC 8949 §4.2.1 for ShareNet 2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+# Conformance vector tests will load JSON from /conformance/vectors/01-cbor.json
+serde_json.workspace = true

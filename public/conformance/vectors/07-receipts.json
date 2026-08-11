@@ -1,0 +1,61 @@
+{
+  "suite": "receipts",
+  "specSection": "SNP/0.1 §A4, 05 §A3",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.936Z",
+  "vectors": [
+    {
+      "id": "delivery-receipt-sign-and-verify",
+      "description": "DeliveryReceipt signed by the recipient (Alice). Beneficiary signs → claimant cannot forge (I13).",
+      "input": {
+        "recipientPublicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      },
+      "expected": {
+        "verifies": true
+      }
+    },
+    {
+      "id": "transit-receipt-sign-and-verify",
+      "description": "TransitReceipt signed by the CLIENT (Bob). Relay is CREDITED but does NOT sign. This replaces pointsForBridging (audit R7).",
+      "input": {
+        "clientPublicKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+      },
+      "expected": {
+        "verifies": true
+      }
+    },
+    {
+      "id": "gateway-receipt-countersigned",
+      "description": "GatewayReceipt counter-signed by BOTH client and gateway. Gateway bears real egress cost, so it attests volume.",
+      "input": {
+        "clientPublicKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "gatewayPublicKeyHex": "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+      },
+      "expected": {
+        "verifies": true
+      }
+    },
+    {
+      "id": "receipt-cross-type-replay-rejection",
+      "description": "A DeliveryReceipt signature MUST NOT verify as a TransitReceipt (different SIG_CONTEXT). I2 domain separation.",
+      "input": {
+        "deliverySigHex": "6041ceb48cb0d8796749b230b1a39838a93ca89f7537195f12d7238b443f8d8692222d0e43a3dd910350b6c8a090fbcb17566449584a18872cf9b87c01868c03",
+        "tryVerifyAs": "transitReceipt",
+        "recipientPublicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      },
+      "expected": {
+        "verifies": false
+      }
+    },
+    {
+      "id": "custody-receipt-chain",
+      "description": "CustodyReceipt signed by NEXT custodian (Dave). Carol is credited; Dave (beneficiary) signs. Chain-verifiable.",
+      "input": {
+        "nextCustodianPublicKeyHex": "1572d1106794c3dbbbe56e8e8c8aea59eb0c4c4db1bc5c063021d3631360f7ad"
+      },
+      "expected": {
+        "verifies": true
+      }
+    }
+  ]
+}

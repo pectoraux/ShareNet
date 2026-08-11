@@ -1,0 +1,20 @@
+[package]
+name = "snp-civic"
+description = "L11 contribution proofs and value function (NOT settlement — human-gated)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+snp-identity.workspace = true
+snp-gateway.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

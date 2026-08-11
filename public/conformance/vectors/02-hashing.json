@@ -1,0 +1,193 @@
+{
+  "suite": "hashing",
+  "specSection": "SNP/0.1 §1.1, §1.2",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.033Z",
+  "vectors": [
+    {
+      "id": "sha256-empty",
+      "description": "SHA-256 of empty input.",
+      "input": {
+        "hex": ""
+      },
+      "expected": {
+        "hashHex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "id": "sha256-abc",
+      "description": "SHA-256 of 'abc' — the NIST FIPS 180-4 test vector.",
+      "input": {
+        "text": "abc"
+      },
+      "expected": {
+        "hashHex": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      }
+    },
+    {
+      "id": "sig-context-manifest",
+      "description": "SIG_CONTEXT for manifest: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "manifest"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31206d616e696665737400",
+        "contextLength": 17
+      }
+    },
+    {
+      "id": "sig-context-deliveryReceipt",
+      "description": "SIG_CONTEXT for deliveryReceipt: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "deliveryReceipt"
+      },
+      "expected": {
+        "contextHex": "534e502f302e312064656c69766572792d7265636569707400",
+        "contextLength": 25
+      }
+    },
+    {
+      "id": "sig-context-transitReceipt",
+      "description": "SIG_CONTEXT for transitReceipt: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "transitReceipt"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31207472616e7369742d7265636569707400",
+        "contextLength": 24
+      }
+    },
+    {
+      "id": "sig-context-gatewayReceipt",
+      "description": "SIG_CONTEXT for gatewayReceipt: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "gatewayReceipt"
+      },
+      "expected": {
+        "contextHex": "534e502f302e3120676174657761792d7265636569707400",
+        "contextLength": 24
+      }
+    },
+    {
+      "id": "sig-context-custodyReceipt",
+      "description": "SIG_CONTEXT for custodyReceipt: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "custodyReceipt"
+      },
+      "expected": {
+        "contextHex": "534e502f302e3120637573746f64792d7265636569707400",
+        "contextLength": 24
+      }
+    },
+    {
+      "id": "sig-context-nodeDescriptor",
+      "description": "SIG_CONTEXT for nodeDescriptor: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "nodeDescriptor"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31206e6f64652d64657363726970746f7200",
+        "contextLength": 24
+      }
+    },
+    {
+      "id": "sig-context-gatewayAdvert",
+      "description": "SIG_CONTEXT for gatewayAdvert: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "gatewayAdvert"
+      },
+      "expected": {
+        "contextHex": "534e502f302e3120676174657761792d61647665727400",
+        "contextLength": 23
+      }
+    },
+    {
+      "id": "sig-context-routeAdvert",
+      "description": "SIG_CONTEXT for routeAdvert: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "routeAdvert"
+      },
+      "expected": {
+        "contextHex": "534e502f302e3120726f7574652d61647665727400",
+        "contextLength": 21
+      }
+    },
+    {
+      "id": "sig-context-revocation",
+      "description": "SIG_CONTEXT for revocation: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "revocation"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31207265766f636174696f6e00",
+        "contextLength": 19
+      }
+    },
+    {
+      "id": "sig-context-deviceCert",
+      "description": "SIG_CONTEXT for deviceCert: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "deviceCert"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31206465766963652d6365727400",
+        "contextLength": 20
+      }
+    },
+    {
+      "id": "sig-context-transitRequest",
+      "description": "SIG_CONTEXT for transitRequest: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "transitRequest"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31207472616e7369742d7265717565737400",
+        "contextLength": 24
+      }
+    },
+    {
+      "id": "sig-context-transitResponse",
+      "description": "SIG_CONTEXT for transitResponse: ASCII bytes (incl. trailing 0x00) prefixing every signature preimage of this type.",
+      "input": {
+        "contextName": "transitResponse"
+      },
+      "expected": {
+        "contextHex": "534e502f302e31207472616e7369742d726573706f6e736500",
+        "contextLength": 25
+      }
+    },
+    {
+      "id": "hkdf-sha256-rfc5869-test1",
+      "description": "HKDF-SHA256 RFC 5869 Test Case 1.",
+      "input": {
+        "ikm": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "salt": "000102030405060708090a0b0c",
+        "info": "f0f1f2f3f4f5f6f7f8f9",
+        "length": 42
+      },
+      "expected": {
+        "okmHex": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+      }
+    },
+    {
+      "id": "nodeid-derivation-alice",
+      "description": "NodeId = SHA-256('SNP/0.1 node\\0' ‖ ed25519_public_key). I4: NodeId is a HASH of the key, not the key itself.",
+      "input": {
+        "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      },
+      "expected": {
+        "nodeIdHex": "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+      }
+    },
+    {
+      "id": "merkle-empty-root",
+      "description": "Merkle root of an empty leaf set = SHA-256('SNP/0.1 empty\\0').",
+      "input": {
+        "leaves": 0
+      },
+      "expected": {
+        "rootHex": "8b8f6a4bed03dd03c795484fb1354b67e707ae7f4e8587b03ee10341d299cc8b"
+      }
+    }
+  ]
+}

@@ -1,0 +1,272 @@
+{
+  "suite": "negative",
+  "specSection": "06 §A5",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.959Z",
+  "vectors": [
+    {
+      "id": "negative-cbor-non-canonical-key-order",
+      "description": "CBOR map with keys in non-canonical (lexicographic) order MUST be rejected. Audit found Kotlin used lexicographic instead of encoded-bytes order.",
+      "input": {
+        "cborHex": "a26362636401616102"
+      },
+      "expected": {
+        "mustReject": true,
+        "errorCode": "NON_CANONICAL"
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-cbor-duplicate-keys",
+      "description": "CBOR map with duplicate keys MUST be rejected (RFC 8949, SNP-CBOR §1 rule 4).",
+      "input": {
+        "cborHex": "a2616101616102"
+      },
+      "expected": {
+        "mustReject": true,
+        "errorCode": "DUPLICATE_KEY"
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-cbor-trailing-bytes",
+      "description": "CBOR with trailing bytes after a complete item MUST be rejected (§1 rule 6).",
+      "input": {
+        "cborHex": "0001"
+      },
+      "expected": {
+        "mustReject": true,
+        "errorCode": "TRAILING_BYTES"
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-cbor-indefinite-length",
+      "description": "Indefinite-length encoding (0x9f...0xff) is forbidden in SNP-CBOR (§1 rule 2).",
+      "input": {
+        "cborHex": "9f01ff"
+      },
+      "expected": {
+        "mustReject": true,
+        "errorCode": "NON_CANONICAL"
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-signature-valid-length-wrong-content",
+      "description": "A 64-byte signature that does not match the payload MUST verify false. Counter to FakeCryptoProvider.verify() => signature.size == 64.",
+      "input": {
+        "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "payload": {
+          "x": 2
+        },
+        "contextName": "manifest",
+        "signatureHex": "13db2685282f54fa2da0217a670a9287d7df1e035b3738b6436cf9b3004a9df4f0d42dbda3bbffadd69390e36cce6ac37f85097d75ba0f07e3eb152a2004460c"
+      },
+      "expected": {
+        "verifies": false
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-frame-ttl-zero-forwarded",
+      "description": "TTL=0 frame MUST NOT be forwarded. forwardFrame() must throw.",
+      "input": {
+        "frame": {
+          "v": 1,
+          "cls": "A",
+          "dst": {
+            "0": 74,
+            "1": 233,
+            "2": 92,
+            "3": 203,
+            "4": 65,
+            "5": 84,
+            "6": 77,
+            "7": 204,
+            "8": 222,
+            "9": 34,
+            "10": 236,
+            "11": 169,
+            "12": 122,
+            "13": 124,
+            "14": 220,
+            "15": 153,
+            "16": 16,
+            "17": 28,
+            "18": 181,
+            "19": 170,
+            "20": 145,
+            "21": 96,
+            "22": 108,
+            "23": 37,
+            "24": 123,
+            "25": 86,
+            "26": 205,
+            "27": 211,
+            "28": 91,
+            "29": 65,
+            "30": 73,
+            "31": 19
+          },
+          "src": {
+            "0": 15,
+            "1": 77,
+            "2": 181,
+            "3": 179,
+            "4": 38,
+            "5": 97,
+            "6": 236,
+            "7": 105,
+            "8": 158,
+            "9": 95,
+            "10": 203,
+            "11": 239,
+            "12": 171,
+            "13": 232,
+            "14": 169,
+            "15": 172,
+            "16": 17,
+            "17": 103,
+            "18": 15,
+            "19": 199,
+            "20": 223,
+            "21": 94,
+            "22": 98,
+            "23": 198,
+            "24": 234,
+            "25": 26,
+            "26": 155,
+            "27": 135,
+            "28": 43,
+            "29": 243,
+            "30": 194,
+            "31": 212
+          },
+          "ttl": 0,
+          "fid": {
+            "0": 10,
+            "1": 123,
+            "2": 190,
+            "3": 51,
+            "4": 154,
+            "5": 135,
+            "6": 26,
+            "7": 154
+          },
+          "seq": 1,
+          "body": {
+            "0": 1
+          }
+        }
+      },
+      "expected": {
+        "forwardThrows": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-route-advert-contains-own-nodeid",
+      "description": "RouteAdvert containing local node's own NodeId in pathVector MUST be discarded (spec §6.3).",
+      "input": {
+        "pathVector": [
+          "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+        ],
+        "localNodeId": "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+      },
+      "expected": {
+        "containsLoop": true,
+        "mustDiscard": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-route-advert-regressed-seq",
+      "description": "RouteAdvert with seq < best-known MUST be discarded (spec §6.3).",
+      "input": {
+        "newSeq": 3,
+        "bestKnownSeq": 7
+      },
+      "expected": {
+        "isRegression": true,
+        "mustDiscard": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-gateway-connect-private-destination",
+      "description": "Gateway MUST reject CONNECT to 192.168.1.1:80 (RFC 1918). Without this, a gateway is an SSRF pivot (T9).",
+      "input": {
+        "host": "192.168.1.1",
+        "port": 80
+      },
+      "expected": {
+        "isPrivate": true,
+        "mustReject": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-mode-a-without-tls-termination",
+      "description": "Mode A TransitRequest without tlsTermination MUST be rejected. Silent plaintext forbidden (I17).",
+      "input": {
+        "tlsTermination": null
+      },
+      "expected": {
+        "mustReject": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-manifest-chunkcount-mismatch",
+      "description": "Manifest whose chunkCount ≠ actual chunk count MUST be rejected. Closes Merkle ambiguity.",
+      "input": {
+        "chunkCount": 99,
+        "actualChunks": 3
+      },
+      "expected": {
+        "mustReject": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-un-revoke",
+      "description": "A message attempting to reverse a revocation MUST be rejected. Revocation is monotone (I15).",
+      "input": {
+        "revokedAt": 1710000000,
+        "unRevokeAt": 1710001000
+      },
+      "expected": {
+        "mustReject": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-ios-advertising-mesh-relay",
+      "description": "iOS node advertising MESH_RELAY MUST be rejected (I12). iOS cannot sustain background relaying.",
+      "input": {
+        "platform": "ios",
+        "capabilities": [
+          "MESH_RELAY"
+        ]
+      },
+      "expected": {
+        "mustReject": true
+      },
+      "mustReject": true
+    },
+    {
+      "id": "negative-receipt-signed-by-claimant",
+      "description": "TransitReceipt signed by relay (claimant) instead of client (beneficiary) MUST fail verification against the client's key. I13.",
+      "input": {
+        "relaySignsAsClaimant": true,
+        "clientPublicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "relayPublicKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+      },
+      "expected": {
+        "verifiesAgainstClientKey": false
+      },
+      "mustReject": true
+    }
+  ]
+}

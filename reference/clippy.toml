@@ -1,0 +1,20 @@
+# clippy configuration for the ShareNet Rust reference implementation.
+# See: https://rust-lang.github.io/rust-clippy/master/index.html
+
+# Treat warnings as errors in CI; comment locally for development.
+# (Set RUSTFLAGS="-D warnings" in CI rather than here, because this file
+# does not support `warn = ...`. Keep thresholds only.)
+
+# Allow functions up to 100 lines (some protocol message decoders are long).
+cognitive-complexity-threshold = 50
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+single-char-binding-names-threshold = 4
+
+# Doc comments are required on public items in the reference implementation.
+# Enforced via `#[warn(missing_docs)]` on each crate's lib.rs, not here.
+
+# Standard lint sets are configured in each crate's `lib.rs` via:
+#   #![warn(missing_docs)]
+#   #![warn(clippy::all, clippy::pedantic)]
+#   #![allow(clippy::module_name_repetitions)]

@@ -1,0 +1,17 @@
+[package]
+name = "snp-identity"
+description = "Four-way identity split: NodeId, DeviceCert, NodeDescriptor, capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

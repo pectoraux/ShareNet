@@ -1,0 +1,18 @@
+[package]
+name = "snp-object"
+description = "Chunking, RFC 6962 Merkle trees, CAS, and Manifests for ShareNet 2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

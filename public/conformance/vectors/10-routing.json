@@ -1,0 +1,55 @@
+{
+  "suite": "routing",
+  "specSection": "SNP/0.1 §6",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.949Z",
+  "vectors": [
+    {
+      "id": "route-advert-sign-and-verify",
+      "description": "RouteAdvert signed by the destination (gateway). Only origin-owned fields signed (spec §6.3).",
+      "input": {
+        "gatewayPublicKeyHex": "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"
+      },
+      "expected": {
+        "verifies": true,
+        "cost": 49991
+      }
+    },
+    {
+      "id": "route-loop-detection",
+      "description": "RouteAdvert containing the local node's own NodeId in pathVector MUST be discarded (spec §6.3).",
+      "input": {
+        "pathVector": [
+          "bb8735df95932686a03be88b7b03b8cb3c51a7afebb63bf12bb429943a87205b",
+          "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+        ],
+        "localNodeId": "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+      },
+      "expected": {
+        "containsLoop": true
+      }
+    },
+    {
+      "id": "route-seq-regression",
+      "description": "RouteAdvert with seq < best-known MUST be discarded (spec §6.3).",
+      "input": {
+        "newSeq": 1,
+        "bestKnownSeq": 5
+      },
+      "expected": {
+        "isRegression": true
+      }
+    },
+    {
+      "id": "route-gateway-migration",
+      "description": "When gateway A fails, selectAlternateGateway returns best route to a DIFFERENT gateway (spec §6.7).",
+      "input": {
+        "failedGatewayId": "5cde20b7f7353f9583987f8c58dad803ad7e07392be3c019578b79cc5a0b4c1d"
+      },
+      "expected": {
+        "alternateDestinationHex": "0f4db5b32661ec699e5fcbefabe8a9ac11670fc7df5e62c6ea1a9b872bf3c2d4",
+        "alternateIsDifferent": true
+      }
+    }
+  ]
+}

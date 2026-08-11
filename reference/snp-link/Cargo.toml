@@ -1,0 +1,19 @@
+[package]
+name = "snp-link"
+description = "L8 Link abstraction and Noise_IK handshake structure for ShareNet 2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-cbor.workspace = true
+snp-crypto.workspace = true
+snp-identity.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,231 @@
+{
+  "suite": "cbor",
+  "specSection": "SNP/0.1 §1",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.009Z",
+  "vectors": [
+    {
+      "id": "cbor-map-ordering-length-first",
+      "description": "RFC 8949 §4.2.1 — keys sorted by fully encoded bytes (length-first for text keys). This is the audit's normative example: Kotlin's lexicographic sort produced a DIFFERENT byte order than Python's encoded-bytes sort.",
+      "input": {
+        "map": {
+          "id": "x",
+          "capturedAt": 1710000000,
+          "sourceLang": "tw",
+          "sourceText": "Hello",
+          "targetLang": "en",
+          "modelVersion": "v1",
+          "contributorId": "user-1",
+          "correctedText": "Hello",
+          "originalModelOutput": "Hello"
+        }
+      },
+      "expected": {
+        "cborHex": "a962696461786a636170747572656441741a65ec87806a736f757263654c616e676274776a736f75726365546578746548656c6c6f6a7461726765744c616e6762656e6c6d6f64656c56657273696f6e6276316d636f6e7472696275746f72496466757365722d316d636f72726563746564546578746548656c6c6f736f726967696e616c4d6f64656c4f75747075746548656c6c6f"
+      }
+    },
+    {
+      "id": "cbor-int-shortest-0",
+      "description": "Integer 0 encodes as a single byte 0x00.",
+      "input": {
+        "value": 0
+      },
+      "expected": {
+        "cborHex": "00"
+      }
+    },
+    {
+      "id": "cbor-int-shortest-23",
+      "description": "Integer 23 encodes as a single byte 0x17.",
+      "input": {
+        "value": 23
+      },
+      "expected": {
+        "cborHex": "17"
+      }
+    },
+    {
+      "id": "cbor-int-1byte-24",
+      "description": "Integer 24 requires the 1-byte form (0x18 0x18).",
+      "input": {
+        "value": 24
+      },
+      "expected": {
+        "cborHex": "1818"
+      }
+    },
+    {
+      "id": "cbor-int-1byte-255",
+      "description": "Integer 255 uses 1-byte form (0x18 0xff).",
+      "input": {
+        "value": 255
+      },
+      "expected": {
+        "cborHex": "18ff"
+      }
+    },
+    {
+      "id": "cbor-int-2byte-256",
+      "description": "Integer 256 uses 2-byte form.",
+      "input": {
+        "value": 256
+      },
+      "expected": {
+        "cborHex": "190100"
+      }
+    },
+    {
+      "id": "cbor-int-4byte-65536",
+      "description": "Integer 65536 uses 4-byte form.",
+      "input": {
+        "value": 65536
+      },
+      "expected": {
+        "cborHex": "1a00010000"
+      }
+    },
+    {
+      "id": "cbor-int-negative-1",
+      "description": "Integer -1 encodes as 0x20.",
+      "input": {
+        "value": -1
+      },
+      "expected": {
+        "cborHex": "20"
+      }
+    },
+    {
+      "id": "cbor-bytestring-empty",
+      "description": "Empty byte string encodes as 0x40.",
+      "input": {
+        "type": "bstr",
+        "hex": ""
+      },
+      "expected": {
+        "cborHex": "40"
+      }
+    },
+    {
+      "id": "cbor-bytestring-3-bytes",
+      "description": "3-byte bstr 0x010203 encodes as 0x43 0x01 0x02 0x03.",
+      "input": {
+        "type": "bstr",
+        "hex": "010203"
+      },
+      "expected": {
+        "cborHex": "43010203"
+      }
+    },
+    {
+      "id": "cbor-textstring-empty",
+      "description": "Empty text string encodes as 0x60.",
+      "input": {
+        "type": "tstr",
+        "value": ""
+      },
+      "expected": {
+        "cborHex": "60"
+      }
+    },
+    {
+      "id": "cbor-textstring-hello",
+      "description": "Text string 'Hello' (5 bytes) encodes as 0x65 + UTF-8.",
+      "input": {
+        "type": "tstr",
+        "value": "Hello"
+      },
+      "expected": {
+        "cborHex": "6548656c6c6f"
+      }
+    },
+    {
+      "id": "cbor-non-ascii-keys-length-first",
+      "description": "Map with non-ASCII (CJK) keys. Length-first ordering: 'age' (3 bytes) < '名' (3 bytes, bytewise '名' > 'age') < '名前' (6 bytes).",
+      "input": {
+        "map": {
+          "名前": "Alice",
+          "age": 30,
+          "名": "Bob"
+        }
+      },
+      "expected": {
+        "cborHex": "a363616765181e63e5908d63426f6266e5908de5898d65416c696365"
+      }
+    },
+    {
+      "id": "cbor-nested-array",
+      "description": "Nested array [1, [2, 3], [4, [5]]].",
+      "input": {
+        "type": "array",
+        "value": [
+          1,
+          [
+            2,
+            3
+          ],
+          [
+            4,
+            [
+              5
+            ]
+          ]
+        ]
+      },
+      "expected": {
+        "cborHex": "830182020382048105"
+      }
+    },
+    {
+      "id": "cbor-null",
+      "description": "null encodes as 0xf6.",
+      "input": {
+        "value": null
+      },
+      "expected": {
+        "cborHex": "f6"
+      }
+    },
+    {
+      "id": "cbor-true",
+      "description": "true encodes as 0xf5.",
+      "input": {
+        "value": true
+      },
+      "expected": {
+        "cborHex": "f5"
+      }
+    },
+    {
+      "id": "cbor-false",
+      "description": "false encodes as 0xf4.",
+      "input": {
+        "value": false
+      },
+      "expected": {
+        "cborHex": "f4"
+      }
+    },
+    {
+      "id": "cbor-empty-map",
+      "description": "Empty map {} encodes as 0xa0.",
+      "input": {
+        "type": "map",
+        "value": {}
+      },
+      "expected": {
+        "cborHex": "a0"
+      }
+    },
+    {
+      "id": "cbor-empty-array",
+      "description": "Empty array [] encodes as 0x80.",
+      "input": {
+        "type": "array",
+        "value": []
+      },
+      "expected": {
+        "cborHex": "80"
+      }
+    }
+  ]
+}

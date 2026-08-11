@@ -1,0 +1,277 @@
+{
+  "suite": "merkle",
+  "specSection": "SNP/0.1 §3.2",
+  "generatedBy": "snp-typescript-reference",
+  "generatedAt": "2026-08-11T04:19:42.916Z",
+  "vectors": [
+    {
+      "id": "merkle-1-leaf",
+      "description": "Single-leaf tree: root = leaf_hash(chunk).",
+      "input": {
+        "leaves": [
+          "010203"
+        ]
+      },
+      "expected": {
+        "rootHex": "054edec1d0211f624fed0cbca9d4f9400b0e491c43742af2c5b0abebf0c990d8",
+        "leafHashHex": "054edec1d0211f624fed0cbca9d4f9400b0e491c43742af2c5b0abebf0c990d8"
+      }
+    },
+    {
+      "id": "merkle-2-leaves",
+      "description": "Two-leaf tree: root = node_hash(leaf_hash(L), leaf_hash(R)). Verifies 0x01 prefix on internal nodes.",
+      "input": {
+        "leaves": [
+          "01",
+          "02"
+        ]
+      },
+      "expected": {
+        "rootHex": "6bcf0e2e93e0a18e22789aee965e6553f4fbe93f0acfc4a705d691c8311c4965",
+        "expectedRootHex": "6bcf0e2e93e0a18e22789aee965e6553f4fbe93f0acfc4a705d691c8311c4965"
+      }
+    },
+    {
+      "id": "merkle-3-leaves-no-duplication",
+      "description": "Three-leaf tree under RFC 6962: root = node_hash(MT([L0,L1]), leaf_hash(L2)). The OLD code duplicated L2 (CVE-2012-2459), producing a DIFFERENT root.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03"
+        ]
+      },
+      "expected": {
+        "rootHex": "e2da0242936eb38ec996a543601b3a1da4226391ff92014ed1a7a248ace36347",
+        "expectedRootHex": "e2da0242936eb38ec996a543601b3a1da4226391ff92014ed1a7a248ace36347",
+        "notDuplicateRoot": true
+      }
+    },
+    {
+      "id": "merkle-5-leaves",
+      "description": "Five-leaf tree. Split at largest power of two < 5 = 4.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ]
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d"
+      }
+    },
+    {
+      "id": "merkle-8-leaves-balanced",
+      "description": "Eight-leaf tree (balanced binary).",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05",
+          "06",
+          "07",
+          "08"
+        ]
+      },
+      "expected": {
+        "rootHex": "c1ad6548cb4c7663110df219ec8b36ca63b01158956f4be31a38a88d0c7f7071"
+      }
+    },
+    {
+      "id": "merkle-5-leaves-proof-index-0",
+      "description": "Inclusion proof for leaf index 0 in a 5-leaf tree.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ],
+        "index": 0
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d",
+        "leafHashHex": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2",
+        "pathLength": 3,
+        "path": [
+          {
+            "side": "right",
+            "hashHex": "fcf0a6c700dd13e274b6fba8deea8dd9b26e4eedde3495717cac8408c9c5177f"
+          },
+          {
+            "side": "right",
+            "hashHex": "78850a5ab36238b076dd99fd258c70d523168704247988a94caa8c9ccd056b8d"
+          },
+          {
+            "side": "right",
+            "hashHex": "9f1afa4dc124cba73134e82ff50f17c8f7164257c79fed9a13f5943a6acb8e3d"
+          }
+        ],
+        "verifies": true
+      }
+    },
+    {
+      "id": "merkle-5-leaves-proof-index-1",
+      "description": "Inclusion proof for leaf index 1 in a 5-leaf tree.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ],
+        "index": 1
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d",
+        "leafHashHex": "fcf0a6c700dd13e274b6fba8deea8dd9b26e4eedde3495717cac8408c9c5177f",
+        "pathLength": 3,
+        "path": [
+          {
+            "side": "left",
+            "hashHex": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2"
+          },
+          {
+            "side": "right",
+            "hashHex": "78850a5ab36238b076dd99fd258c70d523168704247988a94caa8c9ccd056b8d"
+          },
+          {
+            "side": "right",
+            "hashHex": "9f1afa4dc124cba73134e82ff50f17c8f7164257c79fed9a13f5943a6acb8e3d"
+          }
+        ],
+        "verifies": true
+      }
+    },
+    {
+      "id": "merkle-5-leaves-proof-index-2",
+      "description": "Inclusion proof for leaf index 2 in a 5-leaf tree.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ],
+        "index": 2
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d",
+        "leafHashHex": "583c7dfb7b3055d99465544032a571e10a134b1b6f769422bbb71fd7fa167a5d",
+        "pathLength": 3,
+        "path": [
+          {
+            "side": "right",
+            "hashHex": "4f35212d12f9ad2036492c95f1fe79baf4ec7bd9bef3dffa7579f2293ff546a4"
+          },
+          {
+            "side": "left",
+            "hashHex": "6bcf0e2e93e0a18e22789aee965e6553f4fbe93f0acfc4a705d691c8311c4965"
+          },
+          {
+            "side": "right",
+            "hashHex": "9f1afa4dc124cba73134e82ff50f17c8f7164257c79fed9a13f5943a6acb8e3d"
+          }
+        ],
+        "verifies": true
+      }
+    },
+    {
+      "id": "merkle-5-leaves-proof-index-3",
+      "description": "Inclusion proof for leaf index 3 in a 5-leaf tree.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ],
+        "index": 3
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d",
+        "leafHashHex": "4f35212d12f9ad2036492c95f1fe79baf4ec7bd9bef3dffa7579f2293ff546a4",
+        "pathLength": 3,
+        "path": [
+          {
+            "side": "left",
+            "hashHex": "583c7dfb7b3055d99465544032a571e10a134b1b6f769422bbb71fd7fa167a5d"
+          },
+          {
+            "side": "left",
+            "hashHex": "6bcf0e2e93e0a18e22789aee965e6553f4fbe93f0acfc4a705d691c8311c4965"
+          },
+          {
+            "side": "right",
+            "hashHex": "9f1afa4dc124cba73134e82ff50f17c8f7164257c79fed9a13f5943a6acb8e3d"
+          }
+        ],
+        "verifies": true
+      }
+    },
+    {
+      "id": "merkle-5-leaves-proof-index-4",
+      "description": "Inclusion proof for leaf index 4 in a 5-leaf tree.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05"
+        ],
+        "index": 4
+      },
+      "expected": {
+        "rootHex": "b2165c86fbfb34fa51840bb6ba3d5ce0d7dc31f2e605b5ba62c98fa86ff6746d",
+        "leafHashHex": "9f1afa4dc124cba73134e82ff50f17c8f7164257c79fed9a13f5943a6acb8e3d",
+        "pathLength": 1,
+        "path": [
+          {
+            "side": "left",
+            "hashHex": "fa02d31a63cc11cc624881e52af14af7a1c6ab745efa71021cb24086b9b1793f"
+          }
+        ],
+        "verifies": true
+      }
+    },
+    {
+      "id": "merkle-empty-tree",
+      "description": "Empty tree root = SHA-256('SNP/0.1 empty\\0').",
+      "input": {
+        "leaves": []
+      },
+      "expected": {
+        "rootHex": "8b8f6a4bed03dd03c795484fb1354b67e707ae7f4e8587b03ee10341d299cc8b"
+      }
+    },
+    {
+      "id": "merkle-streaming-matches-batch",
+      "description": "Streaming Merkle builder produces the same root as the batch builder.",
+      "input": {
+        "leaves": [
+          "01",
+          "02",
+          "03",
+          "04",
+          "05",
+          "06",
+          "07"
+        ]
+      },
+      "expected": {
+        "batchRootHex": "5e932791a9098819cce0ed256d1360ac88673390b07e5fe662b2a11ab0f4dde9",
+        "streamingRootHex": "b75d78d865ecbd8cc4f87925cd2bd16eb794411418d58fcc6f61d672f677cc6a"
+      }
+    }
+  ]
+}
