@@ -18,6 +18,7 @@
 #![allow(clippy::pedantic)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(deprecated)]
 
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -266,6 +267,16 @@ fn test_2_gateway_discovery() {
     // discover_gateways, but double-check here).
     assert!(advert.verify(), "discovered advertisement signature must verify");
 
+    // N2.0.3: discover_gateways no longer pre-populates circuits (the
+    // GatewayChoice-based Circuit::for_gateway is deprecated). We populate
+    // the circuit explicitly here using the deprecated constructor (this
+    // is a test of the N2.0.1 backward-compat path, so using the deprecated
+    // constructor is acceptable).
+    client_node.circuits.lock().unwrap().insert(
+        gateway_node_id_for(GatewayChoice::A),
+        Circuit::for_gateway(GatewayChoice::A),
+    );
+
     // Select the gateway.
     let selected = client_node
         .select_gateway()
@@ -404,6 +415,19 @@ fn test_3_genuine_failover() {
         .expect("discovery should succeed for both gateways");
     let n_discovered = client_node.known_gateways.lock().unwrap().len();
     assert_eq!(n_discovered, 2, "should have discovered 2 gateways");
+
+    // N2.0.3: discover_gateways no longer pre-populates circuits (the
+    // GatewayChoice-based Circuit::for_gateway is deprecated). We populate
+    // the circuits for both gateways explicitly here using the deprecated
+    // constructor (this is a test of the N2.0.1 backward-compat path).
+    client_node.circuits.lock().unwrap().insert(
+        gateway_node_id_for(GatewayChoice::A),
+        Circuit::for_gateway(GatewayChoice::A),
+    );
+    client_node.circuits.lock().unwrap().insert(
+        gateway_node_id_for(GatewayChoice::B),
+        Circuit::for_gateway(GatewayChoice::B),
+    );
 
     // ── Request 1: via Gateway A (the first discovered gateway). ──
     // The client's select_gateway returns the first non-expired gateway

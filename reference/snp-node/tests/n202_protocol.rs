@@ -1161,7 +1161,7 @@ fn test_7b_route_state_machine() {
     let (gw_ed_sk, gw_ed_pk) = ed25519_keypair_from_seed(b"gw ed25519 seed 7b");
     let gw_id = derive_node_id(&gw_ed_pk);
 
-    let mut route = Route::new(&client_id, gw_id, vec![]);
+    let mut route = Route::new(client_id, gw_id, vec![]);
     assert_eq!(route.state, RouteState::Proposed);
     assert_eq!(route.hops, Vec::<[u8; 32]>::new());
     assert_ne!(route.route_id, [0u8; 32], "route_id must not be all-zero");
@@ -1185,12 +1185,12 @@ fn test_7b_route_state_machine() {
 
     // Illegal: Closed → Active.
     let err = route.transition_to(RouteState::Active).unwrap_err();
-    assert!(err.to_string().contains("illegal Route transition"), "Closed → Active must be rejected: {err}");
+    assert!(err.to_string().contains("Route transition error"), "Closed → Active must be rejected: {err}");
 
     // Illegal: Proposed → Active (must go through Establishing).
-    let mut route2 = Route::new(&client_id, gw_id, vec![]);
+    let mut route2 = Route::new(client_id, gw_id, vec![]);
     let err = route2.transition_to(RouteState::Active).unwrap_err();
-    assert!(err.to_string().contains("illegal Route transition"), "Proposed → Active must be rejected: {err}");
+    assert!(err.to_string().contains("Route transition error"), "Proposed → Active must be rejected: {err}");
 }
 
 /// Test 7c: CircuitV2 state machine — legal + illegal transitions.
@@ -1201,7 +1201,7 @@ fn test_7c_circuit_v2_state_machine() {
     let (gw_ed_sk, gw_ed_pk) = ed25519_keypair_from_seed(b"gw ed25519 seed 7c");
     let gw_id = derive_node_id(&gw_ed_pk);
 
-    let mut route = Route::new(&client_id, gw_id, vec![]);
+    let mut route = Route::new(client_id, gw_id, vec![]);
     let mut circuit = CircuitV2::new(client_id, gw_id, route.route_id);
     assert_eq!(circuit.state, CircuitState::Discovering);
     assert_ne!(circuit.circuit_id, [0u8; 32], "circuit_id must not be all-zero");

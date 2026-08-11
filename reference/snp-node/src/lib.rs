@@ -427,6 +427,52 @@ pub fn gateway_node_id_for(gw: GatewayChoice) -> [u8; 32] {
     derive_node_id(&gateway_public_key_for(gw))
 }
 
+// ─── N2.0.3 GatewayChoice-free helpers ──────────────────────────────────────
+//
+// These helpers expose the N2.0 test gateway identities WITHOUT requiring the
+// caller to import `GatewayChoice`. They exist so that `node.rs` (the
+// production module) can construct the N2.0 demo gateways WITHOUT importing
+// `GatewayChoice` — per the N2.0.3 task spec ("node.rs must NOT import or use
+// GatewayChoice"). The `GatewayChoice` enum itself remains defined here in
+// `lib.rs` (where it is allowed) for backward compat with the N1.9/N2.0 demo
+// functions (`run_gateway_named`, `run_client_to_gateway`, etc.).
+
+/// Gateway A secret key (N2.0 deterministic test value, NOT secret).
+#[must_use]
+pub fn gateway_a_secret() -> [u8; 32] {
+    GATEWAY_A_SECRET
+}
+
+/// Gateway B secret key (N2.0 deterministic test value, NOT secret).
+#[must_use]
+pub fn gateway_b_secret() -> [u8; 32] {
+    GATEWAY_B_SECRET
+}
+
+/// Gateway A Ed25519 public key.
+#[must_use]
+pub fn gateway_a_public_key() -> [u8; 32] {
+    derive_public_key(&GATEWAY_A_SECRET)
+}
+
+/// Gateway B Ed25519 public key.
+#[must_use]
+pub fn gateway_b_public_key() -> [u8; 32] {
+    derive_public_key(&GATEWAY_B_SECRET)
+}
+
+/// Gateway A NodeId (`SHA-256("SNP/0.1 node\0" || gateway_a_public_key())`).
+#[must_use]
+pub fn gateway_a_node_id() -> [u8; 32] {
+    derive_node_id(&gateway_a_public_key())
+}
+
+/// Gateway B NodeId.
+#[must_use]
+pub fn gateway_b_node_id() -> [u8; 32] {
+    derive_node_id(&gateway_b_public_key())
+}
+
 /// Gateway secret key (deterministic for N1.9 demo).
 const GATEWAY_SECRET: [u8; 32] = {
     let mut sk = [0u8; 32];

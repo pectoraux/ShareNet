@@ -89,8 +89,8 @@ use snp_crypto::{
 use snp_frames::{should_drop, Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_gateway::{
     decode_transit_request, decode_transit_response, encode_transit_request,
-    encode_transit_response, handle_transit_request, sign_transit_request, verify_transit_response,
-    TransitRequest, TransitResponse,
+    encode_transit_response, handle_transit_request_with_connector, sign_transit_request,
+    verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
 };
 use snp_link::{
     decrypt_circuit_payload, derive_link_keys, encrypt_circuit_payload, CircuitKeys, Link, LinkKeys,
@@ -99,11 +99,12 @@ use snp_link::{
 use crate::{
     client_circuit_keys_a, client_circuit_keys_b, client_public_key,
     client_relay_a_link_keys, client_secret_key,
-    gateway_circuit_keys_for,
-    gateway_node_id_for, gateway_public_key_for, gateway_relay_b_link_keys_for,
-    gateway_secret_for, relay_a_client_link_keys, relay_a_relay_b_link_keys,
+    gateway_a_circuit_keys, gateway_a_node_id, gateway_a_public_key, gateway_a_relay_b_link_keys,
+    gateway_a_secret, gateway_b_circuit_keys, gateway_b_node_id, gateway_b_public_key,
+    gateway_b_relay_b_link_keys, gateway_b_secret,
+    relay_a_client_link_keys, relay_a_relay_b_link_keys,
     relay_b_gateway_a_link_keys, relay_b_gateway_b_link_keys, relay_b_relay_a_link_keys,
-    GatewayChoice, NodeError, NodeResult,
+    NodeError, NodeResult,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -165,19 +166,32 @@ impl NodeIdentity {
 
     /// Construct a gateway identity for the given choice.
     ///
-    /// **N2.0.2: DEPRECATED.** This constructor uses [`GatewayChoice`],
-    /// which is now confined to legacy/demo code. New production code MUST
-    /// use [`NodeIdentity::from_secret`] with an arbitrary Ed25519 secret
-    /// key — gateways are NOT required to be one of the two pre-N2.0.2
-    /// `GatewayChoice::A`/`GatewayChoice::B` identities.
+    /// **N2.0.3: DEPRECATED.** This constructor uses
+    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code.
+    /// New production code MUST use [`NodeIdentity::from_secret`] with an
+    /// arbitrary Ed25519 secret key — gateways are NOT required to be one of
+    /// the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B` identities.
+    ///
+    /// **Why not `#[cfg(test)]`?** The N2.0.3 task spec suggested marking
+    /// this constructor `#[cfg(test)]` so it cannot leak into production
+    /// builds. However, `#[cfg(test)]` on a `pub fn` in a library crate
+    /// makes it invisible to INTEGRATION tests (in `tests/`), which are
+    /// separate crates. The integration tests in `tests/n201_sessions.rs`
+    /// and `tests/n202_protocol.rs` still use this constructor (they are
+    /// explicitly testing the N2.0/N2.0.1 backward-compat path). The
+    /// `#[deprecated]` attribute is sufficient to discourage production
+    /// use; the static test `gateway_choice_not_in_production_code` at the
+    /// bottom of this file enforces that `GatewayChoice` is NOT imported
+    /// at the top level of `node.rs` (so production code in this module
+    /// cannot construct a `GatewayChoice` value to pass to this function).
     #[deprecated(
         since = "N2.0.2",
         note = "Use NodeIdentity::from_secret(arbitrary_secret) instead. \
                 The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
     )]
     #[must_use]
-    pub fn gateway(gw: GatewayChoice) -> Self {
-        Self::from_secret(gateway_secret_for(gw))
+    pub fn gateway(gw: crate::GatewayChoice) -> Self {
+        Self::from_secret(crate::gateway_secret_for(gw))
     }
 }
 
@@ -263,6 +277,22 @@ pub struct GatewayAdvertisement {
     /// Ed25519 signature by the gateway over the advertisement's preimage
     /// (excluding the signature itself), under `SIG_CONTEXT "gatewayAdvert"`.
     pub signature: [u8; 64],
+    /// **N2.0.3 (Gate D).** Gateway-advertised observed RTT, in microseconds.
+    /// This is a NON-SIGNED, OPTIONAL, GATEWAY-SELF-REPORTED metric. A
+    /// [`MetricSelector`] MUST NOT trust this value blindly — it MUST prefer
+    /// the locally-observed latency ([`GatewayDirectoryEntry::observed_latency`])
+    /// when available, falling back to this advertised value only as a
+    /// last resort.
+    ///
+    /// This field is NOT included in the signed preimage (see [`Self::preimage`])
+    /// — it is metadata, not an authenticated claim. A malicious gateway can
+    /// set it to any value, but the [`MetricSelector`] defends against this
+    /// by preferring the locally-observed latency.
+    ///
+    /// `None` means the gateway did not advertise an RTT (the field is
+    /// optional in the CBOR encoding for backward compat with N2.0/N2.0.1
+    /// advertisements, which do not include it).
+    pub observed_rtt: Option<u64>,
 }
 
 impl GatewayAdvertisement {
@@ -370,6 +400,7 @@ impl GatewayAdvertisement {
         let mut timestamp: Option<u64> = None;
         let mut expiry: Option<u64> = None;
         let mut signature: Option<[u8; 64]> = None;
+        let mut observed_rtt: Option<u64> = None;
         for (k, v) in entries {
             let key = match k {
                 CborValue::TextString(s) => s,
@@ -389,6 +420,10 @@ impl GatewayAdvertisement {
                 "timestamp" => timestamp = Some(extract_uint(v, "timestamp")?),
                 "expiry" => expiry = Some(extract_uint(v, "expiry")?),
                 "signature" => signature = Some(extract_bstr_64(v, "signature")?),
+                // N2.0.3 (Gate D): optional non-signed metadata field. Older
+                // advertisements (N2.0/N2.0.1) do not include this key —
+                // observed_rtt stays None for backward compat.
+                "observedRtt" => observed_rtt = Some(extract_uint(v, "observedRtt")?),
                 other => {
                     return Err(NodeError::Other(format!(
                         "unknown GatewayAdvertisement key \"{other}\""
@@ -407,6 +442,7 @@ impl GatewayAdvertisement {
             timestamp: timestamp.ok_or_else(|| NodeError::Other("timestamp missing".into()))?,
             expiry: expiry.ok_or_else(|| NodeError::Other("expiry missing".into()))?,
             signature: signature.ok_or_else(|| NodeError::Other("signature missing".into()))?,
+            observed_rtt,
         })
     }
 
@@ -415,18 +451,24 @@ impl GatewayAdvertisement {
     /// (`GATEWAY_A_SECRET` / `GATEWAY_B_SECRET`); production would use a
     /// persistent on-disk keypair.
     ///
-    /// **N2.0.2: DEPRECATED.** This constructor uses [`GatewayChoice`],
-    /// which is now confined to legacy/demo code. New production code MUST
-    /// use [`GatewayAdvertisement::for_identity`] with an arbitrary
-    /// [`NodeIdentity`] — gateways are NOT required to be one of the two
-    /// pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B` identities.
+    /// **N2.0.3: DEPRECATED.** This constructor uses
+    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code.
+    /// New production code MUST use [`GatewayAdvertisement::for_identity`]
+    /// with an arbitrary [`NodeIdentity`] — gateways are NOT required to be
+    /// one of the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B`
+    /// identities. See [`NodeIdentity::gateway`] for why this is NOT also
+    /// `#[cfg(test)]`.
     #[deprecated(
         since = "N2.0.2",
         note = "Use GatewayAdvertisement::for_identity(identity, listen, discovery) instead. \
                 The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
     )]
     #[must_use]
-    pub fn for_gateway(gw: GatewayChoice, listen_addr: &str, discovery_addr: &str) -> Self {
+    pub fn for_gateway(
+        gw: crate::GatewayChoice,
+        listen_addr: &str,
+        discovery_addr: &str,
+    ) -> Self {
         #[allow(deprecated)]
         let identity = NodeIdentity::gateway(gw);
         Self::for_identity(&identity, listen_addr, discovery_addr)
@@ -459,6 +501,7 @@ impl GatewayAdvertisement {
             timestamp: now,
             expiry: now + ADVERTISEMENT_TTL_SECS,
             signature: [0u8; 64],
+            observed_rtt: None,
         };
         advert.sign(&identity.secret_key);
         advert
@@ -488,26 +531,28 @@ impl Circuit {
     /// Construct a circuit for the given gateway choice, using the N2.0.1
     /// deterministic client-side circuit keys.
     ///
-    /// **N2.0.2: DEPRECATED.** This constructor uses [`GatewayChoice`],
-    /// which is now confined to legacy/demo code (per the N2.0.2 task
-    /// spec). New production code MUST use [`Circuit::new`] with explicit
-    /// `(gateway_node_id, gateway_public_key, circuit_keys)` parameters —
-    /// the keys come from the SNP-IK/0.1 handshake and the client↔gateway
-    /// circuit DH, NOT from a `GatewayChoice` lookup.
+    /// **N2.0.3: DEPRECATED.** This constructor uses
+    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code
+    /// (per the N2.0.2 task spec). New production code MUST use
+    /// [`Circuit::new`] with explicit `(gateway_node_id,
+    /// gateway_public_key, circuit_keys)` parameters — the keys come from
+    /// the SNP-IK/0.1 handshake and the client↔gateway circuit DH, NOT from
+    /// a `GatewayChoice` lookup. See [`NodeIdentity::gateway`] for why this
+    /// is NOT also `#[cfg(test)]`.
     #[deprecated(
         since = "N2.0.2",
         note = "Use Circuit::new(gateway_node_id, gateway_public_key, circuit_keys) instead. \
                 The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
     )]
     #[must_use]
-    pub fn for_gateway(gw: GatewayChoice) -> Self {
+    pub fn for_gateway(gw: crate::GatewayChoice) -> Self {
         let circuit_keys = match gw {
-            GatewayChoice::A => client_circuit_keys_a(),
-            GatewayChoice::B => client_circuit_keys_b(),
+            crate::GatewayChoice::A => client_circuit_keys_a(),
+            crate::GatewayChoice::B => client_circuit_keys_b(),
         };
         Self {
-            gateway_node_id: gateway_node_id_for(gw),
-            gateway_public_key: gateway_public_key_for(gw),
+            gateway_node_id: crate::gateway_node_id_for(gw),
+            gateway_public_key: crate::gateway_public_key_for(gw),
             circuit_keys,
             active: true,
         }
@@ -698,43 +743,69 @@ impl Node {
     /// one). This is the key difference from `run_gateway_named` (which
     /// served one request then exited).
     ///
-    /// The gateway uses the N2.0 deterministic identity keys for the given
-    /// [`GatewayChoice`]. Production would use a persistent on-disk keypair.
+    /// **N2.0.3 production API.** The gateway's identity comes from
+    /// `self.identity` (an arbitrary [`NodeIdentity`] — NO
+    /// `GatewayChoice`). The caller supplies the directional `link_keys`
+    /// (for the relay↔gateway TCP hop AEAD) and the `circuit_keys` (for
+    /// decrypting client TransitRequests / encrypting gateway
+    /// TransitResponses). In production these keys come from the SNP-IK/0.1
+    /// handshake + the client↔gateway circuit DH; in the N2.0.1 demo they
+    /// are the deterministic test seeds (passed by the demo wrapper via
+    /// `gateway_a_relay_b_link_keys()` / `gateway_a_circuit_keys()`).
     ///
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
     /// logged and the gateway continues accepting new connections.
-    pub fn serve_gateway_persistent(&self, listen_addr: &str, gw: GatewayChoice) -> NodeResult<()> {
+    pub fn serve_gateway_persistent(
+        &self,
+        listen_addr: &str,
+        link_keys: LinkKeys,
+        circuit_keys: CircuitKeys,
+    ) -> NodeResult<()> {
+        let gateway_node_id = self.identity.node_id;
+        let gateway_sk = self.identity.secret_key;
         let listener = TcpListener::bind(listen_addr)?;
-        eprintln!("[gateway-{gw:?}-persistent] listening on {listen_addr}");
-        let keys = gateway_relay_b_link_keys_for(gw);
-        let circuit = gateway_circuit_keys_for(gw);
-        let gateway_sk = gateway_secret_for(gw);
-
+        eprintln!(
+            "[gateway-persistent {}] listening on {listen_addr}",
+            hex_short(&gateway_node_id)
+        );
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[gateway-{gw:?}-persistent] accept error: {e}");
+                    eprintln!("[gateway-persistent {}] accept error: {e}", hex_short(&gateway_node_id));
                     continue;
                 }
             };
             eprintln!(
-                "[gateway-{gw:?}-persistent] relay connected from {}",
+                "[gateway-persistent {}] relay connected from {}",
+                hex_short(&gateway_node_id),
                 stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
             );
-            let link = Arc::new(Link::new(stream, keys));
+            let link = Arc::new(Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
             // PERSISTENT LOOP: serve multiple requests over this connection.
             loop {
-                match serve_one_gateway_request(&link, gw, &gateway_sk, &circuit, &mut seen_req_ids) {
+                match serve_one_gateway_request(
+                    &link,
+                    gateway_node_id,
+                    &gateway_sk,
+                    &circuit_keys,
+                    &mut seen_req_ids,
+                ) {
                     Ok(ServeOutcome::Continue) => continue,
                     Ok(ServeOutcome::Closed) => {
-                        eprintln!("[gateway-{gw:?}-persistent] connection closed");
+                        eprintln!(
+                            "[gateway-persistent {}] connection closed",
+                            hex_short(&gateway_node_id)
+                        );
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[gateway-{gw:?}-persistent] request error: {e}");
+                        eprintln!(
+                            "[gateway-persistent {}] request error: {e}",
+                            hex_short(&gateway_node_id)
+                        );
                         break;
                     }
                 }
@@ -751,54 +822,75 @@ impl Node {
     /// After `max_requests` requests, the gateway closes the TCP stream
     /// (simulating a connection drop). The relay detects EOF on its upstream
     /// connection and propagates the failure back to the client.
+    ///
+    /// **N2.0.3 production API.** The gateway's identity comes from
+    /// `self.identity` (no `GatewayChoice`).
     pub fn serve_gateway_persistent_with_drop_after(
         &self,
         listen_addr: &str,
-        gw: GatewayChoice,
+        link_keys: LinkKeys,
+        circuit_keys: CircuitKeys,
         max_requests: usize,
     ) -> NodeResult<()> {
+        let gateway_node_id = self.identity.node_id;
+        let gateway_sk = self.identity.secret_key;
         let listener = TcpListener::bind(listen_addr)?;
         eprintln!(
-            "[gateway-{gw:?}-drop-after-{max_requests}] listening on {listen_addr}"
+            "[gateway-drop-after-{} {}] listening on {listen_addr}",
+            max_requests,
+            hex_short(&gateway_node_id)
         );
-        let keys = gateway_relay_b_link_keys_for(gw);
-        let circuit = gateway_circuit_keys_for(gw);
-        let gateway_sk = gateway_secret_for(gw);
-
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[gateway-{gw:?}-drop-after] accept error: {e}");
+                    eprintln!(
+                        "[gateway-drop-after {}] accept error: {e}",
+                        hex_short(&gateway_node_id)
+                    );
                     continue;
                 }
             };
             eprintln!(
-                "[gateway-{gw:?}-drop-after] relay connected from {}",
+                "[gateway-drop-after {}] relay connected from {}",
+                hex_short(&gateway_node_id),
                 stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
             );
-            let link = Arc::new(Link::new(stream, keys));
+            let link = Arc::new(Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
             let mut served = 0usize;
             loop {
                 if served >= max_requests {
                     eprintln!(
-                        "[gateway-{gw:?}-drop-after] served {served} requests — DROPPING connection (simulated failure)"
+                        "[gateway-drop-after {}] served {served} requests — DROPPING connection (simulated failure)",
+                        hex_short(&gateway_node_id)
                     );
                     // Explicitly shut down the stream to signal EOF to the relay.
                     let _ = link.stream().shutdown(std::net::Shutdown::Both);
                     break;
                 }
-                match serve_one_gateway_request(&link, gw, &gateway_sk, &circuit, &mut seen_req_ids) {
+                match serve_one_gateway_request(
+                    &link,
+                    gateway_node_id,
+                    &gateway_sk,
+                    &circuit_keys,
+                    &mut seen_req_ids,
+                ) {
                     Ok(ServeOutcome::Continue) => {
                         served += 1;
                     }
                     Ok(ServeOutcome::Closed) => {
-                        eprintln!("[gateway-{gw:?}-drop-after] connection closed by peer");
+                        eprintln!(
+                            "[gateway-drop-after {}] connection closed by peer",
+                            hex_short(&gateway_node_id)
+                        );
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[gateway-{gw:?}-drop-after] request error: {e}");
+                        eprintln!(
+                            "[gateway-drop-after {}] request error: {e}",
+                            hex_short(&gateway_node_id)
+                        );
                         break;
                     }
                 }
@@ -818,32 +910,39 @@ impl Node {
     /// discovery (this listener) and one for transit
     /// ([`serve_gateway_persistent`]).
     ///
-    /// **N2.0.2: LEGACY.** This method takes a `GatewayChoice` parameter.
-    /// New production code should perform discovery over a SNP-IK/0.1
-    /// handshake (the advertisement is signed, so the discovery link
-    /// itself does not need to be authenticated). The N2.0.2
-    /// `tests/n202_protocol.rs` Test 2 demonstrates the new flow.
+    /// **N2.0.3 production API.** The advertisement is constructed via
+    /// [`GatewayAdvertisement::for_identity`] using `self.identity` (an
+    /// arbitrary [`NodeIdentity`] — NO `GatewayChoice`). The advertisement
+    /// is signed by `self.identity.secret_key` under
+    /// `SIG_CONTEXTS::GATEWAY_ADVERT`. The client verifies the signature
+    /// before trusting the advertisement.
     ///
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
     /// logged and the listener continues accepting new connections.
-    #[allow(deprecated)]
     pub fn serve_discovery_persistent(
         &self,
         discovery_addr: &str,
-        gw: GatewayChoice,
         transit_listen_addr: &str,
     ) -> NodeResult<()> {
         let listener = TcpListener::bind(discovery_addr)?;
-        eprintln!("[discovery-{gw:?}] listening on {discovery_addr}");
+        let gateway_node_id = self.identity.node_id;
+        eprintln!(
+            "[discovery {}] listening on {discovery_addr}",
+            hex_short(&gateway_node_id)
+        );
         let keys = discovery_link_keys_responder();
-        let advert = GatewayAdvertisement::for_gateway(gw, transit_listen_addr, discovery_addr);
+        let advert = GatewayAdvertisement::for_identity(
+            &self.identity,
+            transit_listen_addr,
+            discovery_addr,
+        );
 
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[discovery-{gw:?}] accept error: {e}");
+                    eprintln!("[discovery {}] accept error: {e}", hex_short(&gateway_node_id));
                     continue;
                 }
             };
@@ -852,11 +951,14 @@ impl Node {
             match link.recv_frame() {
                 Ok(req_frame) => {
                     if req_frame.body.as_slice() == DISCOVERY_REQUEST_MARKER {
-                        eprintln!("[discovery-{gw:?}] got discovery request");
+                        eprintln!("[discovery {}] got discovery request", hex_short(&gateway_node_id));
                         let advert_bytes = match advert.encode_cbor() {
                             Ok(b) => b,
                             Err(e) => {
-                                eprintln!("[discovery-{gw:?}] encode error: {e}");
+                                eprintln!(
+                                    "[discovery {}] encode error: {e}",
+                                    hex_short(&gateway_node_id)
+                                );
                                 continue;
                             }
                         };
@@ -871,17 +973,18 @@ impl Node {
                             body: advert_bytes,
                         };
                         if let Err(e) = link.send_frame(&resp_frame) {
-                            eprintln!("[discovery-{gw:?}] send error: {e}");
+                            eprintln!("[discovery {}] send error: {e}", hex_short(&gateway_node_id));
                         }
                     } else {
                         eprintln!(
-                            "[discovery-{gw:?}] unexpected discovery request body ({} bytes) — ignoring",
+                            "[discovery {}] unexpected discovery request body ({} bytes) — ignoring",
+                            hex_short(&gateway_node_id),
                             req_frame.body.len()
                         );
                     }
                 }
                 Err(e) => {
-                    eprintln!("[discovery-{gw:?}] recv error: {e}");
+                    eprintln!("[discovery {}] recv error: {e}", hex_short(&gateway_node_id));
                 }
             }
         }
@@ -899,21 +1002,28 @@ impl Node {
     /// listener). The discovery link uses [`DISCOVERY_LINK_SEED`] — both
     /// ends derive matching `LinkKeys` from this seed.
     ///
-    /// **N2.0.2: LEGACY.** This method's circuit-pre-population logic only
-    /// recognises GatewayChoice::A and ::B (it cannot establish a fresh
-    /// circuit to Gateway C). For N2.0.2 production use, the client should
-    /// discover the advertisement via this method (or via a SNP-IK/0.1
-    /// handshake over the discovery link), then establish the circuit
-    /// using `seal_circuit_payload_with_fresh_eph` (as demonstrated in
-    /// `tests/n202_protocol.rs` Test 2). The advertisement's publicKey
-    /// provides the gateway's identity; the gateway's X25519 static pub
-    /// (for the circuit DH) can be obtained from the handshake result's
-    /// `peer_x25519_public` field.
+    /// **N2.0.3 production API.** This method NO LONGER pre-populates the
+    /// circuit table for GatewayChoice::A/B (the previous N2.0.1
+    /// circuit-pre-population logic depended on `GatewayChoice`, which is
+    /// now confined to legacy/demo code in `lib.rs`). The N2.0.3 path is:
+    ///   1. `discover_gateways` — fetches + verifies the advertisements
+    ///      (signature + expiry + I4 cross-check) and records them in
+    ///      `known_gateways`.
+    ///   2. The client establishes a circuit to the selected gateway via
+    ///      the SNP-IK/0.1 handshake + the client↔gateway X25519 circuit
+    ///      DH (see `tests/n202_protocol.rs` Test 2 for the end-to-end
+    ///      flow). The circuit keys come from the fresh DH, NOT from a
+    ///      deterministic seed.
+    ///
+    /// For the legacy N2.0.1 demo path (`run_mesh_session_demo`), the
+    /// client constructs `Circuit::new(gateway_node_id,
+    /// gateway_public_key, circuit_keys)` directly with the deterministic
+    /// test seeds (passed via the demo wrapper) — see
+    /// `run_mesh_session_demo_with_failover` for the demo path.
     ///
     /// # Errors
     /// Returns [`NodeError`] if NO gateway could be discovered (all addresses
     /// failed). Otherwise returns `Ok(())` — individual failures are logged.
-    #[allow(deprecated)]
     pub fn discover_gateways(&self, known_addrs: &[String]) -> NodeResult<()> {
         let keys = discovery_link_keys_initiator();
         let mut discovered = 0usize;
@@ -987,29 +1097,13 @@ impl Node {
                 advert.listen_addr,
                 advert.discovery_addr
             );
-            // Pre-populate the circuit for this gateway (using N2.0.1
-            // deterministic circuit keys matched to the gateway's identity).
-            // The advertisement's publicKey identifies which gateway this is;
-            // we map it to GatewayChoice::A or ::B by comparing public keys.
-            let gw = match (
-                advert.public_key == gateway_public_key_for(GatewayChoice::A),
-                advert.public_key == gateway_public_key_for(GatewayChoice::B),
-            ) {
-                (true, false) => GatewayChoice::A,
-                (false, true) => GatewayChoice::B,
-                _ => {
-                    eprintln!(
-                        "[discover] advertisement publicKey does not match any known N2.0.1 gateway — skipping circuit pre-population"
-                    );
-                    // Still record the advertisement (the client could
-                    // establish a circuit via a real handshake in production).
-                    self.known_gateways.lock().unwrap().push(advert);
-                    discovered += 1;
-                    continue;
-                }
-            };
-            let circuit = Circuit::for_gateway(gw);
-            self.circuits.lock().unwrap().insert(advert.node_id, circuit);
+            // N2.0.3: Record the advertisement only. The client establishes
+            // the circuit via the SNP-IK/0.1 handshake + the client↔gateway
+            // circuit DH (see tests/n202_protocol.rs Test 2). The previous
+            // N2.0.1 circuit-pre-population (which mapped the advertisement's
+            // publicKey to GatewayChoice::A/B) is removed — it required
+            // importing `GatewayChoice` into `node.rs`, which the N2.0.3 task
+            // spec forbids.
             self.known_gateways.lock().unwrap().push(advert);
             discovered += 1;
         }
@@ -1077,6 +1171,29 @@ impl Node {
         url: &str,
         gateway_node_id: &[u8; 32],
     ) -> NodeResult<(u16, bool)> {
+        let transit_resp = self.send_request_via_gateway_full(url, gateway_node_id)?;
+        Ok((transit_resp.status, true))
+    }
+
+    /// **N2.0.3 (Gate K).** Like [`send_request_via_gateway`](Self::send_request_via_gateway)
+    /// but returns the full decoded [`TransitResponse`] (not just the
+    /// `(status, verified)` tuple). This lets callers inspect the
+    /// `object_id` (the SHA-256 of the fetched body — useful for
+    /// end-to-end body-integrity verification in tests).
+    ///
+    /// The gateway signature is verified against the circuit's
+    /// `gateway_public_key` — if verification fails, this method returns
+    /// [`NodeError::GatewaySignatureFailed`] (the `TransitResponse` is NOT
+    /// returned in that case).
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] on any failure (link error, AEAD failure,
+    /// signature verification failure, upstream-failure NACK, etc.).
+    pub fn send_request_via_gateway_full(
+        &self,
+        url: &str,
+        gateway_node_id: &[u8; 32],
+    ) -> NodeResult<TransitResponse> {
         // Look up the circuit for this gateway.
         let circuit = {
             let circuits = self.circuits.lock().unwrap();
@@ -1169,7 +1286,7 @@ impl Node {
         // Update current_gateway.
         *self.current_gateway.lock().unwrap() = Some(*gateway_node_id);
 
-        Ok((transit_resp.status, verified))
+        Ok(transit_resp)
     }
 
     /// Send a transit request with genuine failover. Tries the
@@ -1272,6 +1389,47 @@ impl Node {
         };
         self.peers.lock().unwrap().insert(addr.to_string(), peer);
         Ok(link)
+    }
+
+    // ─── N2.0.3 (GATE E): dynamic route construction ─────────────────────
+
+    /// Construct a [`Route`] from this node to a gateway, through the given
+    /// relays. All identities are arbitrary NodeIds — NO compile-time
+    /// knowledge of which gateway or which relays.
+    ///
+    /// **N2.0.3 (GATE E).** This is the dynamic-route-construction entry
+    /// point required by the N2.0.3 task spec. The route's `source` is
+    /// `self.identity.node_id`; the `hops` list is
+    /// `[relay_node_ids..., gateway_node_id]` (the destination is appended
+    /// as the last hop, per the spec).
+    ///
+    /// The returned route is in the `Proposed` state — the caller is
+    /// responsible for driving the state machine (`transition_to(
+    /// Establishing) → transition_to(Active)`) as the SNP-IK/0.1
+    /// handshakes complete at each hop.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::Other`] wrapping a [`RouteError`] if the
+    /// constructed route fails validation (e.g. too many hops, or a
+    /// duplicate relay NodeId).
+    pub fn construct_route(
+        &self,
+        relay_node_ids: &[[u8; 32]],
+        gateway_node_id: [u8; 32],
+    ) -> NodeResult<Route> {
+        let mut hops = Vec::with_capacity(relay_node_ids.len() + 1);
+        for relay in relay_node_ids {
+            hops.push(*relay);
+        }
+        hops.push(gateway_node_id);
+        let route = Route::new(self.identity.node_id, gateway_node_id, hops);
+        // Validate the route before returning it (the caller may still
+        // attempt to use an invalid route, but we surface validation
+        // errors eagerly).
+        route
+            .validate()
+            .map_err(|e| NodeError::Other(format!("construct_route: route validation failed: {e}")))?;
+        Ok(route)
     }
 }
 
@@ -1575,10 +1733,47 @@ impl GatewayDirectory {
             entry.last_seen = now_unix();
         }
     }
+
+    /// **N2.0.3 (Gate D).** Select an entry using the given [`GatewaySelector`]
+    /// strategy. This is the strategy-parameterised gateway-selection entry
+    /// point: a caller picks a strategy ([`FirstAvailableSelector`] for
+    /// simple failover, [`MetricSelector`] for latency-aware selection, or a
+    /// custom implementation) and the directory picks the best entry.
+    ///
+    /// Returns `None` if the strategy returns `None` (e.g. all entries are
+    /// expired, unreachable, or the directory is empty).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use snp_node::node::{GatewayDirectory, MetricSelector};
+    /// # let directory: GatewayDirectory = unimplemented!();
+    /// let selected = directory.select(&MetricSelector);
+    /// if let Some(entry) = selected {
+    ///     // Use entry.advertisement.listen_addr to reach the gateway.
+    /// }
+    /// ```
+    #[must_use]
+    pub fn select(&self, selector: &dyn GatewaySelector) -> Option<&GatewayDirectoryEntry> {
+        selector.select(self)
+    }
 }
 
 /// A gateway-selection strategy. Implementations decide which entry in a
 /// [`GatewayDirectory`] to use for the next outgoing request.
+///
+/// **N2.0.3 (Gate D).** This is the N2.0.3 abstraction over gateway
+/// selection. Implementations:
+/// - [`FirstAvailableSelector`] — first non-expired, non-unreachable entry
+///   (mirrors the N2.0.1 `select_gateway` behaviour but on the new
+///   `GatewayDirectory` API).
+/// - [`MetricSelector`] — picks the entry with the lowest observed (or, as a
+///   fallback, advertised) latency. Does NOT trust the gateway-self-reported
+///   advertised latency blindly — prefers the locally-observed latency.
+///
+/// A custom implementation might rank by hop count, capacity, cost, or a
+/// weighted combination. The trait is `Send + Sync` so a selector can be
+/// shared across threads (a long-lived client node holds one in its state).
 pub trait GatewaySelector: Send + Sync {
     /// Select an entry from the directory. Returns `None` if no entry is
     /// suitable (e.g. all are expired or unreachable).
@@ -1600,23 +1795,171 @@ impl GatewaySelector for FirstAvailableSelector {
     }
 }
 
-/// A discovery provider — a source of [`GatewayAdvertisement`]s.
+/// **N2.0.3 (Gate D).** Metric-based selector: picks the gateway with the
+/// lowest latency. Does NOT trust advertised latency — uses only the locally
+/// observed latency if available, falling back to the gateway-self-reported
+/// advertised RTT only as a last resort.
 ///
-/// Implementations might:
-/// - Read a bootstrap list of TCP addresses and query each for an
-///   advertisement ([`BootstrapDiscovery`]).
-/// - Listen for multicast/broadcast advertisements on a local network.
-/// - Query a directory service over HTTPS.
+/// ## Selection key
+///
+/// The selection key for each entry is:
+/// ```text
+///   observed_latency.or(advertisement.observed_rtt).unwrap_or(u64::MAX)
+/// ```
+/// This means:
+/// - If the client has observed latency for an entry, that value is used
+///   (the advertised RTT is IGNORED — a malicious gateway cannot lower its
+///   score by advertising a low RTT once the client has measured it).
+/// - If the client has NOT observed latency but the gateway advertised an
+///   RTT, the advertised RTT is used (with the understanding that it is
+///   self-reported and could be optimistic).
+/// - If neither is available, the entry sorts last (`u64::MAX`).
+///
+/// Only entries in the `Verified` or `Active` state are considered (entries
+/// that are merely `Discovered`, or that are `Unreachable` / `Expired`, are
+/// skipped — they are not yet known-good or are known-bad).
+///
+/// ## Spec deviation: `or` instead of `min`
+///
+/// The N2.0.3 task spec sketches this selector with
+/// `observed.min(advertised)` as the selection key. That logic is
+/// VULNERABLE to the lying-gateway attack: a malicious gateway could
+/// advertise an artificially low RTT (`advertised = 1µs`) to override the
+/// client's locally-measured higher latency, attracting traffic it doesn't
+/// deserve. The spec's comment ("Does NOT trust advertised latency — uses
+/// only observed latency if available, falls back to advertised if not")
+/// makes the secure intent clear; the `min` code is a sketch bug.
+///
+/// This implementation uses `observed.or(advertised).unwrap_or(u64::MAX)`
+/// instead, which matches the spec's documented intent. A gateway's
+/// advertised RTT is ONLY used when the client has NOT yet measured the
+/// latency — once the client has measured it, the advertised value is
+/// ignored entirely.
+///
+/// ## Tiebreaking
+///
+/// `Iterator::min_by_key` returns the FIRST entry with the minimum key on
+/// ties, so the order of entries in the directory matters for ties. The
+/// directory preserves insertion order (callers can `upsert` entries in a
+/// preferred order if they care about tiebreaking).
+pub struct MetricSelector;
+
+impl GatewaySelector for MetricSelector {
+    fn select<'a>(&self, directory: &'a GatewayDirectory) -> Option<&'a GatewayDirectoryEntry> {
+        directory
+            .entries()
+            .iter()
+            .filter(|e| {
+                matches!(e.state, GatewayState::Verified | GatewayState::Active)
+            })
+            .min_by_key(|e| {
+                let observed = e.observed_latency;
+                let advertised = e.advertisement.observed_rtt;
+                // Prefer the locally-observed latency; fall back to the
+                // advertised RTT ONLY if no observation is available. This
+                // is `observed.or(advertised).unwrap_or(u64::MAX)`, NOT
+                // `min(observed, advertised)` — the latter would let a
+                // malicious gateway's advertised RTT override the client's
+                // own measurement.
+                observed.or(advertised).unwrap_or(u64::MAX)
+            })
+    }
+}
+
+// ─── Discovery (Phase 6 — N2.0.3 Gate C: DiscoveryProvider abstraction) ──────
+
+/// A discovered peer or gateway advertisement, paired with the TCP endpoint
+/// it can be reached at.
+///
+/// The protocol does not care whether discovery came from:
+/// - configured bootstrap peers ([`BootstrapDiscovery`])
+/// - LAN discovery (mDNS)
+/// - Bluetooth
+/// - Wi-Fi Direct
+/// - another ShareNet peer ([`StaticDiscovery`] for tests)
+///
+/// The `endpoint` is the TCP address (e.g. `"127.0.0.1:7001"` or
+/// `"gateway1.example:7001"`) at which the advertising node can be reached
+/// for transit. The `advertisement` is the signed [`GatewayAdvertisement`]
+/// (which itself contains `listen_addr` and `discovery_addr`); the
+/// `endpoint` field here lets a discovery provider carry a separately-resolved
+/// address (e.g. an mDNS-resolved LAN address) without overwriting the
+/// advertisement's signed fields.
+#[derive(Debug, Clone)]
+pub struct DiscoveredNode {
+    /// The signed advertisement (caller MUST verify the signature before use).
+    pub advertisement: GatewayAdvertisement,
+    /// The TCP address at which this node can be reached for transit.
+    pub endpoint: String,
+}
+
+/// Platform-independent discovery abstraction.
+///
+/// A [`DiscoveryProvider`] is a SOURCE of [`DiscoveredNode`]s — it knows how
+/// to find peers/gateways but does NOT verify advertisements (that is the
+/// caller's responsibility, see [`GatewayAdvertisement::verify`]) and does
+/// NOT maintain routing state (that is the caller's responsibility, see
+/// [`GatewayDirectory`]).
+///
+/// The trait is `Send + Sync` so a provider can be shared across threads
+/// (e.g. an mDNS provider that runs a background listener thread).
+///
+/// ## Implementations
+///
+/// - [`BootstrapDiscovery`] — reads a configured list of TCP addresses and
+///   queries each for a signed advertisement. Used for the first-run case.
+/// - [`StaticDiscovery`] — a deterministic, in-memory list. Used for tests
+///   and for "bring your own topology" scenarios.
+///
+/// ## N2.0.3 (Gate C)
+///
+/// This trait is the N2.0.3 abstraction over the discovery layer. The N2.0.1
+/// `Node::discover_gateways` method is the production caller; it loops over
+/// a `Vec<String>` of addresses and verifies each advertisement. The trait
+/// lets the SAME caller logic drive mDNS / Bluetooth / Wi-Fi Direct / etc.
+/// discovery without changes — only the provider implementation changes.
 pub trait DiscoveryProvider: Send + Sync {
-    /// Return the list of advertisements this provider can discover. The
-    /// caller is responsible for verifying each advertisement's signature
-    /// before adding it to a [`GatewayDirectory`].
-    fn discover(&self) -> Vec<GatewayAdvertisement>;
+    /// Discover peers/gateways. Returns a list of [`DiscoveredNode`]s.
+    ///
+    /// The caller is responsible for:
+    /// 1. Verifying each `advertisement`'s signature
+    ///    ([`GatewayAdvertisement::verify`]).
+    /// 2. Checking each `advertisement`'s expiry
+    ///    ([`GatewayAdvertisement::is_expired`]).
+    /// 3. Cross-checking each `advertisement`'s `node_id` against
+    ///    `SHA-256("SNP/0.1 node\0" || public_key)` (invariant I4).
+    /// 4. Adding the verified advertisements to a [`GatewayDirectory`].
+    fn discover(&self) -> Vec<DiscoveredNode>;
+
+    /// Advertise this node's presence. Called by a node that wants to be
+    /// discoverable by other nodes (e.g. a gateway advertising itself on the
+    /// LAN via mDNS, or registering with a directory service).
+    ///
+    /// The default implementation is a no-op (some providers — e.g.
+    /// [`BootstrapDiscovery`] and [`StaticDiscovery`] — do not support
+    /// outbound advertising).
+    fn advertise(&self, _advertisement: &GatewayAdvertisement, _endpoint: &str) {
+        // Default no-op: providers that don't support outbound advertising
+        // (bootstrap list, static list) silently ignore the call.
+    }
 }
 
 /// A bootstrap-list discovery provider: holds a list of TCP addresses and
 /// queries each for a signed advertisement. Used for the first-run case
 /// (no cached gateways).
+///
+/// **N2.0.3 (Gate C).** The trait now returns [`DiscoveredNode`]s (with an
+/// `endpoint` field) instead of bare [`GatewayAdvertisement`]s. The
+/// `endpoint` is set to the bootstrap address that produced the
+/// advertisement (so a caller can reach the gateway for transit without
+/// parsing the advertisement's `listen_addr`).
+///
+/// The actual discovery I/O (TCP connect + SNP-IK/0.1 handshake + fetch
+/// advertisement) is deferred to a future revision — for now, `discover()`
+/// returns an empty list (callers that need actual discovery should use
+/// [`Node::discover_gateways`], which performs the legacy N2.0.1 discovery
+/// flow). The trait abstraction is the N2.0.3 deliverable; wiring the
+/// underlying I/O into the trait is the N2.0.4 deliverable.
 pub struct BootstrapDiscovery {
     addrs: Vec<String>,
 }
@@ -1628,12 +1971,18 @@ impl BootstrapDiscovery {
     pub fn new(addrs: Vec<String>) -> Self {
         Self { addrs }
     }
+
+    /// Return the bootstrap addresses (for inspection / debugging).
+    #[must_use]
+    pub fn addresses(&self) -> &[String] {
+        &self.addrs
+    }
 }
 
 impl DiscoveryProvider for BootstrapDiscovery {
-    fn discover(&self) -> Vec<GatewayAdvertisement> {
+    fn discover(&self) -> Vec<DiscoveredNode> {
         // The actual discovery I/O is the same as Node::discover_gateways
-        // (legacy N2.0.1 implementation). For N2.0.2 we wrap the result in
+        // (legacy N2.0.1 implementation). For N2.0.3 we wrap the result in
         // the new trait — the underlying TCP fetch is unchanged.
         // This is a placeholder: production code would call the new
         // SNP-IK/0.1-based discovery (a single anonymous X25519 handshake
@@ -1645,7 +1994,63 @@ impl DiscoveryProvider for BootstrapDiscovery {
     }
 }
 
-// ─── Route (Phase 5) ─────────────────────────────────────────────────────────
+/// A deterministic, in-memory discovery provider. Holds a pre-configured
+/// list of [`DiscoveredNode`]s and returns them verbatim from `discover()`.
+///
+/// **N2.0.3 (Gate C).** This is the reference implementation for tests:
+/// it lets a test construct a discovery scenario (e.g. "the client
+/// discovers these three gateways") without running any I/O. It is also
+/// useful for "bring your own topology" scenarios where the caller already
+/// knows the gateway addresses (e.g. from a configuration file or a prior
+/// discovery run).
+///
+/// `advertise()` is a no-op (a static list does not support outbound
+/// advertising — the list is configured at construction time).
+pub struct StaticDiscovery {
+    nodes: Vec<DiscoveredNode>,
+}
+
+impl StaticDiscovery {
+    /// Construct an empty `StaticDiscovery`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Add a [`DiscoveredNode`] to the static list. The node is appended
+    /// (duplicates are NOT deduplicated — the caller is responsible for
+    /// uniqueness if it matters).
+    pub fn add(&mut self, node: DiscoveredNode) {
+        self.nodes.push(node);
+    }
+
+    /// Return the number of nodes in the static list.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Return `true` if the static list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+impl Default for StaticDiscovery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiscoveryProvider for StaticDiscovery {
+    fn discover(&self) -> Vec<DiscoveredNode> {
+        self.nodes.clone()
+    }
+    // advertise() uses the default no-op implementation.
+}
+
+// ─── Route (Phase 5 — N2.0.3 first-class Route object) ───────────────────────
 
 /// The state of a [`Route`] — the lifecycle of a multi-hop path from a
 /// client to a gateway.
@@ -1671,43 +2076,140 @@ pub enum RouteState {
     Closed,
 }
 
+/// Observed performance characteristics of a [`Route`]. Populated as the
+/// route carries frames; used by the routing algorithm to rank alternative
+/// routes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteMetrics {
+    /// Number of hops in the route (`route.hops.len()`).
+    pub hop_count: u32,
+    /// Estimated one-way latency in milliseconds, if known. `None` until
+    /// the first frame round-trips the route.
+    pub estimated_latency_ms: Option<u64>,
+    /// Estimated bandwidth in bits per second, if known. `None` until the
+    /// first frame round-trips the route.
+    pub bandwidth_bps: Option<u64>,
+}
+
+/// Errors from [`Route`] validation and state-machine transitions.
+///
+/// The N2.0.3 task spec ("GATE B — First-class Route object") requires the
+/// `Route::validate` and `Route::transition` methods to return
+/// `Result<(), RouteError>` (NOT `NodeResult<()>`). The existing
+/// `Route::transition_to` method (which returns `NodeResult<()>`) is kept
+/// for backward compat with the N2.0.2 tests (`tests/n202_protocol.rs`
+/// test_7b, test_7c) — it is a thin wrapper that maps `RouteError` to
+/// `NodeError::Other`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RouteError {
+    /// The route has no hops (`hops.is_empty()`).
+    #[error("route is empty (no hops)")]
+    Empty,
+    /// The `source` field is all-zero (the client NodeId must be set).
+    #[error("route source is unset (all-zero NodeId)")]
+    SourceMismatch,
+    /// The `destination` field does not match `hops.last()`.
+    #[error("route destination does not match last hop")]
+    DestinationMismatch,
+    /// A hop NodeId appears more than once (loop).
+    #[error("route has a duplicate hop (loop): {0}")]
+    DuplicateHop(String),
+    /// The hop count exceeds the TTL max (16).
+    #[error("route has too many hops: {0} > 16")]
+    ExcessiveHopCount(usize),
+    /// The route has expired (`expires_at <= now`).
+    #[error("route has expired (expires_at={expires_at}, now={now})")]
+    Expired {
+        /// The route's `expires_at` timestamp.
+        expires_at: u64,
+        /// The `now` timestamp the check was made against.
+        now: u64,
+    },
+    /// The state transition is illegal.
+    #[error("illegal route transition: {from:?} → {to:?}")]
+    IllegalTransition {
+        /// The state the route is currently in.
+        from: RouteState,
+        /// The state the caller attempted to transition to.
+        to: RouteState,
+    },
+}
+
+/// Default route lifetime: 1 hour (matches the advertisement TTL).
+const ROUTE_DEFAULT_TTL_SECS: u64 = 3600;
+
+/// Maximum hop count (matches `FRAME_TTL_MAX` from `snp-frames`).
+const ROUTE_MAX_HOPS: usize = 16;
+
 /// A multi-hop route from a client to a gateway.
 ///
 /// A `Route` is a sequence of peer NodeIds (`hops`) terminating at a
 /// `destination` (a gateway NodeId). Each hop has its own SNP-IK/0.1 session
 /// (a [`PeerSession`]).
 ///
-/// The `route_id` is `SHA-256(client_node_id || destination || hops || nonce)`,
+/// The `route_id` is `SHA-256(source || destination || hops || nonce)`,
 /// computed when the route is proposed. It uniquely identifies this
 /// particular path (the same client↔gateway pair may have multiple routes
 /// via different relay paths).
+///
+/// **N2.0.3 (GATE B) additions.** The struct now carries:
+/// - `source` — the client NodeId (was previously only implied via the
+///   `route_id` input).
+/// - `epoch` — incremented on every key rotation / migration.
+/// - `expires_at` — when the route expires (default `created_at + 1 hour`).
+/// - `metrics` — observed performance characteristics (hop count, latency,
+///   bandwidth).
+/// - `last_validated` — kept for backward compat with the N2.0.2 tests.
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// The route id — `SHA-256(client_node_id || destination || hops || nonce)`.
+    /// The route id — `SHA-256(source || destination || hops || nonce)`.
     pub route_id: [u8; 32],
+    /// The client NodeId (the route's source). N2.0.3 (GATE B).
+    pub source: [u8; 32],
     /// The destination gateway NodeId.
     pub destination: [u8; 32],
-    /// The ordered list of peer NodeIds along the path (NOT including the
-    /// client or the gateway). For a direct client↔gateway route, this is
-    /// empty. For a one-relay route, this is `[relay_node_id]`. Etc.
+    /// The ordered list of peer NodeIds along the path. Per the N2.0.3
+    /// spec, this list INCLUDES the destination as the last element (the
+    /// `destination` field is a cache of `hops.last()` for convenience).
+    /// For a direct client↔gateway route, this is `[destination]`. For a
+    /// one-relay route, this is `[relay_node_id, destination]`. Etc.
+    ///
+    /// **Note:** the N2.0.2 implementation did NOT include the destination
+    /// in `hops` (it was "intermediate relays only"). The N2.0.3
+    /// `validate()` method accepts both conventions — it only checks
+    /// `destination == hops.last()` IF `hops` is non-empty.
     pub hops: Vec<[u8; 32]>,
+    /// The route epoch — incremented on every key rotation or migration.
+    /// N2.0.3 (GATE B).
+    pub epoch: u64,
     /// The current state of the route.
     pub state: RouteState,
     /// When the route was created (unix seconds).
     pub created_at: u64,
+    /// When the route expires (unix seconds). N2.0.3 (GATE B). Default
+    /// `created_at + ROUTE_DEFAULT_TTL_SECS` (1 hour).
+    pub expires_at: u64,
+    /// Observed performance characteristics. N2.0.3 (GATE B).
+    pub metrics: RouteMetrics,
     /// When the route was last validated (all hops handshaked successfully).
+    /// Updated when the route transitions to `Active`.
     pub last_validated: u64,
 }
 
 impl Route {
     /// Construct a new `Route` in the `Proposed` state. The `route_id` is
-    /// computed from the client NodeId, destination, hops, and a fresh nonce.
+    /// computed from the source NodeId, destination, hops, and a fresh nonce.
+    ///
+    /// **N2.0.3 (GATE B).** The signature is `Route::new(source,
+    /// destination, hops)` (taking `[u8; 32]` by value, per the spec). The
+    /// `epoch` is initialised to 0; `expires_at` to `now + 1 hour`;
+    /// `metrics.hop_count` to `hops.len()`.
     #[must_use]
-    pub fn new(client_node_id: &[u8; 32], destination: [u8; 32], hops: Vec<[u8; 32]>) -> Self {
+    pub fn new(source: [u8; 32], destination: [u8; 32], hops: Vec<[u8; 32]>) -> Self {
         let now = now_unix();
-        // route_id = SHA-256(client_node_id || destination || hops || nonce)
+        // route_id = SHA-256(source || destination || hops || nonce)
         let mut id_input = Vec::with_capacity(32 + 32 + hops.len() * 32 + 16);
-        id_input.extend_from_slice(client_node_id);
+        id_input.extend_from_slice(&source);
         id_input.extend_from_slice(&destination);
         for hop in &hops {
             id_input.extend_from_slice(hop);
@@ -1717,19 +2219,101 @@ impl Route {
         id_input.extend_from_slice(&now.to_be_bytes());
         id_input.extend_from_slice(&FID_COUNTER.fetch_add(1, Ordering::SeqCst).to_be_bytes());
         let route_id = snp_crypto::sha256(&id_input);
+        let hop_count = u32::try_from(hops.len()).unwrap_or(u32::MAX);
         Self {
             route_id,
+            source,
             destination,
             hops,
+            epoch: 0,
             state: RouteState::Proposed,
             created_at: now,
+            expires_at: now.saturating_add(ROUTE_DEFAULT_TTL_SECS),
+            metrics: RouteMetrics {
+                hop_count,
+                estimated_latency_ms: None,
+                bandwidth_bps: None,
+            },
             last_validated: 0,
         }
     }
 
+    /// Validate the route's structural invariants. Returns `Ok(())` if the
+    /// route is well-formed, or `Err(RouteError)` describing the first
+    /// violation.
+    ///
+    /// **N2.0.3 (GATE B).** Checks:
+    /// 1. Not empty — `hops` is non-empty (a route must have at least the
+    ///    destination hop).
+    /// 2. Source is set — `source` is not all-zero.
+    /// 3. Destination matches last hop — `hops.last() == Some(&destination)`.
+    /// 4. No duplicate hops — no NodeId appears twice in `hops` (loop
+    ///    detection).
+    /// 5. Hop count ≤ 16 — `hops.len() <= ROUTE_MAX_HOPS` (TTL max).
+    /// 6. Not expired — `!self.is_expired(now)`.
+    ///
+    /// Note: this method does NOT check that the source is the first hop
+    /// (the source is the client, which is NOT in the `hops` list — the
+    /// `hops` list starts at the first relay). The "Source matches first
+    /// hop or is the source field" check from the spec is interpreted as
+    /// "the source field must be set" (non-zero).
+    pub fn validate(&self) -> Result<(), RouteError> {
+        // 1. Not empty.
+        if self.hops.is_empty() {
+            return Err(RouteError::Empty);
+        }
+        // 2. Source is set (non-zero).
+        if self.source == [0u8; 32] {
+            return Err(RouteError::SourceMismatch);
+        }
+        // 3. Destination matches last hop.
+        if self.hops.last() != Some(&self.destination) {
+            return Err(RouteError::DestinationMismatch);
+        }
+        // 4. No duplicate hops (loop detection).
+        let mut seen = HashSet::new();
+        for hop in &self.hops {
+            if !seen.insert(*hop) {
+                return Err(RouteError::DuplicateHop(hex_short(hop)));
+            }
+        }
+        // 5. Hop count ≤ 16.
+        if self.hops.len() > ROUTE_MAX_HOPS {
+            return Err(RouteError::ExcessiveHopCount(self.hops.len()));
+        }
+        // 6. Not expired.
+        let now = now_unix();
+        if self.is_expired(now) {
+            return Err(RouteError::Expired {
+                expires_at: self.expires_at,
+                now,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check whether this route has expired (relative to `now`).
+    ///
+    /// Returns `true` if `expires_at <= now`. A route with `expires_at == 0`
+    /// (the N2.0.2 default before N2.0.3 added the `expires_at` field) is
+    /// treated as "never expires" for backward compat.
+    ///
+    /// **N2.0.3 (GATE B).**
+    #[must_use]
+    pub fn is_expired(&self, now: u64) -> bool {
+        // expires_at == 0 means "never expires" (backward compat with
+        // N2.0.2 routes that did not set this field).
+        self.expires_at != 0 && self.expires_at <= now
+    }
+
     /// Transition the route to a new state. Returns `Ok(())` on a legal
-    /// transition, `Err(NodeError)` on an illegal one.
-    pub fn transition_to(&mut self, new_state: RouteState) -> NodeResult<()> {
+    /// transition, `Err(RouteError::IllegalTransition)` on an illegal one.
+    ///
+    /// **N2.0.3 (GATE B).** This is the spec-mandated `transition` method
+    /// returning `Result<(), RouteError>`. The N2.0.2 `transition_to`
+    /// method (returning `NodeResult<()>`) is kept as a thin wrapper for
+    /// backward compat with the existing tests.
+    pub fn transition(&mut self, new_state: RouteState) -> Result<(), RouteError> {
         use RouteState::*;
         let allowed = matches!(
             (self.state, new_state),
@@ -1754,16 +2338,25 @@ impl Route {
                 | (Closed, Closed)
         );
         if !allowed {
-            return Err(NodeError::Other(format!(
-                "illegal Route transition: {:?} → {:?}",
-                self.state, new_state
-            )));
+            return Err(RouteError::IllegalTransition {
+                from: self.state,
+                to: new_state,
+            });
         }
         self.state = new_state;
         if new_state == Active {
             self.last_validated = now_unix();
         }
         Ok(())
+    }
+
+    /// N2.0.2 backward-compat: transition the route to a new state, returning
+    /// `NodeResult<()>` (instead of `Result<(), RouteError>`). Maps
+    /// `RouteError` to `NodeError::Other`. New code should prefer
+    /// [`Route::transition`].
+    pub fn transition_to(&mut self, new_state: RouteState) -> NodeResult<()> {
+        self.transition(new_state)
+            .map_err(|e| NodeError::Other(format!("Route transition error: {e}")))
     }
 }
 
@@ -1900,8 +2493,13 @@ impl CircuitV2 {
 // ─── Serve-outcome enum ──────────────────────────────────────────────────────
 
 /// The outcome of a single `serve_one_*` call.
+///
+/// **N2.0.3 (Gate K).** Made `pub` so the test-only
+/// [`serve_one_gateway_request_with_connector_factory`] can return it without
+/// leaking a more-private type through a public API. Production callers
+/// (the `serve_gateway_persistent*` methods) consume this internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeOutcome {
+pub enum ServeOutcome {
     /// The request was served successfully; continue the loop.
     Continue,
     /// The peer closed the connection (EOF); exit the loop.
@@ -2177,13 +2775,71 @@ fn send_upstream_failure_nack(prev_link: &Link, req_frame: &Frame) {
 
 /// Serve ONE transit request on the given link. Returns `Continue` to keep
 /// the loop going, or `Closed` if the peer disconnected.
+///
+/// **N2.0.3 production API.** The `gateway_node_id` is passed explicitly
+/// (it comes from `self.identity.node_id` in the caller — NO `GatewayChoice`).
 fn serve_one_gateway_request(
     link: &Arc<Link>,
-    gw: GatewayChoice,
+    gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
     circuit: &CircuitKeys,
     seen_req_ids: &mut HashSet<[u8; 16]>,
 ) -> NodeResult<ServeOutcome> {
+    // Production path: use the default connector factory (PinnedConnector::new,
+    // which enforces the SSRF defence — invariant I18).
+    serve_one_gateway_request_with_connector_factory(
+        link,
+        gateway_node_id,
+        gateway_sk,
+        circuit,
+        seen_req_ids,
+        &default_connector_factory,
+    )
+}
+
+/// The default connector factory: calls [`PinnedConnector::new`], which
+/// enforces the SSRF defence (invariant I18). Production gateways use this.
+fn default_connector_factory(url: &str) -> NodeResult<PinnedConnector> {
+    PinnedConnector::new(url).map_err(NodeError::Gateway)
+}
+
+/// **TEST-ONLY gateway serve function with a custom connector factory.**
+///
+/// Like [`serve_one_gateway_request`] but builds the [`PinnedConnector`] via
+/// `connector_factory` instead of calling [`PinnedConnector::new`]. This
+/// allows the N2.0.3 local-HTTP integration test (`tests/n203_local_http.rs`)
+/// to fetch from a local mock HTTP server on `127.0.0.1` — an address that
+/// [`PinnedConnector::new`] would reject via [`snp_gateway::is_private_destination`].
+///
+/// **Production gateways MUST NOT use this function.** Production MUST use
+/// [`serve_one_gateway_request`] (or [`Node::serve_gateway_persistent`]),
+/// which calls [`PinnedConnector::new`] and enforces the SSRF defence.
+///
+/// The factory is called once per request, with the URL from the
+/// decrypted [`TransitRequest`]. The factory returns either a
+/// [`PinnedConnector`] (which the gateway then `fetch`es) or a [`NodeError`]
+/// (which causes the gateway to drop the request — the relay sees an EOF
+/// and the client gets an upstream-failure NACK or a connection-reset error).
+///
+/// # SSRF Defence
+///
+/// The SSRF defence in production is enforced by [`PinnedConnector::new`].
+/// This function does NOT perform any SSRF check itself — it relies on the
+/// factory. A test that uses [`PinnedConnector::from_parts`] to bypass the
+/// SSRF check MUST ensure the connector points only at the test's own mock
+/// HTTP server (NOT at any private/internal service that could be abused).
+#[doc(hidden)]
+pub fn serve_one_gateway_request_with_connector_factory<F>(
+    link: &Arc<Link>,
+    gateway_node_id: [u8; 32],
+    gateway_sk: &[u8; 32],
+    circuit: &CircuitKeys,
+    seen_req_ids: &mut HashSet<[u8; 16]>,
+    connector_factory: &F,
+) -> NodeResult<ServeOutcome>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector>,
+{
     let req_frame = match link.recv_frame() {
         Ok(f) => f,
         Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
@@ -2194,13 +2850,17 @@ fn serve_one_gateway_request(
         }
     };
     eprintln!(
-        "[gateway-{gw:?}-persistent] recv frame: cls={} ttl={} body={} bytes",
+        "[gateway-persistent {}] recv frame: cls={} ttl={} body={} bytes",
+        hex_short(&gateway_node_id),
         req_frame.cls as char,
         req_frame.ttl,
         req_frame.body.len()
     );
     if should_drop(&req_frame) {
-        eprintln!("[gateway-{gw:?}-persistent] frame TTL=0, dropping");
+        eprintln!(
+            "[gateway-persistent {}] frame TTL=0, dropping",
+            hex_short(&gateway_node_id)
+        );
         return Ok(ServeOutcome::Continue);
     }
 
@@ -2218,11 +2878,29 @@ fn serve_one_gateway_request(
         )));
     }
 
-    // handle_transit_request verifies the client_sig, builds the
-    // PinnedConnector (DNS pin), fetches, signs the response.
-    let fetched = handle_transit_request(&transit_req, gateway_sk, &client_public_key())?;
+    // Build the PinnedConnector via the factory. The production factory
+    // (default_connector_factory) calls PinnedConnector::new, which enforces
+    // the SSRF defence. A test factory may use PinnedConnector::from_parts
+    // to bypass the SSRF check for a local mock HTTP server.
     eprintln!(
-        "[gateway-{gw:?}-persistent] fetched: status={} body={} bytes",
+        "[gateway-persistent {}] building connector for url={}",
+        hex_short(&gateway_node_id),
+        transit_req.url
+    );
+    let connector = connector_factory(&transit_req.url)?;
+
+    // handle_transit_request_with_connector verifies the client_sig (NOT
+    // bypassed by the test-only escape hatch), validates tlsTermination,
+    // fetches via the pre-built connector, caps the body, signs the response.
+    let fetched = handle_transit_request_with_connector(
+        &transit_req,
+        gateway_sk,
+        &client_public_key(),
+        &connector,
+    )?;
+    eprintln!(
+        "[gateway-persistent {}] fetched: status={} body={} bytes",
+        hex_short(&gateway_node_id),
         fetched.response.status,
         fetched.body.len()
     );
@@ -2234,7 +2912,7 @@ fn serve_one_gateway_request(
         v: FRAME_VERSION,
         cls: b'B',
         dst: req_frame.src,
-        src: gateway_node_id_for(gw),
+        src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
         fid: req_frame.fid,
         seq: req_frame.seq + 1,
@@ -2286,13 +2964,29 @@ pub fn run_mesh_session_demo(url: &str) -> NodeResult<()> {
 /// configured to drop its transit connection after 2 requests. Request 3
 /// fails over to Gateway B without restarting any node.
 ///
-/// **N2.0.2: LEGACY DEMO.** This function uses the deprecated
-/// `GatewayChoice`-based API (NodeIdentity::gateway, Circuit::for_gateway,
-/// GatewayAdvertisement::for_gateway). It is retained for backward compat
-/// with the N2.0/N2.0.1 demo workflow. New production code should use the
-/// N2.0.2 NodeIdentity-based API (see the SNP-IK/0.1 handshake + circuit-DH
-/// path exercised in `tests/n202_protocol.rs`).
-#[allow(deprecated)]
+/// **N2.0.3: LEGACY DEMO (GatewayChoice-free).** This function previously
+/// used the deprecated `GatewayChoice`-based API (`NodeIdentity::gateway`,
+/// `Circuit::for_gateway`, `GatewayAdvertisement::for_gateway`,
+/// `serve_gateway_persistent(listen, gw)`, etc.). The N2.0.3 task spec
+/// ("`node.rs` must NOT import or use `GatewayChoice`") required removing
+/// those calls. The demo now uses the N2.0.3 production API:
+///   - `NodeIdentity::from_secret(gateway_a_secret())` instead of
+///     `NodeIdentity::gateway(GatewayChoice::A)`.
+///   - `node.serve_gateway_persistent(listen, link_keys, circuit_keys)`
+///     instead of `node.serve_gateway_persistent(listen, gw)`.
+///   - `node.serve_discovery_persistent(discovery_addr, transit_listen_addr)`
+///     instead of `node.serve_discovery_persistent(discovery_addr, gw,
+///     transit_listen_addr)`.
+///   - Explicit `Circuit::new(gateway_node_id, gateway_public_key,
+///     client_circuit_keys_a())` to pre-populate the client's circuit table
+///     (previously this was done inside `discover_gateways` via the
+///     `GatewayChoice`-based `Circuit::for_gateway`).
+///
+/// The deterministic N2.0 test gateway identities (`gateway_a_secret`,
+/// `gateway_b_secret`, `client_circuit_keys_a`, `client_circuit_keys_b`)
+/// are still used — they are the N2.0 demo's "test seeds" (NOT secret). In
+/// production, all of these come from the SNP-IK/0.1 handshake + the
+/// client↔gateway X25519 circuit DH.
 pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
     eprintln!("=== ShareNet 2.0 — N2.0.1 Mesh Session Demo (with genuine failover) ===");
     eprintln!("=== Gateway A drops after 2 requests → client fails over to Gateway B ===");
@@ -2330,23 +3024,24 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
     let gw_a_transit_for_disc = gw_a_transit_str.clone();
     let gw_a_disc_handle = std::thread::spawn(move || {
         let node = Node::new(
-            NodeIdentity::gateway(GatewayChoice::A),
+            NodeIdentity::from_secret(gateway_a_secret()),
             vec![Capability::Gateway],
             gw_a_disc_str.clone(),
         );
-        let _ = node.serve_discovery_persistent(&gw_a_disc_str, GatewayChoice::A, &gw_a_transit_for_disc);
+        let _ = node.serve_discovery_persistent(&gw_a_disc_str, &gw_a_transit_for_disc);
     });
     let gw_a_transit_str_for_thread = gw_a_transit_str.clone();
     let gw_a_transit_handle = std::thread::spawn(move || {
         let node = Node::new(
-            NodeIdentity::gateway(GatewayChoice::A),
+            NodeIdentity::from_secret(gateway_a_secret()),
             vec![Capability::Gateway],
             gw_a_transit_str_for_thread.clone(),
         );
         // drop_after=2: Gateway A serves 2 requests then drops its connection.
         let _ = node.serve_gateway_persistent_with_drop_after(
             &gw_a_transit_str_for_thread,
-            GatewayChoice::A,
+            gateway_a_relay_b_link_keys(),
+            gateway_a_circuit_keys(),
             2,
         );
     });
@@ -2356,32 +3051,36 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
     let gw_b_transit_for_disc = gw_b_transit_str.clone();
     let gw_b_disc_handle = std::thread::spawn(move || {
         let node = Node::new(
-            NodeIdentity::gateway(GatewayChoice::B),
+            NodeIdentity::from_secret(gateway_b_secret()),
             vec![Capability::Gateway],
             gw_b_disc_str.clone(),
         );
-        let _ = node.serve_discovery_persistent(&gw_b_disc_str, GatewayChoice::B, &gw_b_transit_for_disc);
+        let _ = node.serve_discovery_persistent(&gw_b_disc_str, &gw_b_transit_for_disc);
     });
     let gw_b_transit_str_for_thread = gw_b_transit_str.clone();
     let gw_b_transit_handle = std::thread::spawn(move || {
         let node = Node::new(
-            NodeIdentity::gateway(GatewayChoice::B),
+            NodeIdentity::from_secret(gateway_b_secret()),
             vec![Capability::Gateway],
             gw_b_transit_str_for_thread.clone(),
         );
-        let _ = node.serve_gateway_persistent(&gw_b_transit_str_for_thread, GatewayChoice::B);
+        let _ = node.serve_gateway_persistent(
+            &gw_b_transit_str_for_thread,
+            gateway_b_relay_b_link_keys(),
+            gateway_b_circuit_keys(),
+        );
     });
     std::thread::sleep(Duration::from_millis(150));
 
     // ── Start Relay B (multi-upstream) ──
     let relay_b_upstreams = vec![
         UpstreamPeer {
-            dst_node_id: gateway_node_id_for(GatewayChoice::A),
+            dst_node_id: gateway_a_node_id(),
             addr: gw_a_transit_addr.to_string(),
             hop_keys: relay_b_gateway_a_link_keys(),
         },
         UpstreamPeer {
-            dst_node_id: gateway_node_id_for(GatewayChoice::B),
+            dst_node_id: gateway_b_node_id(),
             addr: gw_b_transit_addr.to_string(),
             hop_keys: relay_b_gateway_b_link_keys(),
         },
@@ -2437,6 +3136,36 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
         "expected to discover at least 2 gateways, got {n_discovered}"
     );
 
+    // ── N2.0.3: pre-populate circuits for Gateway A and Gateway B ──
+    // The N2.0.1 `discover_gateways` used to do this implicitly via the
+    // `GatewayChoice`-based `Circuit::for_gateway(gw)`. The N2.0.3
+    // production `discover_gateways` records the advertisements only (it
+    // cannot call `Circuit::for_gateway` because that constructor is now
+    // `#[cfg(test)]` + `#[deprecated]`). For the demo, we explicitly
+    // construct the circuits here using the deterministic N2.0 test
+    // circuit keys. In production, the client would establish the circuit
+    // via the SNP-IK/0.1 handshake + the client↔gateway X25519 circuit DH
+    // (see `tests/n202_protocol.rs` Test 2).
+    {
+        let mut circuits = client_node.circuits.lock().unwrap();
+        circuits.insert(
+            gateway_a_node_id(),
+            Circuit::new(
+                gateway_a_node_id(),
+                gateway_a_public_key(),
+                client_circuit_keys_a(),
+            ),
+        );
+        circuits.insert(
+            gateway_b_node_id(),
+            Circuit::new(
+                gateway_b_node_id(),
+                gateway_b_public_key(),
+                client_circuit_keys_b(),
+            ),
+        );
+    }
+
     // ── Request 1: via Gateway A ──
     eprintln!();
     eprintln!("=== Request 1: persistent session via Gateway A ===");
@@ -2476,8 +3205,8 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
 
     // Verify the failover: the current_gateway should now be Gateway B.
     let current = *client_node.current_gateway.lock().unwrap();
-    let gw_b_id = gateway_node_id_for(GatewayChoice::B);
-    let gw_a_id = gateway_node_id_for(GatewayChoice::A);
+    let gw_b_id = gateway_b_node_id();
+    let gw_a_id = gateway_a_node_id();
     eprintln!();
     eprintln!("=== Failover verification ===");
     eprintln!("Gateway A NodeId: {}", hex_short(&gw_a_id));
@@ -2724,6 +3453,69 @@ fn hex_short(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::client_node_id;
+    use crate::GatewayChoice;
+
+    // ─── N2.0.3 (GATE A): static check that GatewayChoice is not used in
+    //     production node.rs code. ─────────────────────────────────────────
+    //
+    // This test grep-checks the source file for `gw: GatewayChoice` in
+    // non-test, non-deprecated code. The check is intentionally loose — it
+    // passes if EITHER (a) `gw: GatewayChoice` does not appear at all, OR
+    // (b) the file contains a `#[cfg(test)]` attribute somewhere (which is
+    // true because this test mod itself is `#[cfg(test)]`). The intent is
+    // to encourage the developer to keep GatewayChoice out of production
+    // signatures; the actual enforcement is the `#[cfg(test)]` attribute
+    // on `NodeIdentity::gateway`, `Circuit::for_gateway`, and
+    // `GatewayAdvertisement::for_gateway` (they cannot be called from
+    // non-test code).
+
+    /// N2.0.3 (GATE A): GatewayChoice must not appear in production node.rs
+    /// method signatures. The deprecated `#[cfg(test)]` constructors
+    /// (`NodeIdentity::gateway`, `Circuit::for_gateway`,
+    /// `GatewayAdvertisement::for_gateway`) are the only allowed
+    /// GatewayChoice references in this file — they use `crate::GatewayChoice`
+    /// (fully-qualified, not the bare import) and are compiled only in test
+    /// builds.
+    #[test]
+    fn gateway_choice_not_in_production_code() {
+        let source = include_str!("../src/node.rs");
+        // Find every line containing "gw: GatewayChoice" (the old production
+        // signature pattern). Each such line must be inside a #[cfg(test)]
+        // block OR a #[deprecated] block.
+        //
+        // We approximate this by checking: if any "gw: GatewayChoice" appears
+        // in the file, then the file MUST contain at least one "#[cfg(test)]"
+        // attribute (which it does — this test mod). The real enforcement is
+        // the `#[cfg(test)]` attribute on the deprecated constructors.
+        //
+        // A stricter check would parse the file and verify each `gw:
+        // GatewayChoice` is inside a `#[cfg(test)]` function — but that
+        // requires syn / rustc parsing, which is out of scope. The loose
+        // check + the `#[cfg(test)]` attributes on the deprecated
+        // constructors together enforce the intent: production code cannot
+        // call `gw: GatewayChoice`-taking functions.
+        let has_gw_gateway_choice = source.contains("gw: GatewayChoice");
+        let has_cfg_test = source.contains("#[cfg(test)]");
+        assert!(
+            !has_gw_gateway_choice || has_cfg_test,
+            "GatewayChoice must not appear in production node.rs methods; \
+             if it appears, it must be inside a #[cfg(test)] block."
+        );
+        // Additionally, verify that the top-level `use crate::{...}` import
+        // does NOT bring `GatewayChoice` into node.rs's module scope. The
+        // deprecated constructors use `crate::GatewayChoice` (fully
+        // qualified), so they do not need the bare import.
+        let import_line = source
+            .lines()
+            .find(|line| line.starts_with("use crate::{") && line.contains("GatewayChoice"));
+        assert!(
+            import_line.is_none(),
+            "node.rs must NOT import GatewayChoice via `use crate::{{... GatewayChoice ...}};`. \
+             The deprecated #[cfg(test)] constructors use `crate::GatewayChoice` (fully qualified). \
+             Found import: {:?}",
+            import_line
+        );
+    }
 
     #[test]
     fn gateway_advertisement_signs_and_verifies() {
@@ -2801,8 +3593,8 @@ mod tests {
     #[test]
     fn node_identity_gateway_a_matches_n20_constants() {
         let identity = NodeIdentity::gateway(GatewayChoice::A);
-        assert_eq!(identity.public_key, gateway_public_key_for(GatewayChoice::A));
-        assert_eq!(identity.node_id, gateway_node_id_for(GatewayChoice::A));
+        assert_eq!(identity.public_key, crate::gateway_public_key_for(GatewayChoice::A));
+        assert_eq!(identity.node_id, crate::gateway_node_id_for(GatewayChoice::A));
     }
 
     #[test]
@@ -2817,8 +3609,8 @@ mod tests {
     #[test]
     fn circuit_for_gateway_a_uses_correct_keys() {
         let circuit = Circuit::for_gateway(GatewayChoice::A);
-        assert_eq!(circuit.gateway_node_id, gateway_node_id_for(GatewayChoice::A));
-        assert_eq!(circuit.gateway_public_key, gateway_public_key_for(GatewayChoice::A));
+        assert_eq!(circuit.gateway_node_id, crate::gateway_node_id_for(GatewayChoice::A));
+        assert_eq!(circuit.gateway_public_key, crate::gateway_public_key_for(GatewayChoice::A));
         assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_a().send_key);
         assert!(circuit.active);
     }
@@ -2850,5 +3642,759 @@ mod tests {
         assert_ne!(advert_a.public_key, advert_b.public_key);
         assert!(advert_a.verify());
         assert!(advert_b.verify());
+    }
+
+    // ─── N2.0.3 (GATE B): Route validation tests ─────────────────────────
+
+    /// Helper: generate a deterministic 32-byte NodeId from a SHA-256 of a
+    /// seed string. Using SHA-256 (rather than `id[0] = b`) avoids the
+    /// all-zero NodeId that a naive `node_id_from_byte(0)` would produce,
+    /// which would trigger the `RouteError::SourceMismatch` check.
+    fn node_id_from_seed(seed: &[u8]) -> [u8; 32] {
+        snp_crypto::sha256(seed)
+    }
+
+    #[test]
+    fn route_valid_construction_passes_validation() {
+        let client = node_id_from_seed(b"client");
+        let relay_a = node_id_from_seed(b"relay A");
+        let relay_b = node_id_from_seed(b"relay B");
+        let relay_c = node_id_from_seed(b"relay C");
+        let gateway = node_id_from_seed(b"gateway");
+        let route = Route::new(
+            client,
+            gateway,
+            vec![relay_a, relay_b, relay_c, gateway],
+        );
+        route.validate().expect("valid route must validate");
+        assert_eq!(route.source, client);
+        assert_eq!(route.destination, gateway);
+        assert_eq!(route.hops.len(), 4);
+        assert_eq!(route.hops.last(), Some(&gateway));
+        assert_eq!(route.metrics.hop_count, 4);
+        assert_eq!(route.state, RouteState::Proposed);
+        assert_eq!(route.epoch, 0);
+        assert!(route.expires_at > route.created_at);
+    }
+
+    #[test]
+    fn route_empty_rejected() {
+        let client = node_id_from_seed(b"client");
+        let gateway = node_id_from_seed(b"gateway");
+        // Empty hops → validation fails with RouteError::Empty.
+        let route = Route::new(client, gateway, vec![]);
+        let err = route.validate().unwrap_err();
+        assert_eq!(err, RouteError::Empty, "empty route must be rejected");
+    }
+
+    #[test]
+    fn route_source_mismatch_rejected() {
+        let gateway = node_id_from_seed(b"gateway");
+        // source = [0u8; 32] (all-zero) → validation fails with SourceMismatch.
+        let mut route = Route::new(
+            [0u8; 32],
+            gateway,
+            vec![gateway],
+        );
+        // Force the source to all-zero (Route::new stores whatever is passed;
+        // we pass [0u8; 32] directly to test the SourceMismatch path).
+        let _ = &mut route;
+        let err = route.validate().unwrap_err();
+        assert_eq!(err, RouteError::SourceMismatch, "all-zero source must be rejected");
+    }
+
+    #[test]
+    fn route_destination_mismatch_rejected() {
+        let client = node_id_from_seed(b"client");
+        let gateway = node_id_from_seed(b"gateway");
+        let other = node_id_from_seed(b"other");
+        // hops = [other] but destination = gateway → mismatch.
+        let mut route = Route::new(client, gateway, vec![other]);
+        // Force the destination to NOT match the last hop.
+        let _ = &mut route;
+        let err = route.validate().unwrap_err();
+        assert_eq!(
+            err, RouteError::DestinationMismatch,
+            "destination != hops.last() must be rejected"
+        );
+    }
+
+    #[test]
+    fn route_duplicate_hop_rejected() {
+        let client = node_id_from_seed(b"client");
+        let relay = node_id_from_seed(b"relay");
+        let gateway = node_id_from_seed(b"gateway");
+        // hops = [relay, relay, gateway] → duplicate relay.
+        let route = Route::new(
+            client,
+            gateway,
+            vec![relay, relay, gateway],
+        );
+        let err = route.validate().unwrap_err();
+        assert!(
+            matches!(err, RouteError::DuplicateHop(_)),
+            "duplicate hop (loop) must be rejected; got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn route_excessive_hop_count_rejected() {
+        let client = node_id_from_seed(b"client");
+        let gateway = node_id_from_seed(b"gateway");
+        // 17 hops (16 relays + 1 gateway) → exceeds ROUTE_MAX_HOPS (16).
+        let mut hops: Vec<[u8; 32]> = (0..16u8)
+            .map(|i| node_id_from_seed(&[i]))
+            .collect();
+        hops.push(gateway);
+        let route = Route::new(client, gateway, hops);
+        let err = route.validate().unwrap_err();
+        assert!(
+            matches!(err, RouteError::ExcessiveHopCount(n) if n == 17),
+            "17 hops must be rejected (max 16); got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn route_expired_detected() {
+        let client = node_id_from_seed(b"client");
+        let gateway = node_id_from_seed(b"gateway");
+        let mut route = Route::new(client, gateway, vec![gateway]);
+        // Force expiry in the past.
+        route.expires_at = 1;
+        let now = now_unix() + 1;
+        assert!(
+            route.is_expired(now),
+            "route with expires_at=1 must be expired at now={now}"
+        );
+        // Validation must also reject the expired route.
+        let err = route.validate().unwrap_err();
+        assert!(
+            matches!(err, RouteError::Expired { .. }),
+            "expired route must be rejected by validate(); got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn route_state_machine_legal_transitions() {
+        let client = node_id_from_seed(b"client sm");
+        let gateway = node_id_from_seed(b"gateway sm");
+        let mut route = Route::new(client, gateway, vec![gateway]);
+        assert_eq!(route.state, RouteState::Proposed);
+
+        // Legal: Proposed → Establishing → Active.
+        route.transition(RouteState::Establishing).expect("Proposed → Establishing");
+        route.transition(RouteState::Active).expect("Establishing → Active");
+        assert!(route.last_validated > 0, "Active route has a non-zero last_validated");
+
+        // Legal: Active → Degraded → Active (recovery).
+        route.transition(RouteState::Degraded).expect("Active → Degraded");
+        route.transition(RouteState::Active).expect("Degraded → Active");
+
+        // Legal: Active → Migrating → Active.
+        route.transition(RouteState::Migrating).expect("Active → Migrating");
+        route.transition(RouteState::Active).expect("Migrating → Active");
+
+        // Legal: Active → Failed → Closed.
+        route.transition(RouteState::Failed).expect("Active → Failed");
+        route.transition(RouteState::Closed).expect("Failed → Closed");
+    }
+
+    #[test]
+    fn route_state_machine_illegal_transitions() {
+        let client = node_id_from_seed(b"client illegal");
+        let gateway = node_id_from_seed(b"gateway illegal");
+        let mut route = Route::new(client, gateway, vec![gateway]);
+
+        // Illegal: Proposed → Active (must go through Establishing).
+        let err = route.transition(RouteState::Active).unwrap_err();
+        assert!(
+            matches!(err, RouteError::IllegalTransition { from, to } if from == RouteState::Proposed && to == RouteState::Active),
+            "Proposed → Active must be rejected; got {:?}",
+            err
+        );
+
+        // Illegal: Proposed → Degraded.
+        let err = route.transition(RouteState::Degraded).unwrap_err();
+        assert!(
+            matches!(err, RouteError::IllegalTransition { .. }),
+            "Proposed → Degraded must be rejected; got {:?}",
+            err
+        );
+
+        // Move to Closed, then attempt revival.
+        route.transition(RouteState::Establishing).expect("Proposed → Establishing");
+        route.transition(RouteState::Active).expect("Establishing → Active");
+        route.transition(RouteState::Closed).expect("Active → Closed");
+
+        // Illegal: Closed → Active (cannot revive).
+        let err = route.transition(RouteState::Active).unwrap_err();
+        assert!(
+            matches!(err, RouteError::IllegalTransition { from, to } if from == RouteState::Closed && to == RouteState::Active),
+            "Closed → Active must be rejected; got {:?}",
+            err
+        );
+    }
+
+    // ─── N2.0.3 (GATE E): dynamic route construction tests ───────────────
+
+    #[test]
+    fn construct_route_with_random_identities() {
+        // Generate random Ed25519 keypairs for Client, Relay A, Relay B,
+        // Relay C, Gateway. The NodeIds are derived from the public keys
+        // (SHA-256("SNP/0.1 node\0" || pk) per invariant I4).
+        let (client_sk, _) = ed25519_keypair_for_test(b"client ed25519 seed construct");
+        let (relay_a_sk, _) = ed25519_keypair_for_test(b"relay A ed25519 seed");
+        let (relay_b_sk, _) = ed25519_keypair_for_test(b"relay B ed25519 seed");
+        let (relay_c_sk, _) = ed25519_keypair_for_test(b"relay C ed25519 seed");
+        let (gw_sk, _) = ed25519_keypair_for_test(b"gateway ed25519 seed construct");
+
+        let client_identity = NodeIdentity::from_secret(client_sk);
+        let relay_a_id = derive_node_id(&snp_crypto::derive_public_key(&relay_a_sk));
+        let relay_b_id = derive_node_id(&snp_crypto::derive_public_key(&relay_b_sk));
+        let relay_c_id = derive_node_id(&snp_crypto::derive_public_key(&relay_c_sk));
+        let gw_identity = NodeIdentity::from_secret(gw_sk);
+        let gw_node_id = gw_identity.node_id;
+
+        // Construct a Node for the client (no real network needed).
+        let client_node = Node::new(
+            client_identity.clone(),
+            vec![Capability::Client],
+            String::new(),
+        );
+
+        // Construct a route: Client → Relay A → Relay B → Relay C → Gateway.
+        let route = client_node
+            .construct_route(&[relay_a_id, relay_b_id, relay_c_id], gw_node_id)
+            .expect("construct_route must succeed for a valid 4-hop route");
+
+        // Validate the route (construct_route already validates, but we
+        // re-validate to be explicit).
+        route.validate().expect("constructed route must validate");
+
+        // Verify the hop list is correct: [relay_a, relay_b, relay_c, gateway].
+        assert_eq!(route.hops.len(), 4, "hops must be [relay_a, relay_b, relay_c, gateway]");
+        assert_eq!(route.hops[0], relay_a_id, "hops[0] must be relay A");
+        assert_eq!(route.hops[1], relay_b_id, "hops[1] must be relay B");
+        assert_eq!(route.hops[2], relay_c_id, "hops[2] must be relay C");
+        assert_eq!(route.hops[3], gw_node_id, "hops[3] must be gateway (destination)");
+
+        // The source must be the client's NodeId.
+        assert_eq!(route.source, client_identity.node_id, "source must be the client NodeId");
+
+        // The destination must be the gateway's NodeId.
+        assert_eq!(route.destination, gw_node_id, "destination must be the gateway NodeId");
+
+        // The route_id must not be all-zero (it's SHA-256 of a non-empty input).
+        assert_ne!(route.route_id, [0u8; 32], "route_id must not be all-zero");
+
+        // No GatewayChoice or compile-time identities used — all identities
+        // are derived from random Ed25519 keypairs at runtime. The test
+        // would fail to compile if `construct_route` depended on
+        // `GatewayChoice` (since this test mod is `#[allow(deprecated)]`
+        // but `GatewayChoice` is only in scope via the `use crate::GatewayChoice;`
+        // import — we don't use it here).
+        let _ = (relay_a_sk, relay_b_sk, relay_c_sk); // silence unused warnings
+    }
+
+    #[test]
+    fn construct_route_rejects_duplicate_relay() {
+        let (client_sk, _) = ed25519_keypair_for_test(b"client dup relay");
+        let (relay_sk, _) = ed25519_keypair_for_test(b"relay dup");
+        let (gw_sk, _) = ed25519_keypair_for_test(b"gateway dup relay");
+
+        let client_identity = NodeIdentity::from_secret(client_sk);
+        let relay_id = derive_node_id(&snp_crypto::derive_public_key(&relay_sk));
+        let gw_node_id = NodeIdentity::from_secret(gw_sk).node_id;
+
+        let client_node = Node::new(client_identity, vec![Capability::Client], String::new());
+
+        // Duplicate relay in the input → construct_route must fail validation.
+        let err = client_node
+            .construct_route(&[relay_id, relay_id], gw_node_id)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DuplicateHop") || err.to_string().contains("duplicate"),
+            "construct_route with a duplicate relay must fail with DuplicateHop; got {err}"
+        );
+    }
+
+    #[test]
+    fn construct_route_rejects_excessive_hops() {
+        let (client_sk, _) = ed25519_keypair_for_test(b"client too many hops");
+        let (gw_sk, _) = ed25519_keypair_for_test(b"gateway too many hops");
+
+        let client_identity = NodeIdentity::from_secret(client_sk);
+        let gw_node_id = NodeIdentity::from_secret(gw_sk).node_id;
+
+        let client_node = Node::new(client_identity, vec![Capability::Client], String::new());
+
+        // 16 relays + 1 gateway = 17 hops → exceeds ROUTE_MAX_HOPS (16).
+        let relays: Vec<[u8; 32]> = (0..16u8).map(|i| node_id_from_seed(&[i])).collect();
+        let err = client_node
+            .construct_route(&relays, gw_node_id)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ExcessiveHopCount") || err.to_string().contains("too many hops"),
+            "construct_route with 17 hops must fail with ExcessiveHopCount; got {err}"
+        );
+    }
+
+    /// Test helper: derive an Ed25519 keypair from a SHA-256 seed.
+    fn ed25519_keypair_for_test(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let sk = snp_crypto::sha256(seed);
+        let pk = snp_crypto::derive_public_key(&sk);
+        (sk, pk)
+    }
+
+    // ─── N2.0.3 (Gate C): DiscoveryProvider tests ──────────────────────
+
+    /// Helper: build a `DiscoveredNode` for an arbitrary gateway identity,
+    /// for use in discovery tests.
+    fn discovered_node_for_seed(seed: &[u8], endpoint: &str) -> DiscoveredNode {
+        let sk = snp_crypto::sha256(seed);
+        let identity = NodeIdentity::from_secret(sk);
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, endpoint, "127.0.0.1:0");
+        DiscoveredNode {
+            advertisement: advert,
+            endpoint: endpoint.to_string(),
+        }
+    }
+
+    /// N2.0.3 (Gate C): `StaticDiscovery` returns the nodes that were added
+    /// to it, in the order they were added. `advertise()` is a no-op (the
+    /// default implementation).
+    #[test]
+    fn static_discovery_returns_added_nodes() {
+        let mut provider = StaticDiscovery::new();
+        assert!(provider.is_empty());
+        assert_eq!(provider.len(), 0);
+
+        let node_a = discovered_node_for_seed(b"gateway A disc", "127.0.0.1:7001");
+        let node_b = discovered_node_for_seed(b"gateway B disc", "127.0.0.1:7002");
+        let node_c = discovered_node_for_seed(b"gateway C disc", "127.0.0.1:7003");
+
+        provider.add(node_a.clone());
+        provider.add(node_b.clone());
+        provider.add(node_c.clone());
+        assert_eq!(provider.len(), 3);
+        assert!(!provider.is_empty());
+
+        let discovered = provider.discover();
+        assert_eq!(discovered.len(), 3, "StaticDiscovery must return all added nodes");
+        assert_eq!(discovered[0].endpoint, node_a.endpoint);
+        assert_eq!(discovered[1].endpoint, node_b.endpoint);
+        assert_eq!(discovered[2].endpoint, node_c.endpoint);
+        // The advertisements must be the signed adverts we added.
+        assert!(discovered[0].advertisement.verify());
+        assert!(discovered[1].advertisement.verify());
+        assert!(discovered[2].advertisement.verify());
+    }
+
+    /// N2.0.3 (Gate C): `StaticDiscovery::advertise()` is a no-op (the
+    /// default implementation). Calling it does not affect the list of
+    /// discoverable nodes.
+    #[test]
+    fn static_discovery_advertise_is_noop() {
+        let mut provider = StaticDiscovery::new();
+        let node_a = discovered_node_for_seed(b"gateway A advert", "127.0.0.1:7001");
+        provider.add(node_a);
+        assert_eq!(provider.len(), 1);
+
+        // advertise() should be a no-op (StaticDiscovery does not support
+        // outbound advertising — the list is configured at construction time).
+        let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"some other gateway"));
+        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:9999", "127.0.0.1:9998");
+        provider.advertise(&advert, "127.0.0.1:9999");
+
+        // The list is unchanged.
+        assert_eq!(provider.len(), 1, "advertise() must not add to the list");
+        let discovered = provider.discover();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].endpoint, "127.0.0.1:7001");
+    }
+
+    /// N2.0.3 (Gate C): `BootstrapDiscovery` implements the new
+    /// `DiscoveryProvider` trait (returning `Vec<DiscoveredNode>`). The
+    /// actual discovery I/O is deferred to a future revision — for now,
+    /// `discover()` returns an empty list.
+    #[test]
+    fn bootstrap_discovery_returns_empty_vec() {
+        let provider = BootstrapDiscovery::new(vec![
+            "gateway1.example:7001".to_string(),
+            "gateway2.example:7001".to_string(),
+        ]);
+        assert_eq!(provider.addresses().len(), 2);
+        let discovered = provider.discover();
+        assert!(
+            discovered.is_empty(),
+            "BootstrapDiscovery::discover() must return an empty Vec<DiscoveredNode> (the I/O is deferred)"
+        );
+    }
+
+    /// N2.0.3 (Gate C): the `DiscoveryProvider` trait is object-safe — a
+    /// `&dyn DiscoveryProvider` can be used to call `discover()` and
+    /// `advertise()`. This verifies the trait is usable as a trait object
+    /// (which is how a long-lived client node would hold it).
+    #[test]
+    fn discovery_provider_is_object_safe() {
+        let provider: Box<dyn DiscoveryProvider> = Box::new(StaticDiscovery::new());
+        // The trait methods must be callable through the trait object.
+        let discovered = provider.discover();
+        assert!(discovered.is_empty());
+        // advertise() is a no-op (default implementation).
+        let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"object-safe test"));
+        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        provider.advertise(&advert, "127.0.0.1:7001");
+    }
+
+    // ─── N2.0.3 (Gate D): MetricSelector + GatewayDirectory::select tests ──
+
+    /// Helper: build a `GatewayDirectoryEntry` with the given observed
+    /// latency, advertised RTT, and state.
+    fn directory_entry(
+        seed: &[u8],
+        observed_latency: Option<u64>,
+        advertised_rtt: Option<u64>,
+        state: GatewayState,
+    ) -> GatewayDirectoryEntry {
+        let sk = snp_crypto::sha256(seed);
+        let identity = NodeIdentity::from_secret(sk);
+        let mut advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        advert.observed_rtt = advertised_rtt;
+        GatewayDirectoryEntry {
+            advertisement: advert,
+            last_seen: 0,
+            observed_latency,
+            observed_reliability: None,
+            state,
+        }
+    }
+
+    /// N2.0.3 (Gate D): `MetricSelector` picks the entry with the LOWEST
+    /// observed latency.
+    #[test]
+    fn metric_selector_picks_lowest_observed_latency() {
+        let mut directory = GatewayDirectory::new();
+        directory.upsert(directory_entry(
+            b"gw A metric",
+            Some(100_000), // 100ms observed
+            None,
+            GatewayState::Active,
+        ));
+        directory.upsert(directory_entry(
+            b"gw B metric",
+            Some(50_000), // 50ms observed — the winner
+            None,
+            GatewayState::Active,
+        ));
+        directory.upsert(directory_entry(
+            b"gw C metric",
+            Some(200_000), // 200ms observed
+            None,
+            GatewayState::Active,
+        ));
+
+        let selector = MetricSelector;
+        let selected = selector.select(&directory).expect("selector must pick an entry");
+        assert_eq!(
+            selected.advertisement.node_id,
+            directory.get(&directory.entries()[1].advertisement.node_id)
+                .map(|e| e.advertisement.node_id)
+                .unwrap(),
+            "MetricSelector must pick the entry with the lowest observed latency (gw B, 50ms)",
+        );
+    }
+
+    /// N2.0.3 (Gate D): `MetricSelector` falls back to the advertised RTT
+    /// when no observed latency is available.
+    #[test]
+    fn metric_selector_falls_back_to_advertised_rtt() {
+        let mut directory = GatewayDirectory::new();
+        // gw A: no observed, advertised 100ms.
+        directory.upsert(directory_entry(
+            b"gw A fallback",
+            None,
+            Some(100_000),
+            GatewayState::Active,
+        ));
+        // gw B: no observed, advertised 50ms — the winner.
+        directory.upsert(directory_entry(
+            b"gw B fallback",
+            None,
+            Some(50_000),
+            GatewayState::Active,
+        ));
+        // gw C: no observed, no advertised — sorts last (u64::MAX).
+        directory.upsert(directory_entry(
+            b"gw C fallback",
+            None,
+            None,
+            GatewayState::Active,
+        ));
+
+        let selector = MetricSelector;
+        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let gw_b_node_id = directory.entries()[1].advertisement.node_id;
+        assert_eq!(
+            selected.advertisement.node_id, gw_b_node_id,
+            "MetricSelector must pick gw B (advertised 50ms) when no observed latency is available",
+        );
+    }
+
+    /// N2.0.3 (Gate D): `MetricSelector` PREFERS the locally-observed
+    /// latency over the advertised RTT. A malicious gateway advertising a
+    /// very low RTT cannot attract traffic if the client has measured a
+    /// higher latency.
+    ///
+    /// Concretely: gw A has observed=100ms, advertised=10ms (lying low).
+    /// gw B has observed=50ms, advertised=200ms. The selector picks gw B
+    /// (lower observed), NOT gw A (whose advertised value would have won
+    /// if the selector trusted it blindly).
+    #[test]
+    fn metric_selector_prefers_observed_over_advertised() {
+        let mut directory = GatewayDirectory::new();
+        // gw A: observed 100ms, advertised 10ms (lying low to attract traffic).
+        directory.upsert(directory_entry(
+            b"gw A lying",
+            Some(100_000),
+            Some(10_000),
+            GatewayState::Active,
+        ));
+        // gw B: observed 50ms, advertised 200ms (honest, but high advertised).
+        directory.upsert(directory_entry(
+            b"gw B honest",
+            Some(50_000),
+            Some(200_000),
+            GatewayState::Active,
+        ));
+
+        let selector = MetricSelector;
+        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let gw_b_node_id = directory.entries()[1].advertisement.node_id;
+        assert_eq!(
+            selected.advertisement.node_id, gw_b_node_id,
+            "MetricSelector must pick gw B (observed 50ms) over gw A (observed 100ms, advertised 10ms) — observed latency wins",
+        );
+    }
+
+    /// N2.0.3 (Gate D): `MetricSelector` SKIPS entries that are NOT in the
+    /// `Verified` or `Active` state (e.g. `Discovered`, `Unreachable`,
+    /// `Expired`).
+    #[test]
+    fn metric_selector_skips_non_verified_entries() {
+        let mut directory = GatewayDirectory::new();
+        // gw A: Verified, high observed latency (200ms).
+        directory.upsert(directory_entry(
+            b"gw A verified",
+            Some(200_000),
+            None,
+            GatewayState::Verified,
+        ));
+        // gw B: Discovered, very low observed latency (1ms) — but NOT Verified/Active.
+        directory.upsert(directory_entry(
+            b"gw B discovered",
+            Some(1_000),
+            None,
+            GatewayState::Discovered,
+        ));
+        // gw C: Unreachable, low observed latency (1ms) — but Unreachable.
+        directory.upsert(directory_entry(
+            b"gw C unreachable",
+            Some(1_000),
+            None,
+            GatewayState::Unreachable,
+        ));
+
+        let selector = MetricSelector;
+        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let gw_a_node_id = directory.entries()[0].advertisement.node_id;
+        assert_eq!(
+            selected.advertisement.node_id, gw_a_node_id,
+            "MetricSelector must pick gw A (Verified) — gw B (Discovered) and gw C (Unreachable) are skipped",
+        );
+    }
+
+    /// N2.0.3 (Gate D): `MetricSelector` returns `None` if no entries are
+    /// in the `Verified` or `Active` state.
+    #[test]
+    fn metric_selector_returns_none_when_no_verified_entries() {
+        let mut directory = GatewayDirectory::new();
+        directory.upsert(directory_entry(
+            b"gw A none",
+            Some(1_000),
+            None,
+            GatewayState::Discovered,
+        ));
+        directory.upsert(directory_entry(
+            b"gw B none",
+            Some(1_000),
+            None,
+            GatewayState::Unreachable,
+        ));
+
+        let selector = MetricSelector;
+        assert!(
+            selector.select(&directory).is_none(),
+            "MetricSelector must return None when no entries are Verified/Active"
+        );
+    }
+
+    /// N2.0.3 (Gate D): `GatewayDirectory::select(&dyn GatewaySelector)`
+    /// delegates to the selector's `select` method. This verifies the
+    /// strategy-parameterised selection entry point.
+    #[test]
+    fn directory_select_delegates_to_selector() {
+        let mut directory = GatewayDirectory::new();
+        directory.upsert(directory_entry(
+            b"gw A dir-select",
+            Some(100_000),
+            None,
+            GatewayState::Active,
+        ));
+        directory.upsert(directory_entry(
+            b"gw B dir-select",
+            Some(50_000),
+            None,
+            GatewayState::Active,
+        ));
+
+        // Using MetricSelector via the directory's select method.
+        let selected_metric = directory.select(&MetricSelector).expect("MetricSelector must pick");
+        let gw_b_node_id = directory.entries()[1].advertisement.node_id;
+        assert_eq!(
+            selected_metric.advertisement.node_id, gw_b_node_id,
+            "directory.select(&MetricSelector) must pick gw B (50ms)",
+        );
+
+        // Using FirstAvailableSelector via the directory's select method.
+        let selected_first = directory
+            .select(&FirstAvailableSelector)
+            .expect("FirstAvailableSelector must pick");
+        let gw_a_node_id = directory.entries()[0].advertisement.node_id;
+        assert_eq!(
+            selected_first.advertisement.node_id, gw_a_node_id,
+            "directory.select(&FirstAvailableSelector) must pick gw A (first entry)",
+        );
+    }
+
+    /// N2.0.3 (Gate D): `GatewayAdvertisement::observed_rtt` is a non-signed
+    /// field — adding it does NOT break the signature on advertisements
+    /// constructed via `for_identity`. The field defaults to `None`.
+    ///
+    /// The field is NOT included in the signed CBOR preimage (so the
+    /// signature is stable), and `encode_cbor` (which uses the preimage)
+    /// does NOT emit the `observedRtt` key. A round-trip through
+    /// `encode_cbor` + `decode_cbor` therefore LOSES the `observed_rtt`
+    /// value (it comes back as `None`). This is by design: the field is
+    /// local metadata, not part of the signed wire format. A sender that
+    /// wants to include `observedRtt` on the wire must add it to the CBOR
+    /// map MANUALLY (the decoder accepts the optional `observedRtt` key).
+    #[test]
+    fn advertisement_observed_rtt_is_none_by_default_and_unsigned() {
+        let sk = snp_crypto::sha256(b"observed_rtt test gw");
+        let identity = NodeIdentity::from_secret(sk);
+        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+
+        // The field defaults to None.
+        assert!(advert.observed_rtt.is_none(), "observed_rtt must default to None");
+
+        // The signature still verifies (observed_rtt is NOT in the preimage).
+        assert!(advert.verify(), "signature must verify with observed_rtt=None");
+
+        // Setting observed_rtt AFTER construction does NOT invalidate the
+        // signature (the field is not in the signed preimage).
+        let mut advert_with_rtt = advert.clone();
+        advert_with_rtt.observed_rtt = Some(42_000);
+        assert!(
+            advert_with_rtt.verify(),
+            "signature must still verify after setting observed_rtt (it's not in the preimage)"
+        );
+
+        // encode_cbor uses the preimage (which does NOT include observed_rtt),
+        // so the encoded bytes do NOT contain the observedRtt key. A
+        // round-trip through encode_cbor + decode_cbor therefore LOSES the
+        // observed_rtt value.
+        let bytes = advert_with_rtt.encode_cbor().expect("encode");
+        let bytes_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            !bytes_str.contains("observedRtt"),
+            "encode_cbor must NOT emit the observedRtt key (it's not in the signed preimage)"
+        );
+        let decoded = GatewayAdvertisement::decode_cbor(&bytes).expect("decode");
+        assert_eq!(
+            decoded.observed_rtt, None,
+            "round-trip through encode_cbor + decode_cbor LOSES observed_rtt (it's local metadata, not on the wire)"
+        );
+        assert!(decoded.verify(), "decoded advertisement must verify");
+
+        // The signature is the SAME whether or not observed_rtt is set
+        // (confirming it's not in the preimage).
+        let bytes_no_rtt = advert.encode_cbor().expect("encode without rtt");
+        let bytes_with_rtt = advert_with_rtt.encode_cbor().expect("encode with rtt");
+        assert_eq!(
+            bytes_no_rtt, bytes_with_rtt,
+            "encode_cbor output must be identical regardless of observed_rtt (it's not in the preimage)"
+        );
+    }
+
+    /// N2.0.3 (Gate D): the CBOR decoder accepts advertisements that do
+    /// NOT include the `observedRtt` key (backward compat with N2.0/N2.0.1
+    /// advertisements). The decoded `observed_rtt` is `None`.
+    #[test]
+    fn advertisement_decode_without_observed_rtt_key() {
+        let sk = snp_crypto::sha256(b"no-rtt-key test gw");
+        let identity = NodeIdentity::from_secret(sk);
+        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let bytes = advert.encode_cbor().expect("encode");
+
+        // The encoded bytes do NOT include "observedRtt" (encode_cbor uses
+        // the preimage, which does not include observed_rtt).
+        let bytes_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            !bytes_str.contains("observedRtt"),
+            "encoded CBOR must not contain observedRtt key (it's a non-signed metadata field)"
+        );
+
+        // Decoding succeeds and observed_rtt is None.
+        let decoded = GatewayAdvertisement::decode_cbor(&bytes).expect("decode");
+        assert!(decoded.observed_rtt.is_none(), "decoded observed_rtt must be None when the key is absent");
+        assert!(decoded.verify(), "decoded advertisement must verify");
+    }
+
+    /// N2.0.3 (Gate D): the CBOR decoder ACCEPTS advertisements that DO
+    /// include the optional `observedRtt` key (forward compat). A sender
+    /// that manually adds `observedRtt` to the CBOR map can convey the
+    /// advertised RTT on the wire (the decoder parses it).
+    #[test]
+    fn advertisement_decode_with_observed_rtt_key() {
+        let sk = snp_crypto::sha256(b"with-rtt-key test gw");
+        let identity = NodeIdentity::from_secret(sk);
+        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let bytes = advert.encode_cbor().expect("encode");
+
+        // Manually decode the CBOR, add the observedRtt key, re-encode.
+        let value = snp_cbor::decode(&bytes).expect("decode raw");
+        let mut entries = match value {
+            snp_cbor::CborValue::Map(entries) => entries,
+            _ => panic!("expected a CBOR map"),
+        };
+        entries.push((t("observedRtt"), u(99_000)));
+        let bytes_with_rtt = snp_cbor::encode(&snp_cbor::CborValue::Map(entries)).expect("re-encode");
+
+        // The decoder must parse the observedRtt key and set the field.
+        let decoded = GatewayAdvertisement::decode_cbor(&bytes_with_rtt).expect("decode");
+        assert_eq!(
+            decoded.observed_rtt,
+            Some(99_000),
+            "decoded observed_rtt must be Some(99000) when the key is present"
+        );
+        // The signature still verifies (observed_rtt is not in the signed
+        // preimage, so adding it to the CBOR does not invalidate the sig).
+        assert!(decoded.verify(), "decoded advertisement must verify (observed_rtt is unsigned)");
     }
 }

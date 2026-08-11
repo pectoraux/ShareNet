@@ -1094,6 +1094,64 @@ pub fn handle_transit_request(
     // hostname. The N1.8 TOCTOU gap is closed.
     let connector = PinnedConnector::new(&req.url)?;
 
+    // Delegate the fetch + sign step to the connector-parameterised variant.
+    fetch_and_sign_with_connector(req, gateway_secret_key, &connector)
+}
+
+/// Like [`handle_transit_request`] but uses a pre-built [`PinnedConnector`]
+/// instead of calling [`PinnedConnector::new`] internally.
+///
+/// **TEST-ONLY escape hatch.** This bypasses the SSRF / DNS validation in
+/// [`PinnedConnector::new`] — the caller is responsible for ensuring the
+/// connector points at a safe destination. The N2.0.3 local-HTTP
+/// integration test (`snp-node/tests/n203_local_http.rs`) uses this with a
+/// [`PinnedConnector::from_parts`] that pins to the test's own mock HTTP
+/// server on 127.0.0.1 (an address that [`PinnedConnector::new`] would
+/// reject — see [`is_private_destination`]).
+///
+/// **Production gateways MUST NOT use this function** — production MUST
+/// call [`handle_transit_request`], which builds the connector via
+/// [`PinnedConnector::new`] and enforces the SSRF defence (invariant I18).
+///
+/// The client-signature verification and `tlsTermination` validation are
+/// still performed (these are NOT bypassed — only the SSRF check is).
+///
+/// # Errors
+/// Returns [`GatewayError`] on signature-verification failure, TLS
+/// termination validation failure, HTTP fetch failure, etc.
+pub fn handle_transit_request_with_connector(
+    req: &TransitRequest,
+    gateway_secret_key: &SymmetricKey,
+    client_public_key: &[u8; 32],
+    connector: &PinnedConnector,
+) -> GatewayResult<FetchedResponse> {
+    // Same client-signature verification as handle_transit_request — this
+    // is NOT bypassed by the test-only escape hatch.
+    if !verify_transit_request(req, client_public_key) {
+        return Err(GatewayError::MalformedRequest(
+            "TransitRequest client_sig verification FAILED — request is not \
+             authenticated (N1.9.2: unsigned requests must not reach egress)"
+                .to_string(),
+        ));
+    }
+
+    if req.tls_termination != "GATEWAY_PLAINTEXT" && req.tls_termination != "PAYLOAD_E2E" {
+        return Err(GatewayError::MalformedRequest(format!(
+            "tlsTermination must be GATEWAY_PLAINTEXT or PAYLOAD_E2E; got \"{}\" (I17)",
+            req.tls_termination
+        )));
+    }
+
+    fetch_and_sign_with_connector(req, gateway_secret_key, connector)
+}
+
+/// Shared fetch + cap + sign step used by both [`handle_transit_request`]
+/// and [`handle_transit_request_with_connector`].
+fn fetch_and_sign_with_connector(
+    req: &TransitRequest,
+    gateway_secret_key: &SymmetricKey,
+    connector: &PinnedConnector,
+) -> GatewayResult<FetchedResponse> {
     // Determine the gateway's NodeId from its secret key.
     let gateway_public = derive_public_key(gateway_secret_key);
     let gateway_id = derive_node_id(&gateway_public);

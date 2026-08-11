@@ -2091,3 +2091,427 @@ GATE 1: PASSED ✅
 - TypeScript conformance: 138/138
 - Zero disagreements between Rust and TypeScript
 - All 15 suites pass (CBOR, hashing, identity, chunking, Merkle, manifest, receipts, frames, descriptors, routing, gateway, civic-points, revocation, negative, AEAD)
+
+---
+Task ID: 145-149
+Agent: Z.ai (subagent — N2.0.3 Gates A+B+E)
+Task: Remove GatewayChoice, implement Route object, dynamic route construction
+
+Work Log:
+- Read worklog (last 5 entries) + node.rs (2854→3582 lines), lib.rs (1403→1459 lines),
+  main.rs (241 lines), snp-link/lib.rs, snp-routing/lib.rs. Confirmed baseline:
+  138/138 conformance, 110 tests pass, 0 fail, 3 ignored.
+- GATE A (Remove GatewayChoice from production node.rs):
+  * Removed `GatewayChoice` from the top-level `use crate::{...}` import in node.rs.
+    The deprecated constructors (`NodeIdentity::gateway`, `Circuit::for_gateway`,
+    `GatewayAdvertisement::for_gateway`) now use `crate::GatewayChoice` (fully
+    qualified) in their signatures — they do NOT need the bare import.
+  * Marked the 3 deprecated constructors as `#[deprecated]` (kept — NOT `#[cfg(test)]`
+    because `#[cfg(test)]` on a `pub fn` makes it invisible to integration tests in
+    `tests/` which are separate crates; documented this rationale in each constructor's
+    docstring).
+  * Modified `serve_gateway_persistent`: removed `gw: GatewayChoice` parameter;
+    now takes `(listen_addr, link_keys: LinkKeys, circuit_keys: CircuitKeys)`.
+    Uses `self.identity.secret_key` for the gateway Ed25519 secret and
+    `self.identity.node_id` for the gateway NodeId.
+  * Modified `serve_gateway_persistent_with_drop_after`: same change.
+  * Modified `serve_one_gateway_request` (internal helper): replaced
+    `gw: GatewayChoice` with `gateway_node_id: [u8; 32]` (passed explicitly from
+    the caller's `self.identity.node_id`).
+  * Modified `serve_discovery_persistent`: removed `gw: GatewayChoice` parameter;
+    now takes `(discovery_addr, transit_listen_addr)`. Uses
+    `GatewayAdvertisement::for_identity(&self.identity, ...)` instead of
+    `for_gateway(gw, ...)`.
+  * Modified `discover_gateways`: removed the `GatewayChoice`-based circuit
+    pre-population block (which mapped the advertisement's publicKey to
+    `GatewayChoice::A`/`::B` and called `Circuit::for_gateway(gw)`). The method
+    now records the advertisements only; the client establishes circuits via
+    the SNP-IK/0.1 handshake + circuit DH in production (see tests/n202_protocol.rs
+    Test 2).
+  * Updated `run_mesh_session_demo_with_failover` to use the new API:
+    `NodeIdentity::from_secret(gateway_a_secret())` instead of
+    `NodeIdentity::gateway(GatewayChoice::A)`; explicit
+    `Circuit::new(gateway_a_node_id(), gateway_a_public_key(), client_circuit_keys_a())`
+    to pre-populate the client's circuit table (previously done implicitly by
+    `discover_gateways`).
+  * Added 6 new pub helpers to lib.rs (gateway_a_secret, gateway_b_secret,
+    gateway_a_public_key, gateway_b_public_key, gateway_a_node_id, gateway_b_node_id)
+    so node.rs can construct the N2.0 demo gateways WITHOUT importing GatewayChoice.
+  * Added the static test `gateway_choice_not_in_production_code` to node.rs's
+    test mod. It (a) grep-checks that `gw: GatewayChoice` only appears in
+    `#[cfg(test)]` code (loose check, matches the spec's example), and (b) strictly
+    checks that the top-level `use crate::{...}` import does NOT contain
+    `GatewayChoice`. This enforces that production code in node.rs cannot construct
+    a `GatewayChoice` value (it's not in scope), so it cannot call the deprecated
+    constructors.
+- GATE B (First-class Route object):
+  * Extended the existing `Route` struct with the spec-mandated fields: `source`
+    (client NodeId), `epoch` (key-rotation counter), `expires_at` (unix seconds),
+    `metrics` (RouteMetrics). Kept `last_validated` for backward compat with
+    tests/n202_protocol.rs test_7b.
+  * Added `RouteMetrics` struct (hop_count, estimated_latency_ms, bandwidth_bps).
+  * Added `RouteError` enum (Empty, SourceMismatch, DestinationMismatch,
+    DuplicateHop, ExcessiveHopCount, Expired, IllegalTransition) with thiserror
+    Display impl.
+  * Added `Route::validate(&self) -> Result<(), RouteError>` — checks: not empty,
+    source set (non-zero), destination matches last hop, no duplicate hops
+    (loop detection), hop count ≤ 16 (TTL max), not expired.
+  * Added `Route::is_expired(&self, now: u64) -> bool` — `expires_at <= now`
+    (with `expires_at == 0` meaning "never expires" for backward compat).
+  * Added `Route::transition(&mut self, new_state) -> Result<(), RouteError>` —
+    the spec-mandated state-machine method. Kept `Route::transition_to` (returns
+    `NodeResult<()>`) as a thin wrapper for backward compat with test_7b/test_7c.
+  * Changed `Route::new` signature from `(client_node_id: &[u8; 32], ...)` to
+    `(source: [u8; 32], ...)` (by value, per the spec). Updated test_7b and
+    test_7c in tests/n202_protocol.rs to drop the `&`.
+  * Added 9 validation/state-machine tests to node.rs's test mod:
+    route_valid_construction_passes_validation, route_empty_rejected,
+    route_source_mismatch_rejected, route_destination_mismatch_rejected,
+    route_duplicate_hop_rejected, route_excessive_hop_count_rejected,
+    route_expired_detected, route_state_machine_legal_transitions,
+    route_state_machine_illegal_transitions.
+- GATE E (Dynamic route construction):
+  * Added `Node::construct_route(&self, relay_node_ids: &[[u8; 32]], gateway_node_id: [u8; 32]) -> NodeResult<Route>`.
+    The route's `source` is `self.identity.node_id`; the `hops` list is
+    `[relay_node_ids..., gateway_node_id]` (destination appended as the last hop,
+    per the spec). The method validates the route before returning it.
+  * Added 3 construct_route tests:
+    construct_route_with_random_identities (Client → Relay A → Relay B → Relay C → Gateway
+    with random Ed25519 keypairs — verifies hop list, source, destination, route_id),
+    construct_route_rejects_duplicate_relay, construct_route_rejects_excessive_hops.
+- Fixed integration tests in tests/n201_sessions.rs:
+  * Added `#![allow(deprecated)]` to the test file (it uses the deprecated
+    `Circuit::for_gateway` and `GatewayAdvertisement::for_gateway` in tests 1, 4
+    which are explicitly testing the N2.0/N2.0.1 backward-compat path).
+  * Tests 2 and 3 relied on `discover_gateways` to pre-populate circuits. After
+    GATE A removed that pre-population, the tests failed with "no gateway selected".
+    Fixed by explicitly populating the circuits via `Circuit::for_gateway` after
+    `discover_gateways` (the tests are testing the N2.0.1 backward-compat path,
+    so using the deprecated constructor is appropriate).
+
+Stage Summary:
+- GATE A: PASS ✅. GatewayChoice is removed from production node.rs code.
+  * The top-level `use crate::{...}` import in node.rs does NOT contain
+    `GatewayChoice` (verified by the static test `gateway_choice_not_in_production_code`).
+  * The 3 deprecated constructors (`NodeIdentity::gateway`, `Circuit::for_gateway`,
+    `GatewayAdvertisement::for_gateway`) use `crate::GatewayChoice` (fully qualified)
+    and are `#[deprecated]`. Production code in node.rs cannot call them because
+    `GatewayChoice` is not in scope.
+  * The production methods `serve_gateway_persistent`,
+    `serve_gateway_persistent_with_drop_after`, `serve_discovery_persistent`,
+    `serve_one_gateway_request`, and `discover_gateways` no longer take or use
+    `GatewayChoice`. The gateway identity comes from `self.identity` (an arbitrary
+    `NodeIdentity`); the link keys and circuit keys come from explicit parameters
+    (in production, from the SNP-IK/0.1 handshake + client↔gateway circuit DH).
+  * `send_request_via_gateway` was already GatewayChoice-free (it takes
+    `gateway_node_id: &[u8; 32]` and uses the Circuit's `gateway_public_key`).
+- GATE B: PASS ✅. The Route object has the spec-mandated fields (source, epoch,
+  expires_at, metrics) plus the spec-mandated methods (validate, is_expired,
+  transition). All 9 validation tests pass (empty, source mismatch, destination
+  mismatch, duplicate hop, excessive hop count, expired, legal transitions, illegal
+  transitions, valid construction).
+- GATE E: PASS ✅. `Node::construct_route` constructs a route from this node to
+  a gateway through arbitrary relays. The test `construct_route_with_random_identities`
+  generates random Ed25519 keypairs for Client, Relay A/B/C, and Gateway, constructs
+  a 4-hop route, validates it, and verifies the hop list. No GatewayChoice or
+  compile-time identities used.
+- Test results: 110 → 123 tests pass (+13 new tests), 0 fail, 3 ignored. No regressions.
+- Conformance: 138/138 independently verified (123 INDEPENDENT + 15 NEGATIVE),
+  0 disagreements, 0 unsupported. Unchanged from baseline.
+- Build: `cargo build --workspace` → SUCCESS (only the pre-existing snp-civic
+  missing-doc warning; no new warnings).
+- Clippy: no NEW warnings introduced. The pre-existing warnings about
+  `since = "N2.0.2"` (non-semver since field) and unnested or-patterns are
+  unchanged (same warning count, just at shifted line numbers due to added code).
+- Files modified:
+  * `reference/snp-node/src/lib.rs` (+56 lines): added 6 GatewayChoice-free helpers
+    (gateway_a_secret, gateway_b_secret, gateway_a_public_key, gateway_b_public_key,
+    gateway_a_node_id, gateway_b_node_id).
+  * `reference/snp-node/src/node.rs` (2854 → 3582 lines, +728 lines):
+    - GATE A: modified serve_gateway_persistent, serve_gateway_persistent_with_drop_after,
+      serve_one_gateway_request, serve_discovery_persistent, discover_gateways,
+      run_mesh_session_demo_with_failover; marked 3 constructors deprecated;
+      removed GatewayChoice from imports.
+    - GATE B: extended Route struct (added source, epoch, expires_at, metrics fields);
+      added RouteMetrics struct, RouteError enum, Route::validate/is_expired/transition
+      methods; kept transition_to as backward-compat wrapper.
+    - GATE E: added Node::construct_route method.
+    - Added 13 new tests (1 static + 9 validation + 3 construct_route).
+  * `reference/snp-node/tests/n201_sessions.rs` (+25 lines): added
+    `#![allow(deprecated)]`; added explicit circuit pre-population in tests 2 and 3
+    (workaround for discover_gateways no longer pre-populating circuits).
+  * `reference/snp-node/tests/n202_protocol.rs` (4 lines changed): updated test_7b
+    and test_7c to use the new `Route::new(source, destination, hops)` signature
+    (drop the `&`); updated the illegal-transition error message check to match
+    the new "Route transition error: ..." wrapper format.
+- Design notes:
+  * The spec suggested marking the 3 deprecated constructors as both `#[deprecated]`
+    AND `#[cfg(test)]`. I applied only `#[deprecated]` because `#[cfg(test)]` on a
+    `pub fn` in a lib crate makes it invisible to integration tests (which are
+    separate crates). The integration tests in tests/n201_sessions.rs and
+    tests/n202_protocol.rs use these constructors to test the N2.0/N2.0.1
+    backward-compat path. The static test `gateway_choice_not_in_production_code`
+    enforces the intent (production code cannot construct a `GatewayChoice` value
+    because it's not in scope).
+  * The `discover_gateways` method previously pre-populated circuits for
+    `GatewayChoice::A`/`::B` by mapping the advertisement's publicKey to a
+    `GatewayChoice`. This required importing `GatewayChoice` into node.rs. The
+    N2.0.3 production path is: `discover_gateways` records the advertisement only;
+    the client establishes the circuit via the SNP-IK/0.1 handshake + circuit DH
+    (see tests/n202_protocol.rs Test 2 for the end-to-end flow). The N2.0.1 demo
+    path (`run_mesh_session_demo_with_failover`) explicitly constructs the circuits
+    using the deterministic test seeds.
+  * The `Route::new` signature changed from `(client_node_id: &[u8; 32], ...)` to
+    `(source: [u8; 32], ...)` (by value, per the spec). This is a breaking change
+    for callers; the only callers were test_7b and test_7c in tests/n202_protocol.rs,
+    which were updated. The `last_validated` field was kept on the Route struct
+    (beyond the spec) for backward compat with test_7b's assertion
+    `assert!(route.last_validated > 0, ...)`.
+  * The `Route::transition` method returns `Result<(), RouteError>` (per the spec).
+    The existing `Route::transition_to` method (returning `NodeResult<()>`) is kept
+    as a thin wrapper that maps `RouteError` to `NodeError::Other` — this preserves
+    backward compat with test_7b and test_7c.
+
+---
+Task ID: 147-148-154
+Agent: Z.ai (subagent — N2.0.3 Gates C+D+K)
+Task: DiscoveryProvider, GatewaySelector, Local HTTP gateway test
+
+Work Log:
+- Read worklog (last 5 entries: Task 145-149, Task 136, Task 136b, Task 122-135,
+  Task 121) + node.rs (3582→4400 lines), lib.rs (1449 lines), snp-gateway/src/lib.rs
+  (1415→1472 lines), n201_sessions.rs, n202_protocol.rs, snp-link/lib.rs. Confirmed
+  baseline: 138/138 conformance, 123 tests pass, 0 fail, 3 ignored.
+
+- GATE C (DiscoveryProvider abstraction):
+  * Added `DiscoveredNode` struct (advertisement + endpoint: String) — pairs a
+    signed GatewayAdvertisement with the TCP endpoint at which the advertising
+    node can be reached.
+  * Updated `DiscoveryProvider` trait: `discover(&self) -> Vec<DiscoveredNode>`
+    (was `Vec<GatewayAdvertisement>`), plus a new `advertise(&self, &GatewayAdvertisement,
+    &str)` method with a default no-op impl (some providers don't support outbound
+    advertising — bootstrap list, static list).
+  * Updated `BootstrapDiscovery` to implement the new trait signature. `discover()`
+    still returns an empty list (the actual TCP + SNP-IK/0.1 discovery I/O is
+    deferred to N2.0.4); added `addresses()` accessor.
+  * Added `StaticDiscovery` — a deterministic, in-memory list provider for tests
+    and "bring your own topology" scenarios. `new()`, `add(DiscoveredNode)`, `len()`,
+    `is_empty()`, `Default` impl, `DiscoveryProvider` impl (returns clones of the
+    added nodes; `advertise()` is the default no-op).
+  * Added 4 Gate C unit tests in node.rs test mod:
+    - static_discovery_returns_added_nodes
+    - static_discovery_advertise_is_noop
+    - bootstrap_discovery_returns_empty_vec
+    - discovery_provider_is_object_safe (verifies `Box<dyn DiscoveryProvider>` works)
+
+- GATE D (GatewaySelector abstraction):
+  * Added `observed_rtt: Option<u64>` field to GatewayAdvertisement — a NON-SIGNED,
+    OPTIONAL, GATEWAY-SELF-REPORTED RTT metric. The field is NOT in the signed
+    preimage (signatures still verify against N2.0/N2.0.1 advertisements — backward
+    compat). `for_identity` initializes it to `None`. `decode_cbor` accepts the
+    optional "observedRtt" key (default None for older advertisements). The field
+    lets a MetricSelector fall back to the advertised RTT when no local observation
+    is available.
+  * Added `MetricSelector` — picks the gateway with the lowest latency. Selection
+    key is `observed_latency.or(advertisement.observed_rtt).unwrap_or(u64::MAX)`
+    (NOT the spec's literal `min(observed, advertised)` — see "Spec deviation"
+    note below). Only `Verified`/`Active` entries are considered.
+  * Added `GatewayDirectory::select(&dyn GatewaySelector) -> Option<&GatewayDirectoryEntry>`
+    method — the strategy-parameterised selection entry point.
+  * **Spec deviation note (documented in MetricSelector docstring):** The N2.0.3
+    task spec sketches the MetricSelector with `observed.min(advertised)` as the
+    selection key. That logic is VULNERABLE to the lying-gateway attack: a malicious
+    gateway could advertise an artificially low RTT (e.g. `advertised = 1µs`) to
+    override the client's locally-measured higher latency, attracting traffic it
+    doesn't deserve. The spec's COMMENT ("Does NOT trust advertised latency — uses
+    only observed latency if available, falls back to advertised if not") makes the
+    secure intent clear; the `min` code is a sketch bug. This implementation uses
+    `observed.or(advertised).unwrap_or(u64::MAX)` instead — once the client has
+    measured the latency, the advertised value is IGNORED entirely.
+  * Added 9 Gate D unit tests in node.rs test mod:
+    - metric_selector_picks_lowest_observed_latency
+    - metric_selector_falls_back_to_advertised_rtt
+    - metric_selector_prefers_observed_over_advertised (verifies the lying-gateway
+      attack is defeated)
+    - metric_selector_skips_non_verified_entries
+    - metric_selector_returns_none_when_no_verified_entries
+    - directory_select_delegates_to_selector (verifies both MetricSelector and
+      FirstAvailableSelector via the new directory.select() method)
+    - advertisement_observed_rtt_is_none_by_default_and_unsigned (verifies the
+      field is non-signed — setting it doesn't break the signature; encode_cbor
+      doesn't emit it; round-trip LOSES it by design)
+    - advertisement_decode_without_observed_rtt_key (backward compat with N2.0/N2.0.1)
+    - advertisement_decode_with_observed_rtt_key (forward compat — decoder parses
+      the optional "observedRtt" key)
+
+- GATE K (Local HTTP gateway integration test):
+  * snp-gateway: added `handle_transit_request_with_connector` — a TEST-ONLY
+    variant of `handle_transit_request` that takes a pre-built PinnedConnector
+    (bypassing the SSRF check via `PinnedConnector::new`). The client-signature
+    verification and tlsTermination validation are NOT bypassed. Refactored
+    `handle_transit_request` to delegate to a shared `fetch_and_sign_with_connector`
+    helper (no behavior change for production).
+  * node.rs: added `serve_one_gateway_request_with_connector_factory` — a TEST-ONLY
+    gateway serve function that takes a `connector_factory: &F where F: Fn(&str) ->
+    NodeResult<PinnedConnector>`. The factory is called per-request with the URL
+    from the decrypted TransitRequest. The production factory
+    (`default_connector_factory`) calls `PinnedConnector::new` (enforces SSRF).
+    Refactored `serve_one_gateway_request` to delegate (no behavior change for
+    production). Made `ServeOutcome` `pub` so the test-only function can return it
+    without leaking a more-private type.
+  * node.rs: added `Node::send_request_via_gateway_full` — returns the full
+    decoded TransitResponse (not just (status, verified)). Used by the Gate K test
+    to verify the `object_id` (the SHA-256 of the fetched body — proving body
+    integrity end-to-end). Refactored `Node::send_request_via_gateway` to delegate.
+  * Created `tests/n203_local_http.rs` (NEW, 425 lines) — the Gate K integration
+    test. Topology: Client → Relay → Gateway → local HTTP server (single relay;
+    the N2.0 Relay A → Relay B chain is verified by n20_multihop.rs). The test:
+    1. Starts a local HTTP server on an ephemeral port (returns "Hello, World!").
+    2. Starts a Gateway that serves exactly 1 request via
+       `serve_one_gateway_request_with_connector_factory` with a TEST-ONLY connector
+       factory that pins to `127.0.0.1:HTTP_PORT` via `PinnedConnector::from_parts`
+       (bypassing `is_private_destination`'s rejection of 127.0.0.1).
+    3. Starts a Relay (single-upstream, via `spawn_relay_persistent_with_counter`).
+    4. Starts a Client (NodeIdentity::client + pre-populated circuit).
+    5. Client sends `http://test.local/` → gateway fetches from local HTTP server
+       → verifies status=200, object_id == SHA-256("Hello, World!"), gateway
+       signature verified.
+    6. Gateway thread exits (drops its TCP listener, releases the port).
+    7. Client sends a SECOND request → MUST fail within 5 seconds (not hang).
+       The relay's upstream connection is dead (broken pipe); the relay closes the
+       client connection; the client's `recv_frame` returns EOF. The test enforces
+       a 5-second timeout to catch any hang regression.
+  * TEST-ONLY SSRF bypass is documented clearly in 3 places:
+    - `handle_transit_request_with_connector` docstring (snp-gateway).
+    - `serve_one_gateway_request_with_connector_factory` docstring (node.rs).
+    - `tests/n203_local_http.rs` module docs + inline comments.
+    The docstrings say "Production gateways MUST NOT use this escape hatch —
+    production MUST use `handle_transit_request` / `serve_one_gateway_request`,
+    which calls `PinnedConnector::new` and enforces the SSRF defence (I18)."
+
+Stage Summary:
+- GATE C: PASS ✅. The `DiscoveryProvider` trait is the platform-independent
+  discovery abstraction. `discover(&self) -> Vec<DiscoveredNode>` returns
+  advertisement+endpoint pairs; `advertise(&self, &GatewayAdvertisement, &str)`
+  has a default no-op impl. `StaticDiscovery` is the deterministic reference
+  implementation for tests; `BootstrapDiscovery` is the bootstrap-list provider
+  (I/O deferred to N2.0.4). The trait is object-safe (`Box<dyn DiscoveryProvider>`
+  works — verified by `discovery_provider_is_object_safe` test). 4 Gate C tests pass.
+- GATE D: PASS ✅. `MetricSelector` picks the lowest-latency gateway, preferring
+  locally-observed latency and falling back to advertised RTT only when no
+  observation is available. `GatewayDirectory::select(&dyn GatewaySelector)`
+  is the strategy-parameterised entry point. The `observed_rtt` field on
+  GatewayAdvertisement is non-signed (preimage unchanged — existing conformance
+  vectors and signatures still verify) and optional (decode_cbor accepts both
+  presence and absence). **Spec deviation**: used `observed.or(advertised)` instead
+  of the spec's literal `observed.min(advertised)` — the latter is vulnerable to
+  the lying-gateway attack (a malicious gateway could advertise a low RTT to
+  override the client's measurement). The deviation is documented in the
+  MetricSelector docstring. 9 Gate D tests pass.
+- GATE K: PASS ✅. The end-to-end local-HTTP gateway test verifies:
+  1. A real HTTP fetch at the gateway (not a stub) — the gateway fetches
+     "Hello, World!" from a local HTTP server on 127.0.0.1:PORT.
+  2. Body integrity — the TransitResponse's object_id equals
+     SHA-256("Hello, World!") (proving no tampering at the relay).
+  3. Gateway signature verification — the client verifies the gateway's Ed25519
+     signature on the response.
+  4. Gateway death → client failure (not a hang) — after the gateway serves one
+     request and exits, the client's next request fails in <0.01s (broken pipe
+     from the relay's dead upstream connection). The test enforces a 5-second
+     timeout to catch any hang regression.
+  The SSRF bypass for 127.0.0.1 is TEST-ONLY (via `PinnedConnector::from_parts`
+  in a custom connector factory passed to
+  `serve_one_gateway_request_with_connector_factory`). Production gateways use
+  `PinnedConnector::new` which rejects 127.0.0.1 via `is_private_destination`.
+- Test results: 123 → 138 tests pass (+15 new: 4 Gate C + 9 Gate D + 1 Gate K
+  integration + 1 unaccounted extra that appeared between baseline and the
+  post-Gate-CD run), 0 fail, 3 ignored. No regressions.
+- Conformance: 138/138 independently verified (123 INDEPENDENT + 15 NEGATIVE),
+  0 disagreements, 0 unsupported. Unchanged from baseline. The non-signed
+  `observed_rtt` field on GatewayAdvertisement does NOT affect the signed wire
+  format (encode_cbor uses the preimage, which excludes the field), so existing
+  conformance vectors still pass.
+- Build: `cargo build --workspace` → SUCCESS (only the pre-existing snp-civic
+  missing-doc warning; no new warnings).
+- Files modified:
+  * `reference/snp-gateway/src/lib.rs` (1415 → 1472 lines, +57 lines):
+    - Added `handle_transit_request_with_connector` (TEST-ONLY escape hatch).
+    - Refactored `handle_transit_request` to delegate to a shared
+      `fetch_and_sign_with_connector` helper.
+  * `reference/snp-node/src/node.rs` (3582 → 4400 lines, +818 lines):
+    - GATE C: added DiscoveredNode struct; updated DiscoveryProvider trait
+      (Vec<DiscoveredNode> + advertise method); updated BootstrapDiscovery;
+      added StaticDiscovery.
+    - GATE D: added observed_rtt field to GatewayAdvertisement (non-signed,
+      optional); added MetricSelector; added GatewayDirectory::select method.
+    - GATE K prep: added serve_one_gateway_request_with_connector_factory
+      (TEST-ONLY); refactored serve_one_gateway_request to delegate; added
+      default_connector_factory helper; made ServeOutcome pub; added
+      Node::send_request_via_gateway_full; refactored send_request_via_gateway
+      to delegate.
+    - Added 13 new unit tests (4 Gate C + 9 Gate D) in the test mod.
+  * `reference/snp-node/tests/n203_local_http.rs` (NEW, 425 lines):
+    - The Gate K integration test.
+- Design notes:
+  * The `observed_rtt` field on GatewayAdvertisement is a NON-SIGNED metadata
+    field. It is NOT included in the signed preimage (the signature covers only
+    the original 9 fields: nodeId, publicKey, listenAddr, discoveryAddr,
+    capabilities, egressPolicy, timestamp, expiry, signature). This means:
+    (a) existing N2.0/N2.0.1 advertisements still verify (the preimage is
+        unchanged);
+    (b) `encode_cbor` does NOT emit the `observedRtt` key (it uses the preimage),
+        so a round-trip through encode_cbor + decode_cbor LOSES the field (it
+        comes back as None) — this is by design (the field is local metadata,
+        not on the wire);
+    (c) `decode_cbor` ACCEPTS the optional `observedRtt` key (forward compat —
+        a sender that manually adds it to the CBOR map can convey the advertised
+        RTT on the wire, and the decoder parses it).
+    The `advertisement_decode_with_observed_rtt_key` test verifies (c). The
+    `advertisement_observed_rtt_is_none_by_default_and_unsigned` test verifies
+    (a) and (b).
+  * The MetricSelector's `observed.or(advertised)` logic (vs the spec's
+    `observed.min(advertised)`) is a deliberate security improvement. The spec's
+    comment makes the secure intent clear ("Does NOT trust advertised latency —
+    uses only observed latency if available, falls back to advertised if not"),
+    but the spec's literal `min` code would let a malicious gateway's advertised
+    RTT override the client's measurement. The `or` logic matches the spec's
+    documented intent and defeats the lying-gateway attack. The
+    `metric_selector_prefers_observed_over_advertised` test verifies this with
+    a concrete scenario (gw A: observed 100ms + advertised 10ms lying low;
+    gw B: observed 50ms + advertised 200ms; the selector picks gw B because
+    observed 50ms < observed 100ms, regardless of the lying advertised 10ms).
+  * The Gate K test uses a SINGLE relay (not the N2.0 Relay A → Relay B chain).
+    This is the minimal end-to-end topology for verifying the gateway's HTTP
+    fetch + circuit encryption + relay forwarding. The N2.0 multi-hop chain is
+    verified by `tests/n20_multihop.rs` and `tests/n201_sessions.rs`. The
+    single-relay topology keeps the Gate K test focused on the gateway's HTTP
+    integration (the new behavior) without re-testing multi-hop routing (which
+    is already covered).
+  * The TEST-ONLY SSRF bypass is implemented as a connector factory (a closure
+    `Fn(&str) -> NodeResult<PinnedConnector>`), NOT as a test-mode flag on the
+    gateway. This means:
+    (a) production gateways have NO test-mode flag to accidentally enable;
+    (b) the bypass is local to the test (the closure is defined in the test
+        file, not in the production code);
+    (c) the production `serve_one_gateway_request` calls the default factory
+        (`default_connector_factory` → `PinnedConnector::new`), which enforces
+        the SSRF defence. The bypass function
+        (`serve_one_gateway_request_with_connector_factory`) is `#[doc(hidden)] pub`
+        so it's accessible from integration tests but not advertised in the docs.
+    The client-signature verification and tlsTermination validation are NOT
+    bypassed (they're performed inside `handle_transit_request_with_connector`,
+    same as `handle_transit_request`).
+
+---
+Task ID: 145-154 (N2.0.3 Gates A-E, C-D, K)
+Agent: Z.ai (main — N2.0.3 dynamic mesh routing foundation)
+
+Stage Summary:
+- Gate A: GatewayChoice removed from production node.rs (deprecated + static test)
+- Gate B: Route object with explicit hop list, validation (9 tests), state machine
+- Gate C: DiscoveryProvider trait (object-safe) + StaticDiscovery reference impl
+- Gate D: GatewaySelector trait + FirstAvailableSelector + MetricSelector (prefers observed over advertised)
+- Gate E: Dynamic route construction with random identities (no compile-time topology)
+- Gate K: Local HTTP gateway integration test (deterministic, no external dependency)
+- 138 tests pass, 0 fail, 3 ignored
+- 138/138 conformance, 0 disagreements
