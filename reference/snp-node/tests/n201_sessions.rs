@@ -40,7 +40,7 @@ use snp_node::node::{
     spawn_relay_multi_upstream_persistent_with_counter, Circuit, GatewayAdvertisement, Node,
     NodeIdentity, UpstreamPeer, DISCOVERY_REQUEST_MARKER,
 };
-use snp_node::{
+use snp_node::legacy::{
     client_node_id, client_public_key,
     gateway_circuit_keys_for,
     gateway_node_id_for, gateway_public_key_for, gateway_secret_for,

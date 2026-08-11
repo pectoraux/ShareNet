@@ -105,7 +105,7 @@ fn mesh_demo_round_trip_real_internet() {
 
     let gateway_addr_str = gateway_addr.to_string();
     let gw_handle = std::thread::spawn(move || {
-        let _ = snp_node::run_gateway(&gateway_addr_str);
+        let _ = snp_node::legacy::run_gateway(&gateway_addr_str);
     });
 
     std::thread::sleep(Duration::from_millis(150));
@@ -113,12 +113,12 @@ fn mesh_demo_round_trip_real_internet() {
     let gateway_addr_for_relay = gateway_addr.to_string();
     let relay_addr_str = relay_addr.to_string();
     let relay_handle = std::thread::spawn(move || {
-        let _ = snp_node::run_relay(&relay_addr_str, &gateway_addr_for_relay);
+        let _ = snp_node::legacy::run_relay(&relay_addr_str, &gateway_addr_for_relay);
     });
 
     std::thread::sleep(Duration::from_millis(150));
 
-    let (status, verified) = snp_node::run_client(&relay_addr.to_string(), "https://example.com/")
+    let (status, verified) = snp_node::legacy::run_client(&relay_addr.to_string(), "https://example.com/")
         .expect("client round-trip should succeed");
 
     let _ = gw_handle.join();

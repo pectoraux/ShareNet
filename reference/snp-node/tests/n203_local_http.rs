@@ -61,7 +61,7 @@ use snp_node::node::{
     serve_one_gateway_request_with_connector_factory, spawn_relay_persistent_with_counter,
     Capability, Circuit, Node, NodeIdentity, ServeOutcome,
 };
-use snp_node::{
+use snp_node::legacy::{
     client_circuit_keys_a, gateway_a_circuit_keys, gateway_a_node_id, gateway_a_public_key,
     gateway_a_relay_b_link_keys, gateway_a_secret, relay_a_client_link_keys,
     relay_b_gateway_a_link_keys,

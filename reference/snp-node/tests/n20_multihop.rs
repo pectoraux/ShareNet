@@ -41,7 +41,7 @@ use snp_gateway::{
 use snp_link::{
     decrypt_circuit_payload, encrypt_circuit_payload, encrypt_circuit_payload_with_nonce, Link,
 };
-use snp_node::{
+use snp_node::legacy::{
     gateway_a_circuit_keys, gateway_a_relay_b_link_keys, gateway_b_circuit_keys,
     gateway_b_relay_b_link_keys, gateway_node_id_for, gateway_public_key_for,
     gateway_secret_for, client_circuit_keys_a, client_circuit_keys_b,

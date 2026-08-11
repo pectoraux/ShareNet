@@ -2515,3 +2515,23 @@ Stage Summary:
 - Gate K: Local HTTP gateway integration test (deterministic, no external dependency)
 - 138 tests pass, 0 fail, 3 ignored
 - 138/138 conformance, 0 disagreements
+
+---
+Task ID: 157 (Gate A finalization)
+Agent: Z.ai (main — Gate A: GatewayChoice isolation)
+
+Stage Summary:
+- Legacy code moved from lib.rs to legacy.rs (1349 lines)
+- lib.rs is now 127 lines: just module declarations + re-exports
+- All test files updated to import from snp_node::legacy::
+- main.rs updated to call snp_node::legacy:: for demo functions
+- node.rs deprecated constructors reference crate::legacy::GatewayChoice
+- 138 tests pass, 0 fail, 3 ignored
+- 138/138 conformance, 0 disagreements
+
+GatewayChoice classification:
+- legacy.rs: 39 refs (ISOLATED — the legacy demo module)
+- lib.rs: 3 refs (re-export comments only)
+- node.rs: 70 refs (all in deprecated constructors, doc comments, or #[test] mod)
+- tests: 93 refs (test-only code)
+- Production node.rs methods: 0 GatewayChoice references

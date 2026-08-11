@@ -167,7 +167,7 @@ impl NodeIdentity {
     /// Construct a gateway identity for the given choice.
     ///
     /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code.
+    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code.
     /// New production code MUST use [`NodeIdentity::from_secret`] with an
     /// arbitrary Ed25519 secret key — gateways are NOT required to be one of
     /// the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B` identities.
@@ -190,8 +190,8 @@ impl NodeIdentity {
                 The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
     )]
     #[must_use]
-    pub fn gateway(gw: crate::GatewayChoice) -> Self {
-        Self::from_secret(crate::gateway_secret_for(gw))
+    pub fn gateway(gw: crate::legacy::GatewayChoice) -> Self {
+        Self::from_secret(crate::legacy::gateway_secret_for(gw))
     }
 }
 
@@ -452,7 +452,7 @@ impl GatewayAdvertisement {
     /// persistent on-disk keypair.
     ///
     /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code.
+    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code.
     /// New production code MUST use [`GatewayAdvertisement::for_identity`]
     /// with an arbitrary [`NodeIdentity`] — gateways are NOT required to be
     /// one of the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B`
@@ -465,7 +465,7 @@ impl GatewayAdvertisement {
     )]
     #[must_use]
     pub fn for_gateway(
-        gw: crate::GatewayChoice,
+        gw: crate::legacy::GatewayChoice,
         listen_addr: &str,
         discovery_addr: &str,
     ) -> Self {
@@ -532,7 +532,7 @@ impl Circuit {
     /// deterministic client-side circuit keys.
     ///
     /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::GatewayChoice`], which is now confined to legacy/demo code
+    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code
     /// (per the N2.0.2 task spec). New production code MUST use
     /// [`Circuit::new`] with explicit `(gateway_node_id,
     /// gateway_public_key, circuit_keys)` parameters — the keys come from
@@ -545,14 +545,14 @@ impl Circuit {
                 The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
     )]
     #[must_use]
-    pub fn for_gateway(gw: crate::GatewayChoice) -> Self {
+    pub fn for_gateway(gw: crate::legacy::GatewayChoice) -> Self {
         let circuit_keys = match gw {
-            crate::GatewayChoice::A => client_circuit_keys_a(),
-            crate::GatewayChoice::B => client_circuit_keys_b(),
+            crate::legacy::GatewayChoice::A => client_circuit_keys_a(),
+            crate::legacy::GatewayChoice::B => client_circuit_keys_b(),
         };
         Self {
-            gateway_node_id: crate::gateway_node_id_for(gw),
-            gateway_public_key: crate::gateway_public_key_for(gw),
+            gateway_node_id: crate::legacy::gateway_node_id_for(gw),
+            gateway_public_key: crate::legacy::gateway_public_key_for(gw),
             circuit_keys,
             active: true,
         }
@@ -3452,8 +3452,8 @@ fn hex_short(b: &[u8]) -> String {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::client_node_id;
-    use crate::GatewayChoice;
+    use crate::legacy::client_node_id;
+    use crate::legacy::GatewayChoice;
 
     // ─── N2.0.3 (GATE A): static check that GatewayChoice is not used in
     //     production node.rs code. ─────────────────────────────────────────
@@ -3473,7 +3473,7 @@ mod tests {
     /// method signatures. The deprecated `#[cfg(test)]` constructors
     /// (`NodeIdentity::gateway`, `Circuit::for_gateway`,
     /// `GatewayAdvertisement::for_gateway`) are the only allowed
-    /// GatewayChoice references in this file — they use `crate::GatewayChoice`
+    /// GatewayChoice references in this file — they use `crate::legacy::GatewayChoice`
     /// (fully-qualified, not the bare import) and are compiled only in test
     /// builds.
     #[test]
@@ -3503,7 +3503,7 @@ mod tests {
         );
         // Additionally, verify that the top-level `use crate::{...}` import
         // does NOT bring `GatewayChoice` into node.rs's module scope. The
-        // deprecated constructors use `crate::GatewayChoice` (fully
+        // deprecated constructors use `crate::legacy::GatewayChoice` (fully
         // qualified), so they do not need the bare import.
         let import_line = source
             .lines()
@@ -3511,7 +3511,7 @@ mod tests {
         assert!(
             import_line.is_none(),
             "node.rs must NOT import GatewayChoice via `use crate::{{... GatewayChoice ...}};`. \
-             The deprecated #[cfg(test)] constructors use `crate::GatewayChoice` (fully qualified). \
+             The deprecated #[cfg(test)] constructors use `crate::legacy::GatewayChoice` (fully qualified). \
              Found import: {:?}",
             import_line
         );
@@ -3593,8 +3593,8 @@ mod tests {
     #[test]
     fn node_identity_gateway_a_matches_n20_constants() {
         let identity = NodeIdentity::gateway(GatewayChoice::A);
-        assert_eq!(identity.public_key, crate::gateway_public_key_for(GatewayChoice::A));
-        assert_eq!(identity.node_id, crate::gateway_node_id_for(GatewayChoice::A));
+        assert_eq!(identity.public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
+        assert_eq!(identity.node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
     }
 
     #[test]
@@ -3609,8 +3609,8 @@ mod tests {
     #[test]
     fn circuit_for_gateway_a_uses_correct_keys() {
         let circuit = Circuit::for_gateway(GatewayChoice::A);
-        assert_eq!(circuit.gateway_node_id, crate::gateway_node_id_for(GatewayChoice::A));
-        assert_eq!(circuit.gateway_public_key, crate::gateway_public_key_for(GatewayChoice::A));
+        assert_eq!(circuit.gateway_node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
+        assert_eq!(circuit.gateway_public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
         assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_a().send_key);
         assert!(circuit.active);
     }
@@ -3894,7 +3894,7 @@ mod tests {
         // are derived from random Ed25519 keypairs at runtime. The test
         // would fail to compile if `construct_route` depended on
         // `GatewayChoice` (since this test mod is `#[allow(deprecated)]`
-        // but `GatewayChoice` is only in scope via the `use crate::GatewayChoice;`
+        // but `GatewayChoice` is only in scope via the `use crate::legacy::GatewayChoice;`
         // import — we don't use it here).
         let _ = (relay_a_sk, relay_b_sk, relay_c_sk); // silence unused warnings
     }

@@ -8,6 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 default-run = "snp-node"
 
+[features]
+default = []
+# Enable legacy N1.9/N2.0 demo code (GatewayChoice, deterministic seeds).
+# This is NOT needed for production — it exists only for backward-compat tests.
+legacy-demo = []
+
 [[bin]]
 name = "snp-node"
 path = "src/main.rs"

@@ -140,7 +140,7 @@ fn test_2_malicious_relay_cannot_decrypt_circuit_payload() {
 
     // Client: send a request, expect a valid response.
     let (status, verified) =
-        snp_node::run_client(&relay_addr.to_string(), "http://stub.example/")
+        snp_node::legacy::run_client(&relay_addr.to_string(), "http://stub.example/")
             .expect("client round-trip should succeed");
     assert_eq!(status, 200);
     assert!(verified);
@@ -175,8 +175,8 @@ fn test_3_tampering_relay_gateway_rejects() {
         // WITHOUT sending a response (which the client observes as a recv
         // error or EOF).
         let (stream, _) = gateway_listener.accept().expect("accept");
-        let link = Link::new(stream, snp_node::gateway_link_keys());
-        let circuit = snp_node::gateway_circuit_keys();
+        let link = Link::new(stream, snp_node::legacy::gateway_link_keys());
+        let circuit = snp_node::legacy::gateway_circuit_keys();
         // recv_frame should succeed (the OUTER frame was re-encrypted by the
         // relay with the correct relay→gateway hop key).
         let frame = link.recv_frame().expect("recv_frame");
@@ -205,9 +205,9 @@ fn test_3_tampering_relay_gateway_rejects() {
         // attempting to decrypt the body, it flips one byte of the body
         // before forwarding.
         let (client_stream, _) = relay_listener.accept().expect("accept");
-        let client_link = Link::new(client_stream, snp_node::relay_client_link_keys());
+        let client_link = Link::new(client_stream, snp_node::legacy::relay_client_link_keys());
         let gw_link =
-            Link::connect(&gateway_addr_for_relay, snp_node::relay_gateway_link_keys())
+            Link::connect(&gateway_addr_for_relay, snp_node::legacy::relay_gateway_link_keys())
                 .expect("connect gw");
 
         let mut frame = client_link.recv_frame().expect("recv_frame");
@@ -237,7 +237,7 @@ fn test_3_tampering_relay_gateway_rejects() {
 
     // Client: send a request, expect NO valid response (the gateway rejected
     // the tampered payload, so no response comes back).
-    let result = snp_node::run_client(&relay_addr.to_string(), "http://stub.example/");
+    let result = snp_node::legacy::run_client(&relay_addr.to_string(), "http://stub.example/");
     assert!(
         result.is_err(),
         "CLIENT RECEIVED A VALID RESPONSE — tampering was NOT detected. \
@@ -443,8 +443,8 @@ fn test_5_redirect_to_private_ip_not_followed() {
 /// response frame, encrypt with hop send_key, send.
 fn stub_gateway_round_trip(listener: &TcpListener) {
     let (stream, _) = listener.accept().expect("accept");
-    let link = Link::new(stream, snp_node::gateway_link_keys());
-    let circuit = snp_node::gateway_circuit_keys();
+    let link = Link::new(stream, snp_node::legacy::gateway_link_keys());
+    let circuit = snp_node::legacy::gateway_circuit_keys();
     let req_frame = link.recv_frame().expect("recv_frame");
     eprintln!(
         "[stub-gw] got frame: cls={} body={} bytes",
@@ -503,19 +503,19 @@ fn stub_gateway_round_trip(listener: &TcpListener) {
 /// then forwards unchanged.
 fn malicious_relay_round_trip(listener: &TcpListener, gateway_addr: &str) {
     let (client_stream, _) = listener.accept().expect("accept");
-    let client_link = Link::new(client_stream, snp_node::relay_client_link_keys());
-    let gw_link = Link::connect(gateway_addr, snp_node::relay_gateway_link_keys()).expect("connect");
+    let client_link = Link::new(client_stream, snp_node::legacy::relay_client_link_keys());
+    let gw_link = Link::connect(gateway_addr, snp_node::legacy::relay_gateway_link_keys()).expect("connect");
 
     let mut frame = client_link.recv_frame().expect("recv_frame");
 
     // Attempt to decrypt the body with the relay's hop key — MUST fail.
-    let hop_key = snp_node::relay_client_link_keys().recv_key;
+    let hop_key = snp_node::legacy::relay_client_link_keys().recv_key;
     let attempt = decrypt_circuit_payload(&hop_key, &frame.body);
     assert!(
         attempt.is_none(),
         "MALICIOUS RELAY SUCCEEDED — relay must not be able to decrypt circuit payload"
     );
-    let other_hop_key = snp_node::relay_gateway_link_keys().send_key;
+    let other_hop_key = snp_node::legacy::relay_gateway_link_keys().send_key;
     let attempt2 = decrypt_circuit_payload(&other_hop_key, &frame.body);
     assert!(
         attempt2.is_none(),

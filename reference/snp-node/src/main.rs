@@ -75,7 +75,7 @@ fn cmd_client(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    let (status, verified) = snp_node::run_client(&relay_addr, &url)?;
+    let (status, verified) = snp_node::legacy::run_client(&relay_addr, &url)?;
     println!(
         "Internet request succeeded. Status: {status}. Gateway: {}.",
         if verified { "verified" } else { "NOT verified" }
@@ -115,7 +115,7 @@ fn cmd_relay(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::run_relay(&listen_addr, &gateway_addr)
+    snp_node::legacy::run_relay(&listen_addr, &gateway_addr)
 }
 
 fn cmd_gateway(args: &[String]) -> snp_node::NodeResult<()> {
@@ -138,7 +138,7 @@ fn cmd_gateway(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::run_gateway(&listen_addr)
+    snp_node::legacy::run_gateway(&listen_addr)
 }
 
 fn cmd_mesh_demo(args: &[String]) -> snp_node::NodeResult<()> {
@@ -157,7 +157,7 @@ fn cmd_mesh_demo(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::run_mesh_demo(&url)
+    snp_node::legacy::run_mesh_demo(&url)
 }
 
 fn cmd_mesh_demo_multihop(args: &[String]) -> snp_node::NodeResult<()> {
@@ -176,7 +176,7 @@ fn cmd_mesh_demo_multihop(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::run_mesh_demo_multihop(&url)
+    snp_node::legacy::run_mesh_demo_multihop(&url)
 }
 
 fn cmd_mesh_demo_failover(args: &[String]) -> snp_node::NodeResult<()> {
@@ -195,7 +195,7 @@ fn cmd_mesh_demo_failover(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::run_mesh_demo_failover(&url)
+    snp_node::legacy::run_mesh_demo_failover(&url)
 }
 
 fn cmd_mesh_session_demo(args: &[String]) -> snp_node::NodeResult<()> {

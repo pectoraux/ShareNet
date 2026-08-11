@@ -435,7 +435,7 @@ fn test_2_generic_gateway_c() {
     // Verify this is NOT GatewayChoice::A or B (compile-time check would
     // require importing GatewayChoice — instead we verify at runtime by
     // comparing against the N2.0 test gateway public keys).
-    use snp_node::{gateway_public_key_for, GatewayChoice};
+    use snp_node::legacy::{gateway_public_key_for, GatewayChoice};
     assert_ne!(
         gw_ed_pk,
         gateway_public_key_for(GatewayChoice::A),
