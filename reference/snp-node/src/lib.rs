@@ -230,7 +230,8 @@ pub fn run_gateway(listen_addr: &str) -> NodeResult<()> {
         let stream = stream?;
         eprintln!("[gateway] relay connected from {}", stream.peer_addr()?);
         let link = Link::new(stream, keys);
-        match serve_one_request(&link, &gateway_sk, &circuit) {
+        let mut seen_req_ids = std::collections::HashSet::new();
+        match serve_one_request(&link, &gateway_sk, &circuit, &mut seen_req_ids) {
             Ok(()) => {
                 eprintln!("[gateway] request served, exiting");
                 return Ok(());
@@ -251,6 +252,7 @@ fn serve_one_request(
     link: &Link,
     gateway_sk: &[u8; 32],
     circuit: &CircuitKeys,
+    seen_req_ids: &mut std::collections::HashSet<[u8; 16]>,
 ) -> NodeResult<()> {
     // Recv a frame from the relay. The relay re-encrypted the OUTER frame
     // with the relay→gateway hop key; we decrypt with our recv_key. The
@@ -285,9 +287,16 @@ fn serve_one_request(
         transit_req.method, transit_req.url
     );
 
-    // Handle the request: validate, build PinnedConnector (DNS pin), fetch,
+    // N1.9.2: Circuit replay protection — deduplicate reqId.
+    // If this reqId has been seen before, reject as replay.
+    let req_id_arr: [u8; 16] = transit_req.req_id;
+    if !seen_req_ids.insert(req_id_arr) {
+        return Err(NodeError::CircuitDecryptionFailed);
+    }
+
+    // Handle the request: validate (signature!), build PinnedConnector (DNS pin), fetch,
     // sign. The PinnedConnector closes the N1.8 TOCTOU gap.
-    let fetched = handle_transit_request(&transit_req, gateway_sk)?;
+    let fetched = handle_transit_request(&transit_req, gateway_sk, &client_public_key())?;
     eprintln!(
         "[gateway] fetched: status={} body={} bytes object_id={}",
         fetched.response.status,

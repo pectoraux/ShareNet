@@ -1069,7 +1069,19 @@ pub struct FetchedResponse {
 pub fn handle_transit_request(
     req: &TransitRequest,
     gateway_secret_key: &SymmetricKey,
+    client_public_key: &[u8; 32],
 ) -> GatewayResult<FetchedResponse> {
+    // N1.9.2 FIX: Verify the client's signature BEFORE doing anything else.
+    // Without this, anyone who can send a circuit-encrypted frame can make
+    // the gateway fetch arbitrary URLs — no attribution, no accountability.
+    if !verify_transit_request(req, client_public_key) {
+        return Err(GatewayError::MalformedRequest(
+            "TransitRequest client_sig verification FAILED — request is not \
+             authenticated (N1.9.2: unsigned requests must not reach egress)"
+                .to_string(),
+        ));
+    }
+
     if req.tls_termination != "GATEWAY_PLAINTEXT" && req.tls_termination != "PAYLOAD_E2E" {
         return Err(GatewayError::MalformedRequest(format!(
             "tlsTermination must be GATEWAY_PLAINTEXT or PAYLOAD_E2E; got \"{}\" (I17)",

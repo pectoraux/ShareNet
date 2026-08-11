@@ -1425,3 +1425,52 @@ Stage Summary:
 
 N1.9.1 STATUS: GREEN — all security closure items resolved.
 Remaining: full SNP-IK/0.1 handshake (pre-shared test keys documented as test-only in ADR-0011).
+
+---
+Task ID: 101-105 (N1.9.2 Adversarial Audit)
+Agent: Z.ai (main — adversarial audit + fixes)
+Task: Attack the implementation: (fid,seq) reuse, unsigned request egress, circuit replay
+
+## Three vulnerabilities found and fixed
+
+### Attack 1: (fid, seq) reuse under one directional key — CONFIRMED + FIXED
+PROOF: Encrypting two different plaintexts with the same (key, nonce) produces
+ciphertexts whose XOR equals the plaintexts' XOR. This is a catastrophic
+ChaCha20 stream cipher leak. The receiver had NO replay tracking.
+
+FIX: Added SeenNonceSet — a 1024-entry sliding window bitmap per flow ID.
+recv_frame now checks (fid, seq) against the window BEFORE returning the frame.
+If the same (fid, seq) is seen twice, recv_frame returns ReplayDetected and
+the link must be killed. This prevents the second frame from ever being
+processed, so the nonce is never reused.
+
+### Attack 2: Unsigned TransitRequest reaching egress — CONFIRMED + FIXED
+PROOF: handle_transit_request() did NOT call verify_transit_request(). An
+unsigned request (client_sig = [0; 64]) was fetched successfully — the
+gateway returned HTTP 200 from example.com without ever checking the signature.
+
+FIX: handle_transit_request() now takes a client_public_key parameter and
+calls verify_transit_request() BEFORE any URL parsing, DNS resolution, or
+fetching. An unsigned request is rejected with a signature error. The
+client_sig is no longer decorative.
+
+### Attack 3: Circuit ciphertext replay — CONFIRMED + FIXED
+PROOF: AEAD is stateless — the same ciphertext+nonce decrypts successfully
+every time. The gateway had no reqId deduplication. A captured sealed
+circuit payload could be replayed to force the gateway to re-fetch.
+
+FIX: serve_one_request() now maintains a HashSet<[u8; 16]> of seen reqIds.
+If a reqId is seen twice, the request is rejected as a replay before it
+reaches handle_transit_request().
+
+## Verification
+
+  cargo test --workspace: 76 passed, 0 failed, 2 ignored
+  cargo test --test n19_adversarial: 3 passed (all three attacks proven + fixed)
+  cargo test --test n19_security: 9 passed, 1 ignored (HTTPS test)
+  cargo run -p snp-node -- mesh-demo: success=True, status=200, gatewayVerified=True
+  cargo run -p snp-conformance: 72/138 verified, 0 disagreements
+
+N1.9.2 STATUS: The three attacks were REAL. They are now FIXED with executable
+proofs. The link layer has replay protection. The gateway verifies client
+signatures. The gateway deduplicates reqIds.

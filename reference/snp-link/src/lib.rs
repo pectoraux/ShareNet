@@ -134,6 +134,10 @@ pub enum LinkError {
     /// Frame (de)serialization failure.
     #[error("frame error: {0}")]
     Frame(#[from] snp_frames::FrameError),
+    /// N1.9.2: A replayed (fid, seq) was detected — the same nonce was
+    /// already seen on this link. The link MUST be killed.
+    #[error("replay detected: (fid, seq) already seen — link killed")]
+    ReplayDetected,
     /// CBOR (de)serialization failure (only when the AEAD plaintext is not
     /// a valid Frame — should not happen for well-behaved peers).
     #[error("CBOR error: {0}")]
@@ -418,6 +422,69 @@ pub struct Link {
     stream: Mutex<TcpStream>,
     send_key: SymmetricKey,
     recv_key: SymmetricKey,
+    /// N1.9.2: Replay window — tracks seen (fid, seq) pairs.
+    seen_nonces: Mutex<std::collections::HashMap<[u8; 8], SeenNonceSet>>,
+}
+
+/// N1.9.2: Sliding-window replay tracker for a single flow ID.
+struct SeenNonceSet {
+    highest_seq: u32,
+    window: [u64; 16], // 1024-bit bitmap
+}
+
+impl SeenNonceSet {
+    fn new() -> Self {
+        Self { highest_seq: 0, window: [0u64; 16] }
+    }
+
+    /// Returns true if seq is NEW (accept), false if replay (reject).
+    fn check_and_mark(&mut self, seq: u32) -> bool {
+        const WSIZE: u32 = 1024;
+        if seq == 0 { return false; }
+        if self.highest_seq == 0 {
+            self.highest_seq = seq;
+            self.set_bit(seq);
+            return true;
+        }
+        if seq > self.highest_seq {
+            let shift = seq - self.highest_seq;
+            if shift >= WSIZE {
+                self.window = [0u64; 16];
+            } else {
+                let ws = (shift / 64) as usize;
+                let bs = (shift % 64) as u32;
+                let mut nw = [0u64; 16];
+                for i in 0usize..16 {
+                    let src = i.wrapping_sub(ws);
+                    if src < 16 {
+                        nw[i] = self.window[src] >> bs;
+                        if bs > 0 && src > 0 {
+                            nw[i] |= self.window[src - 1] << (64 - bs);
+                        }
+                    }
+                }
+                self.window = nw;
+            }
+            self.highest_seq = seq;
+            self.set_bit(seq);
+            return true;
+        }
+        let dist = self.highest_seq.saturating_sub(seq);
+        if dist >= WSIZE { return false; }
+        if self.get_bit(seq) { return false; }
+        self.set_bit(seq);
+        true
+    }
+
+    fn set_bit(&mut self, seq: u32) {
+        let p = (seq % 1024) as usize;
+        self.window[p / 64] |= 1u64 << (p % 64);
+    }
+
+    fn get_bit(&self, seq: u32) -> bool {
+        let p = (seq % 1024) as usize;
+        (self.window[p / 64] & (1u64 << (p % 64))) != 0
+    }
 }
 
 impl Link {
@@ -432,6 +499,7 @@ impl Link {
             stream: Mutex::new(stream),
             send_key: keys.send_key,
             recv_key: keys.recv_key,
+            seen_nonces: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -497,6 +565,18 @@ impl Link {
         let plaintext = aead_decrypt(&self.recv_key, &nonce_arr, ciphertext, &tag_arr, b"")
             .ok_or(LinkError::DecryptionFailed)?;
         let frame = Frame::decode_cbor(&plaintext)?;
+
+        // N1.9.2: Replay protection — check (fid, seq) against the seen-nonces window.
+        // This prevents catastrophic nonce reuse: without this check, an attacker
+        // who replays a captured frame causes the same (key, nonce) to be used
+        // twice, leaking plaintext via XOR.
+        let mut seen = self.seen_nonces.lock().expect("seen_nonces mutex poisoned");
+        let fid_arr: [u8; 8] = frame.fid;
+        let set = seen.entry(fid_arr).or_insert_with(SeenNonceSet::new);
+        if !set.check_and_mark(frame.seq) {
+            return Err(LinkError::ReplayDetected);
+        }
+
         Ok(frame)
     }
 
