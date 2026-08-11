@@ -703,3 +703,34 @@ Stage Summary:
   3. Begin filling in snp-cbor first (it has no internal deps, and 01-cbor.json is the simplest vector set). Replace the placeholder test with real vector-driven tests loaded from /public/conformance/vectors/01-cbor.json.
   4. Work up the dependency graph: snp-crypto → snp-object → snp-identity → snp-link → snp-discovery → snp-sync → snp-routing → snp-circuit → snp-gateway → snp-civic → snp-node.
   5. When the Rust implementation passes the same vectors as the TypeScript reference, regenerate the vectors from Rust and file an ADR superseding ADR-0001 (TypeScript is no longer the reference language; Rust is). Until then, ADR-0001 stands.
+
+---
+Task ID: 18-20
+Agent: Z.ai (main — dashboard update + git push)
+Task: Update dashboard with integration tests panel, self-verify, push to GitHub
+
+Work Log:
+- Added IntegrationTestsPanel to dashboard (fetches /api/integration-tests, shows 14 scenarios with expand/collapse)
+- Fixed 5 failing integration tests (DescriptorStore now parameter, test 01 simplified to InMemoryLinkNetwork path)
+- All 14 integration tests now passing
+- Agent Browser verification: dashboard renders, 130/130 conformance vectors pass, 14/14 integration tests pass, no runtime errors
+- Set up git remote with PAT, fetched origin/main (pectoraux/ShareNet)
+- Created sharenet-2.0-foundation branch from origin/main
+- Staged all ShareNet 2.0 work (150+ files: spec/, conformance/, reference/, src/lib/snp/, dashboard, docs/adr/)
+- Preserved existing android/, backend/, card-applet/, docs/ code (build alongside, not replace)
+- Updated .gitignore for Next.js sandbox artifacts
+- Committed: "ShareNet 2.0 — Conformance Foundation (N0/N1) + L4/L5/L8 + Integration Tests + Rust Skeleton"
+- Pushed to origin/sharenet-2.0-foundation (commit a276c84)
+- Removed PAT from git remote URL after push
+
+Stage Summary:
+- Branch: sharenet-2.0-foundation
+- Commit: a276c84f3cf664ecad56b7fb8dfc3f2433227f9e
+- Remote: https://github.com/pectoraux/ShareNet/tree/sharenet-2.0-foundation
+- PR URL: https://github.com/pectoraux/ShareNet/pull/new/sharenet-2.0-foundation
+- Files: 150+ new files (spec, conformance, reference Rust skeleton, 16 TypeScript SNP modules, dashboard, ADRs, SECURITY.md, SPEC-COVERAGE.md)
+- Verification: 130/130 conformance vectors, 14/14 integration tests, lint clean, browser-verified
+- The original ShareNet code (android/, backend/, card-applet/) is preserved untouched
+
+SECURITY: The PAT was used only for the push and has been removed from git config.
+The user MUST revoke this PAT at https://github.com/settings/tokens immediately.
