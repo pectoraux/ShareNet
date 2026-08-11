@@ -111,10 +111,15 @@ use crate::{
 
 pub mod route;
 pub mod discovery;
+pub mod transport;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError};
 pub use discovery::{DiscoveredNode, DiscoveryProvider, StaticDiscovery, BootstrapDiscovery};
+pub use transport::{
+    TcpTransportConnection, TcpTransportListener, TcpTransportProvider, TransportConnection,
+    TransportError, TransportListener, TransportProvider,
+};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -140,7 +145,22 @@ pub const UPSTREAM_FAILURE_MARKER: &[u8] = b"SNP/0.1 upstream-failure";
 
 /// Body marker for the Class C "discovery request" frame. The client sends
 /// this to a gateway's discovery listener to request a signed advertisement.
+///
+/// **N2.0.4 (Gate A) — DEPRECATED.** This marker was used by the N2.0.1
+/// AEAD-encrypted discovery link. The N2.0.4 raw discovery protocol uses
+/// [`DISCOVERY_REQUEST_BYTE`] instead. Kept for backward compatibility with
+/// any external callers that may still reference it.
 pub const DISCOVERY_REQUEST_MARKER: &[u8] = b"SNP/0.1 discovery-request";
+
+/// N2.0.4 (Gate A): the single byte the client sends on a raw TCP
+/// connection to a gateway's discovery listener to request a signed
+/// advertisement. The gateway responds with a 4-byte big-endian length
+/// prefix followed by that many bytes of CBOR-encoded
+/// [`GatewayAdvertisement`].
+///
+/// This is the RAW discovery protocol (no AEAD, no `DISCOVERY_LINK_SEED`).
+/// The advertisement's signature provides the authentication.
+pub const DISCOVERY_REQUEST_BYTE: u8 = 0x01;
 
 // ─── NodeIdentity ────────────────────────────────────────────────────────────
 
@@ -912,12 +932,34 @@ impl Node {
 
     /// Run the discovery listener. Listens on `discovery_addr` for incoming
     /// connections from clients; for each connection, the gateway sends its
-    /// signed [`GatewayAdvertisement`] (CBOR-encoded) as a Class C frame.
+    /// signed [`GatewayAdvertisement`] (CBOR-encoded, length-prefixed).
     ///
-    /// The discovery link uses a SEPARATE seed ([`DISCOVERY_LINK_SEED`]) from
-    /// the transit link — the gateway has TWO active link seeds: one for
-    /// discovery (this listener) and one for transit
-    /// ([`serve_gateway_persistent`]).
+    /// **N2.0.4 (Gate A) — raw unauthenticated discovery protocol.** The
+    /// discovery link is NO LONGER AEAD-encrypted with the deterministic
+    /// `DISCOVERY_LINK_SEED`. Instead the client opens a raw TCP connection
+    /// and sends a single byte `0x01` (the discovery-request marker); the
+    /// gateway responds with a 4-byte big-endian length prefix followed by
+    /// that many bytes of CBOR-encoded `GatewayAdvertisement`. This is the
+    /// SAME protocol implemented by [`BootstrapDiscovery::discover`].
+    ///
+    /// ### Why is unauthenticated discovery safe?
+    ///
+    /// The advertisement is **signed** by the gateway's Ed25519 secret key
+    /// under `SIG_CONTEXTS::GATEWAY_ADVERT`. A network attacker can
+    /// substitute their own advertisement, but the client's
+    /// [`GatewayAdvertisement::verify`] check will reject it (the attacker
+    /// cannot forge a signature under the gateway's public key). The
+    /// attacker can also DROP or REPLAY a real advertisement, but replay
+    /// is bounded by the `expiry` field (a stale advertisement is rejected
+    /// by [`GatewayAdvertisement::is_expired`]).
+    ///
+    /// The DELIBERATE SIMPLIFICATION for N2.0.4 is that an attacker can
+    /// OBSERVE the advertisement request (and learn the gateway's
+    /// `node_id`, `public_key`, `listen_addr`, etc. — though these are
+    /// already public). Production would use an anonymous X25519 ephemeral
+    /// handshake for the discovery link to prevent eavesdropping on the
+    /// advertisement request itself. See `docs/n2.0.3-android-platform-contract.md`
+    /// for the production design.
     ///
     /// **N2.0.3 production API.** The advertisement is constructed via
     /// [`GatewayAdvertisement::for_identity`] using `self.identity` (an
@@ -940,62 +982,65 @@ impl Node {
             "[discovery {}] listening on {discovery_addr}",
             hex_short(&gateway_node_id)
         );
-        let keys = discovery_link_keys_responder();
+        // Pre-encode the advertisement ONCE (it does not change between
+        // connections). Each connection just writes these bytes back.
         let advert = GatewayAdvertisement::for_identity(
             &self.identity,
             transit_listen_addr,
             discovery_addr,
         );
+        let advert_bytes = advert.encode_cbor()?;
 
         for stream in listener.incoming() {
-            let stream = match stream {
+            let mut stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("[discovery {}] accept error: {e}", hex_short(&gateway_node_id));
                     continue;
                 }
             };
-            let link = Arc::new(Link::new(stream, keys));
-            // Read the discovery-request marker frame.
-            match link.recv_frame() {
-                Ok(req_frame) => {
-                    if req_frame.body.as_slice() == DISCOVERY_REQUEST_MARKER {
-                        eprintln!("[discovery {}] got discovery request", hex_short(&gateway_node_id));
-                        let advert_bytes = match advert.encode_cbor() {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!(
-                                    "[discovery {}] encode error: {e}",
-                                    hex_short(&gateway_node_id)
-                                );
-                                continue;
-                            }
-                        };
-                        let resp_frame = Frame {
-                            v: FRAME_VERSION,
-                            cls: b'C',
-                            dst: req_frame.src,
-                            src: advert.node_id,
-                            ttl: FRAME_TTL_MAX,
-                            fid: req_frame.fid,
-                            seq: req_frame.seq + 1,
-                            body: advert_bytes,
-                        };
-                        if let Err(e) = link.send_frame(&resp_frame) {
-                            eprintln!("[discovery {}] send error: {e}", hex_short(&gateway_node_id));
-                        }
-                    } else {
-                        eprintln!(
-                            "[discovery {}] unexpected discovery request body ({} bytes) — ignoring",
-                            hex_short(&gateway_node_id),
-                            req_frame.body.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[discovery {}] recv error: {e}", hex_short(&gateway_node_id));
-                }
+            // N2.0.4: read 1-byte discovery request.
+            let mut req = [0u8; 1];
+            if let Err(e) = std::io::Read::read_exact(&mut stream, &mut req) {
+                eprintln!(
+                    "[discovery {}] recv request error: {e}",
+                    hex_short(&gateway_node_id)
+                );
+                continue;
             }
+            if req[0] != DISCOVERY_REQUEST_BYTE {
+                eprintln!(
+                    "[discovery {}] unexpected discovery request byte 0x{:02x} — ignoring",
+                    hex_short(&gateway_node_id),
+                    req[0]
+                );
+                continue;
+            }
+            eprintln!(
+                "[discovery {}] got discovery request",
+                hex_short(&gateway_node_id)
+            );
+            // N2.0.4: write 4-byte BE length prefix + CBOR advertisement.
+            let len = u32::try_from(advert_bytes.len())
+                .map_err(|_| NodeError::Other(format!(
+                    "advertisement length {} exceeds u32::MAX",
+                    advert_bytes.len()
+                )))?;
+            if let Err(e) = std::io::Write::write_all(&mut stream, &len.to_be_bytes()) {
+                eprintln!(
+                    "[discovery {}] send length error: {e}",
+                    hex_short(&gateway_node_id)
+                );
+                continue;
+            }
+            if let Err(e) = std::io::Write::write_all(&mut stream, &advert_bytes) {
+                eprintln!(
+                    "[discovery {}] send advert error: {e}",
+                    hex_short(&gateway_node_id)
+                );
+                continue;
+            }
+            let _ = std::io::Write::flush(&mut stream);
         }
         Ok(())
     }
@@ -1008,8 +1053,17 @@ impl Node {
     /// `known_gateways`.
     ///
     /// Each address is the gateway's DISCOVERY listener (not its transit
-    /// listener). The discovery link uses [`DISCOVERY_LINK_SEED`] — both
-    /// ends derive matching `LinkKeys` from this seed.
+    /// listener). **N2.0.4 (Gate A):** the discovery link uses the RAW
+    /// unauthenticated protocol (single byte `0x01` request, length-prefixed
+    /// CBOR advertisement response) — NOT the AEAD-encrypted `Link` layer.
+    /// The advertisement's Ed25519 signature provides the authentication.
+    ///
+    /// This method delegates to [`BootstrapDiscovery::discover`] (the trait
+    /// implementation that performs the actual I/O) and records each
+    /// verified [`DiscoveredNode`] into `self.known_gateways`. The
+    /// delegation means `Node::discover_gateways` and a caller that
+    /// directly uses `BootstrapDiscovery::discover` see IDENTICAL behavior
+    /// — the trait is the single source of truth for discovery.
     ///
     /// **N2.0.3 production API.** This method NO LONGER pre-populates the
     /// circuit table for GatewayChoice::A/B (the previous N2.0.1
@@ -1034,53 +1088,17 @@ impl Node {
     /// Returns [`NodeError`] if NO gateway could be discovered (all addresses
     /// failed). Otherwise returns `Ok(())` — individual failures are logged.
     pub fn discover_gateways(&self, known_addrs: &[String]) -> NodeResult<()> {
-        let keys = discovery_link_keys_initiator();
+        let provider = BootstrapDiscovery::new(known_addrs.to_vec());
+        let discovered_nodes = provider.discover();
         let mut discovered = 0usize;
-        for addr in known_addrs {
-            eprintln!("[discover] querying {addr}");
-            let link = match Link::connect(addr, keys) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[discover] connect to {addr} failed: {e}");
-                    continue;
-                }
-            };
-            // Set a read timeout so we don't hang on unresponsive gateways.
-            {
-                let stream = link.stream();
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            }
-            let req_frame = Frame {
-                v: FRAME_VERSION,
-                cls: b'C',
-                dst: [0u8; 32], // broadcast — the gateway responds regardless
-                src: self.identity.node_id,
-                ttl: FRAME_TTL_MAX,
-                fid: random_fid(),
-                seq: 1,
-                body: DISCOVERY_REQUEST_MARKER.to_vec(),
-            };
-            if let Err(e) = link.send_frame(&req_frame) {
-                eprintln!("[discover] send to {addr} failed: {e}");
-                continue;
-            }
-            let resp_frame = match link.recv_frame() {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[discover] recv from {addr} failed: {e}");
-                    continue;
-                }
-            };
-            let advert = match GatewayAdvertisement::decode_cbor(&resp_frame.body) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("[discover] decode advertisement from {addr} failed: {e}");
-                    continue;
-                }
-            };
+        for node in discovered_nodes {
+            let advert = node.advertisement;
+            let addr = &node.endpoint;
             // VERIFY THE SIGNATURE — this is the "authenticated gateway
             // discovery" the audit requested. A forged advertisement is
-            // rejected here.
+            // rejected here. (BootstrapDiscovery::discover already verifies
+            // the signature, but we re-verify here for defence in depth —
+            // a future BootstrapDiscovery implementation might forget.)
             if !advert.verify() {
                 eprintln!("[discover] advertisement from {addr} has INVALID SIGNATURE — rejecting");
                 continue;
@@ -2532,14 +2550,31 @@ where
 }
 
 // ─── Discovery link keys ─────────────────────────────────────────────────────
+//
+// **N2.0.4 (Gate A) — DEPRECATED.** These functions derive AEAD link keys
+// from the deterministic `DISCOVERY_LINK_SEED`. The N2.0.4 raw discovery
+// protocol (used by `BootstrapDiscovery::discover` and
+// `Node::serve_discovery_persistent`) does NOT use AEAD on the discovery
+// link — the advertisement's signature provides the authentication, so the
+// discovery link itself does not need to be encrypted. These functions
+// are kept for backward compatibility with any external callers that may
+// still reference them, but new code MUST use the raw discovery protocol.
 
 /// Client's directional hop keys for the discovery link (initiator).
+///
+/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
+/// (`BootstrapDiscovery::discover`) instead — the AEAD-encrypted discovery
+/// link is no longer used.
 #[must_use]
 pub fn discovery_link_keys_initiator() -> LinkKeys {
     derive_link_keys(DISCOVERY_LINK_SEED, true)
 }
 
 /// Gateway's directional hop keys for the discovery link (responder).
+///
+/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
+/// (`Node::serve_discovery_persistent`) instead — the AEAD-encrypted
+/// discovery link is no longer used.
 #[must_use]
 pub fn discovery_link_keys_responder() -> LinkKeys {
     derive_link_keys(DISCOVERY_LINK_SEED, false)
@@ -3804,22 +3839,203 @@ mod tests {
         assert_eq!(discovered[0].endpoint, "127.0.0.1:7001");
     }
 
-    /// N2.0.3 (Gate C): `BootstrapDiscovery` implements the new
-    /// `DiscoveryProvider` trait (returning `Vec<DiscoveredNode>`). The
-    /// actual discovery I/O is deferred to a future revision — for now,
-    /// `discover()` returns an empty list.
+    /// N2.0.4 (Gate A): `BootstrapDiscovery::discover()` performs actual
+    /// TCP I/O against a real gateway running `serve_discovery_persistent`.
+    /// Verifies the END-TO-END discovery flow:
+    ///   1. Gateway starts serving discovery on an ephemeral port.
+    ///   2. BootstrapDiscovery connects, sends 0x01, reads the
+    ///      length-prefixed CBOR advertisement.
+    ///   3. BootstrapDiscovery verifies the signature + expiry.
+    ///   4. The returned `DiscoveredNode` carries the advertisement and
+    ///      the gateway's TCP endpoint.
     #[test]
-    fn bootstrap_discovery_returns_empty_vec() {
-        let provider = BootstrapDiscovery::new(vec![
-            "gateway1.example:7001".to_string(),
-            "gateway2.example:7001".to_string(),
-        ]);
-        assert_eq!(provider.addresses().len(), 2);
+    fn bootstrap_discovery_discovers_real_gateway() {
+        // Allocate an ephemeral port for the discovery listener.
+        let disc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery");
+        let disc_addr = disc_listener.local_addr().expect("local_addr").to_string();
+        let transit_addr = "127.0.0.1:0".to_string();
+        drop(disc_listener);
+
+        // Spawn a gateway that serves discovery via the N2.0.4 raw protocol.
+        let gateway_identity = NodeIdentity::from_secret(snp_crypto::sha256(b"bootstrap-disc-gw"));
+        let expected_node_id = gateway_identity.node_id;
+        let disc_addr_for_thread = disc_addr.clone();
+        let gateway_disc_handle = std::thread::spawn(move || {
+            let node = Node::new(
+                gateway_identity,
+                vec![Capability::Gateway],
+                disc_addr_for_thread.clone(),
+            );
+            let _ = node.serve_discovery_persistent(&disc_addr_for_thread, &transit_addr);
+        });
+        // Give the listener a moment to bind.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Run BootstrapDiscovery against the gateway.
+        let provider = BootstrapDiscovery::new(vec![disc_addr.clone()]);
+        assert_eq!(provider.addresses().len(), 1);
+        let discovered = provider.discover();
+        assert_eq!(
+            discovered.len(),
+            1,
+            "BootstrapDiscovery must discover exactly 1 gateway, got {}",
+            discovered.len()
+        );
+        let node = &discovered[0];
+        assert_eq!(node.endpoint, disc_addr);
+        assert_eq!(node.advertisement.node_id, expected_node_id);
+        // Signature was already verified inside discover() — re-verify
+        // here for defence in depth.
+        assert!(
+            node.advertisement.verify(),
+            "discovered advertisement signature must verify"
+        );
+        // Expiry was already checked inside discover() — re-check here.
+        assert!(
+            !node.advertisement.is_expired(now_unix()),
+            "discovered advertisement must not be expired"
+        );
+
+        // Clean up the server thread (it will hang on `incoming()` — leak it).
+        std::mem::forget(gateway_disc_handle);
+    }
+
+    /// N2.0.4 (Gate A): `BootstrapDiscovery::discover()` returns an empty
+    /// Vec (NOT an error) when ALL bootstrap addresses are unreachable.
+    /// Individual failures are logged but do not abort the discovery loop.
+    #[test]
+    fn bootstrap_discovery_returns_empty_when_all_unreachable() {
+        // Bind + immediately drop to get a definitely-unbound port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        drop(listener);
+
+        let provider = BootstrapDiscovery::new(vec![addr]);
         let discovered = provider.discover();
         assert!(
             discovered.is_empty(),
-            "BootstrapDiscovery::discover() must return an empty Vec<DiscoveredNode> (the I/O is deferred)"
+            "BootstrapDiscovery must return empty Vec when all addresses are unreachable"
         );
+    }
+
+    /// N2.0.4 (Gate A): `BootstrapDiscovery::discover()` discovers
+    /// MULTIPLE gateways when multiple addresses are configured and all
+    /// are reachable. Verifies the discovery loop does not stop after the
+    /// first gateway.
+    #[test]
+    fn bootstrap_discovery_discovers_multiple_gateways() {
+        // Allocate two ephemeral ports for two discovery listeners.
+        let disc_listener_a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind disc-a");
+        let disc_addr_a = disc_listener_a.local_addr().expect("local_addr").to_string();
+        let disc_listener_b = std::net::TcpListener::bind("127.0.0.1:0").expect("bind disc-b");
+        let disc_addr_b = disc_listener_b.local_addr().expect("local_addr").to_string();
+        let transit_addr = "127.0.0.1:0".to_string();
+        drop(disc_listener_a);
+        drop(disc_listener_b);
+
+        let gw_a = NodeIdentity::from_secret(snp_crypto::sha256(b"bootstrap-multi-gw-a"));
+        let gw_b = NodeIdentity::from_secret(snp_crypto::sha256(b"bootstrap-multi-gw-b"));
+        let expected_a = gw_a.node_id;
+        let expected_b = gw_b.node_id;
+
+        let disc_a_for_thread = disc_addr_a.clone();
+        let transit_a = transit_addr.clone();
+        let gw_a_handle = std::thread::spawn(move || {
+            let node = Node::new(gw_a, vec![Capability::Gateway], disc_a_for_thread.clone());
+            let _ = node.serve_discovery_persistent(&disc_a_for_thread, &transit_a);
+        });
+        let disc_b_for_thread = disc_addr_b.clone();
+        let transit_b = transit_addr.clone();
+        let gw_b_handle = std::thread::spawn(move || {
+            let node = Node::new(gw_b, vec![Capability::Gateway], disc_b_for_thread.clone());
+            let _ = node.serve_discovery_persistent(&disc_b_for_thread, &transit_b);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let provider = BootstrapDiscovery::new(vec![disc_addr_a, disc_addr_b]);
+        let discovered = provider.discover();
+        assert_eq!(
+            discovered.len(),
+            2,
+            "BootstrapDiscovery must discover both gateways, got {}",
+            discovered.len()
+        );
+        let node_ids: Vec<[u8; 32]> =
+            discovered.iter().map(|n| n.advertisement.node_id).collect();
+        assert!(
+            node_ids.contains(&expected_a),
+            "discovered set must contain gateway A"
+        );
+        assert!(
+            node_ids.contains(&expected_b),
+            "discovered set must contain gateway B"
+        );
+
+        std::mem::forget(gw_a_handle);
+        std::mem::forget(gw_b_handle);
+    }
+
+    /// N2.0.4 (Gate A): `BootstrapDiscovery::discover()` REJECTS a
+    /// gateway that serves an advertisement with an INVALID SIGNATURE.
+    /// This is the core security guarantee of the unauthenticated discovery
+    /// protocol — the signature is what makes the unauthenticated link safe.
+    #[test]
+    fn bootstrap_discovery_rejects_forged_advertisement() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        let addr_for_closure = addr.clone();
+
+        // Spawn a "malicious" server that serves a FORGED advertisement
+        // (signed by a DIFFERENT secret key than the one whose public key
+        // is in the advertisement).
+        let server_handle = std::thread::spawn(move || {
+            // Build a real advertisement, then corrupt its signature.
+            let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"real-gw"));
+            let mut advert =
+                GatewayAdvertisement::for_identity(&identity, "127.0.0.1:0", &addr_for_closure);
+            // Sign with a DIFFERENT secret key — this makes the signature
+            // invalid for the advertisement's public_key.
+            let wrong_sk = snp_crypto::sha256(b"wrong-secret");
+            advert.sign(&wrong_sk);
+            assert!(
+                !advert.verify(),
+                "test setup: forged advertisement must NOT verify"
+            );
+            let advert_bytes = advert.encode_cbor().expect("encode");
+            let len_bytes = u32::try_from(advert_bytes.len())
+                .expect("fits in u32")
+                .to_be_bytes();
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut req = [0u8; 1];
+                if stream.read_exact(&mut req).is_err() {
+                    continue;
+                }
+                if req[0] != DISCOVERY_REQUEST_BYTE {
+                    continue;
+                }
+                let _ = stream.write_all(&len_bytes);
+                let _ = stream.write_all(&advert_bytes);
+                let _ = stream.flush();
+                // Serve one connection, then exit.
+                break;
+            }
+        });
+        std::thread::sleep(Duration::from_millis(150));
+
+        let provider = BootstrapDiscovery::new(vec![addr]);
+        let discovered = provider.discover();
+        assert!(
+            discovered.is_empty(),
+            "BootstrapDiscovery must REJECT a forged advertisement (signature verification failed)"
+        );
+
+        // Let the server thread exit (it breaks after one connection).
+        let _ = server_handle.join();
     }
 
     /// N2.0.3 (Gate C): the `DiscoveryProvider` trait is object-safe — a

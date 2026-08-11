@@ -1,8 +1,12 @@
 //! Discovery — platform-independent DiscoveryProvider abstraction.
 //!
 //! Extracted from node.rs for N2.0.3 Gate J (Node decomposition).
+//! Updated for N2.0.4 Gate A (real BootstrapDiscovery I/O).
 
 use super::*;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
 
 
 // ─── Discovery (Phase 6 — N2.0.3 Gate C: DiscoveryProvider abstraction) ──────
@@ -57,6 +61,14 @@ pub struct DiscoveredNode {
 /// a `Vec<String>` of addresses and verifies each advertisement. The trait
 /// lets the SAME caller logic drive mDNS / Bluetooth / Wi-Fi Direct / etc.
 /// discovery without changes — only the provider implementation changes.
+///
+/// ## N2.0.4 (Gate A)
+///
+/// [`BootstrapDiscovery::discover`] NOW performs actual TCP I/O — it
+/// connects to each bootstrap address, sends a single-byte `0x01` discovery
+/// request, reads a 4-byte big-endian length-prefixed CBOR advertisement,
+/// verifies the signature, and checks expiry. Previously (N2.0.3) it
+/// returned an empty `Vec` as a placeholder.
 pub trait DiscoveryProvider: Send + Sync {
     /// Discover peers/gateways. Returns a list of [`DiscoveredNode`]s.
     ///
@@ -68,6 +80,13 @@ pub trait DiscoveryProvider: Send + Sync {
     /// 3. Cross-checking each `advertisement`'s `node_id` against
     ///    `SHA-256("SNP/0.1 node\0" || public_key)` (invariant I4).
     /// 4. Adding the verified advertisements to a [`GatewayDirectory`].
+    ///
+    /// **N2.0.4 (Gate A):** [`BootstrapDiscovery`] performs steps 1-2
+    /// inside `discover()` (so the returned [`DiscoveredNode`]s have
+    /// verified signatures and are non-expired). The caller STILL MUST
+    /// perform step 3 (the I4 cross-check) — this is a defence-in-depth
+    /// measure so a future BootstrapDiscovery implementation that forgets
+    /// signature verification does not cause a security regression.
     fn discover(&self) -> Vec<DiscoveredNode>;
 
     /// Advertise this node's presence. Called by a node that wants to be
@@ -93,12 +112,37 @@ pub trait DiscoveryProvider: Send + Sync {
 /// advertisement (so a caller can reach the gateway for transit without
 /// parsing the advertisement's `listen_addr`).
 ///
-/// The actual discovery I/O (TCP connect + SNP-IK/0.1 handshake + fetch
-/// advertisement) is deferred to a future revision — for now, `discover()`
-/// returns an empty list (callers that need actual discovery should use
-/// [`Node::discover_gateways`], which performs the legacy N2.0.1 discovery
-/// flow). The trait abstraction is the N2.0.3 deliverable; wiring the
-/// underlying I/O into the trait is the N2.0.4 deliverable.
+/// **N2.0.4 (Gate A).** `discover()` NOW performs actual TCP I/O. The
+/// discovery protocol is intentionally simple:
+///
+/// 1. Connect to the bootstrap address via raw TCP.
+/// 2. Send a single byte `0x01` ([`DISCOVERY_REQUEST_BYTE`]) — the
+///    "give me your advertisement" marker.
+/// 3. Read a 4-byte big-endian length prefix.
+/// 4. Read that many bytes of CBOR-encoded [`GatewayAdvertisement`].
+/// 5. Decode the advertisement.
+/// 6. Verify the advertisement's Ed25519 signature under
+///    `SIG_CONTEXTS::GATEWAY_ADVERT`.
+/// 7. Check the advertisement's `expiry` against the current time.
+/// 8. If both checks pass, return `Ok(DiscoveredNode { advertisement, endpoint })`.
+///
+/// ### Why is the discovery link UNAUTHENTICATED?
+///
+/// The advertisement itself is **signed** by the gateway's Ed25519 secret
+/// key under `SIG_CONTEXTS::GATEWAY_ADVERT`. A network attacker can
+/// substitute their own advertisement, but the signature check at step 6
+/// rejects it (the attacker cannot forge a signature under the gateway's
+/// public key). The attacker can also DROP or REPLAY a real advertisement,
+/// but replay is bounded by the `expiry` field (a stale advertisement is
+/// rejected at step 7).
+///
+/// The DELIBERATE SIMPLIFICATION for N2.0.4 is that an attacker can OBSERVE
+/// the advertisement request (and learn the gateway's `node_id`,
+/// `public_key`, `listen_addr`, etc. — though these are already public).
+/// Production would use an anonymous X25519 ephemeral handshake for the
+/// discovery link to prevent eavesdropping on the advertisement request
+/// itself. See `docs/n2.0.3-android-platform-contract.md` for the production
+/// design.
 pub struct BootstrapDiscovery {
     addrs: Vec<String>,
 }
@@ -116,21 +160,101 @@ impl BootstrapDiscovery {
     pub fn addresses(&self) -> &[String] {
         &self.addrs
     }
+
+    /// Query ONE bootstrap address for a signed advertisement.
+    ///
+    /// Implements the raw discovery protocol (see the struct doc). Returns
+    /// an error string (NOT a [`NodeError`]) so the caller can log it
+    /// alongside the failing address — `discover()` does exactly this.
+    fn discover_one(&self, addr: &str) -> Result<DiscoveredNode, String> {
+        // 1. Connect.
+        let mut stream =
+            TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+        // Disable Nagle — the discovery request is 1 byte.
+        let _ = stream.set_nodelay(true);
+        // Set a read timeout so we don't hang on unresponsive gateways.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+        // 2. Send the 1-byte discovery request.
+        stream
+            .write_all(&[DISCOVERY_REQUEST_BYTE])
+            .map_err(|e| format!("send request: {e}"))?;
+        stream.flush().map_err(|e| format!("flush request: {e}"))?;
+
+        // 3. Read the 4-byte big-endian length prefix.
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .map_err(|e| format!("recv length: {e}"))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        // Sanity-check the length — advertisements are < 4 KiB. Anything
+        // larger is either a malformed gateway or an attack.
+        const MAX_ADVERTISEMENT_LEN: usize = 64 * 1024;
+        if len > MAX_ADVERTISEMENT_LEN {
+            return Err(format!(
+                "advertisement length {len} exceeds max {MAX_ADVERTISEMENT_LEN}"
+            ));
+        }
+
+        // 4. Read `len` bytes of CBOR-encoded advertisement.
+        let mut advert_buf = vec![0u8; len];
+        stream
+            .read_exact(&mut advert_buf)
+            .map_err(|e| format!("recv advert: {e}"))?;
+
+        // 5. Decode the advertisement.
+        let advert = GatewayAdvertisement::decode_cbor(&advert_buf)
+            .map_err(|e| format!("decode advert: {e}"))?;
+
+        // 6. VERIFY THE SIGNATURE. This is the security check that makes
+        //    the unauthenticated discovery link safe — a network attacker
+        //    cannot forge a signature under the gateway's public key.
+        if !advert.verify() {
+            return Err("advertisement signature verification failed".to_string());
+        }
+
+        // 7. Check expiry.
+        let now = super::now_unix();
+        if advert.is_expired(now) {
+            return Err("advertisement expired".to_string());
+        }
+
+        // 8. (Step 3 of the caller's responsibility — the I4 cross-check —
+        //    is NOT done here. The caller (`Node::discover_gateways` or
+        //    equivalent) is expected to perform it. This is a
+        //    defence-in-depth measure so a future BootstrapDiscovery
+        //    implementation that forgets signature verification does not
+        //    cause a security regression.)
+        Ok(DiscoveredNode {
+            advertisement: advert,
+            endpoint: addr.to_string(),
+        })
+    }
 }
 
 impl DiscoveryProvider for BootstrapDiscovery {
     fn discover(&self) -> Vec<DiscoveredNode> {
-        // The actual discovery I/O is the same as Node::discover_gateways
-        // (legacy N2.0.1 implementation). For N2.0.3 we wrap the result in
-        // the new trait — the underlying TCP fetch is unchanged.
-        // This is a placeholder: production code would call the new
-        // SNP-IK/0.1-based discovery (a single anonymous X25519 handshake
-        // to each address, fetching the advertisement over the established
-        // link). For now we return an empty list — callers that need
-        // actual discovery should use Node::discover_gateways.
-        let _ = &self.addrs;
-        Vec::new()
+        let mut results = Vec::with_capacity(self.addrs.len());
+        for addr in &self.addrs {
+            eprintln!("[bootstrap-discovery] querying {addr}");
+            match self.discover_one(addr) {
+                Ok(node) => {
+                    eprintln!(
+                        "[bootstrap-discovery] {addr} OK: nodeId={}",
+                        hex_short(&node.advertisement.node_id)
+                    );
+                    results.push(node);
+                }
+                Err(e) => {
+                    eprintln!("[bootstrap-discovery] {addr} failed: {e}");
+                }
+            }
+        }
+        results
     }
+    // advertise() uses the default no-op implementation (a bootstrap list
+    // does not support outbound advertising).
 }
 
 /// A deterministic, in-memory discovery provider. Holds a pre-configured
@@ -188,4 +312,3 @@ impl DiscoveryProvider for StaticDiscovery {
     }
     // advertise() uses the default no-op implementation.
 }
-

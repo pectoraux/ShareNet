@@ -2702,3 +2702,82 @@ N2.0.3 ALL GATES COMPLETE:
   K = PASSED (Local HTTP gateway test)
   L = PASSED (Security regression tests)
   M = PASSED (Android platform contract)
+
+---
+Task ID: 163-164
+Agent: Z.ai (subagent — N2.0.4 Gates A+B)
+Task: TransportProvider + real BootstrapDiscovery
+
+Work Log:
+- Read worklog tail (5 most-recent entries) + reference/snp-node/src/node/{mod,discovery}.rs + reference/snp-link/src/lib.rs + reference/snp-crypto/src/lib.rs for context.
+- Confirmed baseline: 160 tests pass, 0 fail, 3 ignored; 138/138 conformance, 0 disagreements.
+- Gate B (TransportProvider):
+  * Created `reference/snp-node/src/node/transport.rs` (~480 lines):
+    - `TransportError` enum (Connect/Bind/Io/Closed) — `thiserror::Error` impl.
+    - `TransportConnection` trait (`Send`): `send`/`recv`/`is_alive`/`close`.
+    - `TransportListener` trait (`Send`): `accept`/`local_addr`/`close`.
+    - `TransportProvider` trait (`Send + Sync`): `connect`/`listen`.
+    - `TcpTransportProvider` (Rust reference impl): wraps `std::net::TcpStream` + `TcpListener`, sets `TCP_NODELAY`.
+    - `TcpTransportConnection` / `TcpTransportListener`: the concrete impls.
+    - Chose the "connection-establishment level" abstraction (per the task brief): the transport CREATES the stream, the existing Link layer handles framing/AEAD on top.
+    - 6 unit tests: listen returns local_addr; connect to dead addr errs; connect/accept round-trip echoes bytes; `Send+Sync` confirms `Arc<dyn TransportProvider>` works; close marks not-alive; recv on peer EOF returns `Err(Closed)`.
+  * Added `pub mod transport;` to `node/mod.rs` + re-exported `TcpTransportProvider`, `TransportProvider`, `TransportConnection`, `TransportListener`, `TcpTransportConnection`, `TcpTransportListener`, `TransportError`.
+- Gate A (real BootstrapDiscovery):
+  * Added `pub const DISCOVERY_REQUEST_BYTE: u8 = 0x01;` to `node/mod.rs` (the new raw discovery request marker).
+  * Marked `DISCOVERY_REQUEST_MARKER` (legacy AEAD marker) and `discovery_link_keys_initiator`/`discovery_link_keys_responder` as DEPRECATED in their doc-comments (kept for backward compat — no external callers, but no breaking change either).
+  * Rewrote `Node::serve_discovery_persistent` to use the new RAW discovery protocol: read 1 byte, write 4-byte BE length prefix + CBOR advertisement. Removed the `Link`-based AEAD-encrypted discovery loop. Documented WHY unauthenticated discovery is safe (advertisement signature + expiry bound the attacker to drop/replay/observe; forge is rejected by `verify()`).
+  * Rewrote `Node::discover_gateways` to delegate to `BootstrapDiscovery::discover` (the trait is now the single source of truth). The method re-verifies signature + expiry + I4 cross-check for defence in depth.
+  * Rewrote `BootstrapDiscovery::discover` in `node/discovery.rs`:
+    - `discover_one(addr)`: TCP connect (5s read/write timeouts) → write 1-byte `0x01` → read 4-byte BE length → read CBOR advertisement → decode → verify signature → check expiry → return `Ok(DiscoveredNode)`. Length is sanity-checked ≤ 64 KiB.
+    - `discover()`: loops over `addrs`, calls `discover_one`, logs failures, returns the Vec of successful discoveries.
+    - Documented the deliberate simplification: production would use an anonymous X25519 ephemeral handshake for the discovery link to prevent eavesdropping.
+  * Updated `stub_discovery_persistent` in `tests/n201_sessions.rs` to use the new raw protocol (was using the AEAD-encrypted `Link` layer + `DISCOVERY_REQUEST_MARKER`). Removed unused imports (`discovery_link_keys_responder`, `DISCOVERY_REQUEST_MARKER`); added `DISCOVERY_REQUEST_BYTE`.
+  * Removed the old `bootstrap_discovery_returns_empty_vec` test (it asserted the placeholder behaviour).
+  * Added 4 new tests in `node/mod.rs` (test mod):
+    - `bootstrap_discovery_discovers_real_gateway`: spins up a real `Node::serve_discovery_persistent` gateway, runs `BootstrapDiscovery::discover`, verifies the returned `DiscoveredNode` (endpoint, nodeId, signature, expiry).
+    - `bootstrap_discovery_returns_empty_when_all_unreachable`: confirms the discovery loop returns an empty Vec (NOT an error) when all addresses are unreachable.
+    - `bootstrap_discovery_discovers_multiple_gateways`: spins up TWO gateways, confirms the loop discovers both (does not stop after the first).
+    - `bootstrap_discovery_rejects_forged_advertisement`: spins up a "malicious" server that serves a FORGED advertisement (signed by the wrong secret key), confirms `BootstrapDiscovery::discover` REJECTS it (signature verification fails inside `discover_one`). This is the core security guarantee of the unauthenticated discovery protocol.
+- Verification:
+  * `cargo build --workspace` — clean (2 pre-existing warnings, no errors).
+  * `cargo test --workspace` — **169 passed, 0 failed, 3 ignored** (was 160/0/3; added 6 transport tests + 4 discovery tests, removed 1 placeholder test = +9 net).
+  * `cargo run -p snp-conformance -- ../public/conformance/vectors` — **138/138, 0 disagreements** (unchanged).
+  * `cargo run --bin mesh-session-demo -- --url "http://stub.example/test"` — discovery loop works end-to-end (2 gateways discovered via the new raw protocol); the subsequent transit request fails on DNS lookup for `stub.example` (expected — that's a fake URL).
+
+Stage Summary:
+- Gate A (real BootstrapDiscovery): PASS
+  * `BootstrapDiscovery::discover()` performs actual TCP I/O (was returning empty Vec).
+  * Raw discovery protocol: client sends `0x01`, gateway responds with 4-byte BE length prefix + CBOR advertisement.
+  * Signature verification + expiry check happen INSIDE `discover()` — the caller does not need to re-verify (though `Node::discover_gateways` does, for defence in depth).
+  * Deliberate simplification documented: discovery link is UNAUTHENTICATED (the advertisement's Ed25519 signature provides the authentication). Production would use an anonymous X25519 ephemeral handshake for confidentiality.
+  * 4 new tests cover: real discovery, unreachable addresses, multiple gateways, forged-advertisement rejection.
+- Gate B (TransportProvider): PASS
+  * `TransportProvider` / `TransportConnection` / `TransportListener` traits — object-safe, `Send + Sync`.
+  * `TcpTransportProvider` is the Rust reference impl (thin wrapper around `std::net::Tcp*`).
+  * Connection-establishment-level abstraction (NOT I/O-level) — the transport creates the stream, the Link layer handles framing/AEAD on top. This keeps the trait simple and protocol-agnostic.
+  * 6 unit tests cover: listen local_addr, connect to dead addr, connect/accept round-trip, Send+Sync, close marks not-alive, peer-EOF returns Closed.
+- Test results:
+  * `cargo test --workspace`: 169 passed, 0 failed, 3 ignored (was 160/0/3).
+  * `cargo run -p snp-conformance -- ../public/conformance/vectors`: 138/138, 0 disagreements (unchanged).
+- Files modified:
+  * `reference/snp-node/src/node/transport.rs` (NEW, 482 lines): TransportProvider trait + TcpTransportProvider impl + 6 unit tests.
+  * `reference/snp-node/src/node/mod.rs` (+~310 lines, -~80 lines):
+    - Added `pub mod transport;` + re-exports.
+    - Added `DISCOVERY_REQUEST_BYTE` constant; marked `DISCOVERY_REQUEST_MARKER` + `discovery_link_keys_*` as DEPRECATED in doc-comments.
+    - Rewrote `Node::serve_discovery_persistent` to use the raw discovery protocol.
+    - Rewrote `Node::discover_gateways` to delegate to `BootstrapDiscovery::discover`.
+    - Replaced `bootstrap_discovery_returns_empty_vec` test with 4 new tests (`bootstrap_discovery_discovers_real_gateway`, `bootstrap_discovery_returns_empty_when_all_unreachable`, `bootstrap_discovery_discovers_multiple_gateways`, `bootstrap_discovery_rejects_forged_advertisement`).
+  * `reference/snp-node/src/node/discovery.rs` (rewrote `BootstrapDiscovery::discover` + `discover_one`; updated doc-comments):
+    - Real TCP I/O via `std::net::TcpStream` (5s timeouts).
+    - 1-byte request → 4-byte BE length prefix → CBOR advertisement.
+    - Signature verification + expiry check inside `discover_one`.
+    - Documented the deliberate simplification (unauthenticated discovery link, signed advertisement provides authentication).
+  * `reference/snp-node/tests/n201_sessions.rs` (-30 +40 lines):
+    - Updated `stub_discovery_persistent` to use the raw discovery protocol.
+    - Updated imports: removed `discovery_link_keys_responder` + `DISCOVERY_REQUEST_MARKER`, added `DISCOVERY_REQUEST_BYTE`.
+- Limitations / workarounds:
+  * The transport abstraction is at the connection-establishment level (NOT the I/O level). The `TransportConnection` trait provides raw `send`/`recv` of byte buffers; the existing `Link` layer (snp-link) handles length-prefixed framing + AEAD on top. This keeps the transport trait simple and protocol-agnostic (it can be reused by other SNP sub-protocols, e.g. the N2.0.4 raw discovery handshake, without dragging in SNP-frame semantics). The `TcpTransportConnection::recv` uses a 64 KiB buffer and returns whatever the kernel has buffered (one `read` call). Callers that need framed reads use the `Link` layer (which loops `recv` until it has a complete length-prefixed frame).
+  * The discovery link is UNAUTHENTICATED (no AEAD, no X25519 ephemeral handshake). A network attacker can OBSERVE the advertisement request and learn the gateway's `node_id`, `public_key`, `listen_addr`, etc. (these are already public). The attacker can DROP or REPLAY a real advertisement, but replay is bounded by the `expiry` field. The attacker CANNOT forge an advertisement (the signature check rejects it). This is the deliberate simplification for N2.0.4; production would use an anonymous X25519 ephemeral handshake for the discovery link.
+  * The `DISCOVERY_LINK_SEED` constant + `discovery_link_keys_initiator` / `discovery_link_keys_responder` functions are KEPT (with deprecation notes in their doc-comments) for backward compatibility. They are no longer used by any internal code (the new raw discovery protocol does not use AEAD on the discovery link).
+  * `Node::discover_gateways` delegates to `BootstrapDiscovery::discover` (the trait is the single source of truth) and re-verifies signature + expiry + I4 cross-check for defence in depth. The re-verification is redundant (BootstrapDiscovery already verifies inside `discover_one`) but protects against a future BootstrapDiscovery implementation that forgets.
+  * The `bootstrap_discovery_discovers_real_gateway` and `bootstrap_discovery_discovers_multiple_gateways` tests leak the server threads (they call `std::mem::forget` on the `JoinHandle`s). This is because `serve_discovery_persistent` loops forever on `listener.incoming()` — there is no shutdown signal. A future revision would add a shutdown channel (e.g. `std::sync::mpsc::Receiver<()>` or a `tokio::CancellationToken`) so the tests can clean up gracefully.

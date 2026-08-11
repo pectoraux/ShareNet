@@ -36,9 +36,9 @@ use snp_link::{
 };
 
 use snp_node::node::{
-    discovery_link_keys_responder, spawn_relay_persistent_with_counter,
+    spawn_relay_persistent_with_counter,
     spawn_relay_multi_upstream_persistent_with_counter, Circuit, GatewayAdvertisement, Node,
-    NodeIdentity, UpstreamPeer, DISCOVERY_REQUEST_MARKER,
+    NodeIdentity, UpstreamPeer, DISCOVERY_REQUEST_BYTE,
 };
 use snp_node::legacy::{
     client_node_id, client_public_key,
@@ -814,54 +814,56 @@ fn stub_gateway_persistent(
 }
 
 /// Stub persistent discovery listener: accepts connections on `listener`,
-/// receives a discovery-request Class C frame, responds with a signed
-/// GatewayAdvertisement (CBOR-encoded as a Class C frame).
+/// receives a single-byte `0x01` discovery-request, responds with a
+/// length-prefixed CBOR-encoded signed `GatewayAdvertisement`.
+///
+/// **N2.0.4 (Gate A):** the stub now uses the RAW discovery protocol
+/// (no AEAD, no `DISCOVERY_LINK_SEED`) — matching the production
+/// `Node::serve_discovery_persistent` and `BootstrapDiscovery::discover`.
 fn stub_discovery_persistent(
     listener: &TcpListener,
     gw: GatewayChoice,
     transit_listen_addr: &str,
 ) {
-    let keys = discovery_link_keys_responder();
     let advert = GatewayAdvertisement::for_gateway(gw, transit_listen_addr, &listener.local_addr().unwrap().to_string());
+    let advert_bytes = advert.encode_cbor().expect("encode advert");
+    let len_bytes = u32::try_from(advert_bytes.len())
+        .expect("advertisement fits in u32")
+        .to_be_bytes();
 
     for stream in listener.incoming() {
-        let stream = match stream {
+        let mut stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[stub-disc-{gw:?}] accept error: {e}");
                 continue;
             }
         };
-        let link = Link::new(stream, keys);
-        match link.recv_frame() {
-            Ok(req_frame) => {
-                if req_frame.body.as_slice() == DISCOVERY_REQUEST_MARKER {
-                    eprintln!("[stub-disc-{gw:?}] got discovery request");
-                    let advert_bytes = advert.encode_cbor().expect("encode advert");
-                    let resp_frame = Frame {
-                        v: FRAME_VERSION,
-                        cls: b'C',
-                        dst: req_frame.src,
-                        src: advert.node_id,
-                        ttl: FRAME_TTL_MAX,
-                        fid: req_frame.fid,
-                        seq: req_frame.seq + 1,
-                        body: advert_bytes,
-                    };
-                    if let Err(e) = link.send_frame(&resp_frame) {
-                        eprintln!("[stub-disc-{gw:?}] send error: {e}");
-                    }
-                } else {
-                    eprintln!(
-                        "[stub-disc-{gw:?}] unexpected discovery request body ({} bytes)",
-                        req_frame.body.len()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("[stub-disc-{gw:?}] recv error: {e}");
-            }
+        use std::io::{Read, Write};
+        // N2.0.4: read 1-byte discovery request.
+        let mut req = [0u8; 1];
+        if let Err(e) = stream.read_exact(&mut req) {
+            eprintln!("[stub-disc-{gw:?}] recv request error: {e}");
+            continue;
         }
+        if req[0] != DISCOVERY_REQUEST_BYTE {
+            eprintln!(
+                "[stub-disc-{gw:?}] unexpected discovery request byte 0x{:02x}",
+                req[0]
+            );
+            continue;
+        }
+        eprintln!("[stub-disc-{gw:?}] got discovery request");
+        // N2.0.4: send 4-byte BE length prefix + CBOR advertisement.
+        if let Err(e) = stream.write_all(&len_bytes) {
+            eprintln!("[stub-disc-{gw:?}] send length error: {e}");
+            continue;
+        }
+        if let Err(e) = stream.write_all(&advert_bytes) {
+            eprintln!("[stub-disc-{gw:?}] send advert error: {e}");
+            continue;
+        }
+        let _ = stream.flush();
     }
 }
 
