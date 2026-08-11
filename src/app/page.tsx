@@ -1103,8 +1103,10 @@ interface MeshResult {
   requestId?: string
   responseStatus?: number
   responseObjectId?: string
+  responseHeaders?: Record<string, string>
   gatewayVerified: boolean
   clientReceivedResponse: boolean
+  realInternetEgress: boolean
   error?: string
   hint?: string
 }
@@ -1219,6 +1221,12 @@ function MeshSimulatorPanel() {
                     Gateway signature verified
                   </Badge>
                 )}
+                {result.realInternetEgress && (
+                  <Badge variant="outline" className="border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300">
+                    <Globe className="mr-1 size-3" />
+                    Real Internet egress
+                  </Badge>
+                )}
                 {result.responseStatus && (
                   <span className="text-muted-foreground">
                     HTTP {result.responseStatus}
@@ -1268,12 +1276,177 @@ function MeshSimulatorPanel() {
                   <div>gatewaySig: verified ✓</div>
                 </div>
               )}
+
+              {result.responseHeaders && Object.keys(result.responseHeaders).length > 0 && (
+                <div className="mt-3">
+                  <div className="mb-1 text-xs font-semibold text-foreground">Response headers from the real Internet:</div>
+                  <div className="max-h-40 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-3 font-mono text-xs text-muted-foreground sn-scroll">
+                    {Object.entries(result.responseHeaders).slice(0, 10).map(([k, v]) => (
+                      <div key={k} className="flex gap-2">
+                        <span className="text-foreground/70">{k}:</span>
+                        <span className="break-all">{v.slice(0, 100)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <div className="rounded-md border border-border/60 bg-muted/20 p-4 text-center text-sm text-muted-foreground">
               Click "Run simulation" to start a real TCP mesh: Client → Relay → Gateway
             </div>
           )}
+        </CardContent>
+      </Card>
+    </section>
+  )
+}
+
+// ─── Cross-verification panel ──────────────────────────────────────────────
+
+interface CrossVerifySuite {
+  suite: string
+  agreed: number
+  total: number
+  status: 'pass' | 'fail'
+}
+
+interface CrossVerifyResult {
+  language: string
+  pythonBin: string
+  libraries: string[]
+  suites: CrossVerifySuite[]
+  totalAgreed: number
+  totalVectors: number
+  allAgreed: boolean
+  timestamp: string
+  error?: string
+}
+
+function CrossVerificationPanel() {
+  const [result, setResult] = useState<CrossVerifyResult | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const runVerification = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/cross-verify', { cache: 'no-store' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setResult(data as CrossVerifyResult)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void runVerification()
+  }, [runVerification])
+
+  return (
+    <section aria-label="Cross-language verification">
+      <Card className="p-0">
+        <CardHeader className="gap-1 p-4 sm:p-6">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="size-4 text-emerald-600 dark:text-emerald-400" />
+              <CardTitle className="text-base sm:text-lg">
+                Cross-language verification — TypeScript ↔ Python
+              </CardTitle>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void runVerification()}
+              disabled={loading}
+              className="shrink-0"
+            >
+              {loading ? (
+                <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1.5 size-3.5" />
+              )}
+              Re-verify
+            </Button>
+          </div>
+          <CardDescription className="text-xs sm:text-sm">
+            Python independently consumes the TypeScript-generated golden vectors using PyNaCl (Ed25519), cbor2 (CBOR), and cryptography (AEAD). This proves the protocol is language-independent — the original ShareNet CBOR bug (Kotlin vs Python disagreeing on key ordering) cannot recur. This is the cross-language interop proof the GREEN gate requires.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-4 pt-0 sm:p-6 sm:pt-0">
+          {error ? (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-300">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="size-4 shrink-0" />
+                <span>Cross-verification unavailable: {error}</span>
+              </div>
+            </div>
+          ) : loading && !result ? (
+            <div className="space-y-2">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <Skeleton key={i} className="h-8 w-full" />
+              ))}
+            </div>
+          ) : result ? (
+            <>
+              <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+                <Badge
+                  variant="outline"
+                  className={
+                    result.allAgreed
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                  }
+                >
+                  {result.allAgreed ? '✓ All vectors agree' : '✗ Disagreement detected'}
+                </Badge>
+                <span className="text-muted-foreground">
+                  {result.totalAgreed}/{result.totalVectors} vectors verified by {result.language}
+                </span>
+                <span className="text-muted-foreground">
+                  via {result.pythonBin}
+                </span>
+              </div>
+
+              <div className="mb-3 flex flex-wrap gap-2">
+                {result.libraries.map((lib) => (
+                  <Badge key={lib} variant="outline" className="border-border/60 text-xs text-muted-foreground">
+                    {lib}
+                  </Badge>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+                {result.suites.map((s) => (
+                  <div
+                    key={s.suite}
+                    className="flex items-center gap-2 rounded-md border border-border/60 bg-background/40 px-3 py-1.5 text-xs"
+                  >
+                    {s.status === 'pass' ? (
+                      <CheckCircle2 className="size-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : (
+                      <XCircle className="size-3 shrink-0 text-rose-600 dark:text-rose-400" />
+                    )}
+                    <span className="font-mono text-muted-foreground">{s.suite}</span>
+                    <span className="ml-auto text-foreground/80">
+                      {s.agreed}/{s.total}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {result.allAgreed && (
+                <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs text-emerald-700 dark:text-emerald-300">
+                  <CheckCircle2 className="mr-1.5 inline size-3" />
+                  TypeScript and Python AGREE on all {result.totalVectors} vectors. The protocol is language-independent.
+                </div>
+              )}
+            </>
+          ) : null}
         </CardContent>
       </Card>
     </section>
@@ -1776,6 +1949,7 @@ export default function Home() {
             <SuiteTable report={report} loading={loading && !report} />
             <IntegrationTestsPanel />
             <MeshSimulatorPanel />
+            <CrossVerificationPanel />
             <AuditFindingsPanel />
             <ArchitectureLayers />
             <Roadmap />

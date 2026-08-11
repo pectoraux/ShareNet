@@ -34,7 +34,7 @@ import {
   signTransitRequest, verifyTransitRequest, signTransitResponse, verifyTransitResponse,
   type TransitRequest, type TransitResponse,
 } from "../../src/lib/snp/gateway";
-import { signGatewayAdvert, verifyGatewayAdvert } from "../../src/lib/snp/gateway";
+import { signGatewayAdvert, verifyGatewayAdvert, isPrivateDestination } from "../../src/lib/snp/gateway";
 import { encodeFrame, decodeFrame, type Frame } from "../../src/lib/snp/frames";
 import { hashSha256 } from "../../src/lib/snp/hashing";
 import { PROTO_VERSION, SIG_CONTEXTS, FRAME_VERSION } from "../../src/lib/snp/constants";
@@ -124,7 +124,7 @@ if (ROLE === "gateway") {
 
   const server = net.createServer((socket) => {
     console.log(`[${NODE_NAME}] Connection from ${socket.remoteAddress}:${socket.remotePort}`);
-    readFrames(socket, (frame) => {
+    readFrames(socket, async (frame) => {
       console.log(`[${NODE_NAME}] Received frame: cls=${frame.cls} seq=${frame.seq} body=${frame.body.length} bytes`);
       // Decode the TransitRequest from the frame body
       try {
@@ -145,26 +145,72 @@ if (ROLE === "gateway") {
 
             console.log(`[${NODE_NAME}] TransitRequest: ${method} ${url} (tlsTermination=${tlsTermination})`);
 
-            // Simulate fetching the URL — return a fake HTML response
-            const fakeBody = new TextEncoder().encode(
-              `<!DOCTYPE html><html><body><h1>ShareNet Mode A Success</h1>` +
-              `<p>Fetched ${url} via gateway at ${new Date().toISOString()}</p>` +
-              `<p>Gateway NodeId: ${bytesToHex(nodeId).slice(0, 16)}...</p>` +
-              `</body></html>`,
-            );
-            const objectId = hashSha256(fakeBody);
+            // ─── Egress policy enforcement (I18: SSRF defence) ────────────
+            // Parse the URL and check the hostname against isPrivateDestination
+            const parsedUrl = new URL(url);
+            const hostname = parsedUrl.hostname;
+            if (isPrivateDestination(hostname)) {
+              console.log(`[${NODE_NAME}] REJECTED: private destination ${hostname}`);
+              const errorResponse = signTransitResponse(keypair.secretKey, {
+                reqId,
+                status: 403,
+                headers: new Map([["Content-Type", "text/plain"]]),
+                objectId: hashSha256(new TextEncoder().encode(`SSRF blocked: ${hostname}`)),
+                fetchedAt: Math.floor(Date.now() / 1000),
+                gatewayId: nodeId,
+              });
+              const errorFrame: Frame = {
+                v: FRAME_VERSION, cls: "C", dst: frame.src, src: nodeId,
+                ttl: 16, fid: frame.fid, seq: 1,
+                body: cborEncode(responseToCborMap(errorResponse)),
+              };
+              sendFrame(socket, errorFrame);
+              return;
+            }
+
+            // ─── REAL INTERNET FETCH ──────────────────────────────────────
+            // This is the critical difference from the previous simulator:
+            // the gateway actually fetches the URL from the real Internet.
+            // This proves Mode A works end-to-end with the REAL Internet.
+            console.log(`[${NODE_NAME}] Fetching ${url} from the real Internet...`);
+            let responseStatus = 0;
+            let responseHeaders = new Map<string, string>();
+            let responseBody = new Uint8Array();
+
+            try {
+              const fetchResponse = await fetch(url, {
+                method,
+                headers: { "Accept": "text/html,application/json,*/*" },
+                signal: AbortSignal.timeout(Math.min(10000, (deadline - Math.floor(Date.now() / 1000)) * 1000)),
+              });
+              responseStatus = fetchResponse.status;
+              fetchResponse.headers.forEach((value, key) => {
+                responseHeaders.set(key, value);
+              });
+              const bodyBuffer = await fetchResponse.arrayBuffer();
+              responseBody = new Uint8Array(bodyBuffer).slice(0, maxResponseBytes);
+              console.log(`[${NODE_NAME}] Fetched: ${responseStatus} ${fetchResponse.statusText}, ${responseBody.length} bytes`);
+            } catch (fetchError: any) {
+              console.log(`[${NODE_NAME}] Fetch failed: ${fetchError.message}`);
+              responseStatus = 502;
+              responseHeaders.set("Content-Type", "text/plain");
+              responseBody = new TextEncoder().encode(`Gateway fetch error: ${fetchError.message}`);
+            }
+
+            // Compute the objectId (SHA-256 of the response body)
+            const objectId = hashSha256(responseBody);
 
             // Sign the TransitResponse
             const response = signTransitResponse(keypair.secretKey, {
               reqId,
-              status: 200,
-              headers: new Map([["Content-Type", "text/html"]]),
+              status: responseStatus,
+              headers: responseHeaders,
               objectId,
               fetchedAt: Math.floor(Date.now() / 1000),
               gatewayId: nodeId,
             });
 
-            console.log(`[${NODE_NAME}] TransitResponse signed: status=200 objectId=${bytesToHex(objectId).slice(0, 16)}...`);
+            console.log(`[${NODE_NAME}] TransitResponse signed: status=${responseStatus} objectId=${bytesToHex(objectId).slice(0, 16)}... (${responseBody.length} bytes)`);
 
             // Send the response back as a Class C control frame
             const responseFrame: Frame = {
@@ -299,14 +345,24 @@ if (ROLE === "client") {
           console.log(`[${NODE_NAME}] Gateway signature verified: ${verified}`);
 
           if (responseResolver) {
+            // Extract some headers to prove the response came from the real Internet
+            const headers: Record<string, string> = {};
+            if (response.headers instanceof Map) {
+              for (const [k, v] of response.headers.entries()) {
+                if (typeof k === "string" && typeof v === "string") {
+                  headers[k] = v;
+                }
+              }
+            }
             responseResolver({
-              success: verified,
+              success: verified && response.status === 200,
               requestId: bytesToHex(response.reqId),
               status: response.status,
               objectId: bytesToHex(response.objectId),
               gatewayVerified: verified,
+              responseHeaders: headers,
               detail: verified
-                ? `Mode A success: ${response.status} response verified against gateway's public key`
+                ? `Mode A success: ${response.status} response from real Internet, verified against gateway's public key`
                 : "Gateway signature verification FAILED",
             });
             responseResolver = null;
@@ -360,7 +416,7 @@ if (ROLE === "client") {
       const request = signTransitRequest(keypair.secretKey, {
         reqId,
         method: "GET",
-        url: "https://example.com/index.html",
+        url: "https://example.com/",
         headers: new Map([["Accept", "text/html"]]),
         body: null,
         tlsTermination: "GATEWAY_PLAINTEXT", // Mode A — gateway sees plaintext (per spec §4.4)

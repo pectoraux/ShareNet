@@ -44,8 +44,10 @@ interface MeshResult {
   requestId?: string;
   responseStatus?: number;
   responseObjectId?: string;
+  responseHeaders?: Record<string, string>;
   gatewayVerified: boolean;
   clientReceivedResponse: boolean;
+  realInternetEgress: boolean;
   error?: string;
 }
 
@@ -163,26 +165,29 @@ async function runMeshSimulation(): Promise<MeshResult> {
     return {
       timestamp: new Date().toISOString(),
       mode: "A",
-      topology: `Client (:${CLIENT_PORT}) → Relay (:${RELAY_PORT}) → Gateway (:${GATEWAY_PORT}) over real TCP`,
+      topology: `Client (:${CLIENT_PORT}) → Relay (:${RELAY_PORT}) → Gateway (:${GATEWAY_PORT}) over real TCP → REAL INTERNET`,
       stages,
       totalDurationMs: Date.now() - startTime,
       success: result.success === true,
       requestId: result.requestId,
       responseStatus: result.status,
       responseObjectId: result.objectId,
+      responseHeaders: result.responseHeaders,
       gatewayVerified: result.gatewayVerified === true,
       clientReceivedResponse: result.success === true,
+      realInternetEgress: result.success === true && result.status === 200,
     };
   } catch (e: any) {
     return {
       timestamp: new Date().toISOString(),
       mode: "A",
-      topology: `Client (:${CLIENT_PORT}) → Relay (:${RELAY_PORT}) → Gateway (:${GATEWAY_PORT}) over real TCP`,
+      topology: `Client (:${CLIENT_PORT}) → Relay (:${RELAY_PORT}) → Gateway (:${GATEWAY_PORT}) over real TCP → REAL INTERNET`,
       stages,
       totalDurationMs: Date.now() - startTime,
       success: false,
       gatewayVerified: false,
       clientReceivedResponse: false,
+      realInternetEgress: false,
       error: e.message,
     };
   } finally {
