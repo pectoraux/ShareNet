@@ -1,22 +1,19 @@
 [package]
-name = "snp-sync"
-description = "L5 anti-entropy, store-carry-forward, Mode A bundle custody"
+name = "snp-conformance"
+description = "Independent Rust conformance harness — consumes committed JSON vectors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "snp-conformance"
+path = "src/main.rs"
+
 [dependencies]
 snp-cbor.workspace = true
 snp-crypto.workspace = true
 snp-identity.workspace = true
 snp-object.workspace = true
-snp-discovery.workspace = true
-snp-link.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

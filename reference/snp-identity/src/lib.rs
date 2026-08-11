@@ -12,12 +12,12 @@
 //! 4. **`NodeDescriptor`** — the signed, broadcastable record containing the
 //!    NodeId, supported link types, capabilities, and current device cert.
 //!
-//! This is the Rust equivalent of `/src/lib/snp/identity.ts`.
-//!
-//! SKELETON — not yet implemented. The TypeScript reference is authoritative
-//! until this crate is complete and regenerates the golden vectors in
-//! `/public/conformance/vectors/03-identity.json` and
-//! `/public/conformance/vectors/09-descriptors.json`.
+//! This crate implements NodeId derivation and Ed25519 signature verification
+//! against the committed conformance vectors in
+//! `public/conformance/vectors/03-identity.json`. The full DeviceCert /
+//! NodeDescriptor CBOR structures are not yet implemented; they are exercised
+//! by the conformance harness as `UNSUPPORTED` where they require CBOR
+//! reconstruction of complex payload shapes.
 
 #![warn(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -42,7 +42,7 @@ pub enum IdentityError {
     Cbor(#[from] snp_cbor::CborError),
     /// Underlying crypto failure.
     #[error("crypto error: {0}")]
-    Crypto(#[from] snp_crypto::CryptoError),
+    Crypto(String),
 }
 
 /// Convenience `Result` alias.
@@ -52,18 +52,48 @@ pub type IdentityResult<T> = Result<T, IdentityError>;
 pub type NodeId = [u8; 32];
 
 /// Domain-separation tag used in NodeId derivation (I4).
-pub const NODE_ID_DOMAIN: &[u8] = b"SNP/0.1 node\0";
+pub const NODE_ID_DOMAIN: &[u8] = snp_crypto::NODE_ID_DOMAIN;
 
 /// Derive a NodeId from an Ed25519 public key.
 ///
 /// Per invariant I4: `NodeId = SHA-256("SNP/0.1 node\0" || pk)`. The bare key
 /// is NEVER used as a NodeId.
-pub fn derive_node_id(_public_key: &snp_crypto::PublicKey) -> NodeId {
-    todo!("Compute SHA-256(NODE_ID_DOMAIN || pk) via snp_crypto::domain_hash")
+#[must_use]
+pub fn derive_node_id(public_key: &snp_crypto::PublicKey) -> NodeId {
+    snp_crypto::derive_node_id(public_key)
 }
 
+/// Verify an Ed25519 signature made under a specific SIG_CONTEXT.
+///
+/// Preimage = `sig_context(name) || bytes`. Returns `true` iff the signature
+/// is valid under RFC 8032 verification for `public_key`.
+///
+/// Returns `false` if `name` is not a known SIG_CONTEXT.
+#[must_use]
+pub fn verify_signed(
+    public_key: &snp_crypto::PublicKey,
+    context_name: &str,
+    payload_bytes: &[u8],
+    signature: &snp_crypto::SignatureBytes,
+) -> bool {
+    let Some(ctx) = snp_crypto::sig_context(context_name) else {
+        return false;
+    };
+    let mut preimage = Vec::with_capacity(ctx.len() + payload_bytes.len());
+    preimage.extend_from_slice(ctx);
+    preimage.extend_from_slice(payload_bytes);
+    snp_crypto::ed25519_verify(public_key, &preimage, signature)
+}
+
+// === Skeleton types (kept for downstream crate API compatibility) ===
+//
+// These types are NOT yet exercised by the Rust conformance harness. The
+// full DeviceCert / NodeDescriptor CBOR structures are tracked as future
+// work; the `devicecert-sign-and-verify` and `node-descriptor-sign-and-verify`
+// vectors are classified as UNSUPPORTED until then.
+
 /// A device certificate: binds a NodeId to a device Ed25519 public key with
-/// an expiry. Signed by the node's identity key.
+/// an expiry. Signed by the node's identity key. Skeleton stub.
 #[derive(Debug, Clone)]
 pub struct DeviceCert {
     /// The NodeId this cert is issued to.
@@ -72,30 +102,11 @@ pub struct DeviceCert {
     pub device_key: snp_crypto::PublicKey,
     /// Unix timestamp (seconds) at which the cert expires.
     pub expires_at: u64,
-    /// Signature by the node identity key over the canonical CBOR of the
-    /// three fields above, prefixed by `SIG_CONTEXT`.
+    /// Signature by the node identity key.
     pub signature: snp_crypto::Signature,
 }
 
-impl DeviceCert {
-    /// Issue a new DeviceCert by signing with `node_secret`.
-    pub fn issue(
-        _node_id: &NodeId,
-        _device_key: &snp_crypto::PublicKey,
-        _expires_at: u64,
-        _node_secret: &snp_crypto::SecretKey,
-    ) -> IdentityResult<Self> {
-        todo!("Build and sign a DeviceCert per SNP/0.1 §2.2")
-    }
-
-    /// Verify the certificate's signature against `node_public`.
-    pub fn verify(&self, _node_public: &snp_crypto::PublicKey) -> IdentityResult<()> {
-        todo!("Verify DeviceCert signature via snp_crypto::ed25519_verify")
-    }
-}
-
-/// Capabilities a node advertises. Subset of the platform matrix in
-/// `/public/spec/03-PLATFORM-MATRIX.md`.
+/// Capabilities a node advertises. Skeleton stub.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
     /// Can this node act as a relay?
@@ -109,6 +120,7 @@ pub struct Capabilities {
 }
 
 /// A NodeDescriptor: the signed, broadcastable record published by a node.
+/// Skeleton stub — not yet implemented.
 #[derive(Debug, Clone)]
 pub struct NodeDescriptor {
     /// The issuer's NodeId.
@@ -127,46 +139,48 @@ pub struct NodeDescriptor {
     pub signature: snp_crypto::Signature,
 }
 
-impl NodeDescriptor {
-    /// Build and sign a NodeDescriptor.
-    pub fn issue(
-        _node_id: &NodeId,
-        _identity_key: &snp_crypto::PublicKey,
-        _device_cert: DeviceCert,
-        _capabilities: Capabilities,
-        _seq: u64,
-        _issued_at: u64,
-        _identity_secret: &snp_crypto::SecretKey,
-    ) -> IdentityResult<Self> {
-        todo!("Build and sign a NodeDescriptor per SNP/0.1 §2.3")
-    }
-
-    /// Verify the descriptor's signature against the embedded identity key.
-    pub fn verify(&self) -> IdentityResult<()> {
-        todo!("Verify NodeDescriptor signature via snp_crypto::ed25519_verify")
-    }
-
-    /// Encode to canonical CBOR bytes (for the wire and for signature input).
-    pub fn to_cbor(&self) -> IdentityResult<Vec<u8>> {
-        todo!("Encode NodeDescriptor to canonical CBOR")
-    }
-
-    /// Decode from canonical CBOR bytes.
-    pub fn from_cbor(_bytes: &[u8]) -> IdentityResult<Self> {
-        todo!("Decode NodeDescriptor from canonical CBOR")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn placeholder() {
-        // Placeholder — real tests will use the conformance vectors from
-        // /public/conformance/vectors/03-identity.json (NodeId derivation,
-        // DeviceCert issue/verify) and /public/conformance/vectors/09-descriptors.json
-        // (NodeDescriptor wire format).
-        let _ = NODE_ID_DOMAIN;
+    fn nodeid_deterministic_alice() {
+        let pk_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&hex_to_bytes(pk_hex));
+        let id = derive_node_id(&pk);
+        let got: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            got,
+            "4ae95ccb41544dccde22eca97a7cdc99101cb5aa91606c257b56cdd35b414913"
+        );
+        // Deterministic: same input → same output.
+        let id2 = derive_node_id(&pk);
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn rfc8032_test1_verify() {
+        let pk_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let sig_hex = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b";
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&hex_to_bytes(pk_hex));
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&hex_to_bytes(sig_hex));
+        assert!(snp_crypto::ed25519_verify(&pk, b"", &sig));
+    }
+
+    #[test]
+    fn unknown_context_rejects() {
+        let pk = [0u8; 32];
+        let sig = [0u8; 64];
+        assert!(!verify_signed(&pk, "nonsense", b"", &sig));
     }
 }

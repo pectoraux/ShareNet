@@ -23,6 +23,7 @@ members = [
     "snp-gateway",
     "snp-civic",
     "snp-node",
+    "snp-conformance",
 ]
 
 [workspace.package]

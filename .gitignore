@@ -44,3 +44,4 @@ server.log
 /mini-services/.gitkeep
 /db/
 /sharenet-*.png
+reference/target/

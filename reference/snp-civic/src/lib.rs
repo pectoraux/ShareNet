@@ -121,7 +121,8 @@ impl ContributionStore {
         &self,
         _contributor: &snp_identity::NodeId,
     ) -> impl Iterator<Item = &ContributionProof> {
-        todo!("Iterate over proofs attributed to a given contributor")
+        // SKELETON: returns an empty iterator.
+        std::iter::empty()
     }
 }
 

@@ -115,7 +115,9 @@ impl DescriptorStore {
 
     /// Iterate over all known descriptors.
     pub fn iter(&self) -> impl Iterator<Item = &snp_identity::NodeDescriptor> {
-        todo!("Iterate over all known descriptors")
+        // SKELETON: returns an empty iterator. Real implementation will return
+        // an iterator over the backing store.
+        std::iter::empty()
     }
 }
 
