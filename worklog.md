@@ -2677,3 +2677,28 @@ Stage Summary:
 - 141 tests pass, 0 fail, 3 ignored
 - 138/138 conformance, 0 disagreements
 - All identities generated dynamically (no GatewayChoice, no compile-time topology)
+
+---
+Task ID: 160-162 (Gates J+L+M: Node decomposition, Security regression, Android contract)
+Agent: Z.ai (main — final N2.0.3 gates)
+
+Stage Summary:
+- Gate J: Node decomposed into node/mod.rs + node/route.rs + node/discovery.rs
+- Gate L: 19 security regression tests (route loop, excessive hops, expired, epoch, state machine, forged/expired/mismatched advertisement, SSRF, circuit key separation, directional keys, unsigned/tampered transit request, TTL, nonce reuse, capability mismatch, GatewayChoice isolation)
+- Gate M: Android Platform Contract document created (DiscoveryProvider, TransportProvider, PeerSession, Route, Circuit, Gateway, transit frame format, what Gemini MUST/MUST NOT implement)
+- 160 tests pass, 0 fail, 3 ignored
+- 138/138 conformance, 0 disagreements
+
+N2.0.3 ALL GATES COMPLETE:
+  A = PASSED (GatewayChoice isolated to legacy)
+  B = PASSED (Route object with hop list)
+  C = PASSED (DiscoveryProvider)
+  D = PASSED (GatewaySelector)
+  E = PASSED (Dynamic route construction)
+  F = PASSED (Multi-hop transit with dynamic identities)
+  G = PASSED (Relay failure recovery)
+  H = PASSED (Gateway failure recovery)
+  J = PASSED (Node decomposition)
+  K = PASSED (Local HTTP gateway test)
+  L = PASSED (Security regression tests)
+  M = PASSED (Android platform contract)
