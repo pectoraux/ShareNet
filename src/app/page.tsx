@@ -1932,7 +1932,7 @@ function RustSecurityPanel() {
             <div className="flex items-center gap-2">
               <ShieldCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
               <CardTitle className="text-base sm:text-lg">
-                N1.9 Security tests — directional keys, circuit encryption, SSRF pinning
+                N1.9.1 Security tests — directional keys, circuit encryption, CSPRNG nonce, HTTPS pinning
               </CardTitle>
             </div>
             <Button
@@ -1979,7 +1979,7 @@ function RustSecurityPanel() {
                       : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
                   }
                 >
-                  {result.allPassed ? '✓ All 5 security tests pass' : `${result.failed} failing`}
+                  {result.allPassed ? `✓ All ${result.totalTests} security tests pass` : `${result.failed} failing`}
                 </Badge>
                 <span className="text-muted-foreground">
                   {result.passed}/{result.totalTests} passed

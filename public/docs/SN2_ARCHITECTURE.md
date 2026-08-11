@@ -161,6 +161,7 @@ Python, and Rust with zero disagreements across the committed vectors.
 | 0008 | Gateway DNS rebinding defence | proposed |
 | 0009 | Response object hashing semantics | accepted |
 | 0010 | SplitMix64 deterministic stream spec | accepted |
+| 0011 | Key hierarchy — hop, circuit, identity, handshake | accepted |
 
 ---
 
@@ -174,8 +175,9 @@ Python, and Rust with zero disagreements across the committed vectors.
 | N1.6 — Adversarial conformance | ✅ Complete | Honest classification, SSRF defence |
 | N1.7 — Rust conformance core | ✅ Complete | 72/138 Rust, 0 disagreements |
 | N1.7.1 — Spec findings | ✅ Complete | Merkle streaming fix, ADR-0010 |
-| N1.8 — Rust minimal Internet bridge | ✅ Complete | Client → Relay → Gateway → Internet |
+| N1.8 — Rust minimal Internet bridge | ✅ Complete (demo) | Client → Relay → Gateway → example.com → back |
 | N1.9 — Secure Rust Link + Gateway Boundary | ✅ Complete | Directional AEAD keys, circuit encryption, DNS-pinned gateway |
+| N1.9.1 — Security closure | ✅ Complete | getrandom() nonce, HTTPS+IP pinning verified, ADR-0011 key hierarchy |
 | N2 — Crypto correction | ✅ Complete | (folded into N1.5) |
 | N3 — Reference node | 🟡 In progress | (Rust conformance core done; networking next) |
 | N4 — Routing | 🟡 Partial | (TS implementation + integration tests) |

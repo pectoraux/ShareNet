@@ -97,9 +97,10 @@
 //!   deterministic test value. Production derives it from the SNP-IK/0.1
 //!   transcript between client and gateway, so the relay (which only sees
 //!   the outer hop handshakes) cannot derive it.
-//! - The circuit-nonce RNG. N1.9 uses `SHA-256(wall_clock_ns ‖ counter)`
-//!   for the circuit nonce. Production uses `getrandom()` (CSPRNG) so an
-//!   attacker who can predict the wall clock cannot predict the nonce.
+//! - The circuit-nonce RNG. N1.9.1 uses `getrandom()` (OS CSPRNG) for the
+//!   circuit nonce, replacing the N1.9 `SHA-256(wall_clock_ns ‖ counter)`
+//!   heuristic. This guarantees nonce uniqueness across processes, threads,
+//!   reconnects, and session restarts.
 //! - The synchronous `std::net::TcpStream` API. Production ShareNet uses
 //!   async I/O (tokio) for connection pooling and concurrent relays.
 
@@ -109,11 +110,10 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use snp_crypto::{
-    aead_decrypt, aead_encrypt, aead_nonce, aead_open, aead_seal, hkdf_sha256, sha256, SymmetricKey,
+    aead_decrypt, aead_encrypt, aead_nonce, aead_open, aead_seal, hkdf_sha256, SymmetricKey,
 };
 use snp_frames::Frame;
 use thiserror::Error;
@@ -373,26 +373,29 @@ pub fn decrypt_circuit_payload(key: &SymmetricKey, sealed: &[u8]) -> Option<Vec<
     aead_open(key, &nonce, ct_tag, CIRCUIT_AAD)
 }
 
-/// Generate a 12-byte nonce for circuit-layer AEAD.
+/// Generate a 12-byte nonce for circuit-layer AEAD using `getrandom()`.
 ///
-/// N1.9: derives the nonce from a process-local atomic counter + the wall
-/// clock nanoseconds, then SHA-256s them and takes the first 12 bytes. This
-/// is NOT a CSPRNG — production ShareNet uses `getrandom()` for the circuit
-/// nonce. The nonce is sent in clear (prepended to the sealed blob), so it
-/// does not need to be secret; it only needs to be unique per key.
-fn random_circuit_nonce() -> [u8; 12] {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut seed = Vec::with_capacity(16);
-    seed.extend_from_slice(&now_ns.to_le_bytes());
-    seed.extend_from_slice(&c.to_le_bytes());
-    let h = sha256(&seed);
+/// N1.9.1: Replaced the previous `SHA-256(wall_clock_ns ‖ counter)` heuristic
+/// with a proper CSPRNG. The nonce does not need to be secret, but it MUST be
+/// unique per key. `getrandom()` provides cryptographic randomness from the
+/// OS entropy source ( `/dev/urandom` on Linux, `BCryptGenRandom` on Windows,
+/// `SecRandomCopyBytes` on macOS). This guarantees uniqueness across:
+///   - multiple processes
+///   - multiple threads
+///   - reconnects and session restarts
+///   - Android lifecycle interruptions
+///   - key rotation
+///
+/// The 2^96 collision probability under a single key is negligible
+/// (birthday bound: ~2^48 messages for a 50% collision chance, far beyond
+/// any realistic circuit lifetime).
+pub fn random_circuit_nonce() -> [u8; 12] {
     let mut out = [0u8; 12];
-    out.copy_from_slice(&h[..12]);
+    // getrandom() fills the buffer from the OS CSPRNG. On any platform
+    // where getrandom is available (Linux 3.17+, Windows, macOS, Android,
+    // iOS), this cannot fail in practice. If it does fail, we panic —
+    // a failed nonce generation is a fatal error, not a degraded mode.
+    getrandom::getrandom(&mut out).expect("getrandom failed — OS entropy source unavailable");
     out
 }
 

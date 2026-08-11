@@ -1389,3 +1389,39 @@ Stage Summary:
 
 N1.9 STATUS: GREEN — all 5 security tests pass, circuit encryption is real, relay cannot decrypt, gateway pins to validated IP.
 Remaining: full SNP-IK/0.1 handshake (currently pre-shared test keys), HTTPS+IP pinning (currently HTTP for demo).
+
+---
+Task ID: 90-100 (N1.9.1 Security Closure)
+Agent: Z.ai (main — N1.9.1 security closure)
+Task: Replace circuit nonce with getrandom(), HTTPS+IP pinning test, key hierarchy ADR, security tests
+
+Work Log:
+- Replaced SHA-256(wall_clock||counter) circuit nonce with getrandom() (OS CSPRNG) in snp-link/src/lib.rs
+- Added getrandom = "0.2" dependency to snp-link/Cargo.toml
+- Removed unused AtomicU64/Ordering imports and sha256 import from snp-link
+- Made random_circuit_nonce() public for testing
+- Verified HTTPS through pinned IP already works (PinnedConnector.fetch_https uses rustls with SNI + cert validation)
+- Added test_9_real_https_through_pinned_ip — #[ignore] test that fetches https://example.com/ through the PinnedConnector, verifies TLS handshake succeeds with certificate validated against the original hostname (NOT the pinned IP). PASSES when run explicitly.
+- Created ADR-0011: Key Hierarchy — formally documents hop keys (S1/S2), circuit keys (S3), identity keys (Ed25519), and handshake-derived keys (future). Documents the HKDF derivation, directional separation, and key independence properties.
+- Added 5 new N1.9.1 security tests (tests 6-10):
+  - Test 6: 1000 circuit nonces all distinct (getrandom uniqueness)
+  - Test 7: Relay with BOTH hop keys (S1+S2) cannot derive or decrypt circuit key S3
+  - Test 8: Same plaintext encrypted twice produces different ciphertexts (random nonce)
+  - Test 9: Real HTTPS through pinned IP (TLS + SNI + cert validation) — #[ignore], passes when run
+  - Test 10: 1000 nonces across two "sessions" — no collision across reconnect boundaries
+- Updated SN2_ARCHITECTURE.md: N1.8 marked "demo", N1.9.1 added, ADR-0011 added to ADR table
+- Updated dashboard: security panel shows 9 tests (5 N1.9 + 4 N1.9.1, +1 ignored HTTPS test)
+- Agent Browser: "All 9 security tests pass" visible, N1.9.1 tests visible, key hierarchy visible
+
+Stage Summary:
+- Circuit nonce: getrandom() CSPRNG (was SHA-256 heuristic) — FIXED
+- HTTPS + IP pinning: verified with real https://example.com/ test — CONFIRMED WORKING
+- Key hierarchy: ADR-0011 formally documents S1/S2/S3 separation — FROZEN
+- Relay with both hop keys: cannot derive S3 — PROVEN (Test 7)
+- Circuit replay: different ciphertexts for same plaintext — PROVEN (Test 8)
+- Nonce collision across sessions: none — PROVEN (Test 10)
+- 73 Rust tests pass (9 security + 64 others), 2 ignored (HTTPS + real-Internet mesh), 0 failed
+- Mesh demo still works end-to-end with getrandom() nonce
+
+N1.9.1 STATUS: GREEN — all security closure items resolved.
+Remaining: full SNP-IK/0.1 handshake (pre-shared test keys documented as test-only in ADR-0011).

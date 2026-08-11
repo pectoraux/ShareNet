@@ -43,10 +43,16 @@ export async function GET() {
     // Map test names to descriptions
     const testDescriptions: Record<string, string> = {
       test_1_nonce_collision_directional_keys: "Nonce collision — directional keys prevent reuse",
+      test_1_nonce_collision_directional_keys_prevent_reuse: "Nonce collision — directional keys prevent reuse",
       test_2_malicious_relay_cannot_decrypt_circuit_payload: "Malicious relay — cannot decrypt circuit payload",
       test_3_tampering_relay_gateway_rejects: "Tampering relay — gateway rejects modified ciphertext",
       test_4_dns_pinning_connects_to_validated_ip: "DNS pinning — connects to validated IP, not re-resolved",
       test_5_redirect_to_private_ip_not_followed: "Redirect SSRF — redirect to private IP not followed",
+      test_6_circuit_nonce_uniqueness_getrandom: "N1.9.1: Circuit nonce uniqueness (getrandom CSPRNG)",
+      test_7_relay_with_both_hop_keys_cannot_derive_circuit_key: "N1.9.1: Relay with both hop keys cannot derive circuit key S3",
+      test_8_circuit_replay_different_ciphertexts_for_same_plaintext: "N1.9.1: Circuit replay — same plaintext produces different ciphertexts",
+      test_9_real_https_through_pinned_ip: "N1.9.1: Real HTTPS through pinned IP (TLS + SNI + cert validation)",
+      test_10_circuit_nonce_no_collision_across_sessions: "N1.9.1: No nonce collision across reconnect/session boundaries",
     };
 
     return NextResponse.json({
