@@ -1194,6 +1194,55 @@ impl Node {
         url: &str,
         gateway_node_id: &[u8; 32],
     ) -> NodeResult<TransitResponse> {
+        // Use the node's configured listen_addr as Relay A's address, and the
+        // deterministic N2.0 test seed for the client↔Relay A hop keys.
+        let relay_a_addr = self.listen_addr.clone();
+        if relay_a_addr.is_empty() {
+            return Err(NodeError::Other(
+                "no relay address configured (set Node.listen_addr to Relay A's address)".into(),
+            ));
+        }
+        self.send_request_via_gateway_full_with_relay(
+            url,
+            gateway_node_id,
+            &relay_a_addr,
+            client_relay_a_link_keys(),
+        )
+    }
+
+    /// **N2.0.3 (Gates F+G+H).** Like [`send_request_via_gateway_full`]
+    /// but accepts an EXPLICIT relay address and EXPLICIT client↔Relay A
+    /// hop keys. This is the production entry point for dynamic-mesh
+    /// scenarios where the client↔Relay A link uses arbitrary
+    /// SNP-IK/0.1-derived keys (NOT the deterministic N2.0 test seed).
+    ///
+    /// The method:
+    /// 1. Looks up the [`Circuit`] for `gateway_node_id` (the caller is
+    ///    responsible for establishing the circuit first, e.g. via
+    ///    `discover_gateways` + the SNP-IK/0.1 handshake + the
+    ///    client↔gateway X25519 circuit DH).
+    /// 2. Establishes (or reuses) a persistent TCP connection to
+    ///    `relay_addr` using `relay_link_keys` (the client↔Relay A hop
+    ///    keys, initiator side).
+    /// 3. Builds, signs, and circuit-encrypts a [`TransitRequest`].
+    /// 4. Wraps it in a Class B frame addressed to `gateway_node_id`
+    ///    (the frame's `dst` field — relays route based on this).
+    /// 5. Sends the frame via Relay A and waits for the response.
+    /// 6. On a Class C `UPSTREAM_FAILURE_MARKER` frame, returns
+    ///    [`NodeError::UpstreamFailure`] (the caller can fail over to a
+    ///    different gateway).
+    /// 7. On a Class B response, decrypts and verifies the gateway's
+    ///    signature.
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] on any failure.
+    pub fn send_request_via_gateway_full_with_relay(
+        &self,
+        url: &str,
+        gateway_node_id: &[u8; 32],
+        relay_addr: &str,
+        relay_link_keys: LinkKeys,
+    ) -> NodeResult<TransitResponse> {
         // Look up the circuit for this gateway.
         let circuit = {
             let circuits = self.circuits.lock().unwrap();
@@ -1208,15 +1257,8 @@ impl Node {
             ));
         }
 
-        // Get (or establish) the persistent connection to Relay A.
-        let relay_a_addr = self.listen_addr.clone();
-        if relay_a_addr.is_empty() {
-            return Err(NodeError::Other(
-                "no relay address configured (set Node.listen_addr to Relay A's address)".into(),
-            ));
-        }
-
-        let link = self.get_or_connect_peer(&relay_a_addr, client_relay_a_link_keys())?;
+        // Get (or establish) the persistent connection to the relay.
+        let link = self.get_or_connect_peer(relay_addr, relay_link_keys)?;
 
         // Build the TransitRequest.
         let mut req = TransitRequest {
@@ -2840,6 +2882,61 @@ pub fn serve_one_gateway_request_with_connector_factory<F>(
 where
     F: Fn(&str) -> NodeResult<PinnedConnector>,
 {
+    // Default: use the N1.9/N2.0 legacy client public key. This preserves
+    // backward compat with the n203_local_http.rs Gate K test (which uses
+    // the deterministic N2.0 client identity). New tests with dynamic
+    // client identities MUST call
+    // [`serve_one_gateway_request_with_connector_factory_and_client_key`]
+    // and pass the client's actual public key.
+    serve_one_gateway_request_with_connector_factory_and_client_key(
+        link,
+        gateway_node_id,
+        gateway_sk,
+        &client_public_key(),
+        circuit,
+        seen_req_ids,
+        connector_factory,
+    )
+}
+
+/// **N2.0.3 (Gates F+G+H).** Like
+/// [`serve_one_gateway_request_with_connector_factory`] but accepts an
+/// EXPLICIT client public key (used to verify the `TransitRequest`'s
+/// `clientSig`). This is the production entry point for dynamic-mesh
+/// scenarios where the client identity is NOT the deterministic N2.0
+/// test identity.
+///
+/// In production, the gateway learns the client's public key from the
+/// SNP-IK/0.1 handshake (the handshake authenticates the client's
+/// Ed25519 identity). The circuit is established AFTER the handshake,
+/// so the gateway already knows the client's public key when it
+/// receives the first `TransitRequest` over the circuit. This function
+/// takes the client public key as a parameter so the caller (the
+/// gateway's serve loop) can pass in the handshake-authenticated key.
+///
+/// **TEST-ONLY SSRF bypass.** Like
+/// [`serve_one_gateway_request_with_connector_factory`], this function
+/// does NOT perform any SSRF check itself — it relies on the factory. A
+/// test that uses [`PinnedConnector::from_parts`] to bypass the SSRF
+/// check MUST ensure the connector points only at the test's own mock
+/// HTTP server. **Production gateways MUST NOT use this function** —
+/// production MUST use [`serve_one_gateway_request`] (or
+/// [`Node::serve_gateway_persistent`]), which calls
+/// [`PinnedConnector::new`] and enforces the SSRF defence (invariant
+/// I18).
+#[doc(hidden)]
+pub fn serve_one_gateway_request_with_connector_factory_and_client_key<F>(
+    link: &Arc<Link>,
+    gateway_node_id: [u8; 32],
+    gateway_sk: &[u8; 32],
+    client_pk: &[u8; 32],
+    circuit: &CircuitKeys,
+    seen_req_ids: &mut HashSet<[u8; 16]>,
+    connector_factory: &F,
+) -> NodeResult<ServeOutcome>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector>,
+{
     let req_frame = match link.recv_frame() {
         Ok(f) => f,
         Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
@@ -2895,7 +2992,7 @@ where
     let fetched = handle_transit_request_with_connector(
         &transit_req,
         gateway_sk,
-        &client_public_key(),
+        client_pk,
         &connector,
     )?;
     eprintln!(
@@ -3295,7 +3392,185 @@ pub fn spawn_relay_multi_upstream_persistent_with_counter(
     (handle, counter)
 }
 
-// ─── Small CBOR helpers (local to this module) ───────────────────────────────
+/// **N2.0.3 (Gate G).** Inner implementation of a single-upstream relay
+/// that DROPS its prev-hop connection after serving `max_requests`
+/// request-response cycles. Used by the N2.0.3 mesh-failure test to
+/// simulate a relay that dies mid-session (Test 2: Relay B is killed
+/// after 1 request, forcing the client to fail over to the alternate
+/// path via Relay C).
+///
+/// After `max_requests` cycles, the relay explicitly shuts down the
+/// prev-hop TCP stream (`Shutdown::Both`). The prev hop (Relay A in the
+/// test topology) sees this as a connection close on its next
+/// `recv_frame()` call — Relay A's multi-upstream relay sends a
+/// `UPSTREAM_FAILURE_MARKER` NACK back to the client and removes the
+/// dead upstream from its `upstream_links`. The client then fails over
+/// to a different gateway.
+///
+/// **The relay thread does NOT exit** after the drop — it loops back to
+/// `listener.incoming()` and accepts a new connection. This mirrors the
+/// existing `serve_gateway_persistent_with_drop_after` semantics (the
+/// listener stays open; only the per-connection TCP stream is dropped).
+///
+/// # Errors
+/// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
+/// logged and the relay continues accepting new connections.
+fn serve_relay_persistent_with_drop_after_inner(
+    listen_addr: &str,
+    next_hop_addr: &str,
+    prev_hop_keys: LinkKeys,
+    next_hop_keys: LinkKeys,
+    max_requests: usize,
+    connection_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> NodeResult<()> {
+    let listener = TcpListener::bind(listen_addr)?;
+    eprintln!(
+        "[relay-drop-after-{}] listening on {listen_addr}, next-hop={next_hop_addr}",
+        max_requests
+    );
+
+    for stream in listener.incoming() {
+        let prev_stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[relay-drop-after] accept error: {e}");
+                continue;
+            }
+        };
+        eprintln!(
+            "[relay-drop-after] prev-hop connected from {}",
+            prev_stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+        );
+        if let Some(counter) = &connection_counter {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let prev_link = Arc::new(Link::new(prev_stream, prev_hop_keys));
+        let next_link = match Link::connect(next_hop_addr, next_hop_keys) {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
+                eprintln!("[relay-drop-after] connect to next-hop {next_hop_addr} failed: {e}");
+                continue;
+            }
+        };
+        eprintln!("[relay-drop-after] connected to next-hop at {next_hop_addr}");
+
+        let mut served = 0usize;
+        // PERSISTENT LOOP: forward frames in both directions until EOF/error
+        // OR until we've served `max_requests` cycles.
+        loop {
+            if served >= max_requests {
+                eprintln!(
+                    "[relay-drop-after-{}] served {served} requests — DROPPING connection (simulated failure)",
+                    max_requests
+                );
+                let _ = prev_link.stream().shutdown(std::net::Shutdown::Both);
+                let _ = next_link.stream().shutdown(std::net::Shutdown::Both);
+                break;
+            }
+            // prev → next
+            let req_frame = match prev_link.recv_frame() {
+                Ok(f) => f,
+                Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
+                    eprintln!("[relay-drop-after] prev-hop closed connection (EOF)");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[relay-drop-after] prev→next recv error: {e}");
+                    break;
+                }
+            };
+            eprintln!(
+                "[relay-drop-after] prev→next: cls={} ttl={} body={} bytes",
+                req_frame.cls as char,
+                req_frame.ttl,
+                req_frame.body.len()
+            );
+            if should_drop(&req_frame) {
+                eprintln!("[relay-drop-after] frame TTL=0, dropping");
+                continue;
+            }
+            let mut fwd_frame = req_frame.clone();
+            if fwd_frame.ttl > 0 {
+                fwd_frame.ttl -= 1;
+            }
+            if let Err(e) = next_link.send_frame(&fwd_frame) {
+                eprintln!("[relay-drop-after] prev→next send error: {e}");
+                break;
+            }
+            // next → prev
+            let resp_frame = match next_link.recv_frame() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[relay-drop-after] next→prev recv error: {e}");
+                    let nack = Frame {
+                        v: FRAME_VERSION,
+                        cls: b'C',
+                        dst: req_frame.src,
+                        src: req_frame.dst,
+                        ttl: FRAME_TTL_MAX,
+                        fid: req_frame.fid,
+                        seq: req_frame.seq + 1,
+                        body: UPSTREAM_FAILURE_MARKER.to_vec(),
+                    };
+                    let _ = prev_link.send_frame(&nack);
+                    break;
+                }
+            };
+            let mut resp_fwd = resp_frame.clone();
+            if resp_fwd.ttl > 0 {
+                resp_fwd.ttl -= 1;
+            }
+            if let Err(e) = prev_link.send_frame(&resp_fwd) {
+                eprintln!("[relay-drop-after] next→prev send error: {e}");
+                break;
+            }
+            served += 1;
+        }
+        eprintln!("[relay-drop-after] connection cycle complete, looping back to accept");
+    }
+    Ok(())
+}
+
+/// **N2.0.3 (Gate G).** Spawn a single-upstream relay that DROPS its
+/// prev-hop connection after serving `max_requests` request-response
+/// cycles. Returns the relay's thread join handle.
+///
+/// This is the test-only relay counterpart to
+/// [`Node::serve_gateway_persistent_with_drop_after`]. Used by the
+/// N2.0.3 mesh-failure test (`tests/n203_mesh_failure.rs`) to simulate
+/// a relay that dies mid-session: after `max_requests` cycles, the
+/// relay's prev-hop TCP stream is shut down (`Shutdown::Both`), causing
+/// the upstream multi-hop relay (Relay A) to detect the failure, send a
+/// NACK to the client, and remove the dead upstream from its
+/// `upstream_links`.
+///
+/// **The relay thread does NOT exit** after the drop — it loops back to
+/// accept a new connection (mirroring the gateway's
+/// `serve_gateway_persistent_with_drop_after` semantics).
+#[must_use]
+pub fn spawn_relay_persistent_with_drop_after(
+    listen_addr: &str,
+    next_hop_addr: &str,
+    prev_hop_keys: LinkKeys,
+    next_hop_keys: LinkKeys,
+    max_requests: usize,
+) -> std::thread::JoinHandle<()> {
+    let listen = listen_addr.to_string();
+    let next = next_hop_addr.to_string();
+    std::thread::spawn(move || {
+        let _ = serve_relay_persistent_with_drop_after_inner(
+            &listen,
+            &next,
+            prev_hop_keys,
+            next_hop_keys,
+            max_requests,
+            None,
+        );
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Small CBOR helpers (local to this module)
 
 fn t(s: &str) -> CborValue {
     CborValue::TextString(s.to_string())
