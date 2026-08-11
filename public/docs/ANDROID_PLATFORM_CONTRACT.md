@@ -57,21 +57,51 @@ Android implementations:
 
 ### 2. TransportProvider
 
-Not yet defined as a trait in the Rust reference. Android MUST define:
+Defined in the Rust reference as `reference/snp-node/src/node/transport.rs`.
+Android MUST implement the equivalent interface:
 
 ```kotlin
+// Mirrors snp_node::node::transport::TransportProvider
 interface TransportProvider {
-    fun connect(endpoint: String): TransportConnection
-    fun listen(endpoint: String): TransportListener
+    fun connect(addr: String): TransportConnection
+    fun listen(addr: String): TransportListener
 }
 
+// Mirrors snp_node::node::transport::TransportConnection
 interface TransportConnection {
-    fun send(data: ByteArray): Boolean
-    fun onReceived(handler: (ByteArray) -> Unit)
-    fun close()
+    fun send(data: ByteArray): Unit  // throws TransportError on failure
+    fun recv(): ByteArray            // throws TransportError on failure
     fun isAlive(): Boolean
+    fun close(): Unit
+}
+
+// Mirrors snp_node::node::transport::TransportListener
+interface TransportListener {
+    fun accept(): TransportConnection  // blocks until a connection arrives
+    fun localAddr(): String
+    fun close(): Unit
 }
 ```
+
+**Lifecycle:**
+- `connect()` establishes a connection to a remote endpoint. Returns a `TransportConnection`.
+- `listen()` binds to a local address and returns a `TransportListener`.
+- `accept()` blocks until an incoming connection arrives. Returns a new `TransportConnection`.
+- `send()` writes raw bytes. The Link layer handles framing/AEAD on top.
+- `recv()` reads raw bytes until EOF or error.
+- `close()` shuts down the connection/listener. After `close()`, `isAlive()` returns false.
+- **Thread safety:** `TransportConnection` is `Send` (can be moved between threads). `TransportProvider` is `Send + Sync` (can be shared).
+- **Failure semantics:** `send()`/`recv()` throw on I/O failure. The connection is marked dead. The caller MUST NOT retry on the same connection — create a new one.
+- **Timeouts:** Not specified at the transport level. The Link layer sets read/write timeouts via `set_read_timeout`/`set_write_timeout` on the underlying TCP stream.
+- **Cancellation:** `close()` cancels any blocking `recv()` or `accept()` call.
+- **Reconnection:** The transport does NOT auto-reconnect. The Session/Route layer handles reconnection by creating a new transport connection + performing a new SNP-IK/0.1 handshake.
+
+Android implementations:
+- `TcpTransportProvider` — uses `java.net.Socket` / `java.net.ServerSocket`
+- `BleTransportProvider` — uses BluetoothGatt (BLE GATT)
+- `WiFiDirectTransportProvider` — uses WifiP2pManager
+
+The Rust reference provides `TcpTransportProvider` as the canonical implementation.
 
 ### 3. PeerSession
 
