@@ -6,19 +6,29 @@ use super::*;
 /// A signed gateway advertisement. A gateway publishes this to announce
 /// itself; clients verify the signature before trusting the advertisement.
 ///
+/// **N2.0.7:** The advertisement now carries `circuitX25519Pub` — the
+/// gateway's STATIC X25519 circuit public key. This field is INSIDE the
+/// signed preimage, so the X25519 key is cryptographically bound to the
+/// gateway's Ed25519 identity. A client that verifies the advertisement
+/// signature KNOWS the X25519 key authentically belongs to the gateway —
+/// an attacker cannot substitute a different X25519 key without
+/// invalidating the signature. This closes the binding gap identified
+/// in the N2.0.6 audit.
+///
 /// CDDL (sketch):
 ///
 /// ```text
 /// GatewayAdvertisement = {
-///   nodeId:        bstr .size 32,
-///   publicKey:     bstr .size 32,
-///   listenAddr:    tstr,           ; transit listener (relay → gateway)
-///   discoveryAddr: tstr,           ; discovery listener (client → gateway)
-///   capabilities:  [* tstr],       ; ["gateway"] for N2.0.1
-///   egressPolicy:  tstr,           ; "allow-80-443" for N2.0.1
-///   timestamp:     uint,           ; unix seconds
-///   expiry:        uint,           ; unix seconds
-///   signature:     bstr .size 64   ; Ed25519 under SIG_CONTEXT "gatewayAdvert"
+///   nodeId:             bstr .size 32,
+///   publicKey:          bstr .size 32,   ; Ed25519 identity public key
+///   circuitX25519Pub:   bstr .size 32,   ; N2.0.7: static X25519 circuit key
+///   listenAddr:         tstr,            ; transit listener (relay → gateway)
+///   discoveryAddr:      tstr,            ; discovery listener (client → gateway)
+///   capabilities:       [* tstr],        ; ["gateway"] for N2.0.1
+///   egressPolicy:       tstr,            ; "allow-80-443" for N2.0.1
+///   timestamp:          uint,            ; unix seconds
+///   expiry:             uint,            ; unix seconds
+///   signature:          bstr .size 64    ; Ed25519 under SIG_CONTEXT "gatewayAdvert"
 /// }
 /// ```
 ///
@@ -31,6 +41,11 @@ pub struct GatewayAdvertisement {
     pub node_id: [u8; 32],
     /// The gateway's Ed25519 public key.
     pub public_key: [u8; 32],
+    /// **N2.0.7.** The gateway's STATIC X25519 circuit public key. The client
+    /// uses this to derive fresh per-circuit keys via
+    /// `seal_circuit_payload_with_fresh_eph`. This field is INSIDE the signed
+    /// preimage, so it is cryptographically bound to the Ed25519 identity.
+    pub circuit_x25519_pub: [u8; 32],
     /// The TCP address the gateway listens on for transit (relay → gateway).
     pub listen_addr: String,
     /// The TCP address the gateway listens on for discovery (client → gateway).
@@ -77,6 +92,8 @@ impl GatewayAdvertisement {
         CborValue::Map(vec![
             (t("nodeId"), b(&self.node_id)),
             (t("publicKey"), b(&self.public_key)),
+            // N2.0.7: circuitX25519Pub is INSIDE the signed preimage.
+            (t("circuitX25519Pub"), b(&self.circuit_x25519_pub)),
             (t("listenAddr"), t(&self.listen_addr)),
             (t("discoveryAddr"), t(&self.discovery_addr)),
             (t("capabilities"), CborValue::Array(caps)),
@@ -162,6 +179,7 @@ impl GatewayAdvertisement {
         };
         let mut node_id: Option<[u8; 32]> = None;
         let mut public_key: Option<[u8; 32]> = None;
+        let mut circuit_x25519_pub: Option<[u8; 32]> = None;
         let mut listen_addr: Option<String> = None;
         let mut discovery_addr: Option<String> = None;
         let mut capabilities: Option<Vec<Capability>> = None;
@@ -182,6 +200,15 @@ impl GatewayAdvertisement {
             match key.as_str() {
                 "nodeId" => node_id = Some(extract_bstr_32(v, "nodeId")?),
                 "publicKey" => public_key = Some(extract_bstr_32(v, "publicKey")?),
+                // N2.0.7: circuitX25519Pub is mandatory for production
+                // advertisements. For backward compat with old N2.0.6
+                // advertisements that don't carry it, we default to all-zeros
+                // (which will cause circuit establishment to fail — the client
+                // cannot seal a circuit payload without the gateway's X25519
+                // pub). This is the correct behavior: an advertisement without
+                // circuitX25519Pub cannot be used for protocol-driven circuit
+                // establishment.
+                "circuitX25519Pub" => circuit_x25519_pub = Some(extract_bstr_32(v, "circuitX25519Pub")?),
                 "listenAddr" => listen_addr = Some(extract_text(v, "listenAddr")?),
                 "discoveryAddr" => discovery_addr = Some(extract_text(v, "discoveryAddr")?),
                 "capabilities" => capabilities = Some(extract_caps(v, "capabilities")?),
@@ -203,6 +230,7 @@ impl GatewayAdvertisement {
         Ok(Self {
             node_id: node_id.ok_or_else(|| NodeError::Other("nodeId missing".into()))?,
             public_key: public_key.ok_or_else(|| NodeError::Other("publicKey missing".into()))?,
+            circuit_x25519_pub: circuit_x25519_pub.unwrap_or([0u8; 32]),
             listen_addr: listen_addr.ok_or_else(|| NodeError::Other("listenAddr missing".into()))?,
             discovery_addr: discovery_addr
                 .ok_or_else(|| NodeError::Other("discoveryAddr missing".into()))?,
@@ -229,17 +257,59 @@ impl GatewayAdvertisement {
     /// identity.public_key)`, invariant I4). The advertised `publicKey` is
     /// `identity.public_key` (raw 32 bytes, invariant I3).
     ///
+    /// **N2.0.7:** The advertisement now REQUIRES the gateway's static X25519
+    /// circuit public key (`circuit_x25519_pub`). This key is INSIDE the
+    /// signed preimage, so it is cryptographically bound to the Ed25519
+    /// identity. Use [`GatewayAdvertisement::for_identity_with_circuit_key`]
+    /// to construct an advertisement with the X25519 key.
+    ///
     /// The caller is responsible for:
     /// - Generating (or loading) the gateway's Ed25519 identity keypair.
+    /// - Generating (or loading) the gateway's STATIC X25519 circuit keypair.
     /// - Binding the correct `listen_addr` (transit) and `discovery_addr`
     ///   to the gateway's actual TCP listeners.
     /// - Refreshing the advertisement before its `expiry` (default 1 hour).
     #[must_use]
     pub fn for_identity(identity: &NodeIdentity, listen_addr: &str, discovery_addr: &str) -> Self {
+        // N2.0.7: for_identity without an X25519 key creates an advertisement
+        // with circuit_x25519_pub = [0u8; 32]. This is NOT usable for
+        // protocol-driven circuit establishment — callers MUST use
+        // for_identity_with_circuit_key for production. Retained for backward
+        // compat with tests that don't exercise the circuit protocol.
+        Self::for_identity_with_circuit_key(
+            identity,
+            [0u8; 32],
+            listen_addr,
+            discovery_addr,
+        )
+    }
+
+    /// **N2.0.7 production constructor.** Build a signed advertisement that
+    /// carries the gateway's STATIC X25519 circuit public key, bound to the
+    /// Ed25519 identity via the signed preimage.
+    ///
+    /// The `circuit_x25519_pub` is the gateway's persistent X25519 public key
+    /// used for fresh-ephemeral circuit key establishment (see
+    /// `seal_circuit_payload_with_fresh_eph`). The corresponding secret key
+    /// NEVER leaves the gateway. A client that verifies this advertisement
+    /// KNOWS the X25519 key authentically belongs to the gateway identified
+    /// by `identity.node_id`.
+    ///
+    /// # Errors
+    /// Never returns an error (CBOR encoding of the preimage is infallible
+    /// for well-formed inputs). Returns `Self` directly.
+    #[must_use]
+    pub fn for_identity_with_circuit_key(
+        identity: &NodeIdentity,
+        circuit_x25519_pub: [u8; 32],
+        listen_addr: &str,
+        discovery_addr: &str,
+    ) -> Self {
         let now = now_unix();
         let mut advert = Self {
             node_id: identity.node_id,
             public_key: identity.public_key,
+            circuit_x25519_pub,
             listen_addr: listen_addr.to_string(),
             discovery_addr: discovery_addr.to_string(),
             capabilities: vec![Capability::Gateway],

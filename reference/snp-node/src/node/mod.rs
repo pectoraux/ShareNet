@@ -114,7 +114,7 @@ pub mod circuit;
 pub mod session;
 
 // Re-export key types from submodules for convenience
-pub use route::{Route, RouteState, RouteMetrics, RouteError};
+pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
 pub use discovery::{DiscoveredNode, DiscoveryProvider, StaticDiscovery, BootstrapDiscovery};
 pub use identity::{NodeIdentity, Capability};
 pub use gateway::GatewayAdvertisement;
@@ -550,8 +550,8 @@ impl Node {
             "[discovery {}] listening on {discovery_addr}",
             hex_short(&gateway_node_id)
         );
-        // Pre-encode the advertisement ONCE (it does not change between
-        // connections). Each connection just writes these bytes back.
+        // N2.0.7: deprecated sync path uses for_identity (no X25519 key).
+        // The async path (serve_discovery_persistent_async) is canonical.
         let advert = GatewayAdvertisement::for_identity(
             &self.identity,
             transit_listen_addr,
@@ -2277,6 +2277,127 @@ mod tests {
             );
         }
         eprintln!("[static-guard] PASS: all 4 canonical production async entry points exist");
+    }
+
+    /// N2.0.7: The canonical production gateway entry point MUST NOT accept
+    /// `CircuitKeys` as a parameter — it must derive them from the protocol
+    /// (via `open_circuit_payload_with_fresh_eph`). This test scans
+    /// `async_node.rs` for the N2.0.7 protocol-driven gateway function and
+    /// verifies its signature does NOT include `CircuitKeys`.
+    #[test]
+    fn production_gateway_does_not_accept_circuit_keys_param() {
+        let source = include_str!("async_node.rs");
+        // The N2.0.7 protocol-driven gateway function must exist.
+        assert!(
+            source.contains("pub async fn serve_gateway_with_protocol_circuit"),
+            "serve_gateway_with_protocol_circuit must exist"
+        );
+        // The N2.0.7 protocol-driven client send function must exist.
+        assert!(
+            source.contains("pub async fn send_with_protocol_circuit_async"),
+            "send_with_protocol_circuit_async must exist"
+        );
+        // The Route-authoritative client send function must exist.
+        assert!(
+            source.contains("pub async fn send_via_route("),
+            "send_via_route must exist"
+        );
+        // The Route-authoritative relay serve function must exist.
+        assert!(
+            source.contains("pub async fn serve_relay_via_route("),
+            "serve_relay_via_route must exist"
+        );
+        // The protocol-driven gateway function must NOT take CircuitKeys.
+        // Find the function signature and check it doesn't contain CircuitKeys.
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("pub async fn serve_gateway_with_protocol_circuit") {
+                // Check the next 10 lines (the function signature).
+                for j in i..(i + 10).min(lines.len()) {
+                    if lines[j].contains("CircuitKeys") {
+                        panic!(
+                            "serve_gateway_with_protocol_circuit must NOT take CircuitKeys as a parameter \
+                             (it derives keys from the protocol). Found at line {}.",
+                            j + 1
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("[static-guard] PASS: production gateway does not accept CircuitKeys param");
+    }
+
+    /// N2.0.7: The `send_via_route` function must take a `Route` parameter
+    /// (not individual `relay_addr`/`next_hop_addr` parameters). This test
+    /// verifies the signature.
+    #[test]
+    fn send_via_route_takes_route_not_explicit_addresses() {
+        let source = include_str!("async_node.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("pub async fn send_via_route(") {
+                // Check the next 10 lines (the function signature).
+                let sig: String = lines[i..(i + 10).min(lines.len())].join("\n");
+                assert!(
+                    sig.contains("route: &super::Route") || sig.contains("route: &Route"),
+                    "send_via_route must take a Route parameter"
+                );
+                assert!(
+                    !sig.contains("relay_addr: &str"),
+                    "send_via_route must NOT take an explicit relay_addr parameter"
+                );
+                assert!(
+                    !sig.contains("next_hop_addr: &str"),
+                    "send_via_route must NOT take an explicit next_hop_addr parameter"
+                );
+                eprintln!("[static-guard] PASS: send_via_route takes Route, not explicit addresses");
+                return;
+            }
+        }
+        panic!("send_via_route function not found");
+    }
+
+    /// N2.0.7: The `GatewayAdvertisement` must carry `circuit_x25519_pub`
+    /// in the SIGNED preimage (binding the X25519 key to the Ed25519 identity).
+    #[test]
+    fn gateway_advertisement_binds_x25519_in_signed_preimage() {
+        let source = include_str!("gateway.rs");
+        // The struct must have a circuit_x25519_pub field.
+        assert!(
+            source.contains("pub circuit_x25519_pub: [u8; 32]"),
+            "GatewayAdvertisement must have a circuit_x25519_pub field"
+        );
+        // The preimage function must include circuitX25519Pub.
+        assert!(
+            source.contains("(t(\"circuitX25519Pub\"), b(&self.circuit_x25519_pub))"),
+            "GatewayAdvertisement::preimage must include circuitX25519Pub"
+        );
+        // The for_identity_with_circuit_key constructor must exist.
+        assert!(
+            source.contains("pub fn for_identity_with_circuit_key("),
+            "GatewayAdvertisement::for_identity_with_circuit_key must exist"
+        );
+        eprintln!("[static-guard] PASS: GatewayAdvertisement binds X25519 in signed preimage");
+    }
+
+    /// N2.0.7: The Route must have `hop_details: Vec<RouteHop>` (authoritative
+    /// routing plan with endpoints, not just NodeIds).
+    #[test]
+    fn route_has_hop_details_with_endpoints() {
+        let source = include_str!("route.rs");
+        assert!(
+            source.contains("pub struct RouteHop"),
+            "RouteHop struct must exist"
+        );
+        assert!(
+            source.contains("pub hop_details: Vec<RouteHop>"),
+            "Route must have hop_details field"
+        );
+        assert!(
+            source.contains("pub fn new_with_hop_details("),
+            "Route::new_with_hop_details must exist"
+        );
+        eprintln!("[static-guard] PASS: Route has hop_details with endpoints");
     }
 
     #[test]

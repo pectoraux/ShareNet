@@ -96,6 +96,68 @@ const ROUTE_DEFAULT_TTL_SECS: u64 = 3600;
 /// Maximum hop count (matches `FRAME_TTL_MAX` from `snp-frames`).
 const ROUTE_MAX_HOPS: usize = 16;
 
+/// **N2.0.7.** A single hop in a [`Route`]. Carries the hop's NodeId (the
+/// stable identity) AND its current transport endpoint(s) (locators that
+/// can change over time).
+///
+/// This enforces the ShareNet architectural principle:
+///
+/// > **NodeId answers "who?" — transport endpoint answers "where can I
+/// > reach them now?"**
+///
+/// A hop may have MULTIPLE endpoints (e.g. Wi-Fi Direct, BLE, TCP) — the
+/// runtime resolves the current endpoint via the transport/discovery
+/// abstraction. The Route does NOT become invalid merely because a
+/// transport endpoint changes; only the NodeId is the stable identity.
+#[derive(Debug, Clone)]
+pub struct RouteHop {
+    /// The hop's NodeId (`SHA-256("SNP/0.1 node\0" || public_key)`).
+    /// This is the STABLE IDENTITY — it does not change when the transport
+    /// endpoint changes.
+    pub node_id: [u8; 32],
+    /// The hop's current transport endpoint(s). Each entry is a
+    /// transport-specific locator (e.g. `"127.0.0.1:38507"` for TCP,
+    /// `"ble:aa:bb:cc:dd:ee:ff"` for BLE). The runtime tries them in
+    /// order until one connects.
+    ///
+    /// May be empty — in that case, the runtime must resolve the NodeId
+    /// to an endpoint via the discovery/transport abstraction before
+    /// attempting to connect.
+    pub endpoints: Vec<String>,
+    /// The hop's capabilities (Client, Relay, Gateway). Used by the
+    /// routing runtime to verify that each hop can actually perform its
+    /// role in the route.
+    pub capabilities: Vec<super::Capability>,
+}
+
+impl RouteHop {
+    /// Construct a `RouteHop` with a NodeId + a single TCP endpoint.
+    #[must_use]
+    pub fn new(node_id: [u8; 32], endpoint: String) -> Self {
+        Self {
+            node_id,
+            endpoints: vec![endpoint],
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Construct a `RouteHop` with a NodeId + multiple endpoints.
+    #[must_use]
+    pub fn with_endpoints(node_id: [u8; 32], endpoints: Vec<String>) -> Self {
+        Self {
+            node_id,
+            endpoints,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Get the first endpoint (or `None` if empty).
+    #[must_use]
+    pub fn first_endpoint(&self) -> Option<&str> {
+        self.endpoints.first().map(|s| s.as_str())
+    }
+}
+
 /// A multi-hop route from a client to a gateway.
 ///
 /// A `Route` is a sequence of peer NodeIds (`hops`) terminating at a
@@ -115,6 +177,13 @@ const ROUTE_MAX_HOPS: usize = 16;
 /// - `metrics` — observed performance characteristics (hop count, latency,
 ///   bandwidth).
 /// - `last_validated` — kept for backward compat with the N2.0.2 tests.
+///
+/// **N2.0.7 additions.** The struct now carries:
+/// - `hop_details` — a `Vec<RouteHop>` with NodeId + endpoints + capabilities
+///   for each hop. This makes the Route AUTHORITATIVE — the routing runtime
+///   consumes `hop_details` to determine where to connect. The legacy
+///   `hops` field (Vec<[u8; 32]>) is retained for backward compat with
+///   tests that don't use endpoints.
 #[derive(Debug, Clone)]
 pub struct Route {
     /// The route id — `SHA-256(source || destination || hops || nonce)`.
@@ -134,6 +203,12 @@ pub struct Route {
     /// `validate()` method accepts both conventions — it only checks
     /// `destination == hops.last()` IF `hops` is non-empty.
     pub hops: Vec<[u8; 32]>,
+    /// **N2.0.7.** The ordered list of `RouteHop` entries (NodeId + endpoints
+    /// + capabilities). This is the AUTHORITATIVE routing plan — the runtime
+    /// consumes `hop_details` (NOT `hops`) to determine where to connect.
+    /// `hop_details[i].node_id` == `hops[i]` for all `i` (when both are
+    /// populated).
+    pub hop_details: Vec<RouteHop>,
     /// The route epoch — incremented on every key rotation or migration.
     /// N2.0.3 (GATE B).
     pub epoch: u64,
@@ -159,6 +234,10 @@ impl Route {
     /// destination, hops)` (taking `[u8; 32]` by value, per the spec). The
     /// `epoch` is initialised to 0; `expires_at` to `now + 1 hour`;
     /// `metrics.hop_count` to `hops.len()`.
+    ///
+    /// **N2.0.7.** The `hop_details` field is initialized as empty (no
+    /// endpoints). Use [`Route::new_with_hop_details`] for production routes
+    /// that carry transport endpoints.
     #[must_use]
     pub fn new(source: [u8; 32], destination: [u8; 32], hops: Vec<[u8; 32]>) -> Self {
         let now = now_unix();
@@ -180,6 +259,7 @@ impl Route {
             source,
             destination,
             hops,
+            hop_details: Vec::new(), // N2.0.7: empty — use new_with_hop_details for production
             epoch: 0,
             state: RouteState::Proposed,
             created_at: now,
@@ -191,6 +271,55 @@ impl Route {
             },
             last_validated: 0,
         }
+    }
+
+    /// **N2.0.7 production constructor.** Construct a `Route` with
+    /// `RouteHop` entries that carry NodeId + endpoints + capabilities.
+    /// This is the AUTHORITATIVE routing plan — the runtime consumes
+    /// `hop_details` to determine where to connect.
+    ///
+    /// The `hop_details` list MUST include the destination as the last
+    /// element (same convention as `hops`). The `hops` field is
+    /// automatically populated from `hop_details[i].node_id`.
+    ///
+    /// # Panics
+    /// Never panics for well-formed inputs.
+    #[must_use]
+    pub fn new_with_hop_details(
+        source: [u8; 32],
+        destination: [u8; 32],
+        hop_details: Vec<RouteHop>,
+    ) -> Self {
+        let hops: Vec<[u8; 32]> = hop_details.iter().map(|h| h.node_id).collect();
+        let mut route = Self::new(source, destination, hops);
+        route.hop_details = hop_details;
+        route
+    }
+
+    /// **N2.0.7.** Get the `RouteHop` at position `i`. Returns `None` if
+    /// `hop_details` is empty (the route was constructed via `Route::new`
+    /// without endpoints) or `i` is out of bounds.
+    #[must_use]
+    pub fn hop(&self, i: usize) -> Option<&RouteHop> {
+        self.hop_details.get(i)
+    }
+
+    /// **N2.0.7.** Get the first hop's endpoint (the relay the client
+    /// connects to). Returns `None` if `hop_details` is empty or the first
+    /// hop has no endpoints.
+    #[must_use]
+    pub fn first_hop_endpoint(&self) -> Option<&str> {
+        self.hop_details
+            .first()
+            .and_then(|h| h.first_endpoint())
+    }
+
+    /// **N2.0.7.** Check whether this Route has `hop_details` (i.e. was
+    /// constructed via `new_with_hop_details`). Routes without `hop_details`
+    /// cannot be used with `send_via_route` (they have no endpoints).
+    #[must_use]
+    pub fn has_endpoints(&self) -> bool {
+        !self.hop_details.is_empty()
     }
 
     /// Validate the route's structural invariants. Returns `Ok(())` if the

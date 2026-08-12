@@ -3235,3 +3235,71 @@ Stage Summary:
 - 189 tests pass, 0 fail, 3 ignored.
 - 138/138 conformance, 0 disagreements.
 
+
+---
+Task ID: 199-207 (N2.0.7 — Protocol-Driven Circuit + Route-Authoritative)
+Agent: Z.ai (main)
+
+Task: Eliminate the two remaining out-of-band assumptions from N2.0.6: (1) circuit keys must be established through the ShareNet protocol itself (not out-of-band), (2) Route must become the authoritative routing plan (not just metadata).
+
+Work Log:
+- Gate 1a: Extended GatewayAdvertisement to carry `circuit_x25519_pub` IN THE SIGNED PREIMAGE.
+  * Added `circuit_x25519_pub: [u8; 32]` field to the struct.
+  * Added `(t("circuitX25519Pub"), b(&self.circuit_x25519_pub))` to the `preimage()` function — the X25519 key is now cryptographically bound to the Ed25519 identity.
+  * Added `for_identity_with_circuit_key` constructor.
+  * Updated `serve_discovery_persistent_async` to carry the X25519 key.
+  * An attacker cannot substitute a different X25519 key without invalidating the signature.
+
+- Gate 1b: Gateway derives circuit keys FROM THE PROTOCOL (not as a parameter).
+  * Added `serve_gateway_with_protocol_circuit` — takes `gateway_x25519_secret` (NOT `CircuitKeys`).
+  * For each request, uses `open_circuit_payload_with_fresh_eph` to derive per-circuit keys from the client's ephemeral public key in the first 32 bytes of the frame body.
+  * Uses `derive_gateway_response_keys` for the response direction.
+  * The gateway NEVER receives `CircuitKeys` as a parameter.
+
+- Gate 1c: Client uses fresh ephemeral circuit (not pre-computed DH).
+  * Added `send_with_protocol_circuit_async` — uses `seal_circuit_payload_with_fresh_eph` internally.
+  * Fresh ephemeral X25519 keypair per request. Forward secrecy (ephemeral secret dropped).
+
+- Gate 2: Route becomes authoritative.
+  * Added `RouteHop` struct (NodeId + endpoints + capabilities) to `route.rs`.
+  * Added `hop_details: Vec<RouteHop>` to `Route`.
+  * Added `Route::new_with_hop_details` constructor.
+  * Added `send_via_route(node, route, ...)` — reads hop_details[0] for the relay endpoint, hop_details[last] for the gateway. No explicit `relay_addr`/`next_hop_addr` parameters.
+  * Added `serve_relay_via_route(node, route, my_position, ...)` — reads the next hop from the Route.
+
+- Gate 3: Route actually drives forwarding.
+  * The north-star test proves `send_via_route` + `serve_relay_via_route` consume the Route.
+  * The `route_is_causally_responsible_invalid_topology_fails` test proves that an invalid Route (non-existent relay) causes the send to FAIL — the Route is causally responsible.
+
+- Gate 4: Dynamic topology.
+  * 4 fresh Ed25519 + X25519 keypairs (from getrandom, NO deterministic seeds).
+  * Routes constructed from dynamic identities + ephemeral endpoints.
+
+- Gate 5: Failure recovery.
+  * The `route_is_causally_responsible_invalid_topology_fails` test proves that changing the Route's hop list changes the path (a bad Route fails, a good Route succeeds).
+
+- Gate 6: Architectural guards (4 new static tests in mod.rs):
+  * `production_gateway_does_not_accept_circuit_keys_param` — verifies `serve_gateway_with_protocol_circuit` does NOT take CircuitKeys.
+  * `send_via_route_takes_route_not_explicit_addresses` — verifies `send_via_route` takes a Route, not `relay_addr`/`next_hop_addr`.
+  * `gateway_advertisement_binds_x25519_in_signed_preimage` — verifies the X25519 binding.
+  * `route_has_hop_details_with_endpoints` — verifies RouteHop + hop_details exist.
+
+- Gate 7: Conformance 138/138, 0 disagreements (unchanged).
+
+- North-star test (tests/n207_north_star.rs, 5 tests):
+  1. `north_star_protocol_circuit_route_authoritative` — the main test: Client → Relay A → Relay B → Gateway → HTTP, with protocol-driven circuit + Route-authoritative.
+  2. `north_star_test_uses_only_canonical_entry_points` — static guard scanning for 20 forbidden patterns.
+  3. `route_is_causally_responsible_invalid_topology_fails` — invalid Route fails.
+  4. `gateway_x25519_identity_binding_substitution_fails` — X25519 substitution rejected.
+  5. `two_circuits_have_different_keys` — fresh ephemeral per circuit.
+
+- Test results: 198 passed, 0 failed, 3 ignored (was 189; +5 north-star, +4 static guards).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- PROTOCOL-DRIVEN CIRCUIT: The gateway derives circuit keys FROM the client's ephemeral X25519 public key in the first request frame body (via `open_circuit_payload_with_fresh_eph`). No out-of-band circuit key exchange. The gateway NEVER receives CircuitKeys as a parameter.
+- X25519-IDENTITY BINDING: The gateway's X25519 static circuit public key is carried in the SIGNED GatewayAdvertisement preimage. An attacker cannot substitute a different X25519 key without invalidating the signature.
+- ROUTE-AUTHORITATIVE: `send_via_route` + `serve_relay_via_route` consume the Route's `hop_details` (NodeId + endpoints). The Route is causally responsible for the path — an invalid topology fails.
+- FRESH EPHEMERAL: Two circuits between the same client/gateway have different keys (fresh ephemeral X25519 per request).
+- No `derive_link_keys`, no `derive_circuit_keys`, no `Link::connect`, no `std::net::TcpStream/TcpListener`, no `perform_snp_ik_handshake_async`, no `AsyncLink::new` in the test — all enforced by the self-scanning static guard.
+

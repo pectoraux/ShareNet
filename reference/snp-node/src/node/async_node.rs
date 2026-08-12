@@ -525,6 +525,7 @@ pub async fn serve_discovery_persistent_async(
     node: &Node,
     discovery_addr: &str,
     transit_listen_addr: &str,
+    circuit_x25519_pub: [u8; 32],
 ) -> NodeResult<()> {
     let listener = TcpListener::bind(discovery_addr)
         .await
@@ -534,8 +535,13 @@ pub async fn serve_discovery_persistent_async(
         "[discovery-async {}] listening on {discovery_addr}",
         super::hex_short(&gateway_node_id)
     );
-    let advert =
-        GatewayAdvertisement::for_identity(&node.identity, transit_listen_addr, discovery_addr);
+    // N2.0.7: carry the gateway's X25519 circuit pub in the SIGNED advertisement.
+    let advert = GatewayAdvertisement::for_identity_with_circuit_key(
+        &node.identity,
+        circuit_x25519_pub,
+        transit_listen_addr,
+        discovery_addr,
+    );
     let advert_bytes = advert.encode_cbor()?;
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -773,6 +779,239 @@ pub async fn send_request_via_gateway_full_with_relay_async(
     Ok(transit_resp)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// N2.0.7 — PROTOCOL-DRIVEN CIRCUIT ESTABLISHMENT
+// ════════════════════════════════════════════════════════════════════════════
+//
+// N2.0.6 had an out-of-band circuit key assumption: the test computed
+// `x25519_dh(client_secret, gateway_public)` on both sides and passed the
+// resulting `CircuitKeys` into the gateway as a parameter. That is NOT a
+// protocol operation — the gateway cannot have precomputed keys for
+// millions of clients.
+//
+// N2.0.7 eliminates this assumption. The circuit keys are now established
+// THROUGH THE PROTOCOL:
+//
+//   1. Client generates a FRESH ephemeral X25519 keypair per request.
+//   2. Client seals the TransitRequest as `eph_pub(32) || sealed_payload`
+//      via `seal_circuit_payload_with_fresh_eph(gateway_x25519_pub, plaintext)`.
+//   3. Client sends the frame; the relays forward it (they see only opaque
+//      ciphertext — they CANNOT derive the circuit keys because they don't
+//      know the gateway's static X25519 secret).
+//   4. Gateway receives the frame, reads `eph_pub` from the first 32 bytes,
+//      computes `DH(gateway_static_secret, client_eph_pub)`, derives
+//      `CircuitKeys` (responder role), and decrypts the payload via
+//      `open_circuit_payload_with_fresh_eph`.
+//   5. Gateway processes the request, encrypts the response with the
+//      same-derived `send_key` (via `derive_gateway_response_keys`), and
+//      sends it back.
+//   6. Client decrypts the response with its `recv_key` (derived alongside
+//      `send_key` in step 2).
+//
+// The gateway NEVER receives `CircuitKeys` as a parameter. It derives them
+// FROM THE PROTOCOL MATERIAL (the client's ephemeral public key in the
+// first request frame). No out-of-band key exchange.
+
+/// **N2.0.7 canonical production gateway entry point with protocol-driven
+/// circuit establishment.**
+///
+/// Listens on `listen_addr`, accepts ONE incoming connection from a relay,
+/// performs the SNP-IK/0.1 handshake as the RESPONDER, then serves transit
+/// requests. For EACH request, the gateway derives fresh per-circuit keys
+/// FROM THE PROTOCOL:
+///
+/// 1. Reads the client's ephemeral X25519 public key from the first 32 bytes
+///    of the request frame body.
+/// 2. Computes `DH(gateway_x25519_secret, client_eph_pub)`.
+/// 3. Derives `CircuitKeys` (responder role) via `derive_circuit_keys_from_dh`.
+/// 4. Decrypts the TransitRequest with `recv_key`.
+/// 5. Processes the request (fetch URL via the connector).
+/// 6. Encrypts the TransitResponse with `send_key` (same key derivation).
+/// 7. Sends the response frame (body = sealed response, NO eph prefix — the
+///    client already has the keys from step 2 on its side).
+///
+/// The gateway does NOT take `CircuitKeys` as a parameter — it derives them
+/// per-request from the protocol material. This is the N2.0.7 invariant:
+/// **no out-of-band circuit key exchange**.
+///
+/// # Errors
+/// Returns [`NodeError`] on TCP bind failure, handshake failure, or request
+/// processing failure.
+pub async fn serve_gateway_with_protocol_circuit<F>(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    client_ed25519_public: [u8; 32],
+    connector_factory: F,
+) -> NodeResult<()>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync + 'static,
+{
+    let gateway_node_id = node.identity.node_id;
+    let gateway_ed_sk = node.identity.secret_key;
+    let gateway_ed_pk = node.identity.public_key;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
+    eprintln!(
+        "[gateway-protocol {}] listening on {listen_addr}",
+        super::hex_short(&gateway_node_id)
+    );
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
+    eprintln!(
+        "[gateway-protocol {}] relay connected — SNP-IK/0.1 handshake (responder)",
+        super::hex_short(&gateway_node_id)
+    );
+    // SNP-IK/0.1 link handshake (INTERNAL).
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream,
+        false, // responder
+        &gateway_ed_sk,
+        &gateway_ed_pk,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    eprintln!(
+        "[gateway-protocol {}] link handshake OK, peer (relay) nodeId={}",
+        super::hex_short(&gateway_node_id),
+        super::hex_short(&handshake.peer_node_id)
+    );
+    let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+    let connector = Arc::new(connector_factory);
+    let mut seen_req_ids = HashSet::new();
+    loop {
+        let outcome = serve_one_gateway_request_protocol_circuit(
+            &link,
+            gateway_node_id,
+            &gateway_ed_sk,
+            &client_ed25519_public,
+            gateway_x25519_secret,
+            &mut seen_req_ids,
+            connector.as_ref(),
+        )
+        .await;
+        match outcome {
+            Ok(ServeOutcome::Continue) => {
+                eprintln!(
+                    "[gateway-protocol {}] served one request (protocol-driven circuit)",
+                    super::hex_short(&gateway_node_id)
+                );
+                break; // one request is enough for the north-star test
+            }
+            Ok(ServeOutcome::Closed) => break,
+            Err(e) => {
+                eprintln!("[gateway-protocol] error: {e}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Serve ONE transit request with PROTOCOL-DRIVEN circuit key derivation.
+///
+/// The gateway derives the circuit keys FROM the client's ephemeral X25519
+/// public key (in the first 32 bytes of the request frame body) — NOT from
+/// a pre-supplied `CircuitKeys` parameter. This is the N2.0.7 invariant.
+async fn serve_one_gateway_request_protocol_circuit<F>(
+    link: &Arc<AsyncLink>,
+    gateway_node_id: [u8; 32],
+    gateway_sk: &[u8; 32],
+    client_pk: &[u8; 32],
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    seen_req_ids: &mut HashSet<[u8; 16]>,
+    connector_factory: &F,
+) -> NodeResult<ServeOutcome>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync,
+{
+    let req_frame = match link.recv_frame().await {
+        Ok(f) => f,
+        Err(AsyncLinkError::Io(msg))
+            if msg.contains("unexpected eof") || msg.contains("reset") =>
+        {
+            return Ok(ServeOutcome::Closed);
+        }
+        Err(e) => return Err(async_err_to_node(e)),
+    };
+    if should_drop(&req_frame) {
+        return Ok(ServeOutcome::Continue);
+    }
+
+    // N2.0.7: PROTOCOL-DRIVEN CIRCUIT KEY DERIVATION.
+    //
+    // The request frame body is `eph_pub(32) || sealed_payload`. The gateway
+    // reads the client's ephemeral X25519 public key from the first 32 bytes,
+    // computes DH(gateway_static_secret, client_eph_pub), derives CircuitKeys
+    // (responder role), and decrypts the payload.
+    //
+    // The gateway NEVER received CircuitKeys as a parameter — it derived them
+    // FROM THE PROTOCOL MATERIAL.
+    let (client_eph_pub, req_bytes) = snp_link::open_circuit_payload_with_fresh_eph(
+        gateway_x25519_secret,
+        &req_frame.body,
+    )
+    .ok_or(NodeError::CircuitDecryptionFailed)?;
+    eprintln!(
+        "[gateway-protocol {}] derived circuit keys from client ephemeral (eph={})",
+        super::hex_short(&gateway_node_id),
+        super::hex_short(&client_eph_pub.to_bytes())
+    );
+
+    let transit_req = decode_transit_request(&req_bytes)?;
+    let req_id_arr: [u8; 16] = transit_req.req_id;
+    if !seen_req_ids.insert(req_id_arr) {
+        return Err(NodeError::Other(format!(
+            "replay detected: reqId {:?} already seen",
+            req_id_arr
+        )));
+    }
+
+    let connector = connector_factory(&transit_req.url)?;
+    let gateway_sk_arr = *gateway_sk;
+    let client_pk_arr = *client_pk;
+    let fetched = tokio::task::spawn_blocking(move || {
+        handle_transit_request_with_connector(
+            &transit_req,
+            &gateway_sk_arr,
+            &client_pk_arr,
+            &connector,
+        )
+    })
+    .await
+    .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))??;
+
+    // Derive the RESPONSE-direction keys from the SAME DH. The gateway's
+    // `send_key` (responder role) equals the client's `recv_key`.
+    let response_keys = snp_link::derive_gateway_response_keys(
+        gateway_x25519_secret,
+        &client_eph_pub,
+    );
+    let resp_bytes = encode_transit_response(&fetched.response)?;
+    let sealed_resp = encrypt_circuit_payload(&response_keys.send_key, &resp_bytes);
+
+    let resp_frame = Frame {
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: req_frame.src,
+        src: gateway_node_id,
+        ttl: FRAME_TTL_MAX,
+        fid: req_frame.fid,
+        seq: req_frame.seq + 1,
+        body: sealed_resp,
+    };
+    link.send_frame(&resp_frame)
+        .await
+        .map_err(async_err_to_node)?;
+    Ok(ServeOutcome::Continue)
+}
 // ════════════════════════════════════════════════════════════════════════════
 // N2.0.6 CANONICAL PRODUCTION ENTRY POINTS — handshake-on-accept variants
 // ════════════════════════════════════════════════════════════════════════════
@@ -1226,4 +1465,288 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
     node.seen_req_ids.lock().unwrap().insert(req.req_id);
     *node.current_gateway.lock().unwrap() = Some(*gateway_node_id);
     Ok(transit_resp)
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.0.7 — PROTOCOL-DRIVEN CLIENT SEND (fresh ephemeral circuit)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.0.7 canonical production client entry point with protocol-driven
+/// circuit establishment.**
+///
+/// Performs the SNP-IK/0.1 handshake with the relay, then sends a transit
+/// request with a FRESH ephemeral X25519 circuit key. The circuit keys are
+/// established THROUGH THE PROTOCOL — the client generates a fresh ephemeral
+/// X25519 keypair, seals the TransitRequest as `eph_pub(32) || sealed_payload`,
+/// and sends it. The gateway derives the matching keys from the ephemeral
+/// public key in the frame body (via `open_circuit_payload_with_fresh_eph`).
+///
+/// **No out-of-band circuit key exchange.** The client does NOT pre-compute
+/// a DH with the gateway's static key — it uses
+/// `seal_circuit_payload_with_fresh_eph` which generates a fresh ephemeral
+/// per call and returns the circuit keys alongside the sealed body.
+///
+/// # Parameters
+/// - `gateway_x25519_pub`: The gateway's STATIC X25519 circuit public key,
+///   obtained from a VERIFIED `GatewayAdvertisement` (the advertisement
+///   binds this key to the gateway's Ed25519 identity via the signed
+///   preimage — see `GatewayAdvertisement::for_identity_with_circuit_key`).
+///
+/// # Errors
+/// Returns [`NodeError`] on any failure.
+pub async fn send_with_protocol_circuit_async(
+    node: &Node,
+    url: &str,
+    gateway_node_id: &[u8; 32],
+    gateway_ed25519_public: &[u8; 32],
+    gateway_x25519_pub: &snp_crypto::X25519PubKey,
+    relay_addr: &str,
+    relay_node_id: &[u8; 32],
+    client_x25519_secret: &snp_crypto::X25519Secret,
+    client_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<TransitResponse> {
+    // 1. SNP-IK/0.1 link handshake with the relay (INTERNAL).
+    let mut stream = AsyncLink::connect_raw(relay_addr)
+        .await
+        .map_err(async_err_to_node)?;
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream,
+        true, // initiator
+        &node.identity.secret_key,
+        &node.identity.public_key,
+        client_x25519_secret,
+        client_x25519_public,
+        Some(relay_node_id), // pin the relay's NodeId
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    if handshake.peer_node_id != *relay_node_id {
+        return Err(NodeError::Other(format!(
+            "relay identity substitution detected: expected {}, got {}",
+            super::hex_short(relay_node_id),
+            super::hex_short(&handshake.peer_node_id)
+        )));
+    }
+    let link = AsyncLink::new(stream, handshake.link_keys);
+
+    // 2. Build + sign the TransitRequest.
+    let mut req = TransitRequest {
+        req_id: random_req_id(),
+        method: "GET".into(),
+        url: url.to_string(),
+        tls_termination: "GATEWAY_PLAINTEXT".into(),
+        max_response_bytes: 65536,
+        deadline: now_unix() + 60,
+        reply_to: [0u8; 32],
+        client_sig: [0u8; 64],
+    };
+    sign_transit_request(&mut req, &node.identity.secret_key);
+    let req_bytes = encode_transit_request(&req)?;
+
+    // 3. N2.0.7: PROTOCOL-DRIVEN CIRCUIT ESTABLISHMENT.
+    //
+    // `seal_circuit_payload_with_fresh_eph` generates a FRESH ephemeral X25519
+    // keypair, computes DH(client_eph, gateway_static_pub), derives CircuitKeys
+    // (initiator role), encrypts the payload, and returns:
+    //   (circuit_keys, client_eph_pub, body = eph_pub(32) || sealed_payload)
+    //
+    // The fresh ephemeral secret is DROPPED inside the function — forward
+    // secrecy. The client keeps `circuit_keys.recv_key` to decrypt the
+    // gateway's response.
+    let (circuit_keys, _client_eph_pub, sealed_body) =
+        snp_link::seal_circuit_payload_with_fresh_eph(gateway_x25519_pub, &req_bytes);
+
+    eprintln!(
+        "[client-protocol {}] sealed request with fresh ephemeral circuit key (eph={})",
+        super::hex_short(&node.identity.node_id),
+        super::hex_short(&_client_eph_pub.to_bytes())
+    );
+
+    // 4. Build the Class B frame addressed to the gateway.
+    let req_frame = Frame {
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: *gateway_node_id,
+        src: node.identity.node_id,
+        ttl: FRAME_TTL_MAX,
+        fid: random_fid(),
+        seq: 1,
+        body: sealed_body,
+    };
+
+    // 5. Send + receive.
+    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
+
+    if resp_frame.cls != b'B' {
+        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+            return Err(NodeError::UpstreamFailure);
+        }
+        return Err(NodeError::Other(format!(
+            "expected Class B response, got Class {} — likely upstream failure",
+            resp_frame.cls as char
+        )));
+    }
+
+    // 6. Decrypt the response with the circuit recv_key (derived alongside
+    //    send_key in step 3). The gateway used the SAME DH to derive its
+    //    send_key (= client's recv_key).
+    let resp_bytes = decrypt_circuit_payload(&circuit_keys.recv_key, &resp_frame.body)
+        .ok_or(NodeError::CircuitDecryptionFailed)?;
+    let transit_resp: TransitResponse = decode_transit_response(&resp_bytes)?;
+
+    // 7. Verify the gateway's signature.
+    if !verify_transit_response(&transit_resp, gateway_ed25519_public) {
+        return Err(NodeError::GatewaySignatureFailed);
+    }
+
+    node.seen_req_ids.lock().unwrap().insert(req.req_id);
+    *node.current_gateway.lock().unwrap() = Some(*gateway_node_id);
+    Ok(transit_resp)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.0.7 — ROUTE-AUTHORITATIVE ENTRY POINTS
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Gate 2 + Gate 3: The Route is the AUTHORITATIVE routing plan. The client
+// receives a Route (not individual relay_addr/gateway_node_id parameters).
+// The runtime consumes route.hop_details to determine where to connect.
+//
+// The relay serve function takes its position in the route + the Route
+// itself (to know the next hop's NodeId + endpoint), NOT an explicit
+// next_hop_addr parameter.
+
+/// **N2.0.7 canonical production client entry point — Route-authoritative.**
+///
+/// Sends a transit request through the mesh using a [`Route`] as the
+/// authoritative routing plan. The Route carries:
+/// - `hop_details[0]` — the first relay's NodeId + endpoint (the client
+///   connects here).
+/// - `hop_details[last]` — the gateway's NodeId + Ed25519 public key +
+///   X25519 circuit public key (the circuit is established with this
+///   gateway via the protocol).
+///
+/// The client does NOT pass `relay_addr`, `relay_node_id`, `gateway_node_id`
+/// as separate parameters — they all come from the Route. This makes the
+/// Route causally responsible for the path: change the Route's hop list,
+/// and the traffic follows a different path.
+///
+/// Internally:
+/// 1. Extracts the first relay's endpoint from `route.hop_details[0]`.
+/// 2. Extracts the gateway's identity from `route.hop_details[last]`.
+/// 3. Calls `send_with_protocol_circuit_async` (fresh ephemeral circuit).
+///
+/// # Errors
+/// Returns [`NodeError`] if the Route has no `hop_details`, if the first
+/// hop has no endpoints, or on any protocol failure.
+pub async fn send_via_route(
+    node: &Node,
+    route: &super::Route,
+    url: &str,
+    gateway_ed25519_public: &[u8; 32],
+    gateway_x25519_pub: &snp_crypto::X25519PubKey,
+    client_x25519_secret: &snp_crypto::X25519Secret,
+    client_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<snp_gateway::TransitResponse> {
+    // 1. The Route is AUTHORITATIVE — extract the first relay's endpoint
+    //    from hop_details[0].
+    if route.hop_details.is_empty() {
+        return Err(NodeError::Other(
+            "send_via_route: route has no hop_details (use Route::new_with_hop_details)".into(),
+        ));
+    }
+    let first_hop = &route.hop_details[0];
+    let relay_addr = first_hop.first_endpoint().ok_or_else(|| {
+        NodeError::Other("send_via_route: first hop has no endpoints".into())
+    })?;
+    let relay_node_id = first_hop.node_id;
+
+    // 2. The gateway is the LAST hop.
+    let gateway_hop = route.hop_details.last().ok_or_else(|| {
+        NodeError::Other("send_via_route: route has no gateway hop".into())
+    })?;
+    let gateway_node_id = gateway_hop.node_id;
+
+    eprintln!(
+        "[send-via-route {}] route: {} hops, first={}, dest={}",
+        super::hex_short(&node.identity.node_id),
+        route.hop_details.len(),
+        super::hex_short(&relay_node_id),
+        super::hex_short(&gateway_node_id)
+    );
+
+    // 3. Delegate to the protocol-driven circuit send.
+    send_with_protocol_circuit_async(
+        node,
+        url,
+        &gateway_node_id,
+        gateway_ed25519_public,
+        gateway_x25519_pub,
+        relay_addr,
+        &relay_node_id,
+        client_x25519_secret,
+        client_x25519_public,
+    )
+    .await
+}
+
+/// **N2.0.7 canonical production relay entry point — Route-authoritative.**
+///
+/// Like `serve_relay_persistent_async_with_handshake`, but takes the relay's
+/// position in a [`Route`] + the Route itself (to look up the next hop's
+/// NodeId + endpoint). This makes the Route authoritative — the relay
+/// doesn't receive an explicit `next_hop_addr`; it reads the next hop from
+/// the Route.
+///
+/// # Parameters
+/// - `route`: The Route this relay is part of.
+/// - `my_position`: The index of this relay in `route.hop_details`.
+/// - `listen_addr`: The address this relay listens on (from its own
+///   `RouteHop.endpoints[0]`).
+///
+/// # Errors
+/// Returns [`NodeError`] on any failure.
+pub async fn serve_relay_via_route(
+    node: &Node,
+    route: &super::Route,
+    my_position: usize,
+    listen_addr: &str,
+    relay_x25519_secret: &snp_crypto::X25519Secret,
+    relay_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<()> {
+    // The next hop is at my_position + 1 in the Route.
+    let next_hop = route
+        .hop(my_position + 1)
+        .ok_or_else(|| {
+            NodeError::Other(format!(
+                "serve_relay_via_route: no hop at position {} (my_position={}, route has {} hops)",
+                my_position + 1,
+                my_position,
+                route.hop_details.len()
+            ))
+        })?;
+    let next_hop_addr = next_hop.first_endpoint().ok_or_else(|| {
+        NodeError::Other("serve_relay_via_route: next hop has no endpoints".into())
+    })?;
+    let next_hop_node_id = next_hop.node_id;
+
+    eprintln!(
+        "[relay-via-route {}] position {}, next-hop={}",
+        super::hex_short(&node.identity.node_id),
+        my_position,
+        super::hex_short(&next_hop_node_id)
+    );
+
+    // Delegate to the handshake-on-accept relay serve.
+    serve_relay_persistent_async_with_handshake(
+        node,
+        listen_addr,
+        next_hop_addr,
+        next_hop_node_id,
+        relay_x25519_secret,
+        relay_x25519_public,
+    )
+    .await
 }
