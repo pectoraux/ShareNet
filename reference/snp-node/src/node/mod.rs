@@ -144,9 +144,9 @@ pub use topology_protocol::{
 pub use peer_directory::PeerDirectory;
 pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
 pub use route_engine::{
-    CandidateOrigin, DestinationResolver, HopCountCost, InMemoryResolver, LowLatencyCost,
-    NullResolver, RouteCandidate, RouteCandidateState, RouteCostModel, RouteDiscoveryError,
-    RouteEngine,
+    CandidateOrigin, DestinationResolver, DistributedRouteDiscovery, HopCountCost,
+    InMemoryResolver, LowLatencyCost, NullResolver, RouteCandidate, RouteCandidateState,
+    RouteCostModel, RouteDiscoveryError, RouteEngine, DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
 };
 pub use route::RouteCommitment;
 pub use session::{

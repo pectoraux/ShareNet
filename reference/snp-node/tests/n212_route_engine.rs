@@ -7,6 +7,7 @@ use snp_node::node::{
     CandidateOrigin, Capability, HopCountCost, InMemoryResolver, Link, LinkKey, LinkState,
     NodeAdvertisement, NullResolver, RouteCandidateState, RouteDiscoveryError, RouteEngine,
     TopologyGraph, TransportEndpoint, VerifiedPeerSummaryList,
+    DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
 };
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
@@ -801,27 +802,46 @@ fn candidate_gateway_discovery_from_remote_hint() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// North-star test
+// Local topology multi-hop route test (NOT distributed discovery)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// 16. north_star_multi_hop_route
+/// 16. local_topology_multi_hop_route_with_destination_resolution
 ///
-/// The first true multi-hop route scenario:
+/// **N2.1.2.1:** Renamed from `north_star_multi_hop_route` to be honest
+/// about what this test proves.
+///
+/// This test proves LOCAL route computation over an authenticated topology
+/// graph plus destination resolution abstraction. It does NOT prove a
+/// real distributed route-discovery protocol.
+///
+/// Scenario:
 /// - A has no direct Internet gateway.
-/// - Topology: A knows B, B knows C, C knows G.
+/// - A's local topology already contains the executable links:
+///   A → B, B → C, C → G (all authenticated, all usable).
 /// - A learns a RemoteNodeHint saying G is a gateway.
 /// - A does NOT initially have G's authenticated advertisement.
-/// - The route engine must:
-///   1. discover G as a candidate,
-///   2. resolve G (via resolver),
-///   3. establish/verify the actual path A → B → C → G,
-///   4. authenticate every hop,
-///   5. construct the route,
-///   6. validate it,
-///   7. calculate RouteCommitment,
-///   8. return a RouteReady result.
+/// - The InMemoryResolver (TEST-ONLY) supplies G's authenticated record.
+///
+/// The route engine:
+///   1. discovers G as a candidate (from hint),
+///   2. resolves G (via InMemoryResolver — NOT a distributed protocol),
+///   3. computes the path A → B → C → G via Dijkstra over LOCAL links,
+///   4. authenticates every hop (VerifiedNodeDescriptor per hop),
+///   5. constructs the Route (RouteHop sequence with SELECTED LINK endpoints),
+///   6. validates it (Route::validate()),
+///   7. computes RouteCommitment (canonical CBOR hash),
+///   8. returns RouteReady { route, cost }.
+///
+/// **What this does NOT prove:**
+/// - A querying B over the network for C's advertisement.
+/// - A querying B for the B→C link.
+/// - A discovering links it doesn't already possess locally.
+/// - A real distributed route-discovery protocol.
+///
+/// Those capabilities require the `DistributedRouteDiscovery` trait
+/// (defined but explicitly unimplemented in this milestone).
 #[test]
-fn north_star_multi_hop_route() {
+fn local_topology_multi_hop_route_with_destination_resolution() {
     let mut topology = TopologyGraph::new();
 
     // Local node A.
@@ -921,12 +941,15 @@ fn north_star_multi_hop_route() {
     assert!(last_hop.descriptor.circuit_x25519_pub().is_some(),
         "destination gateway must have X25519 circuit key");
 
-    eprintln!("[test 16] PASS: NORTH-STAR — A → B → C → G multi-hop route");
+    eprintln!("[test 16] PASS: LOCAL TOPOLOGY — A → B → C → G multi-hop route");
+    eprintln!("  (This is LOCAL path computation + destination resolution,");
+    eprintln!("   NOT distributed route discovery.)");
     eprintln!("  Route: {} → {} → {} → {}",
         hex_short_local(&a_id), hex_short_local(&b_id),
         hex_short_local(&c_id), hex_short_local(&g_id));
     eprintln!("  Commitment: {}", hex_short_local(commitment.as_bytes()));
     eprintln!("  Hops: {}", route.hops().len());
+    eprintln!("  Cost: {}", g_candidate.route_cost().expect("cost"));
 }
 
 fn hex_short_local(b: &[u8]) -> String {
@@ -1167,4 +1190,364 @@ fn low_latency_cost_model_selects_better_path() {
     // not r1 (500ms + 500ms = 1000ms).
     assert_eq!(route.hops()[0], r2_id, "low-latency cost should select r2 path");
     eprintln!("[test 20] PASS: low-latency cost model selects better path");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.2.1 — Route correctness and distributed-resolution boundary tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Helper: create a relay advertisement with MULTIPLE endpoints.
+fn make_relay_advert_multi_endpoint(
+    label: &[u8],
+    seq: u64,
+    endpoints: Vec<TransportEndpoint>,
+) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+    let (sk, pk) = fresh_keypair(label);
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        endpoints,
+        None, 3600, seq,
+    );
+    (advert, sk, pk)
+}
+
+/// Helper: create a gateway advertisement with MULTIPLE endpoints.
+fn make_gateway_advert_multi_endpoint(
+    label: &[u8],
+    seq: u64,
+    endpoints: Vec<TransportEndpoint>,
+) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+    let (sk, pk) = fresh_keypair(label);
+    let (x_sk, x_pk) = x25519_static_keypair();
+    let _ = x_sk;
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Gateway],
+        endpoints,
+        Some(x_pk.to_bytes()), 3600, seq,
+    );
+    (advert, sk, pk)
+}
+
+/// 21. selected_link_endpoint_is_route_endpoint
+///
+/// N2.1.2.1: The RouteHop endpoint MUST be the endpoint from the selected
+/// Link (LinkKey.endpoint), NOT record.endpoints.first().
+///
+/// This test creates a node that advertises TWO endpoints, then creates
+/// a link using the SECOND endpoint. The route must use the second endpoint
+/// in the RouteHop — not the first.
+#[test]
+fn selected_link_endpoint_is_route_endpoint() {
+    let mut topology = TopologyGraph::new();
+    let (local_sk, local_pk) = fresh_keypair(b"endpoint-local");
+    let local = derive_node_id(&local_pk);
+    let _ = local_sk;
+
+    // Gateway G advertises TWO endpoints: ep1 and ep2.
+    let (g_advert, _, g_pk) = make_gateway_advert_multi_endpoint(
+        b"endpoint-gw", 1,
+        vec![
+            TransportEndpoint::tcp("127.0.0.1:1111"),  // ep1 (first in advertisement)
+            TransportEndpoint::tcp("127.0.0.1:2222"),  // ep2 (second in advertisement)
+        ],
+    );
+    topology.accept_advertisement(g_advert.verify_into_verified().expect("verify")).expect("accept");
+    let g_id = derive_node_id(&g_pk);
+
+    // Create a link using the SECOND endpoint (ep2).
+    let selected_endpoint = TransportEndpoint::tcp("127.0.0.1:2222");
+    topology.add_link(Link::new_up(
+        LinkKey::new(local, g_id, selected_endpoint.clone()),
+        None,
+    ));
+
+    let engine = RouteEngine::new(local);
+    let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
+
+    let ready: Vec<_> = candidates.iter().filter(|c| c.is_ready()).collect();
+    assert_eq!(ready.len(), 1, "should have 1 ready route");
+    let route = ready[0].route().expect("route");
+
+    // The RouteHop endpoint MUST be ep2 (the selected link's endpoint),
+    // NOT ep1 (the first endpoint in the advertisement).
+    let hop = &route.hop_details()[0];
+    assert_eq!(hop.endpoints[0], selected_endpoint,
+        "RouteHop endpoint MUST match the selected Link's endpoint, not record.endpoints.first()");
+    assert_ne!(hop.endpoints[0], TransportEndpoint::tcp("127.0.0.1:1111"),
+        "RouteHop endpoint must NOT be the first advertised endpoint");
+    eprintln!("[test 21] PASS: selected link endpoint is route endpoint");
+}
+
+/// 22. route_commitment_changes_with_selected_link_endpoint
+///
+/// N2.1.2.1: Two routes to the same gateway via different selected link
+/// endpoints MUST produce different RouteCommitments.
+#[test]
+fn route_commitment_changes_with_selected_link_endpoint() {
+    let mut topology1 = TopologyGraph::new();
+    let mut topology2 = TopologyGraph::new();
+    let (local_sk, local_pk) = fresh_keypair(b"commit-endpoint-local");
+    let local = derive_node_id(&local_pk);
+    let _ = local_sk;
+
+    // Gateway G advertises TWO endpoints.
+    let (g_advert, _, g_pk) = make_gateway_advert_multi_endpoint(
+        b"commit-endpoint-gw", 1,
+        vec![
+            TransportEndpoint::tcp("127.0.0.1:1111"),
+            TransportEndpoint::tcp("127.0.0.1:2222"),
+        ],
+    );
+    let g_verified = g_advert.verify_into_verified().expect("verify");
+    let g_id = derive_node_id(&g_pk);
+
+    topology1.accept_advertisement(g_verified.clone()).expect("accept");
+    topology2.accept_advertisement(g_verified).expect("accept");
+
+    // Topology 1: link via ep1.
+    topology1.add_link(Link::new_up(
+        LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:1111")),
+        None,
+    ));
+
+    // Topology 2: link via ep2.
+    topology2.add_link(Link::new_up(
+        LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:2222")),
+        None,
+    ));
+
+    let engine = RouteEngine::new(local);
+    let candidates1 = engine.discover_and_compute(&topology1, &NullResolver, &HopCountCost);
+    let candidates2 = engine.discover_and_compute(&topology2, &NullResolver, &HopCountCost);
+
+    let route1 = candidates1.iter().find(|c| c.is_ready()).expect("route1 ready").route().expect("route1");
+    let route2 = candidates2.iter().find(|c| c.is_ready()).expect("route2 ready").route().expect("route2");
+
+    // Same source, same destination, same descriptor — but DIFFERENT selected endpoint.
+    assert_eq!(route1.source(), route2.source());
+    assert_eq!(route1.destination(), route2.destination());
+    assert_ne!(
+        route1.hop_details()[0].endpoints[0],
+        route2.hop_details()[0].endpoints[0],
+        "routes must use different selected endpoints"
+    );
+
+    // RouteCommitment MUST differ because the selected endpoint differs.
+    assert_ne!(
+        route1.route_commitment(),
+        route2.route_commitment(),
+        "routes with different selected link endpoints MUST have different commitments"
+    );
+    eprintln!("[test 22] PASS: route commitment changes with selected link endpoint");
+}
+
+/// 23. best_route_selects_lowest_computed_cost
+///
+/// N2.1.2.1: best_route() must select the route with the minimum actual
+/// computed cost — NOT the first ready candidate based on discovery order.
+///
+/// This test constructs two gateway routes where:
+/// - Candidate A (discovered first): 3-hop route, higher cost.
+/// - Candidate B (discovered second): 1-hop route, lower cost.
+///
+/// best_route() must return Candidate B's route.
+#[test]
+fn best_route_selects_lowest_computed_cost() {
+    let mut topology = TopologyGraph::new();
+    let (local_sk, local_pk) = fresh_keypair(b"best-local");
+    let local = derive_node_id(&local_pk);
+    let _ = local_sk;
+
+    // Gateway G1: 3-hop route (local → r1 → r2 → g1).
+    let (r1_advert, _, r1_pk) = make_relay_advert(b"best-relay-1", 1);
+    topology.accept_advertisement(r1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let r1_id = derive_node_id(&r1_pk);
+
+    let (r2_advert, _, r2_pk) = make_relay_advert(b"best-relay-2", 1);
+    topology.accept_advertisement(r2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let r2_id = derive_node_id(&r2_pk);
+
+    let (g1_advert, _, g1_pk) = make_gateway_advert(b"best-gw-1", 1);
+    topology.accept_advertisement(g1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let g1_id = derive_node_id(&g1_pk);
+
+    topology.add_link(Link::new_up(
+        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
+    ));
+    topology.add_link(Link::new_up(
+        LinkKey::new(r1_id, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
+    ));
+    topology.add_link(Link::new_up(
+        LinkKey::new(r2_id, g1_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
+    ));
+
+    // Gateway G2: 1-hop route (local → g2).
+    let (g2_advert, _, g2_pk) = make_gateway_advert(b"best-gw-2", 1);
+    topology.accept_advertisement(g2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let g2_id = derive_node_id(&g2_pk);
+
+    topology.add_link(Link::new_up(
+        LinkKey::new(local, g2_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
+    ));
+
+    let engine = RouteEngine::new(local);
+    let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
+
+    let ready: Vec<_> = candidates.iter().filter(|c| c.is_ready()).collect();
+    assert_eq!(ready.len(), 2, "should have 2 ready routes");
+
+    // The first ready candidate might be G1 (3-hop) or G2 (1-hop) depending
+    // on discovery order. But best_route() must return G2 (1-hop, lower cost).
+    let best = RouteEngine::best_route(&candidates).expect("best route");
+    assert_eq!(best.destination(), g2_id,
+        "best_route must select the lower-cost route (G2, 1-hop), not G1 (3-hop)");
+    assert_eq!(best.hops().len(), 1, "best route must be the 1-hop route");
+
+    // Verify the cost is correct.
+    let (best_route, best_cost) = RouteEngine::best_route_with_cost(&candidates).expect("best");
+    assert_eq!(best_route.destination(), g2_id);
+    // HopCountCost: 1 hop = 1_000_000, 3 hops = 3_000_000.
+    assert!(best_cost < 3_000_000, "1-hop cost must be less than 3-hop cost");
+
+    eprintln!("[test 23] PASS: best_route selects lowest computed cost");
+}
+
+/// 24. remote_hint_does_not_create_local_link
+///
+/// N2.1.2.1: A RemoteNodeHint is non-authoritative and must NOT create
+/// a local link in the topology. The topology's LinkTable must remain
+/// unchanged after processing a hint.
+#[test]
+fn remote_hint_does_not_create_local_link() {
+    let mut topology = TopologyGraph::new();
+    let (local_sk, local_pk) = fresh_keypair(b"hint-no-link-local");
+    let local = derive_node_id(&local_pk);
+    let _ = local_sk;
+
+    // Snapshot the link count before processing a hint.
+    let link_count_before = topology.link_count();
+
+    // Create a hint about a remote gateway.
+    let (sender_sk, sender_pk) = fresh_keypair(b"hint-no-link-sender");
+    let sender_id = derive_node_id(&sender_pk);
+    let remote_gw = [0xAB; 32];
+    let summary = snp_node::node::PeerSummary {
+        node_id: remote_gw,
+        advertisement_sequence: 1,
+        capabilities: vec!["gateway".to_string()],
+        visibility: "active".to_string(),
+        last_seen: now_unix(),
+        distance_hint: 2,
+    };
+    let list = snp_node::node::PeerSummaryList::create_and_sign(
+        &sender_sk, &sender_pk, sender_id, vec![summary], 1,
+    );
+    let verified = list.verify_into_verified().expect("verify");
+    topology.process_peer_summaries(&verified);
+
+    // The hint must NOT create a local link.
+    assert_eq!(topology.link_count(), link_count_before,
+        "RemoteNodeHint must NOT create a local link");
+
+    // The hint must NOT make the remote node directly reachable.
+    assert!(!topology.is_directly_reachable(&remote_gw),
+        "RemoteNodeHint must NOT make the node directly reachable");
+
+    // The hint must NOT create an authenticated record.
+    assert!(topology.get_record(&remote_gw).is_none(),
+        "RemoteNodeHint must NOT create an authenticated record");
+
+    // The hint IS stored as a non-authoritative RemoteNodeHint.
+    assert!(topology.remote_hints().contains_key(&remote_gw),
+        "RemoteNodeHint must be stored as a hint (not a link or record)");
+
+    eprintln!("[test 24] PASS: remote hint does not create local link");
+}
+
+/// 25. in_memory_resolver_is_test_only_route_resolution
+///
+/// N2.1.2.1: InMemoryResolver is explicitly documented as TEST-ONLY.
+/// It does NOT perform distributed route discovery. This test verifies
+/// that InMemoryResolver returns pre-registered records (simulating
+/// resolution) but does NOT query any network.
+#[test]
+fn in_memory_resolver_is_test_only_route_resolution() {
+    // InMemoryResolver returns pre-registered records.
+    let mut resolver = InMemoryResolver::new();
+
+    // Create a gateway advertisement and register it.
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"resolver-test-gw", 1);
+    let gw_id = derive_node_id(&gw_pk);
+    let gw_verified = gw_advert.verify_into_verified().expect("verify");
+    resolver.register_verified(gw_verified);
+
+    // Resolution succeeds for the registered node.
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: gw_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: now_unix(),
+        distance_hint: 1,
+        learned_from: [0x00; 32],
+        received_at: now_unix(),
+        source_propagation_sequence: 1,
+    };
+    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &gw_id, &hint);
+    assert!(resolved.is_some(), "InMemoryResolver must return registered records");
+    assert_eq!(resolved.unwrap().node_id(), gw_id);
+
+    // Resolution fails for an unregistered node.
+    let unknown_id = [0xCD; 32];
+    let resolved_unknown = snp_node::node::DestinationResolver::resolve(&resolver, &unknown_id, &hint);
+    assert!(resolved_unknown.is_none(),
+        "InMemoryResolver must return None for unregistered nodes");
+
+    // Key point: InMemoryResolver does NOT perform any network operation.
+    // It is a deterministic TEST-ONLY stub. A production resolver would
+    // query an authenticated next-hop peer, receive advertisement bytes,
+    // and call NodeAdvertisement::verify_into_verified().
+    //
+    // The InMemoryResolver skips all of that by returning pre-authenticated
+    // records from a local map. This is why it is TEST-ONLY.
+
+    eprintln!("[test 25] PASS: InMemoryResolver is test-only route resolution");
+}
+
+/// 26. distributed_route_discovery_is_explicitly_unimplemented
+///
+/// N2.1.2.1: The architecture explicitly marks distributed route discovery
+/// as unimplemented. The DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED constant
+/// is false, and the DistributedRouteDiscovery trait has no production
+/// implementation.
+#[test]
+fn distributed_route_discovery_is_explicitly_unimplemented() {
+    // The constant must be false — distributed discovery is NOT implemented.
+    assert!(!DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
+        "DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED must be false in this milestone");
+
+    // The DistributedRouteDiscovery trait exists (it compiles), but no
+    // production implementation is available. The trait defines the
+    // interface for future implementation:
+    //
+    //   fn discover_path(
+    //       &mut self,
+    //       source: &[u8; 32],
+    //       destination: &[u8; 32],
+    //   ) -> Option<Vec<([u8; 32], LinkKey)>>;
+    //
+    // A production implementation would:
+    // 1. Query an authenticated next-hop peer for the next segment.
+    // 2. Receive and verify the next-hop node's advertisement.
+    // 3. Discover the usable link from the current hop to the next hop.
+    // 4. Continue until the destination is reached and authenticated.
+    //
+    // This is explicitly NOT implemented. The RouteEngine currently performs
+    // LOCAL path computation only.
+
+    // Verify the trait can be referenced (it exists in the type system).
+    fn _assert_trait_exists<T: snp_node::node::DistributedRouteDiscovery>() {}
+    // (No concrete type to pass — there is no implementation.)
+
+    eprintln!("[test 26] PASS: distributed route discovery is explicitly unimplemented");
 }

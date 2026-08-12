@@ -1,4 +1,38 @@
-//! N2.1.2 — Route Discovery, Construction, and Validation.
+//! N2.1.2 / N2.1.2.1 — Route Computation, Construction, and Validation.
+//!
+//! ## N2.1.2.1 correction: honest LOCAL vs DISTRIBUTED boundary
+//!
+//! **This module implements LOCAL route computation over an authenticated
+//! topology graph, plus a destination-resolution abstraction. It does NOT
+//! implement a distributed route-discovery protocol.**
+//!
+//! The distinction is critical:
+//!
+//! ### LOCAL GRAPH PATH COMPUTATION (implemented here)
+//!
+//! The `RouteEngine` runs Dijkstra over the **local** `TopologyGraph`'s
+//! `LinkTable`. It only traverses links that are already present locally
+//! and whose remote nodes are already authenticated locally (or injected
+//! via the `DestinationResolver` as already-verified records).
+//!
+//! This is sufficient when:
+//! - The local node already has authenticated links to all intermediate hops.
+//! - The destination's authenticated advertisement is available (either
+//!   locally or via the resolver).
+//!
+//! ### DISTRIBUTED ROUTE DISCOVERY (NOT implemented here)
+//!
+//! In a real ShareNet mesh, node A may know only B, while the full path
+//! A → B → C → G requires discovering B→C and C→G links that A does NOT
+//! locally possess. This requires a distributed next-hop resolution
+//! protocol where A queries B (an authenticated next-hop peer) for
+//! C's advertisement and the B→C link, then queries C for G's
+//! advertisement and the C→G link.
+//!
+//! That protocol is **explicitly unimplemented** in this milestone. The
+//! `DistributedRouteDiscovery` trait below defines the interface, but no
+//! production implementation exists. The `InMemoryResolver` is a TEST-ONLY
+//! stub that simulates resolution by returning pre-authenticated records.
 //!
 //! ## Core principle: Hints are NOT routes
 //!
@@ -16,10 +50,17 @@
 //! executable next hop. It can only become a DESTINATION CANDIDATE that
 //! triggers RESOLUTION.
 //!
-//! ## Route discovery pipeline
+//! ## N2.1.2.1 correction: selected link endpoint → RouteHop endpoint
+//!
+//! The Dijkstra path computation selects a concrete `Link` (with a specific
+//! `LinkKey.endpoint`). The resulting `RouteHop` MUST use the EXACT endpoint
+//! from the selected link — NOT `record.endpoints.first()`. This ensures
+//! the `RouteCommitment` binds the endpoint that was actually proven usable.
+//!
+//! ## Route computation pipeline (LOCAL)
 //!
 //! ```text
-//! Topology
+//! Topology (local)
 //!     │
 //!     ├── direct authenticated gateways  ──► direct candidate
 //!     │                                      (state: AUTHENTICATED)
@@ -29,6 +70,7 @@
 //!                                                │
 //!                                                ▼
 //!                                          DestinationResolver
+//!                                          (TRUST BOUNDARY — see below)
 //!                                                │
 //!                                    ┌───────────┴───────────┐
 //!                                    │                       │
@@ -37,9 +79,9 @@
 //!                           state: AUTHENTICATED       state: FAILED
 //!                                    │
 //!                                    ▼
-//!                          next-hop path resolution
-//!                          (BFS over usable directed
-//!                           authenticated links)
+//!                          LOCAL path computation
+//!                          (Dijkstra over local usable
+//!                           directed authenticated links)
 //!                                    │
 //!                            ┌───────┴───────┐
 //!                            │               │
@@ -49,16 +91,17 @@
 //!                            │
 //!                            ▼
 //!                  construct RouteHop sequence
-//!                  (from AuthenticatedNodeRecords + endpoints)
+//!                  (VerifiedNodeDescriptor + SELECTED LINK endpoint)
 //!                            │
 //!                            ▼
 //!                      validate Route
 //!                            │
 //!                            ▼
 //!                  compute RouteCommitment
+//!                  (binds exact selected endpoints)
 //!                            │
 //!                            ▼
-//!                    state: ROUTE_READY
+//!                    state: ROUTE_READY { route, cost }
 //! ```
 //!
 //! ## Cost model
@@ -71,6 +114,17 @@
 //! - **SELF_REPORTED** — untrusted hint values (distance_hint, claimed
 //!   capabilities from `RemoteNodeHint`). These MUST NOT influence cost
 //!   directly; they may only prioritize candidate resolution order.
+//!
+//! ## DestinationResolver is a TRUST BOUNDARY
+//!
+//! `DestinationResolver` is not merely a lookup interface. It is a
+//! **security-critical trust boundary**. The production resolver MUST
+//! obtain destination advertisements through an authenticated protocol
+//! (not merely a trusted callback). A malicious or buggy resolver could
+//! return a forged record, but the route engine performs additional
+//! validation (the record must have a valid `VerifiedNodeDescriptor`,
+//! the destination must be a gateway with an X25519 key, etc.).
+//! The `InMemoryResolver` is TEST-ONLY and MUST NOT be used in production.
 
 use super::*;
 use crate::node::link::{Link, LinkKey, LinkState};
@@ -158,9 +212,18 @@ pub enum RouteCandidateState {
         path: Vec<[u8; 32]>,
     },
     /// A complete, validated `Route` exists and is ready for use.
+    ///
+    /// **N2.1.2.1:** The `cost` field stores the actual computed route cost
+    /// (from the `RouteCostModel` used during path computation). This allows
+    /// `best_route()` to select the genuinely lowest-cost route, rather than
+    /// relying on candidate discovery order.
     RouteReady {
         /// The constructed route.
         route: Route,
+        /// The computed route cost (from `RouteCostModel::path_cost()`).
+        /// Lower is better. This is the actual cost of the selected path,
+        /// NOT the `distance_hint` (which is SELF_REPORTED and untrusted).
+        cost: u64,
     },
     /// Resolution or path construction failed. The topology is NOT poisoned
     /// — the candidate is simply unusable.
@@ -285,7 +348,20 @@ impl RouteCandidate {
     #[must_use]
     pub fn route(&self) -> Option<&Route> {
         match &self.state {
-            RouteCandidateState::RouteReady { route } => Some(route),
+            RouteCandidateState::RouteReady { route, .. } => Some(route),
+            _ => None,
+        }
+    }
+
+    /// **N2.1.2.1.** Get the computed route cost, if the candidate is ready.
+    ///
+    /// This is the actual cost computed by the `RouteCostModel` during
+    /// path computation — NOT the `distance_hint` (which is SELF_REPORTED
+    /// and untrusted). Lower is better.
+    #[must_use]
+    pub fn route_cost(&self) -> Option<u64> {
+        match &self.state {
+            RouteCandidateState::RouteReady { cost, .. } => Some(*cost),
             _ => None,
         }
     }
@@ -360,7 +436,23 @@ impl DestinationResolver for NullResolver {
     }
 }
 
-/// An in-memory resolver for testing. Maps NodeId → AuthenticatedNodeRecord.
+/// **TEST-ONLY.** An in-memory resolver that maps NodeId → AuthenticatedNodeRecord.
+///
+/// ## N2.1.2.1: This is NOT a production resolver
+///
+/// `InMemoryResolver` simulates destination resolution by returning
+/// pre-authenticated records from a local map. It does NOT perform any
+/// network operation, does NOT query next-hop peers, and does NOT obtain
+/// advertisements through an authenticated protocol.
+///
+/// It is suitable ONLY for deterministic route-engine testing. In a
+/// production system, a real `DestinationResolver` implementation MUST
+/// obtain destination advertisements through an authenticated protocol
+/// (e.g., querying an authenticated next-hop peer, receiving the
+/// advertisement bytes, and calling `NodeAdvertisement::verify_into_verified()`).
+///
+/// `DestinationResolver` is a **TRUST BOUNDARY**, not merely a lookup
+/// interface.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryResolver {
     records: HashMap<[u8; 32], AuthenticatedNodeRecord>,
@@ -393,6 +485,79 @@ impl DestinationResolver for InMemoryResolver {
         self.records.get(destination).cloned()
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Distributed route discovery boundary (N2.1.2.1)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.2.1.** The distributed route-discovery interface.
+///
+/// This trait defines the interface for a FUTURE production implementation
+/// of distributed next-hop route discovery. It is **explicitly unimplemented**
+/// in this milestone — no production implementation exists.
+///
+/// ## What this would do (when implemented)
+///
+/// In a real ShareNet mesh, node A may know only B, while the full path
+/// A → B → C → G requires discovering B→C and C→G links that A does NOT
+/// locally possess. A `DistributedRouteDiscovery` implementation would:
+///
+/// 1. Query an authenticated next-hop peer (e.g., B) for the next segment
+///    of the path toward the destination.
+/// 2. Receive the next-hop node's advertisement (or the destination's
+///    advertisement if the next-hop peer knows it directly).
+/// 3. Verify the received advertisement via `NodeAdvertisement::verify_into_verified()`.
+/// 4. Discover the usable link from the current hop to the next hop.
+/// 5. Update the local route-discovery state with the newly authenticated
+///    node and link.
+/// 6. Continue until the destination is reached and authenticated.
+///
+/// ## Why it's not implemented yet
+///
+/// Distributed route discovery requires:
+/// - An authenticated query/response protocol between peers.
+/// - A way to request and verify advertisements through the mesh.
+/// - A way to discover usable links without already possessing them locally.
+///
+/// These are networking-layer concerns that belong in a future milestone
+/// (N2.1.x or N2.2.x), not in the route-engine library.
+///
+/// ## Current approach
+///
+/// The `RouteEngine` currently performs LOCAL path computation over the
+/// local `TopologyGraph`'s `LinkTable`. It can only traverse links that
+/// are already present locally. The `DestinationResolver` trait bridges
+/// non-authoritative hints to authenticated records, but the current
+/// implementations (`NullResolver`, `InMemoryResolver`) do NOT perform
+/// distributed discovery.
+///
+/// ## Marker
+///
+/// This trait exists to make the architectural boundary EXPLICIT. The
+/// `DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED` constant below is `false`,
+/// allowing tests and documentation to verify that distributed discovery
+/// is not yet available.
+pub trait DistributedRouteDiscovery {
+    /// Discover a path to a destination by querying next-hop peers.
+    ///
+    /// Returns the ordered path of authenticated NodeIds and the links
+    /// between them, or `None` if discovery failed.
+    ///
+    /// This method is NOT implemented in this milestone.
+    fn discover_path(
+        &mut self,
+        source: &[u8; 32],
+        destination: &[u8; 32],
+    ) -> Option<Vec<([u8; 32], crate::node::link::LinkKey)>>;
+}
+
+/// **N2.1.2.1.** A compile-time and runtime marker indicating whether
+/// distributed route discovery is implemented.
+///
+/// This is `false` in the current milestone. Tests can check this value
+/// to verify that the architecture explicitly marks distributed discovery
+/// as unimplemented.
+pub const DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED: bool = false;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Route cost model
@@ -621,18 +786,22 @@ impl RouteEngine {
         }
     }
 
-    // ─── Path computation (BFS over directed authenticated links) ────────
+    // ─── Path computation (Dijkstra over directed authenticated links) ───
 
     /// Find the lowest-cost usable directed path from source to destination.
     ///
-    /// Uses BFS to find all paths, then selects the lowest-cost one according
-    /// to the `RouteCostModel`. Only USABLE directed links (Up/Degraded)
-    /// are traversed. Only AUTHENTICATED nodes (in the local topology or
-    /// added to the working set) are visited.
+    /// Uses Dijkstra with a proper min-heap to find the lowest-cost path
+    /// according to the `RouteCostModel`. Only USABLE directed links
+    /// (Up/Degraded) are traversed. Only AUTHENTICATED nodes (in the local
+    /// topology or added to the working set) are visited.
     ///
-    /// Returns the ordered path of NodeIds (excluding source, including
-    /// destination) and the ordered list of links, or `None` if no path
-    /// exists.
+    /// **N2.1.2.1:** Returns the ordered path of NodeIds (excluding source,
+    /// including destination), the ordered list of selected Links (each
+    /// carrying its `LinkKey.endpoint`), AND the total computed cost.
+    /// The links are returned so that `build_route` can use the EXACT
+    /// `LinkKey.endpoint` for each `RouteHop` — NOT `record.endpoints.first()`.
+    ///
+    /// Returns `None` if no path exists.
     fn find_path(
         &self,
         topology: &TopologyGraph,
@@ -643,29 +812,14 @@ impl RouteEngine {
         // topology. The path engine checks these if the local topology
         // doesn't have the record.
         extra_records: &HashMap<[u8; 32], AuthenticatedNodeRecord>,
-    ) -> Option<(Vec<[u8; 32]>, Vec<Link>)> {
+    ) -> Option<(Vec<[u8; 32]>, Vec<Link>, u64)> {
         if self.source == [0u8; 32] {
             return None;
         }
 
-        // BFS to find the shortest path (in hops). We do a BFS that records
-        // the parent of each node, then reconstruct the path.
-        //
-        // For cost-model-aware path selection, we use a modified Dijkstra
-        // approach: we explore paths in order of accumulated cost.
-        //
-        // However, the cost model operates on links + nodes, and we need
-        // to look up links from the topology. Let's do a simple approach:
-        // 1. BFS to find ALL shortest-hop paths (within a hop limit).
-        // 2. Among those, pick the lowest-cost one.
-        //
-        // Actually, for correctness with arbitrary cost models, let's do
-        // a proper Dijkstra. The graph is small (at most a few dozen nodes
-        // in the local topology), so this is fine.
-
-        // Build adjacency: for each node, list of (neighbor, link).
-        // We use the topology's directed links.
-        let mut adjacency: HashMap<[u8; 32], Vec<(LinkKey)>> = HashMap::new();
+        // Build adjacency: for each node, list of outgoing LinkKeys.
+        // Only usable directed links are included.
+        let mut adjacency: HashMap<[u8; 32], Vec<LinkKey>> = HashMap::new();
         for link in topology.directory().link_table().all() {
             if link.is_usable() {
                 adjacency
@@ -676,7 +830,7 @@ impl RouteEngine {
         }
 
         // Dijkstra with cost model.
-        // We use a proper min-heap (BinaryHeap with Reverse) to ensure
+        // We use a proper min-heap (BinaryHeap with custom Ord) to ensure
         // the lowest-cost path is always expanded first. This is critical
         // for correctness — a FIFO queue would not guarantee optimal paths.
         //
@@ -715,7 +869,8 @@ impl RouteEngine {
             visited.insert(node);
 
             if node == *destination && !path.is_empty() {
-                return Some((path, links));
+                // N2.1.2.1: return the cost alongside the path and links.
+                return Some((path, links, cost));
             }
 
             // Explore neighbors.
@@ -778,10 +933,17 @@ impl RouteEngine {
     ///
     /// This is the full pipeline for one candidate:
     /// 1. Resolve (if remote).
-    /// 2. Find a usable directed path.
-    /// 3. Construct `RouteHop`s from authenticated records + endpoints.
+    /// 2. Find a usable directed path (Dijkstra).
+    /// 3. Construct `RouteHop`s from authenticated records + **selected link
+    ///    endpoints** (NOT `record.endpoints.first()`).
     /// 4. Validate the route.
     /// 5. Compute `RouteCommitment` (done inside `Route::new_with_hop_details`).
+    /// 6. Store the computed route cost in `RouteReady { route, cost }`.
+    ///
+    /// **N2.1.2.1:** Step 3 uses the `LinkKey.endpoint` from each selected
+    /// link in the Dijkstra path — NOT the first endpoint from the node's
+    /// advertisement. This ensures the `RouteCommitment` binds the endpoint
+    /// that was actually proven usable.
     ///
     /// The candidate state is updated to reflect the outcome.
     pub fn build_route(
@@ -829,15 +991,21 @@ impl RouteEngine {
         }
 
         // Step 2: Find a usable directed path.
-        let path_result = self.find_path(topology, &destination, cost_model, &extra_records);
-        match path_result {
+        // N2.1.2.1: find_path now returns (path, links, cost).
+        // The links carry the selected LinkKey.endpoint for each hop.
+        let (path, links, route_cost) = match self.find_path(
+            topology,
+            &destination,
+            cost_model,
+            &extra_records,
+        ) {
             None => {
                 candidate.state = RouteCandidateState::Failed {
                     reason: RouteDiscoveryError::NoPathFound,
                 };
                 return;
             }
-            Some((path, links)) => {
+            Some((path, links, cost)) => {
                 if path.len() > MAX_ROUTE_HOPS {
                     candidate.state = RouteCandidateState::Failed {
                         reason: RouteDiscoveryError::TooManyHops(path.len()),
@@ -846,17 +1014,32 @@ impl RouteEngine {
                 }
                 // Move to Reachable state.
                 candidate.state = RouteCandidateState::Reachable { path: path.clone() };
+                (path, links, cost)
             }
-        }
-
-        // Step 3: Construct RouteHops from authenticated records + endpoints.
-        let path = match &candidate.state {
-            RouteCandidateState::Reachable { path } => path.clone(),
-            _ => unreachable!(),
         };
 
+        // Step 3: Construct RouteHops from authenticated records + SELECTED
+        // LINK ENDPOINTS.
+        //
+        // N2.1.2.1: For each hop in `path`, the corresponding link in
+        // `links` is the directed link that was proven usable by Dijkstra.
+        // The RouteHop MUST use `link.key.endpoint` — NOT
+        // `record.endpoints.first()`. This ensures the RouteCommitment
+        // binds the exact endpoint that was actually used to prove
+        // reachability.
+        //
+        // path[i] is the i-th hop NodeId (excluding source).
+        // links[i] is the link from path[i-1] (or source if i==0) to path[i].
+        // links[i].key.endpoint is the endpoint of path[i] as reached
+        //   via this specific link.
+        debug_assert_eq!(
+            path.len(),
+            links.len(),
+            "path and links must have the same length"
+        );
+
         let mut hop_details: Vec<RouteHop> = Vec::with_capacity(path.len());
-        for node_id in &path {
+        for (hop_index, (node_id, link)) in path.iter().zip(links.iter()).enumerate() {
             let record = topology
                 .get_record(node_id)
                 .or_else(|| extra_records.get(node_id))
@@ -873,27 +1056,16 @@ impl RouteEngine {
             // Validate the hop is either a relay (intermediate) or gateway (destination).
             let is_destination = *node_id == destination;
             if !is_destination && !record.descriptor.is_relay() {
-                let hop_index = hop_details.len();
                 candidate.state = RouteCandidateState::Failed {
                     reason: RouteDiscoveryError::HopNotRelay { hop_index },
                 };
                 return;
             }
-            // Select the first endpoint. (Endpoint selection policy is
-            // pluggable in principle; for now we use the first.)
-            let endpoint = match record.endpoints.first() {
-                Some(ep) => ep.clone(),
-                None => {
-                    candidate.state = RouteCandidateState::Failed {
-                        reason: RouteDiscoveryError::ValidationFailed(
-                            RouteError::HopMissingEndpoint {
-                                hop_index: hop_details.len(),
-                            },
-                        ),
-                    };
-                    return;
-                }
-            };
+            // N2.1.2.1: Use the SELECTED LINK's endpoint — NOT
+            // record.endpoints.first(). The link was proven usable by
+            // Dijkstra, and its endpoint is the one that must appear in
+            // the RouteHop and RouteCommitment.
+            let endpoint = link.key.endpoint.clone();
             hop_details.push(RouteHop::new(record.descriptor.clone(), endpoint));
         }
 
@@ -908,8 +1080,11 @@ impl RouteEngine {
             return;
         }
 
-        // Step 6: Route is ready.
-        candidate.state = RouteCandidateState::RouteReady { route };
+        // Step 6: Route is ready — store the computed cost.
+        candidate.state = RouteCandidateState::RouteReady {
+            route,
+            cost: route_cost,
+        };
     }
 
     /// Compute routes for all candidates.
@@ -956,10 +1131,38 @@ impl RouteEngine {
             .collect()
     }
 
-    /// Get the best (lowest-cost, first ready) route from a list of candidates.
+    /// **N2.1.2.1.** Get the best (lowest-computed-cost) ready route from a
+    /// list of candidates.
+    ///
+    /// Unlike the previous implementation (which returned the first ready
+    /// candidate based on discovery order), this method selects the route
+    /// with the **minimum actual computed cost** from the `RouteCostModel`.
+    ///
+    /// The cost is stored in `RouteCandidateState::RouteReady { cost }`
+    /// during `build_route()`. It reflects the actual path cost (hop count,
+    /// RTT, etc.) — NOT the `distance_hint` (which is SELF_REPORTED and
+    /// untrusted).
+    ///
+    /// Returns `None` if no candidate is ready.
     #[must_use]
     pub fn best_route(candidates: &[RouteCandidate]) -> Option<&Route> {
-        candidates.iter().filter_map(|c| c.route()).next()
+        candidates
+            .iter()
+            .filter_map(|c| c.route_cost().map(|cost| (cost, c.route().expect("ready"))))
+            .min_by_key(|(cost, _)| *cost)
+            .map(|(_, route)| route)
+    }
+
+    /// **N2.1.2.1.** Get the best ready route AND its computed cost.
+    ///
+    /// Returns `None` if no candidate is ready.
+    #[must_use]
+    pub fn best_route_with_cost(candidates: &[RouteCandidate]) -> Option<(&Route, u64)> {
+        candidates
+            .iter()
+            .filter_map(|c| c.route_cost().map(|cost| (cost, c.route().expect("ready"))))
+            .min_by_key(|(cost, _)| *cost)
+            .map(|(cost, route)| (route, cost))
     }
 }
 
