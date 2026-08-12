@@ -2968,3 +2968,48 @@ GatewayChoice is confined to:
 - legacy.rs (the isolated legacy module)
 - tests/ (test-only code)
 - mod.rs test mod (the static test that enforces the boundary)
+
+---
+Task ID: 183-185 (N2.0.5: Production path trace + north-star test)
+Agent: Z.ai (main)
+
+## Production Path Analysis
+
+Traced every Node entry point to the socket:
+
+1. **serve_relay_persistent** → TcpListener::bind → Link::new(stream, prev_hop_keys) + Link::connect(next_hop, next_hop_keys)
+2. **serve_gateway_persistent** → TcpListener::bind → Link::new(stream, link_keys)
+3. **serve_discovery_persistent** → TcpListener::bind → raw TCP (no Link, advertisement is signed)
+4. **send_request_via_gateway_full_with_relay** → get_or_connect_peer → Link::connect(addr, relay_link_keys)
+5. **discover_gateways** → TcpStream::connect (raw TCP for discovery handshake)
+
+KEY FINDING: ALL production methods take LinkKeys as a PARAMETER. The Node itself does NOT call derive_link_keys or perform_snp_ik_handshake. The CALLER decides which key establishment to use. This means:
+- Production callers use perform_snp_ik_handshake → fresh keys per session
+- Legacy/demo callers use derive_link_keys → deterministic seeds
+- The Node is key-establishment-agnostic — it just uses whatever LinkKeys it receives
+
+The sync TCP (std::net) in Node methods is acceptable for N2.0.5 because:
+1. The key establishment is already SNP-IK (the caller's responsibility)
+2. The deterministic keys are not in production code (static tests enforce)
+3. The async transport is the canonical abstraction but wiring it into every Node method is a separate milestone
+
+## North-Star Test
+
+Created `reference/snp-node/tests/n205_north_star.rs`:
+
+Client → Relay A → Relay B → Gateway → local HTTP server → back
+
+with:
+- 4 dynamic identities (random Ed25519 keypairs generated at runtime)
+- Fresh circuit keys (from random seed, not CIRCUIT_SEED_A/B)
+- Explicit Route object (validated, state machine: Proposed → Establishing → Active)
+- Explicit Circuit object (Circuit::new with explicit gateway_node_id + gateway_public_key)
+- Actual HTTP request through the mesh to a local HTTP server
+- Response body integrity verified (objectId = SHA-256("Hello, ShareNet!"))
+- Gateway signature verified (Ed25519)
+- No GatewayChoice
+- No deterministic test seeds (random seeds derived from SHA-256 of label + timestamp)
+- No compile-time topology
+
+182 tests pass, 0 fail, 3 ignored
+138/138 conformance, 0 disagreements
