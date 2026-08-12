@@ -4098,3 +4098,104 @@ Stage Summary:
 - Stateless staleness bound (MAX_PROPAGATION_MESSAGE_AGE_SECS) supplements
   process-local propagation_state for restart scenarios.
 - Ready for N2.1.2 (route computation).
+
+---
+Task ID: 281-300 (N2.1.2 — Route Discovery, Construction, and Validation)
+Agent: Z.ai (main)
+
+Task: Implement the first real route-discovery system for ShareNet. The goal is NOT merely "run Dijkstra on a graph" — it is to discover and construct an EXECUTABLE, AUTHENTICATED route through ShareNet nodes toward an Internet gateway, while strictly separating authoritative topology knowledge from non-authoritative discovery hints.
+
+Work Log:
+- Created route_engine.rs (~970 lines) with:
+  * RouteEngine — the main route discovery engine.
+  * RouteCandidate — a destination candidate (direct or remote).
+  * CandidateOrigin — Direct (authenticated) vs Remote (hint).
+  * RouteCandidateState — Discovered → Resolving → Authenticated → Reachable → RouteReady (or Failed). States are NOT collapsed.
+  * RouteDiscoveryError — detailed failure reasons.
+  * DestinationResolver trait — resolves RemoteNodeHint → AuthenticatedNodeRecord.
+    - NullResolver: never resolves.
+    - InMemoryResolver: for testing.
+  * RouteCostModel trait — pluggable cost model.
+    - HopCountCost: minimize hops (default), ties broken by RTT.
+    - LowLatencyCost: minimize total measured RTT.
+  * NodeIdHex — Display wrapper for [u8; 32] in error messages.
+  * HeapEntry — proper BinaryHeap min-heap entry for Dijkstra.
+
+- Route discovery pipeline:
+  1. discover_gateway_candidates(): direct (all_gateway_records) + remote (gateway_hints).
+  2. resolve_candidate(): DestinationResolver resolves hint → AuthenticatedNodeRecord.
+  3. find_path(): Dijkstra over usable directed authenticated links (proper BinaryHeap min-heap).
+  4. build_route(): construct RouteHop sequence from AuthenticatedNodeRecords + endpoints.
+  5. Route::validate(): check all structural invariants.
+  6. RouteCommitment: computed at Route construction time (canonical CBOR hash).
+
+- Infrastructure additions:
+  * AdvertisementAcceptanceStore::all_records(): iterate ALL accepted records.
+  * PeerDirectory::all_gateway_records(): ALL gateway records (not just directly reachable).
+  * TopologyGraph::all_gateway_records(): delegates to PeerDirectory.
+
+- Security invariants enforced:
+  1. No hint → hop conversion (type system + resolution required).
+  2. No unauthenticated hop (RouteHop requires VerifiedNodeDescriptor).
+  3. No distance_hint as route (SELF_REPORTED, only prioritizes resolution).
+  4. Directed links only (A→B does not enable B→A).
+  5. Relay capability required for intermediate hops.
+  6. X25519 circuit key required for destination gateway.
+  7. No topology poisoning (failed candidates don't mutate TopologyGraph).
+  8. Route validation (all structural invariants checked).
+
+- Metric classification:
+  * MEASURED: locally observed link RTT, success rate.
+  * SIGNED: authenticated capabilities from VerifiedNodeDescriptor.
+  * SELF_REPORTED: distance_hint, claimed_capabilities (untrusted).
+    → only affects candidate resolution ORDER, never route cost.
+
+- 20 new tests (n212_route_engine.rs):
+  1. direct_gateway_route (A → G)
+  2. two_hop_gateway_route (A → B → G)
+  3. three_hop_gateway_route (A → B → C → G)
+  4. remote_gateway_hint_is_not_route
+  5. forged_gateway_hint_cannot_become_route
+  6. directed_link_required
+  7. stale_link_rejected
+  8. stale_destination_advertisement_rejected
+  9. unauthenticated_hop_rejected
+  10. gateway_without_x25519_rejected
+  11. route_commitment_changes_when_hop_changes
+  12. route_commitment_changes_when_endpoint_changes
+  13. route_validation_rejects_invalid_order
+  14. route_resolution_survives_alternate_candidate
+  15. candidate_gateway_discovery_from_remote_hint
+  16. north_star_multi_hop_route (A → B → C → G, full pipeline)
+  17. candidate_origin_distinguishes_direct_vs_remote
+  18. distance_hint_does_not_affect_route_cost
+  19. failed_candidate_does_not_poison_topology
+  20. low_latency_cost_model_selects_better_path
+
+- North-star test: A has no direct Internet gateway. A knows B, B knows C,
+  C knows G. A learns a RemoteNodeHint saying G is a gateway. A does NOT
+  initially possess G's authenticated advertisement. The route engine:
+  1. discovers G as a candidate (from hint)
+  2. resolves G (via InMemoryResolver)
+  3. establishes the path A → B → C → G (Dijkstra over directed links)
+  4. authenticates every hop (VerifiedNodeDescriptor per hop)
+  5. constructs the Route (RouteHop sequence)
+  6. validates it (Route::validate())
+  7. computes RouteCommitment (canonical CBOR hash)
+  8. returns RouteReady
+
+- Test results: 293 passed, 0 failed, 3 ignored (was 272; +21 new).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Route engine discovers, resolves, and constructs authenticated routes.
+- RemoteNodeHint is NEVER directly converted to a RouteHop.
+- DestinationResolver trait bridges hints → authenticated records.
+- Dijkstra with proper BinaryHeap min-heap (not FIFO) for correct path selection.
+- Pluggable cost models (HopCountCost, LowLatencyCost).
+- distance_hint is SELF_REPORTED, only affects candidate order, never route cost.
+- Failed candidates do NOT poison the topology.
+- Route validation enforces all structural invariants.
+- RouteCommitment binds the exact authoritative route contents.
+- North-star test proves the full A → B → C → G pipeline works end-to-end.
+- Ready for N2.2 (Internet gateway traffic) or N2.1.3 (route recovery).
