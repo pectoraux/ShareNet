@@ -2,10 +2,14 @@
 //!
 //! Extracted from node.rs for N2.0.3 Gate J (Node decomposition).
 //! Updated for N2.0.4 Gate A (real BootstrapDiscovery I/O).
+//!
+//! **N2.0.6:** The sync `BootstrapDiscovery` implementation is
+//! `#[deprecated]` — production code MUST use the async equivalent
+//! `async_node::discover_gateways_async`. Retained for backward-compat with
+//! the N2.0.4 sync tests.
 
 use super::*;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 
@@ -166,10 +170,14 @@ impl BootstrapDiscovery {
     /// Implements the raw discovery protocol (see the struct doc). Returns
     /// an error string (NOT a [`NodeError`]) so the caller can log it
     /// alongside the failing address — `discover()` does exactly this.
+    ///
+    /// **N2.0.6: DEPRECATED** — use the async equivalent
+    /// `async_node::discover_gateways_async`.
+    #[deprecated(since = "N2.0.6", note = "use `async_node::discover_gateways_async`")]
     fn discover_one(&self, addr: &str) -> Result<DiscoveredNode, String> {
         // 1. Connect.
         let mut stream =
-            TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+            std::net::TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
         // Disable Nagle — the discovery request is 1 byte.
         let _ = stream.set_nodelay(true);
         // Set a read timeout so we don't hang on unresponsive gateways.
@@ -234,6 +242,13 @@ impl BootstrapDiscovery {
 }
 
 impl DiscoveryProvider for BootstrapDiscovery {
+    /// **N2.0.6: DEPRECATED** — use `async_node::discover_gateways_async`.
+    /// (Trait impl methods cannot carry `#[deprecated]`; the deprecation is
+    /// documented here and enforced by the static test
+    /// `sync_tcp_not_in_production_node_modules`, which scans for
+    /// `std::net::TcpStream::connect` references — those are in
+    /// `discover_one`, which IS `#[deprecated]`.)
+    #[allow(deprecated)]
     fn discover(&self) -> Vec<DiscoveredNode> {
         let mut results = Vec::with_capacity(self.addrs.len());
         for addr in &self.addrs {

@@ -14,6 +14,8 @@ snp-identity.workspace = true
 snp-frames.workspace = true
 thiserror.workspace = true
 getrandom = "0.2"
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "macros", "time"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }

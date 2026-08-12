@@ -1,42 +1,62 @@
-//! N2.0.5 North-Star Integration Test
+//! N2.0.6 North-Star Integration Test — the strongest reference-level proof.
 //!
-//! The strongest reference-level simulation:
+//! Topology:
 //!
-//! Client → Relay A → Relay B → Gateway → local HTTP → back
+//! ```text
+//!   Client ──[SNP-IK/0.1]──> Relay A ──[SNP-IK/0.1]──> Relay B ──[SNP-IK/0.1]──> Gateway ──> local HTTP
+//!     └──────────────────── [circuit DH: client↔gateway X25519] ────────────────────┘
+//! ```
 //!
-//! with:
-//! - Dynamic identities (random Ed25519 + X25519 keypairs)
-//! - SNP-IK/0.1 handshake for fresh directional session keys at each hop
-//! - Fresh circuit keys from client↔gateway X25519 DH
-//! - Actual HTTP request through the mesh
-//! - Relay failure → route recovery
-//! - Gateway failure → alternate gateway
-//! - No process restart
-//! - No GatewayChoice
-//! - No deterministic session keys
-//! - No compile-time topology
+//! This test exercises the FULL canonical production path:
+//!
+//! 1. **Dynamic identities** — 4 random Ed25519 + X25519 keypairs (no
+//!    deterministic seeds, no `GatewayChoice`, no compile-time topology).
+//! 2. **SNP-IK/0.1 handshakes** at every hop via
+//!    [`perform_snp_ik_handshake_async`] — fresh directional AEAD link keys
+//!    per hop, identity binding (the client pins each peer's NodeId).
+//! 3. **Canonical async transport** — [`AsyncLink`] (Tokio-based AEAD
+//!    framing) for all frame send/recv.
+//! 4. **Dynamic Route** — [`Route::new`] with an explicit hop list, validated
+//!    by [`Route::validate`], state machine driven Proposed → Establishing
+//!    → Active.
+//! 5. **Dynamic Circuit** — [`Circuit::new`] with the gateway's NodeId +
+//!    Ed25519 public key + fresh circuit keys derived from a client↔gateway
+//!    X25519 DH (NOT a deterministic seed).
+//! 6. **Real HTTP traffic** — a local HTTP server returns `"Hello, ShareNet!"`;
+//!    the client sends a TransitRequest through the mesh; the gateway fetches
+//!    via `PinnedConnector::from_parts` (test-only SSRF bypass for 127.0.0.1);
+//!    the response body's SHA-256 (`object_id`) is verified end-to-end.
+//! 7. **No process restart** — relay and gateway run in tokio tasks; the
+//!    client task sends the request and verifies the response.
 
 #![allow(clippy::pedantic, deprecated)]
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
 
-use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_ephemeral_keypair};
-use snp_frames::Frame;
+use snp_crypto::{
+    derive_node_id, derive_public_key, sha256, x25519_dh, x25519_static_keypair, X25519PubKey,
+    X25519Secret,
+};
+use snp_frames::{Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_gateway::{
-    decode_transit_response, encode_transit_request, handle_transit_request,
-    sign_transit_request, verify_transit_response, TransitRequest, TransitResponse,
+    decode_transit_response, encode_transit_request, sign_transit_request,
+    verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
+};
+use snp_link::async_link::{
+    async_relay_forward_links, perform_snp_ik_handshake_async, AsyncLink,
 };
 use snp_link::{
-    decrypt_circuit_payload, encrypt_circuit_payload, perform_snp_ik_handshake, Link, LinkKeys,
-    CircuitKeys,
+    decrypt_circuit_payload, derive_circuit_keys_from_dh, encrypt_circuit_payload, LinkKeys,
 };
 use snp_node::node::{
-    Node, NodeIdentity, GatewayAdvertisement, Circuit, Route, RouteState,
+    async_node::serve_one_gateway_request_async_with_connector, Circuit, Node, NodeIdentity,
+    Route, RouteState, ServeOutcome, Capability,
 };
+use std::net::{IpAddr, Ipv4Addr};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
+/// Now-unix-seconds helper.
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,330 +64,366 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Generate a random Ed25519 + X25519 identity for a node.
+/// A node's full identity: Ed25519 (signing) + X25519 (rendezvous) + NodeId.
+///
+/// The X25519 secret is wrapped in `Arc` so it can be shared between the
+/// circuit-DH computation (in the test thread) and the SNP-IK/0.1 handshake
+/// (in a tokio task). `X25519Secret` is not `Clone`, but `Arc::clone` just
+/// bumps the refcount — the underlying secret bytes are shared.
 struct NodeIdents {
     ed_sk: [u8; 32],
     ed_pk: [u8; 32],
-    x_sk: snp_crypto::X25519Secret,
-    x_pk: snp_crypto::X25519PubKey,
+    x_sk: Arc<X25519Secret>,
+    x_pk: X25519PubKey,
     node_id: [u8; 32],
 }
 
 impl NodeIdents {
-    fn random(label: &[u8]) -> Self {
-        let mut seed = Vec::new();
-        seed.extend_from_slice(label);
-        seed.extend_from_slice(&now_unix().to_be_bytes());
-        seed.extend_from_slice(&[0u8; 8]); // counter would go here
-        let ed_sk = sha256(&seed);
+    /// Generate a fresh identity from an OS-CSPRNG (NO deterministic seeds).
+    fn fresh() -> Self {
+        let mut ed_sk = [0u8; 32];
+        getrandom::getrandom(&mut ed_sk).expect("getrandom");
         let ed_pk = derive_public_key(&ed_sk);
-        let (x_sk, x_pk) = x25519_ephemeral_keypair();
         let node_id = derive_node_id(&ed_pk);
-        Self { ed_sk, ed_pk, x_sk, x_pk, node_id }
+        let (x_sk, x_pk) = x25519_static_keypair();
+        Self {
+            ed_sk,
+            ed_pk,
+            x_sk: Arc::new(x_sk),
+            x_pk,
+            node_id,
+        }
     }
 }
 
-/// Perform SNP-IK/0.1 handshake between two nodes over a TCP connection.
-/// Returns (initiator_link_keys, responder_link_keys, session_id).
-fn do_handshake(
-    initiator: &NodeIdents,
-    responder: &NodeIdents,
-    addr: &str,
-) -> (LinkKeys, LinkKeys, [u8; 32]) {
-    // Responder listens
-    let listener = TcpListener::bind(addr).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let listener = TcpListener::bind(&addr).unwrap();
-
-    let r_sk = responder.ed_sk;
-    let r_pk = responder.ed_pk;
-    let r_x_sk = responder.x_sk.clone(); // X25519StaticSecret is not Clone... we need a workaround
-    let r_x_pk = responder.x_pk;
-
-    // We can't clone X25519Secret. So we need to generate a NEW X25519 keypair
-    // for the responder that matches. Actually, perform_snp_ik_handshake takes
-    // references, so we just need the responder to use the same keys.
-    // The issue is that X25519StaticSecret doesn't implement Clone.
-    // Solution: generate fresh X25519 keypairs for the handshake (they're ephemeral anyway
-    // in the SNP-IK construction — the static key is the X25519 rendezvous key from the NodeDescriptor).
-    // Actually, perform_snp_ik_handshake generates its OWN ephemeral key internally.
-    // The my_x25519_secret/public are the STATIC X25519 keys (rendezvousPub from NodeDescriptor).
-    // We need the responder to use the SAME static X25519 keypair it advertised.
-    // Since X25519StaticSecret is not Clone, we need to generate a new one and pass it.
-    // For this test, we'll generate fresh static X25519 keypairs for each node
-    // and use those for the handshake.
-
-    let h = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        perform_snp_ik_handshake(
-            &mut stream,
-            false, // responder
-            &r_sk,
-            &r_pk,
-            &r_x_sk,
-            &r_x_pk,
-            None,
-        ).unwrap()
-    });
-
-    let mut client = TcpStream::connect(&addr).unwrap();
-    let i_result = perform_snp_ik_handshake(
-        &mut client,
-        true, // initiator
-        &initiator.ed_sk,
-        &initiator.ed_pk,
-        &initiator.x_sk,
-        &initiator.x_pk,
-        Some(&responder.node_id),
-    ).unwrap();
-
-    let r_result = h.join().unwrap();
-
-    // Verify keys match
-    assert_eq!(i_result.link_keys.send_key, r_result.link_keys.recv_key,
-        "Initiator send_key must equal responder recv_key");
-    assert_eq!(i_result.link_keys.recv_key, r_result.link_keys.send_key,
-        "Initiator recv_key must equal responder send_key");
-    assert_eq!(i_result.peer_node_id, responder.node_id,
-        "Initiator must see responder's NodeId");
-
-    (i_result.link_keys, r_result.link_keys, i_result.session_id)
+/// Bind an ephemeral port and return the address (drops the listener).
+async fn ephemeral_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().to_string()
 }
 
-/// Start a local HTTP server that returns a deterministic response.
-fn start_local_http() -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// Perform the SNP-IK/0.1 handshake as the INITIATOR (client side).
+///
+/// Connects to `peer_addr`, performs the handshake with `expected_peer_node_id`
+/// pinning, returns the resulting `LinkKeys` + the `AsyncLink` ready for use.
+async fn handshake_initiator(
+    my_idents: &NodeIdents,
+    peer_addr: &str,
+    expected_peer_node_id: &[u8; 32],
+) -> (LinkKeys, AsyncLink) {
+    let mut stream = AsyncLink::connect_raw(peer_addr)
+        .await
+        .expect("initiator: connect");
+    let result = perform_snp_ik_handshake_async(
+        &mut stream,
+        true, // initiator
+        &my_idents.ed_sk,
+        &my_idents.ed_pk,
+        &my_idents.x_sk,
+        &my_idents.x_pk,
+        Some(expected_peer_node_id),
+    )
+    .await
+    .expect("initiator: handshake");
+    assert_eq!(
+        result.peer_node_id, *expected_peer_node_id,
+        "initiator: peer NodeId must match expected (identity substitution would be rejected)"
+    );
+    let link = AsyncLink::new(stream, result.link_keys);
+    (result.link_keys, link)
+}
+
+/// A local HTTP server that returns a deterministic body.
+async fn start_local_http() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
-        let _ = stream.read(&mut buf);
+        let _ = stream.read(&mut buf).await;
         let body = b"Hello, ShareNet!";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        stream.write_all(response.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
     });
     (addr, handle)
 }
 
-/// Run a gateway that fetches from a local HTTP server.
-fn run_gateway(
-    listen_addr: &str,
-    gateway_idents: &NodeIdents,
-    link_keys: LinkKeys,
-    circuit_keys: CircuitKeys,
-    http_addr: &str,
-) {
-    let listener = TcpListener::bind(listen_addr).unwrap();
-    let (mut stream, _) = listener.accept().unwrap();
-    let link = Link::new(stream, link_keys);
+/// Test-only connector factory: bypasses `is_private_destination` to allow
+/// fetching from the local mock HTTP server on 127.0.0.1.
+fn test_connector_factory(
+    url: &str,
+) -> Result<PinnedConnector, snp_node::legacy::NodeError> {
+    let parsed = url::Url::parse(url).expect("parse url");
+    let port = parsed.port_or_known_default().expect("port");
+    Ok(PinnedConnector::from_parts(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        parsed.host_str().unwrap_or("test.local").to_string(),
+        port,
+        parsed.scheme().to_string(),
+        parsed.path().to_string(),
+    ))
+}
 
-    // Recv request frame
-    let req_frame = link.recv_frame().unwrap();
-    assert!(!snp_frames::should_drop(&req_frame));
+/// Hex-short for diagnostics.
+fn hex_short(b: &[u8]) -> String {
+    let n = b.len().min(8);
+    b[..n]
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<String>()
+        + "…"
+}
 
-    // Decrypt circuit payload
-    let req_bytes = decrypt_circuit_payload(&circuit_keys.recv_key, &req_frame.body)
-        .expect("circuit decrypt");
-    let transit_req: TransitRequest = snp_gateway::decode_transit_request(&req_bytes).unwrap();
+// ─── Test 1: north-star happy path (manual client send) ─────────────────────
 
-    // Verify client signature
-    // (In production, the gateway would know the client's public key from the
-    // circuit handshake. For this test, we use a test client key.)
-    let client_sk = sha256(b"north-star-client-ed25519-key");
-    let client_pk = derive_public_key(&client_sk);
-    assert!(snp_gateway::verify_transit_request(&transit_req, &client_pk),
-        "Gateway must verify client signature");
+/// The north-star integration test:
+///
+/// Client → Relay A → Relay B → Gateway → local HTTP → back, with:
+/// - 4 dynamic identities (fresh Ed25519 + X25519 keypairs)
+/// - SNP-IK/0.1 handshakes at every hop (identity binding, fresh keys)
+/// - Canonical async transport (AsyncLink / tokio)
+/// - Dynamic Route (Proposed → Establishing → Active)
+/// - Dynamic Circuit (fresh client↔gateway X25519 DH)
+/// - Real HTTP traffic + body integrity (objectId = SHA-256(body))
+/// - No GatewayChoice, no deterministic seeds, no compile-time topology
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn north_star_async_snp_ik_dynamic_mesh_with_http() {
+    // ═══ 1. Generate dynamic identities ═══
+    let client_idents = NodeIdents::fresh();
+    let relay_a_idents = NodeIdents::fresh();
+    let relay_b_idents = NodeIdents::fresh();
+    let gateway_idents = NodeIdents::fresh();
 
-    // Fetch from local HTTP server using a raw TCP connection (bypassing SSRF
-    // for this test — the local HTTP server is a test fixture)
-    let mut http_stream = TcpStream::connect(http_addr).unwrap();
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n"
+    eprintln!("[north-star] client     nodeId={}", hex_short(&client_idents.node_id));
+    eprintln!("[north-star] relay A    nodeId={}", hex_short(&relay_a_idents.node_id));
+    eprintln!("[north-star] relay B    nodeId={}", hex_short(&relay_b_idents.node_id));
+    eprintln!("[north-star] gateway    nodeId={}", hex_short(&gateway_idents.node_id));
+
+    // ═══ 2. Allocate ephemeral ports + start HTTP ═══
+    let gateway_transit_addr = ephemeral_addr().await;
+    let relay_b_addr = ephemeral_addr().await;
+    let relay_a_addr = ephemeral_addr().await;
+    let (http_addr, http_handle) = start_local_http().await;
+    // The URL the client requests — uses the local HTTP server's actual port.
+    // The `test_connector_factory` bypasses SSRF to allow 127.0.0.1.
+    let http_url = format!("http://test.local:{}/", http_addr.rsplit(':').next().unwrap());
+
+    // ═══ 3. Establish circuit keys via client↔gateway X25519 DH ═══
+    // The circuit key is end-to-end (client ↔ gateway); relays NEVER possess it.
+    // Both sides compute the SAME DH output (X25519 is symmetric).
+    let circuit_dh_client = x25519_dh(&client_idents.x_sk, &gateway_idents.x_pk);
+    let circuit_dh_gateway = x25519_dh(&gateway_idents.x_sk, &client_idents.x_pk);
+    assert_eq!(
+        circuit_dh_client, circuit_dh_gateway,
+        "client↔gateway X25519 DH must produce the same shared secret on both sides"
     );
-    http_stream.write_all(request.as_bytes()).unwrap();
-    let mut http_response = Vec::new();
-    http_stream.read_to_end(&mut http_response).unwrap();
+    let client_circuit_keys = derive_circuit_keys_from_dh(&circuit_dh_client, true);
+    let gateway_circuit_keys = derive_circuit_keys_from_dh(&circuit_dh_gateway, false);
 
-    // Parse the HTTP response (simple: just take the body after \r\n\r\n)
-    let body_start = http_response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    let body = &http_response[body_start..];
-    let object_id = sha256(body);
-
-    // Build and sign TransitResponse
-    let mut response = TransitResponse {
-        req_id: transit_req.req_id,
-        status: 200,
-        headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
-        object_id,
-        fetched_at: now_unix(),
-        gateway_id: gateway_idents.node_id,
-        gateway_sig: [0u8; 64],
-    };
-    snp_gateway::sign_transit_response(&mut response, &gateway_idents.ed_sk);
-
-    // Encrypt response
-    let resp_bytes = snp_gateway::encode_transit_response(&response).unwrap();
-    let sealed_resp = encrypt_circuit_payload(&circuit_keys.send_key, &resp_bytes);
-
-    // Send response frame
-    let resp_frame = Frame {
-        v: snp_frames::FRAME_VERSION,
-        cls: b'B',
-        dst: req_frame.src,
-        src: gateway_idents.node_id,
-        ttl: snp_frames::FRAME_TTL_MAX,
-        fid: req_frame.fid,
-        seq: req_frame.seq + 1,
-        body: sealed_resp,
-    };
-    link.send_frame(&resp_frame).unwrap();
-}
-
-/// Run a relay that forwards one round-trip.
-fn run_relay(
-    listen_addr: &str,
-    next_hop_addr: &str,
-    prev_hop_keys: LinkKeys,
-    next_hop_keys: LinkKeys,
-) {
-    let listener = TcpListener::bind(listen_addr).unwrap();
-    let (client_stream, _) = listener.accept().unwrap();
-    let client_link = Arc::new(Link::new(client_stream, prev_hop_keys));
-    let gw_link = Arc::new(Link::connect(next_hop_addr, next_hop_keys).unwrap());
-
-    // Forward client → gateway
-    let mut frame = client_link.recv_frame().unwrap();
-    if frame.ttl > 0 { frame.ttl -= 1; }
-    gw_link.send_frame(&frame).unwrap();
-
-    // Forward gateway → client
-    let mut resp = gw_link.recv_frame().unwrap();
-    if resp.ttl > 0 { resp.ttl -= 1; }
-    client_link.send_frame(&resp).unwrap();
-}
-
-#[test]
-fn north_star_dynamic_mesh_with_snp_ik() {
-    // === Generate dynamic identities ===
-    let client_idents = NodeIdents::random(b"north-star-client");
-    let relay_a_idents = NodeIdents::random(b"north-star-relay-a");
-    let relay_b_idents = NodeIdents::random(b"north-star-relay-b");
-    let gateway_idents = NodeIdents::random(b"north-star-gateway");
-
-    // === Start local HTTP server ===
-    let (http_addr, http_handle) = start_local_http();
-
-    // === Allocate ephemeral ports ===
-    let gw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let gw_addr = gw_listener.local_addr().unwrap().to_string();
-    let gw_addr_for_relay_b = gw_addr.clone();
-    drop(gw_listener);
-
-    let relay_b_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let relay_b_addr = relay_b_listener.local_addr().unwrap().to_string();
-    let relay_b_addr_for_relay_a = relay_b_addr.clone();
-    drop(relay_b_listener);
-
-    let relay_a_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let relay_a_addr = relay_a_listener.local_addr().unwrap().to_string();
-    let relay_a_addr_for_client = relay_a_addr.clone();
-    drop(relay_a_listener);
-
-    // === Perform SNP-IK/0.1 handshakes to establish fresh session keys ===
-    // Note: We can't use perform_snp_ik_handshake directly because it needs
-    // the X25519 static keys and the TCP stream. For this test, we generate
-    // fresh X25519 keypairs and perform the handshake over TCP.
-    //
-    // However, the Node's serve_relay_persistent and serve_gateway_persistent
-    // take LinkKeys as a parameter — they don't do the handshake internally.
-    // So we need to either:
-    // 1. Do the handshake FIRST, then pass the resulting LinkKeys to the Node
-    // 2. Or use derive_link_keys (which the test does, since the Node methods
-    //    take pre-computed keys)
-    //
-    // For this north-star test, we use derive_link_keys with RANDOM seeds
-    // (not deterministic test seeds) to prove that the Node works with
-    // arbitrary keys. In production, the caller would use perform_snp_ik_handshake.
-
-    let s1_seed = sha256(b"north-star-s1-random-seed");
-    let s2_seed = sha256(b"north-star-s2-random-seed");
-    let s3_seed = sha256(b"north-star-s3-random-seed");
-
-    let client_relay_keys = snp_link::derive_link_keys(&s1_seed, true);
-    let relay_a_client_keys = snp_link::derive_link_keys(&s1_seed, false);
-    let relay_a_relay_b_keys = snp_link::derive_link_keys(&s2_seed, true);
-    let relay_b_relay_a_keys = snp_link::derive_link_keys(&s2_seed, false);
-    let relay_b_gw_keys = snp_link::derive_link_keys(&s3_seed, true);
-    let gw_relay_b_keys = snp_link::derive_link_keys(&s3_seed, false);
-
-    // === Generate fresh circuit keys ===
-    let circuit_seed = sha256(b"north-star-circuit-random-seed");
-    let client_circuit = snp_link::derive_circuit_keys(&circuit_seed, true);
-    let gateway_circuit = snp_link::derive_circuit_keys(&circuit_seed, false);
-
-    // === Construct Route ===
-    let route = Route::new(
+    // ═══ 4. Construct the dynamic Route ═══
+    let mut route = Route::new(
         client_idents.node_id,
         gateway_idents.node_id,
-        vec![relay_a_idents.node_id, relay_b_idents.node_id, gateway_idents.node_id],
+        vec![
+            relay_a_idents.node_id,
+            relay_b_idents.node_id,
+            gateway_idents.node_id,
+        ],
     );
-    assert!(route.validate().is_ok(), "Route must be valid");
-    let mut route = route;
-    route.transition(RouteState::Establishing).unwrap();
-    route.transition(RouteState::Active).unwrap();
-
-    // === Construct Circuit ===
-    let circuit = Circuit::new(
-        gateway_idents.node_id,
-        gateway_idents.ed_pk,
-        client_circuit,
+    route.validate().expect("route must be valid");
+    route.transition(RouteState::Establishing).expect("Proposed → Establishing");
+    eprintln!(
+        "[north-star] route: {} hops (relay A → relay B → gateway)",
+        route.hops.len()
     );
 
-    // === Start gateway ===
-    let gw_handle = std::thread::spawn({
-        let gw_idents = gateway_idents.clone_shallow();
-        let link_keys = gw_relay_b_keys;
-        let circuit_keys = gateway_circuit;
-        let http_addr = http_addr.clone();
-        move || {
-            run_gateway(&gw_addr, &gw_idents, link_keys, circuit_keys, &http_addr);
-        }
-    });
-    std::thread::sleep(Duration::from_millis(50));
+    // ═══ 5. Start the gateway (async, with handshake-on-accept) ═══
+    let gateway_handle = {
+        let gateway_sk = gateway_idents.ed_sk;
+        let gateway_pk = gateway_idents.ed_pk;
+        let gateway_x_sk = Arc::clone(&gateway_idents.x_sk);
+        let gateway_x_pk = gateway_idents.x_pk;
+        let gateway_node_id = gateway_idents.node_id;
+        let client_ed_pk = client_idents.ed_pk;
+        let circuit_keys = gateway_circuit_keys;
+        let listen_addr = gateway_transit_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen_addr).await.expect("gateway: bind");
+            eprintln!("[north-star] gateway listening on {listen_addr}");
+            let (mut stream, _) = listener.accept().await.expect("gateway: accept");
+            eprintln!("[north-star] gateway accepted relay connection");
+            let handshake = perform_snp_ik_handshake_async(
+                &mut stream,
+                false, // responder
+                &gateway_sk,
+                &gateway_pk,
+                &gateway_x_sk,
+                &gateway_x_pk,
+                None,
+            )
+            .await
+            .expect("gateway: handshake");
+            eprintln!(
+                "[north-star] gateway handshake OK, peer (relay) nodeId={}",
+                hex_short(&handshake.peer_node_id)
+            );
+            let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+            let mut seen_req_ids = std::collections::HashSet::new();
+            // Serve loop (one request for this test).
+            loop {
+                let outcome = serve_one_gateway_request_async_with_connector(
+                    &link,
+                    gateway_node_id,
+                    &gateway_sk,
+                    &client_ed_pk,
+                    &circuit_keys,
+                    &mut seen_req_ids,
+                    &|url| test_connector_factory(url),
+                )
+                .await;
+                match outcome {
+                    Ok(ServeOutcome::Continue) => {
+                        eprintln!("[north-star] gateway served one request");
+                        break;
+                    }
+                    Ok(ServeOutcome::Closed) => {
+                        eprintln!("[north-star] gateway connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[north-star] gateway error: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // === Start relay B (forwards to gateway) ===
-    let relay_b_handle = std::thread::spawn({
-        let next_hop = gw_addr_for_relay_b.clone();
-        let prev_keys = relay_b_relay_a_keys;
-        let next_keys = relay_b_gw_keys;
-        move || {
-            run_relay(&relay_b_addr, &next_hop, prev_keys, next_keys);
-        }
-    });
-    std::thread::sleep(Duration::from_millis(50));
+    // ═══ 6. Start Relay B (async, handshakes on both sides) ═══
+    let relay_b_handle = {
+        let relay_b_sk = relay_b_idents.ed_sk;
+        let relay_b_pk = relay_b_idents.ed_pk;
+        let relay_b_x_sk = Arc::clone(&relay_b_idents.x_sk);
+        let relay_b_x_pk = relay_b_idents.x_pk;
+        let gateway_node_id = gateway_idents.node_id;
+        let listen_addr = relay_b_addr.clone();
+        let gateway_addr = gateway_transit_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen_addr).await.expect("relay B: bind");
+            eprintln!("[north-star] relay B listening on {listen_addr}");
+            let (mut prev_stream, _) = listener.accept().await.expect("relay B: accept");
+            eprintln!("[north-star] relay B accepted relay A connection");
+            let prev_handshake = perform_snp_ik_handshake_async(
+                &mut prev_stream,
+                false, // responder (Relay A is the initiator here)
+                &relay_b_sk,
+                &relay_b_pk,
+                &relay_b_x_sk,
+                &relay_b_x_pk,
+                None,
+            )
+            .await
+            .expect("relay B: prev handshake");
+            eprintln!(
+                "[north-star] relay B handshake with relay A OK, peer nodeId={}",
+                hex_short(&prev_handshake.peer_node_id)
+            );
+            let prev_link = Arc::new(AsyncLink::new(prev_stream, prev_handshake.link_keys));
+            // Connect to gateway + handshake (initiator).
+            let mut next_stream = AsyncLink::connect_raw(&gateway_addr)
+                .await
+                .expect("relay B: connect to gateway");
+            let next_handshake = perform_snp_ik_handshake_async(
+                &mut next_stream,
+                true, // initiator
+                &relay_b_sk,
+                &relay_b_pk,
+                &relay_b_x_sk,
+                &relay_b_x_pk,
+                Some(&gateway_node_id),
+            )
+            .await
+            .expect("relay B: next handshake");
+            assert_eq!(
+                next_handshake.peer_node_id, gateway_node_id,
+                "relay B: gateway identity must match expected"
+            );
+            eprintln!("[north-star] relay B handshake with gateway OK");
+            let next_link = Arc::new(AsyncLink::new(next_stream, next_handshake.link_keys));
+            let _ = async_relay_forward_links(prev_link, next_link).await;
+            eprintln!("[north-star] relay B forwarding complete");
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // === Start relay A (forwards to relay B) ===
-    let relay_a_handle = std::thread::spawn({
-        let next_hop = relay_b_addr_for_relay_a.clone();
-        let prev_keys = relay_a_client_keys;
-        let next_keys = relay_a_relay_b_keys;
-        move || {
-            run_relay(&relay_a_addr, &next_hop, prev_keys, next_keys);
-        }
-    });
-    std::thread::sleep(Duration::from_millis(50));
+    // ═══ 7. Start Relay A (async, handshakes on both sides) ═══
+    let relay_a_handle = {
+        let relay_a_sk = relay_a_idents.ed_sk;
+        let relay_a_pk = relay_a_idents.ed_pk;
+        let relay_a_x_sk = Arc::clone(&relay_a_idents.x_sk);
+        let relay_a_x_pk = relay_a_idents.x_pk;
+        let relay_b_node_id = relay_b_idents.node_id;
+        let listen_addr = relay_a_addr.clone();
+        let relay_b_addr_local = relay_b_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen_addr).await.expect("relay A: bind");
+            eprintln!("[north-star] relay A listening on {listen_addr}");
+            let (mut prev_stream, _) = listener.accept().await.expect("relay A: accept");
+            eprintln!("[north-star] relay A accepted client connection");
+            let prev_handshake = perform_snp_ik_handshake_async(
+                &mut prev_stream,
+                false, // responder (client is the initiator)
+                &relay_a_sk,
+                &relay_a_pk,
+                &relay_a_x_sk,
+                &relay_a_x_pk,
+                None,
+            )
+            .await
+            .expect("relay A: prev handshake");
+            eprintln!(
+                "[north-star] relay A handshake with client OK, peer nodeId={}",
+                hex_short(&prev_handshake.peer_node_id)
+            );
+            let prev_link = Arc::new(AsyncLink::new(prev_stream, prev_handshake.link_keys));
+            // Connect to relay B + handshake (initiator).
+            let mut next_stream = AsyncLink::connect_raw(&relay_b_addr_local)
+                .await
+                .expect("relay A: connect to relay B");
+            let next_handshake = perform_snp_ik_handshake_async(
+                &mut next_stream,
+                true, // initiator
+                &relay_a_sk,
+                &relay_a_pk,
+                &relay_a_x_sk,
+                &relay_a_x_pk,
+                Some(&relay_b_node_id),
+            )
+            .await
+            .expect("relay A: next handshake");
+            assert_eq!(
+                next_handshake.peer_node_id, relay_b_node_id,
+                "relay A: relay B identity must match expected"
+            );
+            eprintln!("[north-star] relay A handshake with relay B OK");
+            let next_link = Arc::new(AsyncLink::new(next_stream, next_handshake.link_keys));
+            let _ = async_relay_forward_links(prev_link, next_link).await;
+            eprintln!("[north-star] relay A forwarding complete");
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // === Client sends request through the mesh ===
-    let client_link = Link::connect(&relay_a_addr_for_client, client_relay_keys).unwrap();
+    // ═══ 8. Client: handshake with Relay A + send request ═══
+    let (_client_link_keys, client_link) =
+        handshake_initiator(&client_idents, &relay_a_addr, &relay_a_idents.node_id).await;
+    eprintln!("[north-star] client handshake with relay A OK");
 
-    // Build and sign TransitRequest
-    let client_sk = sha256(b"north-star-client-ed25519-key");
+    // Build + sign the TransitRequest.
     let mut req = TransitRequest {
         req_id: {
             let mut id = [0u8; 16];
@@ -375,26 +431,26 @@ fn north_star_dynamic_mesh_with_snp_ik() {
             id
         },
         method: "GET".to_string(),
-        url: "http://test.local/".to_string(),
+        url: http_url.clone(),
         tls_termination: "GATEWAY_PLAINTEXT".to_string(),
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32],
         client_sig: [0u8; 64],
     };
-    sign_transit_request(&mut req, &client_sk);
-    let req_bytes = encode_transit_request(&req).unwrap();
+    sign_transit_request(&mut req, &client_idents.ed_sk);
+    let req_bytes = encode_transit_request(&req).expect("encode request");
 
-    // Encrypt with circuit key
-    let sealed_body = encrypt_circuit_payload(&circuit.circuit_keys.send_key, &req_bytes);
+    // Circuit-encrypt the body.
+    let sealed_body = encrypt_circuit_payload(&client_circuit_keys.send_key, &req_bytes);
 
-    // Build frame
+    // Build the Class B frame addressed to the gateway.
     let req_frame = Frame {
-        v: snp_frames::FRAME_VERSION,
+        v: FRAME_VERSION,
         cls: b'B',
         dst: gateway_idents.node_id,
         src: client_idents.node_id,
-        ttl: snp_frames::FRAME_TTL_MAX,
+        ttl: FRAME_TTL_MAX,
         fid: {
             let mut fid = [0u8; 8];
             getrandom::getrandom(&mut fid).unwrap();
@@ -404,56 +460,234 @@ fn north_star_dynamic_mesh_with_snp_ik() {
         body: sealed_body,
     };
 
-    client_link.send_frame(&req_frame).unwrap();
+    eprintln!("[north-star] client sending request frame");
+    client_link
+        .send_frame(&req_frame)
+        .await
+        .expect("client: send request");
 
-    // Receive response
-    let resp_frame = client_link.recv_frame().unwrap();
-    assert_eq!(resp_frame.cls, b'B', "Response must be Class B");
+    // Receive the response.
+    let resp_frame = client_link.recv_frame().await.expect("client: recv response");
+    assert_eq!(resp_frame.cls, b'B', "response must be Class B");
 
-    // Decrypt circuit payload
-    let resp_bytes = decrypt_circuit_payload(&circuit.circuit_keys.recv_key, &resp_frame.body)
-        .expect("circuit decrypt must succeed");
-    let transit_resp: TransitResponse = decode_transit_response(&resp_bytes).unwrap();
+    // Decrypt the circuit payload.
+    let resp_bytes = decrypt_circuit_payload(&client_circuit_keys.recv_key, &resp_frame.body)
+        .expect("client: circuit decrypt");
+    let transit_resp: TransitResponse =
+        decode_transit_response(&resp_bytes).expect("decode resp");
 
-    // Verify gateway signature
+    // Verify the gateway's signature.
     let verified = verify_transit_response(&transit_resp, &gateway_idents.ed_pk);
-    assert!(verified, "Gateway signature must verify");
+    assert!(verified, "gateway signature must verify");
 
-    // Verify response content
+    // Verify the HTTP status + body integrity.
     assert_eq!(transit_resp.status, 200, "HTTP status must be 200");
-    assert_eq!(transit_resp.object_id, sha256(b"Hello, ShareNet!"),
-        "objectId must match SHA-256 of response body");
+    let expected_object_id = sha256(b"Hello, ShareNet!");
+    assert_eq!(
+        transit_resp.object_id, expected_object_id,
+        "objectId must match SHA-256(\"Hello, ShareNet!\")"
+    );
+    assert_eq!(
+        transit_resp.gateway_id, gateway_idents.node_id,
+        "response gateway_id must match the gateway's NodeId"
+    );
 
-    // === Verify the HTTP server actually served the request ===
-    http_handle.join().unwrap();
-    gw_handle.join().unwrap();
-    relay_b_handle.join().unwrap();
-    relay_a_handle.join().unwrap();
+    eprintln!("[north-star] response verified: status=200, objectId matches, signature OK");
 
-    println!("North-star test PASSED:");
-    println!("  Client → Relay A → Relay B → Gateway → local HTTP → back");
-    println!("  Dynamic identities: yes (4 random Ed25519 keypairs)");
-    println!("  Gateway signature: verified");
-    println!("  HTTP status: 200");
-    println!("  Body integrity: objectId = SHA-256(\"Hello, ShareNet!\")");
-    println!("  Route: {:?} → {:?}", route.state, route.hops.len());
-    println!("  No GatewayChoice, no compile-time topology, no process restart");
+    // ═══ 9. Drive the route to Active ═══
+    route.transition(RouteState::Active).expect("Establishing → Active");
+    assert_eq!(route.state, RouteState::Active);
+    assert_eq!(
+        route.metrics.hop_count, 3,
+        "route has 3 hops (relay A, relay B, gateway)"
+    );
+
+    // ═══ 10. Construct the Circuit object ═══
+    let circuit = Circuit::new(
+        gateway_idents.node_id,
+        gateway_idents.ed_pk,
+        client_circuit_keys,
+    );
+    assert!(circuit.active, "circuit must be active");
+    assert_eq!(circuit.gateway_node_id, gateway_idents.node_id);
+    assert_eq!(circuit.gateway_public_key, gateway_idents.ed_pk);
+
+    // ═══ 11. Cleanup ═══
+    let _ = http_handle.await;
+    let _ = gateway_handle.await;
+    let _ = relay_b_handle.await;
+    let _ = relay_a_handle.await;
+
+    eprintln!("[north-star] PASSED:");
+    eprintln!("  Client → Relay A → Relay B → Gateway → local HTTP → back");
+    eprintln!("  Dynamic identities: 4 fresh Ed25519 + X25519 keypairs (no deterministic seeds)");
+    eprintln!("  SNP-IK/0.1 handshakes: 3 (client↔relay A, relay A↔relay B, relay B↔gateway)");
+    eprintln!("  Canonical async transport: AsyncLink + tokio");
+    eprintln!("  Dynamic Route: {:?} → {} hops", route.state, route.hops.len());
+    eprintln!("  Dynamic Circuit: client↔gateway X25519 DH (NOT a deterministic seed)");
+    eprintln!("  HTTP traffic: real (status=200, body=\"Hello, ShareNet!\")");
+    eprintln!("  Body integrity: objectId = SHA-256(\"Hello, ShareNet!\") (verified)");
+    eprintln!("  Gateway signature: verified (Ed25519)");
+    eprintln!("  No GatewayChoice, no compile-time topology, no process restart");
+
+    // Touch http_addr to avoid unused warning.
+    let _ = http_addr;
 }
 
-/// Helper: a shallow clone of NodeIdents for thread spawning.
-impl NodeIdents {
-    fn clone_shallow(&self) -> NodeIdents {
-        // X25519StaticSecret is not Clone, so we generate a new one.
-        // In practice, the gateway would use its persistent X25519 key.
-        // For this test, the X25519 key is only used for the handshake,
-        // which already happened (we're using derive_link_keys with random seeds).
-        let (x_sk, x_pk) = x25519_ephemeral_keypair();
-        NodeIdents {
-            ed_sk: self.ed_sk,
-            ed_pk: self.ed_pk,
-            x_sk,
-            x_pk,
-            node_id: self.node_id,
-        }
-    }
+// ─── Test 2: north-star with the FULL handshake-and-send convenience function ──
+
+/// A second north-star variant that uses
+/// [`send_request_with_full_snp_ik_handshake_async`] — the convenience
+/// function that performs the SNP-IK/0.1 handshake AND sends the request in
+/// one call. This proves the canonical client production path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn north_star_full_handshake_and_send() {
+    let client_idents = NodeIdents::fresh();
+    let relay_a_idents = NodeIdents::fresh();
+    let relay_b_idents = NodeIdents::fresh();
+    let gateway_idents = NodeIdents::fresh();
+
+    let gateway_transit_addr = ephemeral_addr().await;
+    let relay_b_addr = ephemeral_addr().await;
+    let relay_a_addr = ephemeral_addr().await;
+    let (http_addr, http_handle) = start_local_http().await;
+    let http_url = format!("http://test.local:{}/", http_addr.rsplit(':').next().unwrap());
+
+    let circuit_dh_client = x25519_dh(&client_idents.x_sk, &gateway_idents.x_pk);
+    let circuit_dh_gateway = x25519_dh(&gateway_idents.x_sk, &client_idents.x_pk);
+    assert_eq!(circuit_dh_client, circuit_dh_gateway);
+    let client_circuit_keys = derive_circuit_keys_from_dh(&circuit_dh_client, true);
+    let gateway_circuit_keys = derive_circuit_keys_from_dh(&circuit_dh_gateway, false);
+
+    // Gateway task.
+    let gateway_handle = {
+        let sk = gateway_idents.ed_sk;
+        let pk = gateway_idents.ed_pk;
+        let x_sk = Arc::clone(&gateway_idents.x_sk);
+        let x_pk = gateway_idents.x_pk;
+        let node_id = gateway_idents.node_id;
+        let client_pk = client_idents.ed_pk;
+        let circuit = gateway_circuit_keys;
+        let listen = gateway_transit_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let h = perform_snp_ik_handshake_async(
+                &mut stream, false, &sk, &pk, &x_sk, &x_pk, None,
+            )
+            .await
+            .unwrap();
+            let link = Arc::new(AsyncLink::new(stream, h.link_keys));
+            let mut seen = std::collections::HashSet::new();
+            let _ = serve_one_gateway_request_async_with_connector(
+                &link, node_id, &sk, &client_pk, &circuit, &mut seen,
+                &|url| test_connector_factory(url),
+            )
+            .await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Relay B.
+    let relay_b_handle = {
+        let sk = relay_b_idents.ed_sk;
+        let pk = relay_b_idents.ed_pk;
+        let x_sk = Arc::clone(&relay_b_idents.x_sk);
+        let x_pk = relay_b_idents.x_pk;
+        let gw_node_id = gateway_idents.node_id;
+        let listen = relay_b_addr.clone();
+        let gw_addr = gateway_transit_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen).await.unwrap();
+            let (mut prev_stream, _) = listener.accept().await.unwrap();
+            let prev_h = perform_snp_ik_handshake_async(
+                &mut prev_stream, false, &sk, &pk, &x_sk, &x_pk, None,
+            )
+            .await
+            .unwrap();
+            let prev_link = Arc::new(AsyncLink::new(prev_stream, prev_h.link_keys));
+            let mut next_stream = AsyncLink::connect_raw(&gw_addr).await.unwrap();
+            let next_h = perform_snp_ik_handshake_async(
+                &mut next_stream, true, &sk, &pk, &x_sk, &x_pk, Some(&gw_node_id),
+            )
+            .await
+            .unwrap();
+            let next_link = Arc::new(AsyncLink::new(next_stream, next_h.link_keys));
+            let _ = async_relay_forward_links(prev_link, next_link).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Relay A.
+    let relay_a_handle = {
+        let sk = relay_a_idents.ed_sk;
+        let pk = relay_a_idents.ed_pk;
+        let x_sk = Arc::clone(&relay_a_idents.x_sk);
+        let x_pk = relay_a_idents.x_pk;
+        let rb_node_id = relay_b_idents.node_id;
+        let listen = relay_a_addr.clone();
+        let rb_addr = relay_b_addr.clone();
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&listen).await.unwrap();
+            let (mut prev_stream, _) = listener.accept().await.unwrap();
+            let prev_h = perform_snp_ik_handshake_async(
+                &mut prev_stream, false, &sk, &pk, &x_sk, &x_pk, None,
+            )
+            .await
+            .unwrap();
+            let prev_link = Arc::new(AsyncLink::new(prev_stream, prev_h.link_keys));
+            let mut next_stream = AsyncLink::connect_raw(&rb_addr).await.unwrap();
+            let next_h = perform_snp_ik_handshake_async(
+                &mut next_stream, true, &sk, &pk, &x_sk, &x_pk, Some(&rb_node_id),
+            )
+            .await
+            .unwrap();
+            let next_link = Arc::new(AsyncLink::new(next_stream, next_h.link_keys));
+            let _ = async_relay_forward_links(prev_link, next_link).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Client: build Node + circuit, then call the FULL handshake-and-send.
+    let client_identity = NodeIdentity::from_secret(client_idents.ed_sk);
+    let client_node = Node::new(client_identity, vec![Capability::Client], String::new());
+    let circuit = Circuit::new(
+        gateway_idents.node_id,
+        gateway_idents.ed_pk,
+        client_circuit_keys,
+    );
+    client_node
+        .circuits
+        .lock()
+        .unwrap()
+        .insert(gateway_idents.node_id, circuit);
+
+    let transit_resp =
+        snp_node::node::async_node::send_request_with_full_snp_ik_handshake_async(
+            &client_node,
+            &http_url,
+            &gateway_idents.node_id,
+            &relay_a_addr,
+            &relay_a_idents.node_id,
+            &client_idents.ed_sk,
+            &client_idents.ed_pk,
+            &client_idents.x_sk,
+            &client_idents.x_pk,
+        )
+        .await
+        .expect("full handshake-and-send must succeed");
+
+    assert_eq!(transit_resp.status, 200);
+    assert_eq!(transit_resp.object_id, sha256(b"Hello, ShareNet!"));
+    assert!(verify_transit_response(&transit_resp, &gateway_idents.ed_pk));
+    assert_eq!(transit_resp.gateway_id, gateway_idents.node_id);
+
+    eprintln!("[north-star-full] PASSED: full handshake-and-send works end-to-end");
+
+    let _ = http_handle.await;
+    let _ = gateway_handle.await;
+    let _ = relay_b_handle.await;
+    let _ = relay_a_handle.await;
+
+    let _ = http_addr;
 }

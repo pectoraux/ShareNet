@@ -77,7 +77,6 @@
 //!   gateways and routes frames based on `Frame.dst`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -108,6 +107,7 @@ pub mod route;
 pub mod discovery;
 pub mod transport;
 pub mod async_transport;
+pub mod async_node;
 pub mod identity;
 pub mod gateway;
 pub mod circuit;
@@ -256,6 +256,15 @@ impl Node {
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
     /// logged and the relay continues accepting new connections.
+    ///
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::serve_relay_persistent_async`]
+    /// (the canonical async production path via `AsyncLink` +
+    /// `perform_snp_ik_handshake_async`). This sync variant is retained only
+    /// for backward-compat with the N2.0.1 / N2.0.4 sync tests.
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::serve_relay_persistent_async` (canonical async path)"
+    )]
     pub fn serve_relay_persistent(
         &self,
         listen_addr: &str,
@@ -284,6 +293,11 @@ impl Node {
     ///
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure or if `upstreams` is empty.
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::serve_relay_multi_upstream_persistent_async`].
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::serve_relay_multi_upstream_persistent_async`"
+    )]
     pub fn serve_relay_multi_upstream_persistent(
         &self,
         listen_addr: &str,
@@ -322,6 +336,11 @@ impl Node {
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
     /// logged and the gateway continues accepting new connections.
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::serve_gateway_persistent_async`].
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::serve_gateway_persistent_async` (canonical async path)"
+    )]
     pub fn serve_gateway_persistent(
         &self,
         listen_addr: &str,
@@ -330,7 +349,7 @@ impl Node {
     ) -> NodeResult<()> {
         let gateway_node_id = self.identity.node_id;
         let gateway_sk = self.identity.secret_key;
-        let listener = TcpListener::bind(listen_addr)?;
+        let listener = std::net::TcpListener::bind(listen_addr)?;
         eprintln!(
             "[gateway-persistent {}] listening on {listen_addr}",
             hex_short(&gateway_node_id)
@@ -391,6 +410,13 @@ impl Node {
     ///
     /// **N2.0.3 production API.** The gateway's identity comes from
     /// `self.identity` (no `GatewayChoice`).
+    /// **N2.0.6: DEPRECATED.** Use a tokio task that closes the listener
+    /// after `max_requests` (the async path does not have a built-in
+    /// drop-after variant — tests use `tokio::select!` with a oneshot).
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use the async runtime with `tokio::select!` for drop-after behaviour"
+    )]
     pub fn serve_gateway_persistent_with_drop_after(
         &self,
         listen_addr: &str,
@@ -400,7 +426,7 @@ impl Node {
     ) -> NodeResult<()> {
         let gateway_node_id = self.identity.node_id;
         let gateway_sk = self.identity.secret_key;
-        let listener = TcpListener::bind(listen_addr)?;
+        let listener = std::net::TcpListener::bind(listen_addr)?;
         eprintln!(
             "[gateway-drop-after-{} {}] listening on {listen_addr}",
             max_requests,
@@ -508,12 +534,17 @@ impl Node {
     /// # Errors
     /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
     /// logged and the listener continues accepting new connections.
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::serve_discovery_persistent_async`].
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::serve_discovery_persistent_async`"
+    )]
     pub fn serve_discovery_persistent(
         &self,
         discovery_addr: &str,
         transit_listen_addr: &str,
     ) -> NodeResult<()> {
-        let listener = TcpListener::bind(discovery_addr)?;
+        let listener = std::net::TcpListener::bind(discovery_addr)?;
         let gateway_node_id = self.identity.node_id;
         eprintln!(
             "[discovery {}] listening on {discovery_addr}",
@@ -624,6 +655,11 @@ impl Node {
     /// # Errors
     /// Returns [`NodeError`] if NO gateway could be discovered (all addresses
     /// failed). Otherwise returns `Ok(())` — individual failures are logged.
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::discover_gateways_async`].
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::discover_gateways_async`"
+    )]
     pub fn discover_gateways(&self, known_addrs: &[String]) -> NodeResult<()> {
         let provider = BootstrapDiscovery::new(known_addrs.to_vec());
         let discovered_nodes = provider.discover();
@@ -800,6 +836,13 @@ impl Node {
     ///
     /// # Errors
     /// Returns [`NodeError`] on any failure.
+    /// **N2.0.6: DEPRECATED.** Use [`crate::node::async_node::send_request_via_gateway_full_with_relay_async`]
+    /// or [`crate::node::async_node::send_request_with_full_snp_ik_handshake_async`]
+    /// (the canonical async path with a real SNP-IK/0.1 handshake).
+    #[deprecated(
+        since = "N2.0.6",
+        note = "use `snp_node::node::async_node::send_request_via_gateway_full_with_relay_async` (canonical async path)"
+    )]
     pub fn send_request_via_gateway_full_with_relay(
         &self,
         url: &str,
@@ -1057,9 +1100,18 @@ pub enum ServeOutcome {
 }
 
 // ─── Relay serve internals ───────────────────────────────────────────────────
+//
+// N2.0.6: The sync relay internals below are `#[deprecated]` — they are
+// called only from the `#[deprecated]` `pub fn serve_relay_persistent` /
+// `serve_relay_multi_upstream_persistent` / `serve_gateway_persistent_with_drop_after`
+// methods (above). New production code MUST use the async equivalents in
+// `node/async_node.rs` (`serve_relay_persistent_async` etc.).
 
 /// Internal: persistent single-upstream relay. Accepts an optional connection
 /// counter (for tests to verify "same connection served N requests").
+///
+/// **N2.0.6: DEPRECATED** — see module-level note above.
+#[deprecated(since = "N2.0.6", note = "use `async_node::serve_relay_persistent_async`")]
 fn serve_relay_persistent_inner(
     listen_addr: &str,
     next_hop_addr: &str,
@@ -1067,7 +1119,7 @@ fn serve_relay_persistent_inner(
     next_hop_keys: LinkKeys,
     connection_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> NodeResult<()> {
-    let listener = TcpListener::bind(listen_addr)?;
+    let listener = std::net::TcpListener::bind(listen_addr)?;
     eprintln!("[relay-persistent] listening on {listen_addr}, next-hop={next_hop_addr}");
 
     for stream in listener.incoming() {
@@ -1166,13 +1218,16 @@ fn serve_relay_persistent_inner(
 /// whose `dst_node_id` matches `frame.dst`. On upstream failure for one
 /// gateway, sends an upstream-failure NACK back to the prev hop (so the
 /// client can fail over to a different gateway) and continues serving.
+///
+/// **N2.0.6: DEPRECATED** — see module-level note above.
+#[deprecated(since = "N2.0.6", note = "use `async_node::serve_relay_multi_upstream_persistent_async`")]
 fn serve_relay_multi_upstream_persistent_inner(
     listen_addr: &str,
     upstreams: &[UpstreamPeer],
     prev_hop_keys: LinkKeys,
     connection_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> NodeResult<()> {
-    let listener = TcpListener::bind(listen_addr)?;
+    let listener = std::net::TcpListener::bind(listen_addr)?;
     eprintln!(
         "[relay-multi-upstream-persistent] listening on {listen_addr}, {} upstreams",
         upstreams.len()
@@ -1620,6 +1675,9 @@ pub fn spawn_relay_multi_upstream_persistent_with_counter(
 /// # Errors
 /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
 /// logged and the relay continues accepting new connections.
+///
+/// **N2.0.6: DEPRECATED** — see module-level note above.
+#[deprecated(since = "N2.0.6", note = "use the async runtime with `tokio::select!` for drop-after behaviour")]
 fn serve_relay_persistent_with_drop_after_inner(
     listen_addr: &str,
     next_hop_addr: &str,
@@ -1628,7 +1686,7 @@ fn serve_relay_persistent_with_drop_after_inner(
     max_requests: usize,
     connection_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> NodeResult<()> {
-    let listener = TcpListener::bind(listen_addr)?;
+    let listener = std::net::TcpListener::bind(listen_addr)?;
     eprintln!(
         "[relay-drop-after-{}] listening on {listen_addr}, next-hop={next_hop_addr}",
         max_requests
@@ -2129,6 +2187,65 @@ mod tests {
                      `#[deprecated]` / `#[cfg(test)]`.",
                     name, lineno
                 );
+            }
+        }
+    }
+
+    /// N2.0.6: `std::net::TcpListener::bind` / `std::net::TcpStream::connect`
+    /// (the synchronous transport) must NOT appear in production node/ module
+    /// code — only in `#[deprecated]` method bodies, `#[cfg(test)]` blocks,
+    /// or comments. New production code MUST use the canonical async transport
+    /// (`tokio::net::TcpListener::bind` / `AsyncLink::connect_raw` /
+    /// `perform_snp_ik_handshake_async`).
+    ///
+    /// This test scans every `node/` module source file for the sync transport
+    /// signatures and fails if any appear in a production region. The sync
+    /// `transport.rs` module is excluded (it is entirely `#[deprecated]`).
+    #[test]
+    fn sync_tcp_not_in_production_node_modules() {
+        let modules: &[(&str, &str)] = &[
+            ("node/mod.rs", include_str!("mod.rs")),
+            ("node/circuit.rs", include_str!("circuit.rs")),
+            ("node/gateway.rs", include_str!("gateway.rs")),
+            ("node/identity.rs", include_str!("identity.rs")),
+            ("node/session.rs", include_str!("session.rs")),
+            ("node/route.rs", include_str!("route.rs")),
+            ("node/discovery.rs", include_str!("discovery.rs")),
+            ("node/async_transport.rs", include_str!("async_transport.rs")),
+            ("node/async_node.rs", include_str!("async_node.rs")),
+        ];
+        // The sync transport signatures we forbid in production code:
+        //   - `use std::net::TcpListener` — sync TCP import
+        //   - `use std::net::TcpStream` — sync TCP import
+        //   - `std::net::TcpListener::bind` — sync TCP listener bind
+        //   - `std::net::TcpStream::connect` — sync TCP client connect
+        // The async equivalents use `tokio::net::TcpListener` /
+        // `tokio::net::TcpStream` / `AsyncLink::connect_raw`.
+        // We do NOT forbid the unqualified `TcpListener::bind` because both
+        // the sync (`use std::net::TcpListener`) and async
+        // (`use tokio::net::TcpListener`) versions use that call shape — the
+        // fully-qualified `std::net::TcpListener::bind` is the unambiguous
+        // sync signature.
+        const FORBIDDEN: &[&str] = &[
+            "use std::net::TcpListener",
+            "use std::net::TcpStream",
+            "std::net::TcpListener::bind",
+            "std::net::TcpStream::connect",
+        ];
+        for (name, source) in modules {
+            for needle in FORBIDDEN {
+                if let Some((lineno, line)) = scan_for_offending_reference(name, source, needle) {
+                    panic!(
+                        "Production node module {}:{} references sync transport `{}` outside a \
+                         #[deprecated] block or #[cfg(test)] block.\n  Line: {line}\n  \
+                         New production code MUST use the canonical async transport: \
+                         `tokio::net::TcpListener`, `tokio::net::TcpStream`, \
+                         `AsyncLink::connect_raw`, `perform_snp_ik_handshake_async`. \
+                         Mark the enclosing fn `#[deprecated]` or move the sync code to \
+                         `crate::legacy`.",
+                        name, lineno, needle
+                    );
+                }
             }
         }
     }

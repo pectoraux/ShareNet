@@ -121,6 +121,9 @@ use snp_crypto::{
 use snp_frames::Frame;
 use thiserror::Error;
 
+// N2.0.6 — canonical async production transport.
+pub mod async_link;
+
 /// Errors from the L8 link layer.
 #[derive(Debug, Error)]
 pub enum LinkError {
@@ -399,7 +402,7 @@ pub fn derive_link_keys_from_dh(
 /// alongside the descriptor) so that an active attacker cannot strip the
 /// ephemeral key and substitute their own — the signature binds all four
 /// fields together.
-fn node_descriptor_preimage(
+pub(crate) fn node_descriptor_preimage(
     node_id: &[u8; 32],
     pub_key: &[u8; 32],
     eph_pub: &[u8; 32],
@@ -414,7 +417,7 @@ fn node_descriptor_preimage(
 }
 
 /// Encode a full SNP-IK/0.1 handshake message (descriptor + signature).
-fn encode_handshake_message(
+pub(crate) fn encode_handshake_message(
     node_id: &[u8; 32],
     pub_key: &[u8; 32],
     eph_pub: &[u8; 32],
@@ -432,7 +435,7 @@ fn encode_handshake_message(
 }
 
 /// Decode a SNP-IK/0.1 handshake message. Returns the five fields in order.
-fn decode_handshake_message(
+pub(crate) fn decode_handshake_message(
     bytes: &[u8],
 ) -> LinkResult<([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 64])> {
     let value = snp_cbor::decode(bytes)?;
