@@ -4008,3 +4008,93 @@ Stage Summary:
 - Multi-hop destination discovery works: A learns G exists at ~3 hops via B, but G is NOT authenticated.
 - Ready for N2.1.2 (route computation).
 
+
+---
+Task ID: 271-280 (N2.1.1.2 — Authenticate Propagation Messages Before Topology Mutation)
+Agent: Z.ai (main)
+
+Task: N2.1.1.1 introduced RemoteNodeHint (non-authoritative) and propagation_sequence replay prevention, but process_peer_summaries() accepted an UNVERIFIED PeerSummaryList and advanced propagation_state BEFORE any authentication. This milestone fixes the security-critical defect.
+
+Work Log:
+- Added VerifiedPeerSummaryList type:
+  * Private constructor — only verify_into_verified() can produce it.
+  * Wraps PeerSummaryList with verified accessors (sender_node_id, propagation_sequence, summaries, etc.).
+  * An UNVERIFIED PeerSummaryList CANNOT be passed to process_peer_summaries() (compile error).
+
+- PeerSummaryList::verify_into_verified() performs FULL stateless verification:
+  1. Ed25519 signature under TOPOLOGY_MSG_CONTEXT.
+  2. sender_node_id == derive_node_id(sender_ed25519_public_key) (I4).
+  3. Clock validation:
+     - timestamp <= now + MAX_CLOCK_SKEW_SECS (no future-dated messages).
+     - timestamp >= now - MAX_PROPAGATION_MESSAGE_AGE_SECS (not stale).
+  4. propagation_sequence >= 1 (zero is reserved/invalid).
+  5. summaries.len() <= MAX_PEER_SUMMARIES_PER_MESSAGE (256).
+  6. Per-summary semantic validation:
+     - distance_hint <= MAX_DISTANCE_HINT (64).
+     - visibility is "active" or "stale".
+     - node_id != [0u8;32] (all-zero is not a valid NodeId).
+
+- PeerSummaryList::verify() now delegates to verify_into_verified().is_some().
+- PeerSummaryList::sign() made pub (for re-signing after field mutation;
+  matches NodeAdvertisement::sign() visibility).
+
+- TopologyGraph::process_peer_summaries() signature changed:
+    &PeerSummaryList  ->  &VerifiedPeerSummaryList
+  Type-level enforcement: an unverified PeerSummaryList cannot mutate the topology.
+
+- Ordering inside process_peer_summaries():
+  1. (verified by type guarantee — before this function)
+  2. freshness check (read propagation_state)
+  3. if stale -> return Stale (NO mutation of any state)
+  4. commit propagation_state (write)
+  5. process summaries (write remote_hints)
+  An attacker CANNOT advance propagation_state using a forged message,
+  because a forged message cannot produce a VerifiedPeerSummaryList.
+
+- New constants:
+  * MAX_DISTANCE_HINT = 64 (sanity bound on discovery heuristic).
+  * MAX_PROPAGATION_MESSAGE_AGE_SECS = 86400 (stateless staleness bound;
+    supplements process-local propagation_state for restart scenarios).
+
+- Preserved (from N2.1.1.1, unchanged):
+  * RemoteNodeHint (non-authoritative third-party claim).
+  * direct_gateways() vs gateway_hints() separation.
+  * all_known_gateways() removed.
+  * Directed topology + Link model.
+  * PeerDirectory, AuthenticatedNodeRecord, NodeAdvertisement.
+  * Route architecture (untouched).
+
+- Updated all 16 existing process_peer_summaries() call sites in n211_topology.rs
+  to call verify_into_verified() first.
+
+- 10 new adversarial tests (40 total in n211_topology.rs):
+  N11. forged_propagation_message_does_not_advance_replay_state
+       (mandatory replay/DoS test: attacker forges seq=1,000,000,
+        propagation_state unchanged, real seq=11 still accepted)
+  N12. invalid_propagation_signature_does_not_mutate_topology
+       (no hint added, no hint updated, propagation_state unchanged)
+  N13. verified_message_type_required_for_topology_mutation
+       (type-level proof: raw PeerSummaryList cannot be passed)
+  N14. semantic_validation_rejects_future_dated_propagation
+  N15. semantic_validation_rejects_stale_propagation
+  N16. semantic_validation_rejects_oversized_summary_list
+  N17. semantic_validation_rejects_invalid_distance_hint
+  N18. semantic_validation_rejects_invalid_visibility
+  N19. propagation_sender_identity_mismatch_rejected (I4)
+  N20. zero_propagation_sequence_rejected
+
+- Test results: 272 passed, 0 failed, 3 ignored (was 262; +10 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- VerifiedPeerSummaryList type enforces verification before topology mutation.
+- process_peer_summaries() accepts ONLY &VerifiedPeerSummaryList.
+- An unverified PeerSummaryList cannot mutate the topology graph (compile error).
+- propagation_state advances ONLY AFTER: signature verification + identity
+  consistency + clock validation + semantic validation + freshness check.
+- A forged message cannot advance propagation_state (DoS attack closed).
+- Semantic validation rejects: future-dated, stale, oversized, invalid
+  distance_hint, invalid visibility, identity mismatch, zero sequence.
+- Stateless staleness bound (MAX_PROPAGATION_MESSAGE_AGE_SECS) supplements
+  process-local propagation_state for restart scenarios.
+- Ready for N2.1.2 (route computation).
