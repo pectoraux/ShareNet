@@ -1403,3 +1403,103 @@ fn sequence_never_regresses_after_restart() {
     let _ = std::fs::remove_file(&tmp);
     eprintln!("[test 59] PASS: sequence never regresses after restart");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.0.6 — Sequence Exhaustion Guard tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 60. sequence_increments_normally
+#[test]
+fn sequence_increments_normally() {
+    let mut store = AdvertisementSequenceStore::in_memory_starting_at(41);
+    let next = store.next_sequence().expect("must increment");
+    assert_eq!(next, 42);
+    assert_eq!(store.current_sequence(), 42);
+    let next2 = store.next_sequence().expect("must increment again");
+    assert_eq!(next2, 43);
+    assert_eq!(store.current_sequence(), 43);
+    eprintln!("[test 60] PASS: sequence increments normally");
+}
+
+/// 61. sequence_exhaustion_rejected
+#[test]
+fn sequence_exhaustion_rejected() {
+    let mut store = AdvertisementSequenceStore::in_memory_starting_at(u64::MAX);
+    let result = store.next_sequence();
+    assert!(matches!(result, Err(SequenceStoreError::SequenceExhausted)),
+        "u64::MAX + 1 must return SequenceExhausted, not saturate or wrap");
+    eprintln!("[test 61] PASS: sequence exhaustion rejected");
+}
+
+/// 62. sequence_exhaustion_does_not_mutate_state
+#[test]
+fn sequence_exhaustion_does_not_mutate_state() {
+    let mut store = AdvertisementSequenceStore::in_memory_starting_at(u64::MAX);
+    let _ = store.next_sequence(); // Returns Err.
+    assert_eq!(store.current_sequence(), u64::MAX,
+        "in-memory sequence must NOT change when SequenceExhausted is returned");
+    eprintln!("[test 62] PASS: sequence exhaustion does not mutate state");
+}
+
+/// 63. sequence_exhaustion_does_not_persist_new_state
+#[test]
+fn sequence_exhaustion_does_not_persist_new_state() {
+    let tmp = std::env::temp_dir().join(format!("snp-seq-exhaust-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Create a file with sequence = u64::MAX.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"SNSQ");
+    data.push(1u8);
+    data.extend_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&tmp, &data).expect("write");
+
+    let mut store = AdvertisementSequenceStore::open(&tmp).expect("open");
+    assert_eq!(store.current_sequence(), u64::MAX);
+
+    // Attempt next_sequence — must fail.
+    let result = store.next_sequence();
+    assert!(matches!(result, Err(SequenceStoreError::SequenceExhausted)),
+        "must return SequenceExhausted");
+
+    // The file must NOT have changed.
+    let file_data = std::fs::read(&tmp).expect("read");
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&file_data[5..13]);
+    assert_eq!(u64::from_le_bytes(buf), u64::MAX,
+        "persisted sequence must NOT change when SequenceExhausted is returned");
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 63] PASS: sequence exhaustion does not persist new state");
+}
+
+/// 64. restart_preserves_max_sequence
+#[test]
+fn restart_preserves_max_sequence() {
+    let tmp = std::env::temp_dir().join(format!("snp-seq-max-restart-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Create a file with sequence = u64::MAX.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"SNSQ");
+    data.push(1u8);
+    data.extend_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&tmp, &data).expect("write");
+
+    let store = AdvertisementSequenceStore::open(&tmp).expect("open");
+    assert_eq!(store.current_sequence(), u64::MAX);
+
+    // Restart — must load u64::MAX.
+    let store2 = store.restart().expect("restart");
+    assert_eq!(store2.current_sequence(), u64::MAX,
+        "u64::MAX must survive restart");
+
+    // next_sequence must still return SequenceExhausted.
+    let mut store2 = store2;
+    let result = store2.next_sequence();
+    assert!(matches!(result, Err(SequenceStoreError::SequenceExhausted)),
+        "must return SequenceExhausted after restart with u64::MAX");
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 64] PASS: restart preserves max sequence");
+}

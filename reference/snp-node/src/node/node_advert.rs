@@ -1017,6 +1017,11 @@ pub enum SequenceStoreError {
     Io(std::io::Error),
     /// The persistence file is corrupted.
     Corrupt(String),
+    /// The sequence counter has reached `u64::MAX` and cannot be
+    /// incremented further. The node must rotate its identity or use
+    /// an epoch reset mechanism (not yet implemented). The in-memory
+    /// sequence is NOT changed.
+    SequenceExhausted,
 }
 
 impl std::fmt::Display for SequenceStoreError {
@@ -1024,6 +1029,7 @@ impl std::fmt::Display for SequenceStoreError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Corrupt(msg) => write!(f, "corrupt sequence store: {msg}"),
+            Self::SequenceExhausted => write!(f, "sequence exhausted: u64::MAX reached, cannot increment"),
         }
     }
 }
@@ -1124,15 +1130,28 @@ impl AdvertisementSequenceStore {
     ///
     /// If persistence fails, the in-memory counter is NOT advanced.
     ///
+    /// ## N2.1.0.6: Sequence exhaustion
+    ///
+    /// If `self.sequence == u64::MAX`, this method returns
+    /// `SequenceStoreError::SequenceExhausted`. The in-memory counter
+    /// is NOT changed. The node must rotate its identity or use an
+    /// epoch reset mechanism (not yet implemented).
+    ///
     /// # Errors
-    /// Returns `io::Error` if the file cannot be written.
-    pub fn next_sequence(&mut self) -> std::io::Result<u64> {
-        let next = self.sequence.saturating_add(1);
+    /// Returns `SequenceStoreError::SequenceExhausted` if the sequence
+    /// has reached `u64::MAX`.
+    /// Returns `SequenceStoreError::Io` if the file cannot be written.
+    pub fn next_sequence(&mut self) -> Result<u64, SequenceStoreError> {
+        // Check for sequence exhaustion BEFORE computing next.
+        if self.sequence == u64::MAX {
+            return Err(SequenceStoreError::SequenceExhausted);
+        }
+        let next = self.sequence + 1; // Safe: checked above.
         let old_sequence = self.sequence;
         self.sequence = next; // temporarily set for persist()
         if let Err(e) = self.persist() {
             self.sequence = old_sequence; // rollback
-            return Err(e);
+            return Err(SequenceStoreError::Io(e));
         }
         Ok(next)
     }
