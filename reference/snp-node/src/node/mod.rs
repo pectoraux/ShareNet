@@ -119,6 +119,7 @@ pub mod topology_protocol;
 pub mod peer_directory;
 pub mod topology;
 pub mod propagation_state;
+pub mod route_discovery;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -146,6 +147,10 @@ pub use propagation_state::{PropagationStateError, PropagationStateStore};
 pub use topology::{
     PropagationResult, RemoteNodeHint, RemoteHintFreshness, TopologyGraph, TopologySnapshot,
     TopologyKnowledgeSnapshot, ExecutableNetworkSnapshot,
+};
+pub use route_discovery::{
+    CandidateDestination, RouteProposal, RouteAcceptance, CommittedRoute, CommitError,
+    DiscoveredPath, commit_route, discover_path, ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
