@@ -1007,6 +1007,9 @@ pub enum CommitError {
     PathProposalMismatch,
     /// The validated path has no hops.
     EmptyPath,
+    /// P0/P1 #1: a participant supplied more than one acceptance. There must
+    /// be exactly ONE acceptance per required participant.
+    DuplicateAcceptance { participant: [u8; 32] },
 }
 
 impl std::fmt::Display for CommitError {
@@ -1028,6 +1031,7 @@ impl std::fmt::Display for CommitError {
             Self::SourceNotFirstHop => write!(f, "source is not the first hop"),
             Self::PathProposalMismatch => write!(f, "proposal hop_node_ids do not match validated path"),
             Self::EmptyPath => write!(f, "validated path is empty"),
+            Self::DuplicateAcceptance { participant } => write!(f, "duplicate acceptance from {}", hex_short(participant)),
         }
     }
 }
@@ -1153,7 +1157,16 @@ pub fn commit_route(
                 }
             }
         }
-        accepted_by.entry(acc.participant_node_id).or_insert(acc);
+        // P0/P1 #1: reject duplicate acceptances. Exactly ONE acceptance per
+        // required participant. A second acceptance from the same participant
+        // is ambiguous (what did they actually agree to?) and could be used
+        // to inflate the commitment with conflicting statements.
+        if accepted_by.contains_key(&acc.participant_node_id) {
+            return Err(CommitError::DuplicateAcceptance {
+                participant: acc.participant_node_id,
+            });
+        }
+        accepted_by.insert(acc.participant_node_id, acc);
     }
 
     // 7. Every required participant accepted.
@@ -1169,12 +1182,24 @@ pub fn commit_route(
     // NodeIds. For every hop: node_id, record_node_id, role, and the complete
     // LinkEvidence (Direct link fields or Attested attestation fields).
     // For every acceptance: the complete canonical acceptance object
-    // (proposal_hash, participant, role, conditions, timestamp, expiry, signature).
+    // (proposal_hash, participant, participant_public_key, role, conditions,
+    // timestamp, expiry, signature).
+    //
+    // P1 #2: acceptances are SORTED by participant_node_id before commitment
+    // construction, so the commitment is order-independent. Two callers that
+    // collect the same acceptances in different orders produce the SAME
+    // commitment — required for cross-implementation interoperability.
     //
     // This ensures that two routes with the same NodeIds but different link
     // evidence produce DIFFERENT commitments — the commitment is a true
     // integrity identifier for the finalized route agreement.
     let commitment = {
+        // P1 #2: sort acceptances by participant_node_id (ascending) for
+        // canonical ordering. The acceptances are a SET keyed by participant,
+        // not an ordered sequence.
+        let mut sorted_acceptances: Vec<&RouteAcceptance> = acceptances.iter().collect();
+        sorted_acceptances.sort_by_key(|acc| acc.participant_node_id);
+
         let hops_cbor: Vec<CborValue> = validated_path.hops().iter().map(|hop| {
             let link_cbor = match &hop.incoming_link {
                 None => CborValue::Null,
@@ -1203,11 +1228,14 @@ pub fn commit_route(
             ])
         }).collect();
 
-        let acceptances_cbor: Vec<CborValue> = acceptances.iter().map(|acc| {
+        // P1 #3: include participant_public_key in the commitment so the
+        // "complete acceptance object" claim is literally true.
+        let acceptances_cbor: Vec<CborValue> = sorted_acceptances.iter().map(|acc| {
             let conditions: Vec<CborValue> = acc.conditions.iter().map(|c| CborValue::TextString(c.clone())).collect();
             CborValue::Map(vec![
                 (CborValue::TextString("proposalHash".into()), CborValue::ByteString(acc.proposal_hash.to_vec())),
                 (CborValue::TextString("participantNodeId".into()), CborValue::ByteString(acc.participant_node_id.to_vec())),
+                (CborValue::TextString("participantPublicKey".into()), CborValue::ByteString(acc.participant_public_key.to_vec())),
                 (CborValue::TextString("role".into()), CborValue::TextString(acc.role.as_str().to_string())),
                 (CborValue::TextString("conditions".into()), CborValue::Array(conditions)),
                 (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(acc.timestamp)),
