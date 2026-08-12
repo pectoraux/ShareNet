@@ -4261,3 +4261,89 @@ Stage Summary:
 - InMemoryResolver documented as TEST-ONLY.
 - DestinationResolver documented as a TRUST BOUNDARY.
 - Ready for N2.2 (Internet gateway traffic).
+
+---
+Task ID: 307-316 (N2.1.2.2 — Make Link Authentication a Real Security Boundary)
+Agent: Z.ai (main)
+
+Task: The Link abstraction was documented as "authenticated" but Link::new_up() was public and LinkTable::insert() accepted any Link with no verification. Make the boundary real via an AuthenticatedLink type.
+
+Work Log:
+- Added AuthenticatedLink type:
+  * Private inner Link field — no public arbitrary constructor.
+  * AuthenticatedLink::from_verified_handshake(key, advert, session_id) is the ONLY production constructor.
+  * Requires: key.remote_node_id == advert.node_id() (identity binding).
+  * Requires: key.endpoint in advert.endpoints() (endpoint authorization).
+  * Requires: session_id != [0u8;32] (handshake was performed).
+  * Returns AuthenticatedLinkError on failure (NodeIdMismatch, UnauthorizedEndpoint, MissingHandshake).
+  * Accessors: as_link(), into_link(), key(), session_id(), is_usable().
+
+- Visibility changes (production hardening):
+  * Link::new_up() → pub(crate) (was pub).
+  * LinkTable::insert() → pub(crate) (was pub).
+  * PeerDirectory::add_link() → pub(crate) (was pub).
+  * TopologyGraph::add_link() → pub(crate) (was pub).
+
+- New production paths (public):
+  * LinkTable::insert_authenticated(AuthenticatedLink).
+  * PeerDirectory::add_authenticated_link(AuthenticatedLink).
+  * TopologyGraph::add_authenticated_link(AuthenticatedLink).
+
+- Test-only paths (cfg(any(test, feature = "test-support"))):
+  * Link::new_up_for_testing(key, session_id).
+  * LinkTable::insert_for_testing(Link).
+  * PeerDirectory::add_link_for_testing(Link).
+  * TopologyGraph::add_link_for_testing(Link).
+  * The "test-support" Cargo feature MUST NOT be enabled in production.
+
+- Added "test-support" Cargo feature to snp-node/Cargo.toml.
+- Added snp-node as a dev-dependency with test-support feature for integration tests.
+
+- Updated all existing tests (n211_topology.rs, n212_route_engine.rs) to use:
+  * Link::new_up_for_testing instead of Link::new_up.
+  * table.insert_for_testing instead of table.insert.
+  * graph.add_link_for_testing instead of graph.add_link.
+
+- Security invariant now true in code:
+  > "Every Link consumed by RouteEngine is an authenticated, endpoint-bound
+  > relationship established through the ShareNet identity handshake."
+
+- An arbitrary caller CANNOT:
+  * Manufacture a forwardable Up Link.
+  * Insert an unauthenticated Link into a production LinkTable.
+  * Bind an attacker-chosen endpoint to a verified NodeId.
+  * Create a Link without a completed handshake (non-zero session_id).
+
+- 10 new tests (n2122_authenticated_link.rs):
+  1. unauthenticated_link_cannot_enter_link_table
+  2. missing_handshake_cannot_create_up_link
+  3. handshake_identity_mismatch_rejected
+  4. unauthorized_endpoint_rejected
+  5. authenticated_endpoint_creates_link
+  6. authenticated_link_recovers_to_up_after_probe
+  7. failed_handshake_creates_no_forwardable_link
+  8. route_engine_ignores_unauthenticated_link
+  9. authenticated_link_end_to_end_route (full A→B→G with AuthenticatedLinks)
+  10. production_build_has_no_public_new_up (feature-gate verified)
+
+- Preserved:
+  * RemoteNodeHint non-authoritativeness.
+  * VerifiedPeerSummaryList.
+  * AuthenticatedNodeRecord.
+  * Route / RouteCommitment / RouteEngine cost model.
+  * Directed topology model.
+  * DistributedRouteDiscovery boundary (explicitly unimplemented).
+
+- Test results: 309 passed, 0 failed, 3 ignored (was 299; +10 new).
+- Conformance: 138/138, 0 disagreements.
+- Production build (no test-support) compiles cleanly.
+
+Stage Summary:
+- AuthenticatedLink type enforces real security boundary at the Link layer.
+- Link::new_up and LinkTable::insert are pub(crate) — not accessible to external production code.
+- The only production path is AuthenticatedLink::from_verified_handshake → insert_authenticated.
+- Endpoint authorization prevents binding attacker-chosen endpoints to verified NodeIds.
+- Missing handshake (zero session_id) is rejected.
+- Identity mismatch (LinkKey.remote_node_id != advert.node_id) is rejected.
+- test-support Cargo feature provides test-only constructors for deterministic testing.
+- Ready for N2.2 (Internet gateway traffic) or distributed route discovery.
