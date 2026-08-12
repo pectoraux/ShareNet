@@ -1347,3 +1347,387 @@ fn hex_short(b: &[u8]) -> String {
     let n = b.len().min(8);
     b[..n].iter().map(|x| format!("{x:02x}")).collect::<String>() + "…"
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// N2.0.5: Code moved from `node/mod.rs` (deterministic-key demo + discovery
+// link keys). These functions use the deterministic N2.0 test seeds and are
+// NOT production code. They live here so that `node/mod.rs` (the production
+// module) is free of deterministic key derivation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Discovery link keys (N2.0.1 deterministic test seed) ───────────────────
+//
+// **N2.0.5: MOVED here from `node/mod.rs`.** These were `pub` in `node/mod.rs`
+// but were marked deprecated in N2.0.4 (Gate A). They are now isolated in the
+// legacy module so that `node/mod.rs` is free of any deterministic-seed
+// derivation. The N2.0.4 raw discovery protocol (`BootstrapDiscovery::discover`
+// + `Node::serve_discovery_persistent`) does NOT use these — the discovery link
+// is unauthenticated TCP + signed advertisement.
+
+/// Seed for the discovery link (Client ↔ Gateway). Both ends derive matching
+/// `LinkKeys` from this seed; the client is the initiator, the gateway is the
+/// responder. The discovery link is SEPARATE from the transit link (which
+/// uses the S3a/S3b hop keys).
+///
+/// **N2.0.1 test-only. DEPRECATED since N2.0.4 (Gate A).** Production uses
+/// the raw discovery protocol — the advertisement's signature provides the
+/// authentication, so the discovery link itself does not need to be
+/// authenticated.
+pub const DISCOVERY_LINK_SEED: &[u8] = b"SNP/0.1 N2.0.1 gateway-discovery seed";
+
+/// Client's directional hop keys for the discovery link (initiator).
+///
+/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
+/// (`crate::node::BootstrapDiscovery::discover`) instead — the
+/// AEAD-encrypted discovery link is no longer used.
+#[must_use]
+pub fn discovery_link_keys_initiator() -> LinkKeys {
+    derive_link_keys(DISCOVERY_LINK_SEED, true)
+}
+
+/// Gateway's directional hop keys for the discovery link (responder).
+///
+/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
+/// (`crate::node::Node::serve_discovery_persistent`) instead — the
+/// AEAD-encrypted discovery link is no longer used.
+#[must_use]
+pub fn discovery_link_keys_responder() -> LinkKeys {
+    derive_link_keys(DISCOVERY_LINK_SEED, false)
+}
+
+// ─── N2.0.1 mesh session demo (deterministic-key demo) ──────────────────────
+
+/// N2.0.1: deterministic Relay A secret key (for the demo). Not used
+/// cryptographically (relays don't sign anything in N2.0.1) — just for
+/// NodeIdentity construction.
+#[must_use]
+pub fn relay_secret_a() -> [u8; 32] {
+    let mut sk = [0u8; 32];
+    let mut i = 0u32;
+    while i < 32 {
+        sk[i as usize] = ((i.wrapping_mul(61)).wrapping_add(13)) as u8;
+        i += 1;
+    }
+    sk
+}
+
+/// N2.0.1: deterministic Relay B secret key (for the demo).
+#[must_use]
+pub fn relay_secret_b() -> [u8; 32] {
+    let mut sk = [0u8; 32];
+    let mut i = 0u32;
+    while i < 32 {
+        sk[i as usize] = ((i.wrapping_mul(67)).wrapping_add(29)) as u8;
+        i += 1;
+    }
+    sk
+}
+
+/// Run the N2.0.1 mesh session demo. This is the transition from "scripted
+/// proxy topology" to "real network":
+///
+/// 1. Start Gateway A and Gateway B as PERSISTENT nodes (each with a transit
+///    listener AND a discovery listener). Gateway A is configured to drop its
+///    transit connection after 2 requests (simulating a mid-session failure).
+/// 2. Start Relay B (multi-upstream: persistent connections to BOTH gateways).
+/// 3. Start Relay A (single-upstream: persistent connection to Relay B).
+/// 4. Client discovers gateways via signed advertisements (not hardcoded).
+/// 5. Client sends Request 1 → succeeds via Gateway A.
+/// 6. Client sends Request 2 → succeeds via Gateway A (SAME persistent session).
+/// 7. Gateway A's connection drops (simulated failure — the gateway closes
+///    its TCP stream after the 2nd request).
+/// 8. Client sends Request 3 → fails over to Gateway B (new circuit, same
+///    client process — NO NODE RESTART).
+///
+/// **N2.0.5: MOVED here from `node/mod.rs`.** This function uses the
+/// deterministic N2.0 test gateway identities (`gateway_a_secret`,
+/// `gateway_b_secret`) and the deterministic N2.0 client circuit keys
+/// (`client_circuit_keys_a`, `client_circuit_keys_b`). It is the N2.0.1
+/// demo, NOT production code. Production uses the SNP-IK/0.1 handshake +
+/// the client↔gateway X25519 circuit DH (see `tests/n202_protocol.rs`).
+///
+/// # Errors
+/// Returns [`NodeError`] on any unrecoverable failure.
+pub fn run_mesh_session_demo(url: &str) -> NodeResult<()> {
+    run_mesh_session_demo_with_failover(url)
+}
+
+/// Run the N2.0.1 mesh session demo WITH genuine failover. Gateway A is
+/// configured to drop its transit connection after 2 requests. Request 3
+/// fails over to Gateway B without restarting any node.
+///
+/// **N2.0.3: LEGACY DEMO (GatewayChoice-free).** This function previously
+/// used the deprecated `GatewayChoice`-based API (`NodeIdentity::gateway`,
+/// `Circuit::for_gateway`, `GatewayAdvertisement::for_gateway`,
+/// `serve_gateway_persistent(listen, gw)`, etc.). The N2.0.3 task spec
+/// ("`node.rs` must NOT import or use `GatewayChoice`") required removing
+/// those calls. The demo now uses the N2.0.3 production API:
+///   - `NodeIdentity::from_secret(gateway_a_secret())` instead of
+///     `NodeIdentity::gateway(GatewayChoice::A)`.
+///   - `node.serve_gateway_persistent(listen, link_keys, circuit_keys)`
+///     instead of `node.serve_gateway_persistent(listen, gw)`.
+///   - `node.serve_discovery_persistent(discovery_addr, transit_listen_addr)`
+///     instead of `node.serve_discovery_persistent(discovery_addr, gw,
+///     transit_listen_addr)`.
+///   - Explicit `Circuit::new(gateway_node_id, gateway_public_key,
+///     client_circuit_keys_a())` to pre-populate the client's circuit table
+///     (previously this was done inside `discover_gateways` via the
+///     `GatewayChoice`-based `Circuit::for_gateway`).
+///
+/// The deterministic N2.0 test gateway identities (`gateway_a_secret`,
+/// `gateway_b_secret`, `client_circuit_keys_a`, `client_circuit_keys_b`)
+/// are still used — they are the N2.0 demo's "test seeds" (NOT secret). In
+/// production, all of these come from the SNP-IK/0.1 handshake + the
+/// client↔gateway X25519 circuit DH.
+///
+/// **N2.0.5: MOVED here from `node/mod.rs`.**
+pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
+    use crate::node::{
+        Capability, Circuit, Node, NodeIdentity, UpstreamPeer,
+    };
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    eprintln!("=== ShareNet 2.0 — N2.0.1 Mesh Session Demo (with genuine failover) ===");
+    eprintln!("=== Gateway A drops after 2 requests → client fails over to Gateway B ===");
+    eprintln!("=== URL: {url} ===");
+    eprintln!();
+
+    // Allocate ephemeral ports.
+    let gw_a_transit_l = TcpListener::bind("127.0.0.1:0")?;
+    let gw_a_transit_addr = gw_a_transit_l.local_addr()?;
+    let gw_a_disc_l = TcpListener::bind("127.0.0.1:0")?;
+    let gw_a_disc_addr = gw_a_disc_l.local_addr()?;
+    let gw_b_transit_l = TcpListener::bind("127.0.0.1:0")?;
+    let gw_b_transit_addr = gw_b_transit_l.local_addr()?;
+    let gw_b_disc_l = TcpListener::bind("127.0.0.1:0")?;
+    let gw_b_disc_addr = gw_b_disc_l.local_addr()?;
+    let relay_b_l = TcpListener::bind("127.0.0.1:0")?;
+    let relay_b_addr = relay_b_l.local_addr()?;
+    let relay_a_l = TcpListener::bind("127.0.0.1:0")?;
+    let relay_a_addr = relay_a_l.local_addr()?;
+    drop(gw_a_transit_l);
+    drop(gw_a_disc_l);
+    drop(gw_b_transit_l);
+    drop(gw_b_disc_l);
+    drop(relay_b_l);
+    drop(relay_a_l);
+
+    let gw_a_transit_str = gw_a_transit_addr.to_string();
+    let gw_a_disc_str = gw_a_disc_addr.to_string();
+    let gw_b_transit_str = gw_b_transit_addr.to_string();
+    let gw_b_disc_str = gw_b_disc_addr.to_string();
+    let relay_b_str = relay_b_addr.to_string();
+    let relay_a_str = relay_a_addr.to_string();
+
+    // ── Start Gateway A (transit with drop_after=2, + discovery) ──
+    let gw_a_transit_for_disc = gw_a_transit_str.clone();
+    let gw_a_disc_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(gateway_a_secret()),
+            vec![Capability::Gateway],
+            gw_a_disc_str.clone(),
+        );
+        let _ = node.serve_discovery_persistent(&gw_a_disc_str, &gw_a_transit_for_disc);
+    });
+    let gw_a_transit_str_for_thread = gw_a_transit_str.clone();
+    let gw_a_transit_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(gateway_a_secret()),
+            vec![Capability::Gateway],
+            gw_a_transit_str_for_thread.clone(),
+        );
+        // drop_after=2: Gateway A serves 2 requests then drops its connection.
+        let _ = node.serve_gateway_persistent_with_drop_after(
+            &gw_a_transit_str_for_thread,
+            gateway_a_relay_b_link_keys(),
+            gateway_a_circuit_keys(),
+            2,
+        );
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    // ── Start Gateway B (transit + discovery) ──
+    let gw_b_transit_for_disc = gw_b_transit_str.clone();
+    let gw_b_disc_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(gateway_b_secret()),
+            vec![Capability::Gateway],
+            gw_b_disc_str.clone(),
+        );
+        let _ = node.serve_discovery_persistent(&gw_b_disc_str, &gw_b_transit_for_disc);
+    });
+    let gw_b_transit_str_for_thread = gw_b_transit_str.clone();
+    let gw_b_transit_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(gateway_b_secret()),
+            vec![Capability::Gateway],
+            gw_b_transit_str_for_thread.clone(),
+        );
+        let _ = node.serve_gateway_persistent(
+            &gw_b_transit_str_for_thread,
+            gateway_b_relay_b_link_keys(),
+            gateway_b_circuit_keys(),
+        );
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    // ── Start Relay B (multi-upstream) ──
+    let relay_b_upstreams = vec![
+        UpstreamPeer {
+            dst_node_id: gateway_a_node_id(),
+            addr: gw_a_transit_addr.to_string(),
+            hop_keys: relay_b_gateway_a_link_keys(),
+        },
+        UpstreamPeer {
+            dst_node_id: gateway_b_node_id(),
+            addr: gw_b_transit_addr.to_string(),
+            hop_keys: relay_b_gateway_b_link_keys(),
+        },
+    ];
+    let relay_b_str_for_thread = relay_b_str.clone();
+    let relay_b_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(relay_secret_b()),
+            vec![Capability::Relay],
+            relay_b_str_for_thread.clone(),
+        );
+        let _ = node.serve_relay_multi_upstream_persistent(
+            &relay_b_str_for_thread,
+            &relay_b_upstreams,
+            relay_b_relay_a_link_keys(),
+        );
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    // ── Start Relay A ──
+    let relay_b_addr_for_relay_a = relay_b_addr.to_string();
+    let relay_a_str_for_thread = relay_a_str.clone();
+    let relay_a_handle = std::thread::spawn(move || {
+        let node = Node::new(
+            NodeIdentity::from_secret(relay_secret_a()),
+            vec![Capability::Relay],
+            relay_a_str_for_thread.clone(),
+        );
+        let _ = node.serve_relay_persistent(
+            &relay_a_str_for_thread,
+            &relay_b_addr_for_relay_a,
+            relay_a_client_link_keys(),
+            relay_a_relay_b_link_keys(),
+        );
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    // ── Client: discover gateways ──
+    let client_node = Node::new(
+        NodeIdentity::client(),
+        vec![Capability::Client],
+        relay_a_addr.to_string(),
+    );
+
+    eprintln!();
+    eprintln!("=== Client: discovering gateways via signed advertisements ===");
+    let discovery_addrs = vec![gw_a_disc_addr.to_string(), gw_b_disc_addr.to_string()];
+    client_node.discover_gateways(&discovery_addrs)?;
+    let n_discovered = client_node.known_gateways.lock().unwrap().len();
+    eprintln!("=== Client: discovered {n_discovered} gateway(s) ===");
+    assert!(
+        n_discovered >= 2,
+        "expected to discover at least 2 gateways, got {n_discovered}"
+    );
+
+    // ── N2.0.3: pre-populate circuits for Gateway A and Gateway B ──
+    // The N2.0.1 `discover_gateways` used to do this implicitly via the
+    // `GatewayChoice`-based `Circuit::for_gateway(gw)`. The N2.0.3
+    // production `discover_gateways` records the advertisements only (it
+    // cannot call `Circuit::for_gateway` because that constructor is now
+    // `#[deprecated]`). For the demo, we explicitly construct the circuits
+    // here using the deterministic N2.0 test circuit keys. In production,
+    // the client would establish the circuit via the SNP-IK/0.1 handshake +
+    // the client↔gateway X25519 circuit DH (see `tests/n202_protocol.rs`
+    // Test 2).
+    {
+        let mut circuits = client_node.circuits.lock().unwrap();
+        circuits.insert(
+            gateway_a_node_id(),
+            Circuit::new(
+                gateway_a_node_id(),
+                gateway_a_public_key(),
+                client_circuit_keys_a(),
+            ),
+        );
+        circuits.insert(
+            gateway_b_node_id(),
+            Circuit::new(
+                gateway_b_node_id(),
+                gateway_b_public_key(),
+                client_circuit_keys_b(),
+            ),
+        );
+    }
+
+    // ── Request 1: via Gateway A ──
+    eprintln!();
+    eprintln!("=== Request 1: persistent session via Gateway A ===");
+    let start = Instant::now();
+    let (status1, verified1) = client_node.send_request(url)?;
+    let elapsed1 = start.elapsed();
+    println!(
+        "Request 1 OK: status={status1}, gateway-A verified={verified1}, RTT={:.2}s",
+        elapsed1.as_secs_f64()
+    );
+
+    // ── Request 2: SAME persistent session via Gateway A ──
+    eprintln!();
+    eprintln!("=== Request 2: SAME persistent session via Gateway A ===");
+    let start = Instant::now();
+    let (status2, verified2) = client_node.send_request(url)?;
+    let elapsed2 = start.elapsed();
+    println!(
+        "Request 2 OK: status={status2}, gateway-A verified={verified2}, RTT={:.2}s (same TCP connection as Request 1)",
+        elapsed2.as_secs_f64()
+    );
+
+    // ── Gateway A drops its connection after 2 requests (configured above) ──
+    eprintln!();
+    eprintln!("=== Gateway A's transit connection DROPPED after 2 requests (configured) ===");
+
+    // ── Request 3: with failover ──
+    eprintln!();
+    eprintln!("=== Request 3: send_request_with_failover → should fail over to Gateway B ===");
+    let start = Instant::now();
+    let (status3, verified3) = client_node.send_request_with_failover(url)?;
+    let elapsed3 = start.elapsed();
+    println!(
+        "Request 3 OK: status={status3}, verified={verified3}, RTT={:.2}s (FAILED OVER to Gateway B — no node restart)",
+        elapsed3.as_secs_f64()
+    );
+
+    // Verify the failover: the current_gateway should now be Gateway B.
+    let current = *client_node.current_gateway.lock().unwrap();
+    let gw_b_id = gateway_b_node_id();
+    let gw_a_id = gateway_a_node_id();
+    eprintln!();
+    eprintln!("=== Failover verification ===");
+    eprintln!("Gateway A NodeId: {}", hex_short(&gw_a_id));
+    eprintln!("Gateway B NodeId: {}", hex_short(&gw_b_id));
+    eprintln!("Current gateway:  {}", current.map_or("(none)".into(), |c| hex_short(&c)));
+    if current == Some(gw_b_id) {
+        println!("FAILOVER CONFIRMED: client switched from Gateway A → Gateway B without restarting any node.");
+    } else {
+        eprintln!("WARNING: current gateway is not Gateway B — failover may not have triggered.");
+    }
+
+    eprintln!();
+    eprintln!("=== N2.0.1 mesh session demo (with failover) complete ===");
+
+    // Detach threads.
+    std::mem::forget(gw_a_disc_handle);
+    std::mem::forget(gw_a_transit_handle);
+    std::mem::forget(gw_b_disc_handle);
+    std::mem::forget(gw_b_transit_handle);
+    std::mem::forget(relay_b_handle);
+    std::mem::forget(relay_a_handle);
+
+    Ok(())
+}

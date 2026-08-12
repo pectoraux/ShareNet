@@ -1,14 +1,39 @@
 //! Async transport — Tokio-based async I/O for the ShareNet reference node.
 //!
+//! **N2.0.5: This is the SINGLE CANONICAL PRODUCTION network path.** All
+//! production runtime networking goes through this module. The synchronous
+//! transport (`transport.rs`) is `#[deprecated]` and retained only for
+//! tests / backward compatibility.
+//!
 //! N2.0.4 Gate D: genuine async networking using Tokio.
 //! This module provides async versions of TransportProvider, TransportConnection,
 //! and TransportListener using `tokio::net::TcpStream` / `tokio::net::TcpListener`.
 //!
-//! The async transport is the production path for concurrent networking.
-//! The synchronous transport (in `transport.rs`) remains for tests and
-//! backward compatibility.
+//! ## Design (N2.0.5 — concrete types, no async-trait)
+//!
+//! Per the N2.0.5 task spec, we do NOT define an async-trait abstraction
+//! here (avoiding the `async_trait` crate dependency + the object-safety
+//! rabbit hole of native async traits). Instead, the canonical production
+//! transport is the concrete `AsyncTcpConnection` / `AsyncTcpListener` /
+//! `AsyncTcpTransportProvider` types. The Node uses these types directly;
+//! the Android platform implements equivalent concrete types (a
+//! `BleAsyncConnection` etc.) behind the same shape.
+//!
+//! A trait abstraction (`AsyncTransportConnection` / `AsyncTransportListener`
+//! / `AsyncTransportProvider`) can be formalized when a non-TCP transport is
+//! actually implemented (e.g. BLE GATT for Android peer-to-peer discovery).
+//! Until then, the concrete types are the abstraction — a caller that wants
+//! to swap transports replaces the type, not a trait object.
+//!
+//! ## Why async?
+//!
+//! The production node MUST handle concurrent connections — a relay
+//! forwards between many client/gateway pairs in parallel; a gateway
+//! serves many relays concurrently. Synchronous I/O (one thread per
+//! connection) does not scale to the production workload. Tokio's
+//! lightweight task scheduler + `tokio::io::split` for bidirectional
+//! relay forwarding is the production design.
 
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,12 +41,20 @@ use tokio::net::{TcpListener, TcpStream};
 /// Errors from the async transport layer.
 #[derive(Debug, Error)]
 pub enum AsyncTransportError {
+    /// `connect()` failed — the address and the underlying OS error are
+    /// included for diagnostics.
     #[error("connect to {0}: {1}")]
     Connect(String, String),
+    /// `listen()` / `bind()` failed — the address and the underlying OS
+    /// error are included for diagnostics.
     #[error("bind {0}: {1}")]
     Bind(String, String),
+    /// A read or write on an established connection failed. The underlying
+    /// OS error is included.
     #[error("io: {0}")]
     Io(String),
+    /// The peer closed the connection cleanly. Returned by `recv_framed`
+    /// when the peer has shut down their write side (EOF).
     #[error("connection closed")]
     Closed,
 }

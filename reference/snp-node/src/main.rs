@@ -214,7 +214,7 @@ fn cmd_mesh_session_demo(args: &[String]) -> snp_node::NodeResult<()> {
         }
         i += 1;
     }
-    snp_node::node::run_mesh_session_demo(&url)
+    snp_node::legacy::run_mesh_session_demo(&url)
 }
 
 fn usage(prog: &str) {

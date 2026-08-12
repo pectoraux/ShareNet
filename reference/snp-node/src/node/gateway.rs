@@ -1,6 +1,5 @@
 //! Extracted from node/mod.rs for N2.0.4 Gate E (node decomposition).
 use super::*;
-use thiserror::Error;
 
 // ─── GatewayAdvertisement ────────────────────────────────────────────────────
 

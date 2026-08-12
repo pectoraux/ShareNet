@@ -80,7 +80,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use snp_cbor::CborValue;
 use snp_crypto::{
@@ -93,17 +93,12 @@ use snp_gateway::{
     verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
 };
 use snp_link::{
-    decrypt_circuit_payload, derive_link_keys, encrypt_circuit_payload, CircuitKeys, Link, LinkKeys,
+    decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, Link, LinkKeys,
 };
 
 use crate::{
     client_circuit_keys_a, client_circuit_keys_b, client_public_key,
     client_relay_a_link_keys, client_secret_key,
-    gateway_a_circuit_keys, gateway_a_node_id, gateway_a_public_key, gateway_a_relay_b_link_keys,
-    gateway_a_secret, gateway_b_circuit_keys, gateway_b_node_id, gateway_b_public_key,
-    gateway_b_relay_b_link_keys, gateway_b_secret,
-    relay_a_client_link_keys, relay_a_relay_b_link_keys,
-    relay_b_gateway_a_link_keys, relay_b_gateway_b_link_keys, relay_b_relay_a_link_keys,
     NodeError, NodeResult,
 };
 
@@ -129,23 +124,33 @@ pub use session::{
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,
     CircuitState, CircuitV2,
 };
+// N2.0.5: The async transport is the SINGLE CANONICAL PRODUCTION network
+// path. The sync transport above is `#[deprecated]` — retained for tests
+// and backward compatibility only. The re-export below uses
+// `#[allow(deprecated)]` so callers that still reference the sync types
+// (e.g. `tests/n204_runtime.rs`) get the deprecation warning at THEIR call
+// sites, not at this re-export.
+#[allow(deprecated)]
 pub use transport::{
     TcpTransportConnection, TcpTransportListener, TcpTransportProvider, TransportConnection,
     TransportError, TransportListener, TransportProvider,
 };
+// N2.0.5: The async transport is the SINGLE CANONICAL PRODUCTION network
+// path. The sync transport above is `#[deprecated]` — retained for tests
+// and backward compatibility only.
+pub use async_transport::{
+    async_relay_forward, AsyncTcpConnection, AsyncTcpListener, AsyncTcpTransportProvider,
+    AsyncTransportError,
+};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-/// Seed for the discovery link (Client ↔ Gateway). Both ends derive matching
-/// `LinkKeys` from this seed; the client is the initiator, the gateway is the
-/// responder. The discovery link is SEPARATE from the transit link (which
-/// uses the S3a/S3b hop keys).
-///
-/// **N2.0.1 test-only.** Production would use an anonymous X25519 ephemeral
-/// handshake for discovery — the advertisement's signature provides the
-/// authentication, so the discovery link itself does not need to be
-/// authenticated.
-const DISCOVERY_LINK_SEED: &[u8] = b"SNP/0.1 N2.0.1 gateway-discovery seed";
+// **N2.0.5: `DISCOVERY_LINK_SEED` MOVED to `crate::legacy`.** It was a
+// deterministic N2.0.1 test seed for the AEAD-encrypted discovery link.
+// The N2.0.4 raw discovery protocol does NOT use AEAD on the discovery
+// link — the advertisement's signature provides the authentication. The
+// constant is retained in `crate::legacy` for backward compatibility with
+// any external callers that may still reference it.
 
 /// Default advertisement lifetime: 1 hour.
 const ADVERTISEMENT_TTL_SECS: u64 = 3600;
@@ -1522,360 +1527,40 @@ where
     Ok(ServeOutcome::Continue)
 }
 
-// ─── Discovery link keys ─────────────────────────────────────────────────────
+// ─── Discovery link keys (MOVED to legacy.rs in N2.0.5) ──────────────────────
 //
-// **N2.0.4 (Gate A) — DEPRECATED.** These functions derive AEAD link keys
-// from the deterministic `DISCOVERY_LINK_SEED`. The N2.0.4 raw discovery
-// protocol (used by `BootstrapDiscovery::discover` and
-// `Node::serve_discovery_persistent`) does NOT use AEAD on the discovery
-// link — the advertisement's signature provides the authentication, so the
-// discovery link itself does not need to be encrypted. These functions
-// are kept for backward compatibility with any external callers that may
-// still reference them, but new code MUST use the raw discovery protocol.
+// **N2.0.5: MOVED to `crate::legacy`.** The `DISCOVERY_LINK_SEED` constant
+// and the `discovery_link_keys_initiator` / `discovery_link_keys_responder`
+// functions were deterministic test seeds. They have been moved to
+// `crate::legacy` (alongside the other N1.9/N2.0 deterministic test seeds).
+// New production code MUST NOT use them — the N2.0.4 raw discovery protocol
+// (`BootstrapDiscovery::discover` + `Node::serve_discovery_persistent`)
+// uses unauthenticated TCP + a signed advertisement (no AEAD on the
+// discovery link). See `crate::legacy::discovery_link_keys_initiator` for
+// the legacy function.
 
-/// Client's directional hop keys for the discovery link (initiator).
-///
-/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
-/// (`BootstrapDiscovery::discover`) instead — the AEAD-encrypted discovery
-/// link is no longer used.
-#[must_use]
-pub fn discovery_link_keys_initiator() -> LinkKeys {
-    derive_link_keys(DISCOVERY_LINK_SEED, true)
-}
+// ─── N2.0.1 mesh session demo (MOVED to legacy.rs in N2.0.5) ─────────────────
+//
+// **N2.0.5: MOVED to `crate::legacy`.** The `run_mesh_session_demo` and
+// `run_mesh_session_demo_with_failover` functions were N2.0.1 demo code
+// that used the deterministic N2.0 test gateway identities
+// (`gateway_a_secret`, `gateway_b_secret`) and the deterministic N2.0
+// client circuit keys (`client_circuit_keys_a`, `client_circuit_keys_b`).
+// They have been moved to `crate::legacy` (alongside the other N1.9/N2.0
+// demo code). The `mesh-session-demo` binary and the `mesh-session-demo`
+// subcommand in `main.rs` now call `crate::legacy::run_mesh_session_demo`.
+// See `crate::legacy::run_mesh_session_demo` for the legacy function.
 
-/// Gateway's directional hop keys for the discovery link (responder).
-///
-/// **N2.0.4 (Gate A) — DEPRECATED.** Use the raw discovery protocol
-/// (`Node::serve_discovery_persistent`) instead — the AEAD-encrypted
-/// discovery link is no longer used.
-#[must_use]
-pub fn discovery_link_keys_responder() -> LinkKeys {
-    derive_link_keys(DISCOVERY_LINK_SEED, false)
-}
-
-// ─── N2.0.1 mesh session demo ────────────────────────────────────────────────
-
-/// Run the N2.0.1 mesh session demo. This is the transition from "scripted
-/// proxy topology" to "real network":
-///
-/// 1. Start Gateway A and Gateway B as PERSISTENT nodes (each with a transit
-///    listener AND a discovery listener). Gateway A is configured to drop its
-///    transit connection after 2 requests (simulating a mid-session failure).
-/// 2. Start Relay B (multi-upstream: persistent connections to BOTH gateways).
-/// 3. Start Relay A (single-upstream: persistent connection to Relay B).
-/// 4. Client discovers gateways via signed advertisements (not hardcoded).
-/// 5. Client sends Request 1 → succeeds via Gateway A.
-/// 6. Client sends Request 2 → succeeds via Gateway A (SAME persistent session).
-/// 7. Gateway A's connection drops (simulated failure — the gateway closes
-///    its TCP stream after the 2nd request).
-/// 8. Client sends Request 3 → fails over to Gateway B (new circuit, same
-///    client process — NO NODE RESTART).
-///
-/// # Errors
-/// Returns [`NodeError`] on any unrecoverable failure.
-pub fn run_mesh_session_demo(url: &str) -> NodeResult<()> {
-    run_mesh_session_demo_with_failover(url)
-}
-
-/// Run the N2.0.1 mesh session demo WITH genuine failover. Gateway A is
-/// configured to drop its transit connection after 2 requests. Request 3
-/// fails over to Gateway B without restarting any node.
-///
-/// **N2.0.3: LEGACY DEMO (GatewayChoice-free).** This function previously
-/// used the deprecated `GatewayChoice`-based API (`NodeIdentity::gateway`,
-/// `Circuit::for_gateway`, `GatewayAdvertisement::for_gateway`,
-/// `serve_gateway_persistent(listen, gw)`, etc.). The N2.0.3 task spec
-/// ("`node.rs` must NOT import or use `GatewayChoice`") required removing
-/// those calls. The demo now uses the N2.0.3 production API:
-///   - `NodeIdentity::from_secret(gateway_a_secret())` instead of
-///     `NodeIdentity::gateway(GatewayChoice::A)`.
-///   - `node.serve_gateway_persistent(listen, link_keys, circuit_keys)`
-///     instead of `node.serve_gateway_persistent(listen, gw)`.
-///   - `node.serve_discovery_persistent(discovery_addr, transit_listen_addr)`
-///     instead of `node.serve_discovery_persistent(discovery_addr, gw,
-///     transit_listen_addr)`.
-///   - Explicit `Circuit::new(gateway_node_id, gateway_public_key,
-///     client_circuit_keys_a())` to pre-populate the client's circuit table
-///     (previously this was done inside `discover_gateways` via the
-///     `GatewayChoice`-based `Circuit::for_gateway`).
-///
-/// The deterministic N2.0 test gateway identities (`gateway_a_secret`,
-/// `gateway_b_secret`, `client_circuit_keys_a`, `client_circuit_keys_b`)
-/// are still used — they are the N2.0 demo's "test seeds" (NOT secret). In
-/// production, all of these come from the SNP-IK/0.1 handshake + the
-/// client↔gateway X25519 circuit DH.
-pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
-    eprintln!("=== ShareNet 2.0 — N2.0.1 Mesh Session Demo (with genuine failover) ===");
-    eprintln!("=== Gateway A drops after 2 requests → client fails over to Gateway B ===");
-    eprintln!("=== URL: {url} ===");
-    eprintln!();
-
-    // Allocate ephemeral ports.
-    let gw_a_transit_l = TcpListener::bind("127.0.0.1:0")?;
-    let gw_a_transit_addr = gw_a_transit_l.local_addr()?;
-    let gw_a_disc_l = TcpListener::bind("127.0.0.1:0")?;
-    let gw_a_disc_addr = gw_a_disc_l.local_addr()?;
-    let gw_b_transit_l = TcpListener::bind("127.0.0.1:0")?;
-    let gw_b_transit_addr = gw_b_transit_l.local_addr()?;
-    let gw_b_disc_l = TcpListener::bind("127.0.0.1:0")?;
-    let gw_b_disc_addr = gw_b_disc_l.local_addr()?;
-    let relay_b_l = TcpListener::bind("127.0.0.1:0")?;
-    let relay_b_addr = relay_b_l.local_addr()?;
-    let relay_a_l = TcpListener::bind("127.0.0.1:0")?;
-    let relay_a_addr = relay_a_l.local_addr()?;
-    drop(gw_a_transit_l);
-    drop(gw_a_disc_l);
-    drop(gw_b_transit_l);
-    drop(gw_b_disc_l);
-    drop(relay_b_l);
-    drop(relay_a_l);
-
-    let gw_a_transit_str = gw_a_transit_addr.to_string();
-    let gw_a_disc_str = gw_a_disc_addr.to_string();
-    let gw_b_transit_str = gw_b_transit_addr.to_string();
-    let gw_b_disc_str = gw_b_disc_addr.to_string();
-    let relay_b_str = relay_b_addr.to_string();
-    let relay_a_str = relay_a_addr.to_string();
-
-    // ── Start Gateway A (transit with drop_after=2, + discovery) ──
-    let gw_a_transit_for_disc = gw_a_transit_str.clone();
-    let gw_a_disc_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(gateway_a_secret()),
-            vec![Capability::Gateway],
-            gw_a_disc_str.clone(),
-        );
-        let _ = node.serve_discovery_persistent(&gw_a_disc_str, &gw_a_transit_for_disc);
-    });
-    let gw_a_transit_str_for_thread = gw_a_transit_str.clone();
-    let gw_a_transit_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(gateway_a_secret()),
-            vec![Capability::Gateway],
-            gw_a_transit_str_for_thread.clone(),
-        );
-        // drop_after=2: Gateway A serves 2 requests then drops its connection.
-        let _ = node.serve_gateway_persistent_with_drop_after(
-            &gw_a_transit_str_for_thread,
-            gateway_a_relay_b_link_keys(),
-            gateway_a_circuit_keys(),
-            2,
-        );
-    });
-    std::thread::sleep(Duration::from_millis(150));
-
-    // ── Start Gateway B (transit + discovery) ──
-    let gw_b_transit_for_disc = gw_b_transit_str.clone();
-    let gw_b_disc_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(gateway_b_secret()),
-            vec![Capability::Gateway],
-            gw_b_disc_str.clone(),
-        );
-        let _ = node.serve_discovery_persistent(&gw_b_disc_str, &gw_b_transit_for_disc);
-    });
-    let gw_b_transit_str_for_thread = gw_b_transit_str.clone();
-    let gw_b_transit_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(gateway_b_secret()),
-            vec![Capability::Gateway],
-            gw_b_transit_str_for_thread.clone(),
-        );
-        let _ = node.serve_gateway_persistent(
-            &gw_b_transit_str_for_thread,
-            gateway_b_relay_b_link_keys(),
-            gateway_b_circuit_keys(),
-        );
-    });
-    std::thread::sleep(Duration::from_millis(150));
-
-    // ── Start Relay B (multi-upstream) ──
-    let relay_b_upstreams = vec![
-        UpstreamPeer {
-            dst_node_id: gateway_a_node_id(),
-            addr: gw_a_transit_addr.to_string(),
-            hop_keys: relay_b_gateway_a_link_keys(),
-        },
-        UpstreamPeer {
-            dst_node_id: gateway_b_node_id(),
-            addr: gw_b_transit_addr.to_string(),
-            hop_keys: relay_b_gateway_b_link_keys(),
-        },
-    ];
-    let relay_b_str_for_thread = relay_b_str.clone();
-    let relay_b_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(relay_secret_b()),
-            vec![Capability::Relay],
-            relay_b_str_for_thread.clone(),
-        );
-        let _ = node.serve_relay_multi_upstream_persistent(
-            &relay_b_str_for_thread,
-            &relay_b_upstreams,
-            relay_b_relay_a_link_keys(),
-        );
-    });
-    std::thread::sleep(Duration::from_millis(150));
-
-    // ── Start Relay A ──
-    let relay_b_addr_for_relay_a = relay_b_addr.to_string();
-    let relay_a_str_for_thread = relay_a_str.clone();
-    let relay_a_handle = std::thread::spawn(move || {
-        let node = Node::new(
-            NodeIdentity::from_secret(relay_secret_a()),
-            vec![Capability::Relay],
-            relay_a_str_for_thread.clone(),
-        );
-        let _ = node.serve_relay_persistent(
-            &relay_a_str_for_thread,
-            &relay_b_addr_for_relay_a,
-            relay_a_client_link_keys(),
-            relay_a_relay_b_link_keys(),
-        );
-    });
-    std::thread::sleep(Duration::from_millis(150));
-
-    // ── Client: discover gateways ──
-    let client_node = Node::new(
-        NodeIdentity::client(),
-        vec![Capability::Client],
-        relay_a_addr.to_string(),
-    );
-
-    eprintln!();
-    eprintln!("=== Client: discovering gateways via signed advertisements ===");
-    let discovery_addrs = vec![gw_a_disc_addr.to_string(), gw_b_disc_addr.to_string()];
-    client_node.discover_gateways(&discovery_addrs)?;
-    let n_discovered = client_node.known_gateways.lock().unwrap().len();
-    eprintln!("=== Client: discovered {n_discovered} gateway(s) ===");
-    assert!(
-        n_discovered >= 2,
-        "expected to discover at least 2 gateways, got {n_discovered}"
-    );
-
-    // ── N2.0.3: pre-populate circuits for Gateway A and Gateway B ──
-    // The N2.0.1 `discover_gateways` used to do this implicitly via the
-    // `GatewayChoice`-based `Circuit::for_gateway(gw)`. The N2.0.3
-    // production `discover_gateways` records the advertisements only (it
-    // cannot call `Circuit::for_gateway` because that constructor is now
-    // `#[cfg(test)]` + `#[deprecated]`). For the demo, we explicitly
-    // construct the circuits here using the deterministic N2.0 test
-    // circuit keys. In production, the client would establish the circuit
-    // via the SNP-IK/0.1 handshake + the client↔gateway X25519 circuit DH
-    // (see `tests/n202_protocol.rs` Test 2).
-    {
-        let mut circuits = client_node.circuits.lock().unwrap();
-        circuits.insert(
-            gateway_a_node_id(),
-            Circuit::new(
-                gateway_a_node_id(),
-                gateway_a_public_key(),
-                client_circuit_keys_a(),
-            ),
-        );
-        circuits.insert(
-            gateway_b_node_id(),
-            Circuit::new(
-                gateway_b_node_id(),
-                gateway_b_public_key(),
-                client_circuit_keys_b(),
-            ),
-        );
-    }
-
-    // ── Request 1: via Gateway A ──
-    eprintln!();
-    eprintln!("=== Request 1: persistent session via Gateway A ===");
-    let start = Instant::now();
-    let (status1, verified1) = client_node.send_request(url)?;
-    let elapsed1 = start.elapsed();
-    println!(
-        "Request 1 OK: status={status1}, gateway-A verified={verified1}, RTT={:.2}s",
-        elapsed1.as_secs_f64()
-    );
-
-    // ── Request 2: SAME persistent session via Gateway A ──
-    eprintln!();
-    eprintln!("=== Request 2: SAME persistent session via Gateway A ===");
-    let start = Instant::now();
-    let (status2, verified2) = client_node.send_request(url)?;
-    let elapsed2 = start.elapsed();
-    println!(
-        "Request 2 OK: status={status2}, gateway-A verified={verified2}, RTT={:.2}s (same TCP connection as Request 1)",
-        elapsed2.as_secs_f64()
-    );
-
-    // ── Gateway A drops its connection after 2 requests (configured above) ──
-    eprintln!();
-    eprintln!("=== Gateway A's transit connection DROPPED after 2 requests (configured) ===");
-
-    // ── Request 3: with failover ──
-    eprintln!();
-    eprintln!("=== Request 3: send_request_with_failover → should fail over to Gateway B ===");
-    let start = Instant::now();
-    let (status3, verified3) = client_node.send_request_with_failover(url)?;
-    let elapsed3 = start.elapsed();
-    println!(
-        "Request 3 OK: status={status3}, verified={verified3}, RTT={:.2}s (FAILED OVER to Gateway B — no node restart)",
-        elapsed3.as_secs_f64()
-    );
-
-    // Verify the failover: the current_gateway should now be Gateway B.
-    let current = *client_node.current_gateway.lock().unwrap();
-    let gw_b_id = gateway_b_node_id();
-    let gw_a_id = gateway_a_node_id();
-    eprintln!();
-    eprintln!("=== Failover verification ===");
-    eprintln!("Gateway A NodeId: {}", hex_short(&gw_a_id));
-    eprintln!("Gateway B NodeId: {}", hex_short(&gw_b_id));
-    eprintln!("Current gateway:  {}", current.map_or("(none)".into(), |c| hex_short(&c)));
-    if current == Some(gw_b_id) {
-        println!("FAILOVER CONFIRMED: client switched from Gateway A → Gateway B without restarting any node.");
-    } else {
-        eprintln!("WARNING: current gateway is not Gateway B — failover may not have triggered.");
-    }
-
-    eprintln!();
-    eprintln!("=== N2.0.1 mesh session demo (with failover) complete ===");
-
-    // Detach threads.
-    std::mem::forget(gw_a_disc_handle);
-    std::mem::forget(gw_a_transit_handle);
-    std::mem::forget(gw_b_disc_handle);
-    std::mem::forget(gw_b_transit_handle);
-    std::mem::forget(relay_b_handle);
-    std::mem::forget(relay_a_handle);
-
-    Ok(())
-}
 
 // ─── Test/demo helpers (public for tests) ────────────────────────────────────
-
-/// N2.0.1: deterministic Relay A secret key (for the demo). Not used
-/// cryptographically (relays don't sign anything in N2.0.1) — just for
-/// NodeIdentity construction.
-#[must_use]
-pub fn relay_secret_a() -> [u8; 32] {
-    let mut sk = [0u8; 32];
-    let mut i = 0u32;
-    while i < 32 {
-        sk[i as usize] = ((i.wrapping_mul(61)).wrapping_add(13)) as u8;
-        i += 1;
-    }
-    sk
-}
-
-/// N2.0.1: deterministic Relay B secret key (for the demo).
-#[must_use]
-pub fn relay_secret_b() -> [u8; 32] {
-    let mut sk = [0u8; 32];
-    let mut i = 0u32;
-    while i < 32 {
-        sk[i as usize] = ((i.wrapping_mul(67)).wrapping_add(29)) as u8;
-        i += 1;
-    }
-    sk
-}
+//
+// **N2.0.5: `relay_secret_a` and `relay_secret_b` MOVED to `crate::legacy`.**
+// They were deterministic N2.0 demo secret keys (not cryptographically
+// meaningful — relays don't sign anything in N2.0.1). They live in
+// `crate::legacy` now so that `node/mod.rs` is free of deterministic key
+// derivation. Re-exported here for backward compatibility with any tests
+// that still reference `snp_node::node::relay_secret_a`.
+pub use crate::legacy::{relay_secret_a, relay_secret_b};
 
 /// Wrap `serve_relay_persistent_inner` with a connection counter (for tests).
 /// Returns the relay's thread join handle and the counter.
@@ -2310,6 +1995,142 @@ mod tests {
              Found import: {:?}",
             import_line
         );
+    }
+
+    // ─── N2.0.5 (Item 2/3): static checks that deterministic-seed key
+    //      derivation (`derive_link_keys`) and `GatewayChoice` do not appear
+    //      in production node/ module code (only in `#[deprecated]`
+    //      constructors, `#[cfg(test)]` blocks, or comments). ──────────────
+
+    /// N2.0.5: Helper — scan a source file for `needle` references outside
+    /// doc-comments, code-comments, `#[cfg(test)]` blocks, and
+    /// `#[deprecated]` function bodies. Returns the (line_number, line)
+    /// of the first offending occurrence, or `None` if all references are
+    /// in allowed regions.
+    fn scan_for_offending_reference(
+        module_name: &str,
+        source: &str,
+        needle: &str,
+    ) -> Option<(usize, String)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut in_cfg_test = false;
+        for (lineno, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // Track #[cfg(test)] mod entry — once we enter the test mod, we
+            // stay there for the rest of the file (the test mod is at the end).
+            if trimmed.starts_with("#[cfg(test)]") {
+                in_cfg_test = true;
+            }
+            if in_cfg_test {
+                continue;
+            }
+            if !line.contains(needle) {
+                continue;
+            }
+            // Allowed: any comment line.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Allowed: inside a `#[deprecated]` function body. We look
+            // backwards up to 15 lines for a `#[deprecated` attribute,
+            // stopping if we hit a `}` line (which would mean we're outside
+            // any deprecated fn — the previous function has closed). We do
+            // NOT stop at `pub fn` lines because the `#[deprecated]`
+            // attribute sits ABOVE the `pub fn` line, so we need to scan
+            // past it.
+            let start = lineno.saturating_sub(15);
+            let mut found_deprecated = false;
+            for prev in lines[start..lineno].iter().rev() {
+                let pt = prev.trim_start();
+                if pt.starts_with("#[deprecated") {
+                    found_deprecated = true;
+                    break;
+                }
+                // Stop if we hit a closing brace at column 0 — that's the
+                // end of a previous function (we've left any deprecated fn
+                // we might have been in). We use a column-0 `}` (i.e.
+                // trimmed line starts with `}`) to avoid false positives
+                // from nested `}` inside the function body (those are
+                // indented).
+                if pt.starts_with("}") {
+                    break;
+                }
+            }
+            if !found_deprecated {
+                return Some((lineno + 1, line.to_string()));
+            }
+            let _ = module_name; // module_name is used in the panic message at the call site
+        }
+        None
+    }
+
+    /// N2.0.5 (Item 2): `derive_link_keys` (the deterministic-seed AEAD key
+    /// derivation function) must NOT appear in production node/ module code.
+    /// It is only allowed in `crate::legacy` (which holds the deterministic
+    /// N1.9/N2.0 test seeds) and in `#[deprecated]` constructors or
+    /// `#[cfg(test)]` blocks.
+    ///
+    /// This test scans every `node/` module source file for `derive_link_keys`
+    /// references and fails if any appear in a production region (i.e. not
+    /// in a comment, `#[deprecated]` body, or `#[cfg(test)]` block).
+    #[test]
+    fn derive_link_keys_not_in_production_node_modules() {
+        let modules: &[(&str, &str)] = &[
+            ("node/mod.rs", include_str!("mod.rs")),
+            ("node/circuit.rs", include_str!("circuit.rs")),
+            ("node/gateway.rs", include_str!("gateway.rs")),
+            ("node/identity.rs", include_str!("identity.rs")),
+            ("node/session.rs", include_str!("session.rs")),
+            ("node/route.rs", include_str!("route.rs")),
+            ("node/discovery.rs", include_str!("discovery.rs")),
+            ("node/transport.rs", include_str!("transport.rs")),
+            ("node/async_transport.rs", include_str!("async_transport.rs")),
+        ];
+        for (name, source) in modules {
+            if let Some((lineno, line)) = scan_for_offending_reference(name, source, "derive_link_keys") {
+                panic!(
+                    "Production node module {}:{} references `derive_link_keys` outside a \
+                     #[deprecated] block or #[cfg(test)] block.\n  Line: {line}\n  \
+                     `derive_link_keys` is the deterministic-seed AEAD key derivation — \
+                     production node/ modules must NOT use it. Move the call to \
+                     `crate::legacy` or mark it `#[deprecated]` / `#[cfg(test)]`.",
+                    name, lineno
+                );
+            }
+        }
+    }
+
+    /// N2.0.5 (Item 3): `GatewayChoice` must NOT appear in production node/
+    /// module code — only in `#[deprecated]` constructors
+    /// (`Circuit::for_gateway`, `GatewayAdvertisement::for_gateway`,
+    /// `NodeIdentity::gateway`), `#[cfg(test)]` blocks, or comments.
+    ///
+    /// This test scans every `node/` module source file for `GatewayChoice`
+    /// references and fails if any appear in a production region.
+    #[test]
+    fn gateway_choice_not_in_production_node_modules() {
+        let modules: &[(&str, &str)] = &[
+            ("node/mod.rs", include_str!("mod.rs")),
+            ("node/circuit.rs", include_str!("circuit.rs")),
+            ("node/gateway.rs", include_str!("gateway.rs")),
+            ("node/identity.rs", include_str!("identity.rs")),
+            ("node/session.rs", include_str!("session.rs")),
+            ("node/route.rs", include_str!("route.rs")),
+            ("node/discovery.rs", include_str!("discovery.rs")),
+            ("node/transport.rs", include_str!("transport.rs")),
+            ("node/async_transport.rs", include_str!("async_transport.rs")),
+        ];
+        for (name, source) in modules {
+            if let Some((lineno, line)) = scan_for_offending_reference(name, source, "GatewayChoice") {
+                panic!(
+                    "Production node module {}:{} references `GatewayChoice` outside a \
+                     #[deprecated] block, #[cfg(test)] block, or comment.\n  Line: {line}\n  \
+                     Move the GatewayChoice-dependent code to `crate::legacy` or mark it \
+                     `#[deprecated]` / `#[cfg(test)]`.",
+                    name, lineno
+                );
+            }
+        }
     }
 
     #[test]

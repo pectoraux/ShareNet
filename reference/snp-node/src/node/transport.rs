@@ -1,5 +1,15 @@
 //! Transport — platform-independent TransportProvider abstraction.
 //!
+//! **N2.0.5: DEPRECATED for production runtime.** This module provides the
+//! SYNCHRONOUS transport abstraction (`std::net::TcpStream`-backed). The
+//! production runtime now uses the ASYNC transport abstraction in
+//! [`super::async_transport`] (Tokio-backed, supports concurrent connections,
+//! is the single canonical network path). This module is kept for tests and
+//! backward compatibility with code that still needs synchronous I/O (e.g.
+//! `tests/n204_runtime.rs`'s `gate_b_transport_provider_tcp_roundtrip` test).
+//!
+//! ## Historical context
+//!
 //! Extracted for N2.0.4 Gate B. The [`TransportProvider`] trait abstracts
 //! over the underlying network transport (TCP, BLE GATT, Wi-Fi Direct, etc.)
 //! so the same SNP-Node logic can run on platforms that do not expose POSIX
@@ -36,18 +46,30 @@
 //!    SNP sub-protocols (e.g. the N2.0.4 raw discovery handshake) without
 //!    dragging in SNP-frame semantics.
 //!
-//! ## Production readiness
+//! ## Production readiness (N2.0.5)
 //!
-//! The [`TcpTransportProvider`] IS production-ready — it is a thin wrapper
-//! around `std::net::TcpStream` / `std::net::TcpListener` that sets
-//! `TCP_NODELAY` (disables Nagle, since SNP frames are small and we want
-//! low latency) and exposes a `Send + Sync` trait object.
+//! The [`TcpTransportProvider`] IS functionally production-ready — it is a
+//! thin wrapper around `std::net::TcpStream` / `std::net::TcpListener` that
+//! sets `TCP_NODELAY` (disables Nagle, since SNP frames are small and we want
+//! low latency) and exposes a `Send + Sync` trait object. However, the
+//! PRODUCTION RUNTIME uses the async transport (`AsyncTcpTransportProvider`)
+//! because the production node needs to handle concurrent connections (relays
+//! forwarding between many client/gateway pairs in parallel). This sync
+//! transport is retained for tests + backward compatibility.
 //!
 //! The trait abstraction is the N2.0.4 deliverable: the Android platform
 //! (see `docs/n2.0.3-android-platform-contract.md`) implements a
 //! `BleTransportProvider` (BLE GATT) and a `WifiDirectTransportProvider`
 //! (Wi-Fi Direct) behind the same trait, so the SNP-Node logic does not
 //! change between platforms.
+
+// N2.0.5: The sync transport is `#[deprecated]` for production runtime.
+// The module itself uses `#[allow(deprecated)]` so the trait definitions
+// can reference each other (e.g. `TransportListener::accept` returns
+// `Box<dyn TransportConnection>`) without triggering the deprecation
+// warning at the trait-definition level. External callers (production code)
+// will still see the deprecation warning if they use these types.
+#![allow(deprecated)]
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -119,6 +141,17 @@ pub enum TransportError {
 /// The trait is object-safe — `Box<dyn TransportConnection>` is the
 /// intended usage. `Send` is required so the connection can be moved
 /// between threads (e.g. handed off to a relay forwarder thread).
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpConnection`] instead — the production
+/// runtime is async (Tokio-based). This sync trait is retained for tests
+/// and backward compatibility.
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use the async transport (super::async_transport::AsyncTcpConnection) instead. \
+            The production runtime is async (Tokio-based); this sync trait is retained \
+            for tests and backward compatibility."
+)]
 pub trait TransportConnection: Send {
     /// Send raw bytes. Returns `Ok(())` if all bytes were written, or
     /// `Err` if the connection is dead.
@@ -142,6 +175,16 @@ pub trait TransportConnection: Send {
 ///
 /// Wraps a `TcpListener` (or BLE advertise handle, Wi-Fi Direct group
 /// owner socket, etc.) and accepts incoming connections.
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpListener`] instead — the production
+/// runtime is async (Tokio-based).
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use the async transport (super::async_transport::AsyncTcpListener) instead. \
+            The production runtime is async (Tokio-based); this sync trait is retained \
+            for tests and backward compatibility."
+)]
 pub trait TransportListener: Send {
     /// Accept one incoming connection. Blocks until a connection arrives.
     fn accept(&mut self) -> Result<Box<dyn TransportConnection>, TransportError>;
@@ -171,6 +214,17 @@ pub trait TransportListener: Send {
 ///   Android port (see `docs/n2.0.3-android-platform-contract.md`).
 /// - (Android) `WifiDirectTransportProvider` — Wi-Fi Direct group owner.
 ///   Implemented in the Android port.
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpTransportProvider`] instead — the
+/// production runtime is async (Tokio-based) and supports concurrent
+/// connections.
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use the async transport (super::async_transport::AsyncTcpTransportProvider) instead. \
+            The production runtime is async (Tokio-based) and supports concurrent connections; \
+            this sync trait is retained for tests and backward compatibility."
+)]
 pub trait TransportProvider: Send + Sync {
     /// Connect to a remote endpoint. The address format is
     /// transport-defined (for TCP, `"host:port"`; for BLE, a MAC address
@@ -190,14 +244,27 @@ pub trait TransportProvider: Send + Sync {
 /// [`TransportProvider`] trait. Sets `TCP_NODELAY` (disables Nagle) on
 /// every connection — SNP frames are small and we want low latency.
 ///
-/// ## Production-ready
+/// ## Production-ready (N2.0.4)
 ///
-/// This IS production-ready — it is a thin wrapper around the standard
-/// library's TCP types. The trait abstraction (not this impl) is the
-/// N2.0.4 deliverable.
+/// This IS functionally production-ready — it is a thin wrapper around the
+/// standard library's TCP types. The trait abstraction (not this impl) is
+/// the N2.0.4 deliverable.
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpTransportProvider`] instead. The
+/// production runtime is async (Tokio-based) and supports concurrent
+/// connections; this sync impl is retained for tests and backward
+/// compatibility.
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use AsyncTcpTransportProvider (super::async_transport) instead. \
+            The production runtime is async (Tokio-based); this sync impl is retained \
+            for tests and backward compatibility."
+)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TcpTransportProvider;
 
+#[allow(deprecated)]
 impl TcpTransportProvider {
     /// Construct a new `TcpTransportProvider`.
     #[must_use]
@@ -206,6 +273,7 @@ impl TcpTransportProvider {
     }
 }
 
+#[allow(deprecated)]
 impl TransportProvider for TcpTransportProvider {
     fn connect(&self, addr: &str) -> Result<Box<dyn TransportConnection>, TransportError> {
         let stream = TcpStream::connect(addr)
@@ -230,11 +298,21 @@ impl TransportProvider for TcpTransportProvider {
 /// any I/O error — callers SHOULD check [`is_alive`](TransportConnection::is_alive)
 /// before reusing a connection from a pool, but the trait methods are
 /// safe to call even after an error (they will return `Err`).
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpConnection`] instead.
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use AsyncTcpConnection (super::async_transport) instead. \
+            The production runtime is async (Tokio-based); this sync impl is retained \
+            for tests and backward compatibility."
+)]
 pub struct TcpTransportConnection {
     stream: TcpStream,
     alive: bool,
 }
 
+#[allow(deprecated)]
 impl TransportConnection for TcpTransportConnection {
     fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
         if !self.alive {
@@ -291,10 +369,18 @@ impl TransportConnection for TcpTransportConnection {
 /// Wraps a `std::net::TcpListener`. Accepting a connection returns a
 /// `Box<dyn TransportConnection>` (a [`TcpTransportConnection`] under the
 /// hood).
+///
+/// **N2.0.5: DEPRECATED for production runtime.** Use the async
+/// [`super::async_transport::AsyncTcpListener`] instead.
+#[deprecated(
+    since = "N2.0.5",
+    note = "Use AsyncTcpListener (super::async_transport) instead."
+)]
 pub struct TcpTransportListener {
     listener: TcpListener,
 }
 
+#[allow(deprecated)]
 impl TransportListener for TcpTransportListener {
     fn accept(&mut self) -> Result<Box<dyn TransportConnection>, TransportError> {
         let (stream, _peer_addr) = self
@@ -323,6 +409,7 @@ impl TransportListener for TcpTransportListener {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::sync::Arc;

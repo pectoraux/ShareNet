@@ -3,7 +3,6 @@
 //! Extracted from node.rs for N2.0.3 Gate J (Node decomposition).
 
 use super::*;
-use thiserror::Error;
 
 
 // ─── Route (Phase 5 — N2.0.3 first-class Route object) ───────────────────────

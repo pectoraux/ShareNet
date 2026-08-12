@@ -62,7 +62,7 @@ fn main() -> ExitCode {
         }
         i += 1;
     }
-    match snp_node::node::run_mesh_session_demo(&url) {
+    match snp_node::legacy::run_mesh_session_demo(&url) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
