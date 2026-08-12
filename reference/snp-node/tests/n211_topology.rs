@@ -206,7 +206,7 @@ fn peer_directory_remove_peer_is_explicit() {
 
 #[test]
 fn topology_graph_directed_links() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (sk_a, pk_a) = fresh_keypair(b"tg-a");
     let (sk_b, pk_b) = fresh_keypair(b"tg-b");
     let node_a = derive_node_id(&pk_a);
@@ -232,7 +232,7 @@ fn topology_graph_directed_links() {
 
 #[test]
 fn topology_graph_reachable_gateways() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (gw_advert, _, gw_pk) = make_gateway_advert(b"tg-gw", 1);
     let gw_verified = gw_advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(gw_verified).expect("accept");
@@ -260,7 +260,7 @@ fn topology_graph_reachable_gateways() {
 
 #[test]
 fn topology_graph_snapshot_is_immutable() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (advert, _, pk) = make_relay_advert(b"tg-snap", 1);
     let verified = advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(verified).expect("accept");
@@ -282,7 +282,7 @@ fn topology_graph_snapshot_is_immutable() {
 
 #[test]
 fn topology_graph_remote_propagation() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
 
     // We know about a direct relay.
     let (relay_advert, _, relay_pk) = make_relay_advert(b"tg-prop-relay", 1);
@@ -328,7 +328,7 @@ fn topology_graph_remote_propagation() {
 
 #[test]
 fn topology_graph_generate_peer_summaries() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
 
     // Add a direct relay.
     let (relay_advert, _, _) = make_relay_advert(b"tg-gen-relay", 1);
@@ -350,7 +350,7 @@ fn topology_graph_generate_peer_summaries() {
 
 #[test]
 fn node_churn_appears_disappears_returns() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (advert, _, pk) = make_relay_advert(b"tg-churn", 1);
     let verified = advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(verified).expect("accept");
@@ -448,7 +448,7 @@ fn peer_summary_from_record() {
 
 #[test]
 fn link_failure_makes_node_unreachable_but_known() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (advert, _, pk) = make_relay_advert(b"tg-fail", 1);
     let verified = advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(verified).expect("accept");
@@ -478,7 +478,7 @@ use snp_node::node::{PropagationResult, RemoteNodeHint};
 /// 1. remote_hint_is_not_authenticated_node
 #[test]
 fn remote_hint_is_not_authenticated_node() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
 
     // Create a fake summary claiming node G is a gateway.
     let fake_gw_id = [0xAA; 32];
@@ -505,7 +505,7 @@ fn remote_hint_is_not_authenticated_node() {
 /// 2. fake_gateway_claim_is_not_authenticated
 #[test]
 fn fake_gateway_claim_is_not_authenticated() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let fake_gw_id = [0xBB; 32];
     let summary = PeerSummary {
         node_id: fake_gw_id,
@@ -534,7 +534,7 @@ fn fake_gateway_claim_is_not_authenticated() {
 /// 3. direct_gateways_excludes_remote_hints
 #[test]
 fn direct_gateways_excludes_remote_hints() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
 
     // Add an authenticated direct relay (not a gateway).
     let (relay_advert, _, relay_pk) = make_relay_advert(b"direct-relay", 1);
@@ -570,7 +570,7 @@ fn direct_gateways_excludes_remote_hints() {
 /// 4. gateway_hints_contains_remote_claim
 #[test]
 fn gateway_hints_contains_remote_claim() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let gw_id = [0xEE; 32];
     let summary = PeerSummary {
         node_id: gw_id,
@@ -597,7 +597,7 @@ fn gateway_hints_contains_remote_claim() {
 /// 5. remote_hint_cannot_become_verified_descriptor
 #[test]
 fn remote_hint_cannot_become_verified_descriptor() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let target_id = [0xFF; 32];
     let summary = PeerSummary {
         node_id: target_id,
@@ -629,7 +629,7 @@ fn remote_hint_cannot_become_verified_descriptor() {
 /// 6. multi_hop_destination_discovery_without_authentication
 #[test]
 fn multi_hop_destination_discovery_without_authentication() {
-    let mut graph_a = TopologyGraph::new();
+    let mut graph_a = TopologyGraph::new_for_testing();
 
     // A knows B directly (authenticated).
     let (b_advert, _, b_pk) = make_relay_advert(b"multi-b", 1);
@@ -705,7 +705,7 @@ fn multi_hop_destination_discovery_without_authentication() {
 /// 7. distance_hint_is_not_route
 #[test]
 fn distance_hint_is_not_route() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let target = [0x44; 32];
     let summary = PeerSummary {
         node_id: target,
@@ -734,7 +734,7 @@ fn distance_hint_is_not_route() {
 /// 8. propagation_sequence_replay_rejected
 #[test]
 fn propagation_sequence_replay_rejected() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (sk, pk) = fresh_keypair(b"replay-sender");
     let sender_id = derive_node_id(&pk);
 
@@ -776,7 +776,7 @@ fn propagation_sequence_replay_rejected() {
 /// 9. stale_propagation_message_rejected
 #[test]
 fn stale_propagation_message_rejected() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let (sk, pk) = fresh_keypair(b"stale-prop");
     let sender_id = derive_node_id(&pk);
 
@@ -801,7 +801,7 @@ fn stale_propagation_message_rejected() {
 /// 10. provenance_preserved
 #[test]
 fn provenance_preserved() {
-    let mut graph = TopologyGraph::new();
+    let mut graph = TopologyGraph::new_for_testing();
     let target = [0x77; 32];
     let (sender_sk, sender_pk) = fresh_keypair(b"provenance-sender");
     let sender_id = derive_node_id(&sender_pk);

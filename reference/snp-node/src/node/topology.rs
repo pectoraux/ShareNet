@@ -226,7 +226,7 @@ impl TopologyGraph {
     /// makes the testing intent explicit and is easy to grep for in production
     /// code reviews.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             directory: PeerDirectory::new(),
             remote_hints: HashMap::new(),
@@ -236,17 +236,33 @@ impl TopologyGraph {
 
     /// Create a new empty in-memory topology graph, explicitly for testing.
     ///
-    /// This is the same as `new()` but with a name that makes the testing
-    /// intent explicit. **Production code must NOT call this** — it creates
-    /// an ephemeral (non-persistent) propagation state store, which defeats
-    /// restart-replay protection.
+    /// This is the **only** public constructor that produces an ephemeral
+    /// (non-persistent) topology graph. It exists for unit tests that don't
+    /// touch the filesystem.
     ///
-    /// ## Code-review guard
+    /// ## ⚠️ TESTING ONLY — do NOT use in production
     ///
-    /// A simple grep for `new_for_testing` in non-test code reveals any
-    /// accidental misuse. Alternatively, a future CI lint could forbid
-    /// `TopologyGraph::new()` and `TopologyGraph::new_for_testing()` outside
-    /// of `#[cfg(test)]` modules and `tests/` directories.
+    /// This constructor creates an ephemeral `PropagationStateStore` that
+    /// does NOT persist across restart. If production networking code uses
+    /// this constructor, the restart-replay protection (review-gate fix #2)
+    /// is silently defeated — an old propagation message could become
+    /// acceptable again after a restart.
+    ///
+    /// Production code MUST use `TopologyGraph::open(path)` or
+    /// `TopologyGraph::open_with_propagation_path(peer_path, prop_path)`,
+    /// which load persistent replay-protection state from disk.
+    ///
+    /// ## Why `new()` is private
+    ///
+    /// `TopologyGraph::new()` is private. The only public ephemeral
+    /// constructor is `new_for_testing()`. This makes accidental production
+    /// misuse harder — a developer must explicitly opt into "testing" mode.
+    /// A CI grep for `new_for_testing` in non-test code (`src/` excluding
+    /// `tests/`) catches any misuse at code review.
+    ///
+    /// `impl Default for TopologyGraph` is deliberately REMOVED. The
+    /// `Default::default()` path would also produce ephemeral state, so it
+    /// is removed to close that escape hatch entirely.
     #[must_use]
     pub fn new_for_testing() -> Self {
         Self::new()
@@ -741,11 +757,13 @@ impl TopologyGraph {
     }
 }
 
-impl Default for TopologyGraph {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// NOTE: `impl Default for TopologyGraph` is deliberately REMOVED (N2.1.1.1
+// review-gate fix #9). The `Default::default()` path would produce an
+// ephemeral (non-persistent) topology graph, silently defeating the
+// restart-replay protection established in review-gate fix #2. Production
+// code MUST use `TopologyGraph::open(path)` or
+// `TopologyGraph::open_with_propagation_path(...)`. Tests use
+// `TopologyGraph::new_for_testing()`.
 
 /// An immutable point-in-time view of the topology.
 ///
