@@ -28,7 +28,7 @@ fn authenticated_relay_descriptor() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1234")],
         None, // no X25519 circuit key for relays
-        3600,
+        3600, 1,  // sequence = 1
     );
     let verified = advert.verify_into_verified()
         .expect("relay advertisement must verify");
@@ -50,7 +50,7 @@ fn authenticated_gateway_descriptor() {
         vec![Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:5678")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     let verified = advert.verify_into_verified()
         .expect("gateway advertisement must verify");
@@ -71,7 +71,7 @@ fn authenticated_multi_role_descriptor() {
         vec![Capability::Relay, Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:9999")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     let verified = advert.verify_into_verified()
         .expect("multi-role advertisement must verify");
@@ -90,7 +90,7 @@ fn invalid_relay_signature_rejected() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     // Tamper with the signature.
     advert.signature[0] ^= 0xff;
@@ -109,7 +109,7 @@ fn invalid_gateway_signature_rejected() {
         vec![Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     advert.signature[0] ^= 0xff;
     assert!(advert.verify_into_verified().is_none(),
@@ -126,7 +126,7 @@ fn tampered_capabilities_rejected() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     // Tamper with capabilities after signing.
     advert.capabilities.push(Capability::Gateway);
@@ -144,7 +144,7 @@ fn tampered_endpoint_rejected() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1234")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     // Tamper with the endpoint after signing.
     advert.endpoints[0] = TransportEndpoint::tcp("127.0.0.1:9999");
@@ -163,7 +163,7 @@ fn tampered_gateway_x25519_key_rejected() {
         vec![Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     // Tamper with the X25519 key after signing.
     if let Some(ref mut key) = advert.x25519_circuit_public {
@@ -184,7 +184,7 @@ fn replayed_advertisement_rejected() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         None,
-        0, // expires immediately
+        0, 1, // expires immediately, sequence = 1
     );
     // Wait a tiny bit to ensure `now > expiry`.
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -202,7 +202,7 @@ fn relay_route_hop_accepts_no_gateway_key() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     let verified = advert.verify_into_verified().expect("must verify");
     let desc = verified.descriptor();
@@ -226,7 +226,7 @@ fn gateway_route_hop_requires_gateway_key() {
         vec![Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     let gw_verified = gw_advert.verify_into_verified().expect("must verify");
     let gw_desc = gw_verified.descriptor();
@@ -256,7 +256,7 @@ fn multi_hop_route_relay_relay_gateway() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     let relay_a_desc = relay_a_advert.verify_into_verified().expect("must verify").descriptor();
 
@@ -266,7 +266,7 @@ fn multi_hop_route_relay_relay_gateway() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:2")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     let relay_b_desc = relay_b_advert.verify_into_verified().expect("must verify").descriptor();
 
@@ -276,7 +276,7 @@ fn multi_hop_route_relay_relay_gateway() {
         vec![Capability::Gateway],
         vec![TransportEndpoint::tcp("127.0.0.1:3")],
         Some(x_pk.to_bytes()),
-        3600,
+        3600, 1,  // sequence = 1
     );
     let gw_desc = gw_advert.verify_into_verified().expect("must verify").descriptor();
 
@@ -323,7 +323,7 @@ fn cross_platform_advertisement_vectors() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1234")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     // The same secret key + same inputs produces the same NodeId + Ed25519 pk.
     // The nonce is random, so two advertisements will have different nonces
@@ -341,7 +341,7 @@ fn cross_platform_advertisement_vectors() {
         vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1234")],
         None,
-        3600,
+        3600, 1,  // sequence = 1
     );
     assert_ne!(
         advert1.nonce, advert2.nonce,
@@ -382,4 +382,265 @@ fn verified_node_descriptor_is_generic() {
         "NodeAdvertisement::verify_into_verified must exist"
     );
     eprintln!("[static-guard] PASS: VerifiedNodeDescriptor is generic (not gateway-specific)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.0.1 — Sequence, clock, role/key, and acceptance store tests
+// ════════════════════════════════════════════════════════════════════════════
+
+use snp_node::node::{
+    AcceptanceResult, AdvertisementAcceptanceStore, AuthenticatedNodeRecord,
+    MAX_ADVERTISEMENT_LIFETIME_SECS, MAX_CLOCK_SKEW_SECS,
+};
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 16. newer_advertisement_supersedes_older
+#[test]
+fn newer_advertisement_supersedes_older() {
+    let (sk, pk) = fresh_keypair(b"seq-newer");
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // First advertisement (sequence 1).
+    let advert1 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    let verified1 = advert1.verify_into_verified().expect("advert 1 must verify");
+    let result1 = store.accept(verified1);
+    assert!(matches!(result1, AcceptanceResult::Accepted(_)), "first advert must be accepted");
+
+    // Second advertisement (sequence 2 — newer).
+    let advert2 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:2")],
+        None, 3600, 2,
+    );
+    let verified2 = advert2.verify_into_verified().expect("advert 2 must verify");
+    let result2 = store.accept(verified2);
+    assert!(matches!(result2, AcceptanceResult::Accepted(_)), "newer advert must be accepted");
+    eprintln!("[test 16] PASS: newer advertisement supersedes older");
+}
+
+/// 17. older_advertisement_rejected_as_stale
+#[test]
+fn older_advertisement_rejected_as_stale() {
+    let (sk, pk) = fresh_keypair(b"seq-stale");
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept sequence 2 first.
+    let advert2 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 2,
+    );
+    let verified2 = advert2.verify_into_verified().expect("must verify");
+    store.accept(verified2);
+
+    // Now try sequence 1 (older) — must be rejected as stale.
+    let advert1 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    let verified1 = advert1.verify_into_verified().expect("must verify");
+    let result = store.accept(verified1);
+    assert!(matches!(result, AcceptanceResult::Stale { advert_sequence: 1, known_sequence: 2 }),
+        "older sequence must be rejected as stale; got {:?}", result);
+    eprintln!("[test 17] PASS: older advertisement rejected as stale");
+}
+
+/// 18. same_sequence_duplicate_rejected
+#[test]
+fn same_sequence_duplicate_rejected() {
+    let (sk, pk) = fresh_keypair(b"seq-dup");
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept sequence 1.
+    let advert1 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    let verified1 = advert1.verify_into_verified().expect("must verify");
+    store.accept(verified1);
+
+    // Same sequence (different nonce, but same sequence) — must be rejected.
+    let advert1b = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1, // same sequence
+    );
+    let verified1b = advert1b.verify_into_verified().expect("must verify");
+    let result = store.accept(verified1b);
+    assert!(matches!(result, AcceptanceResult::Duplicate { sequence: 1 }),
+        "same sequence must be rejected as duplicate; got {:?}", result);
+    eprintln!("[test 18] PASS: same sequence duplicate rejected");
+}
+
+/// 19. future_timestamp_rejected
+#[test]
+fn future_timestamp_rejected() {
+    let (sk, pk) = fresh_keypair(b"future-ts");
+    let mut advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    // Set timestamp far in the future.
+    advert.timestamp = now_unix() + MAX_CLOCK_SKEW_SECS + 100;
+    advert.sign(&sk);
+    assert!(advert.verify_into_verified().is_none(),
+        "future-dated timestamp beyond MAX_CLOCK_SKEW must be rejected");
+    eprintln!("[test 19] PASS: future timestamp rejected");
+}
+
+/// 20. expiry_before_timestamp_rejected
+#[test]
+fn expiry_before_timestamp_rejected() {
+    let (sk, pk) = fresh_keypair(b"expiry-before-ts");
+    let mut advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    // Set expiry BEFORE timestamp.
+    advert.expiry = advert.timestamp - 1;
+    advert.sign(&sk);
+    assert!(advert.verify_into_verified().is_none(),
+        "expiry before timestamp must be rejected");
+    eprintln!("[test 20] PASS: expiry before timestamp rejected");
+}
+
+/// 21. excessive_lifetime_rejected
+#[test]
+fn excessive_lifetime_rejected() {
+    let (sk, pk) = fresh_keypair(b"excessive-lifetime");
+    let mut advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, MAX_ADVERTISEMENT_LIFETIME_SECS + 1, 1,
+    );
+    // The lifetime (expiry - timestamp) exceeds MAX_ADVERTISEMENT_LIFETIME_SECS.
+    assert!(advert.verify_into_verified().is_none(),
+        "excessive lifetime must be rejected");
+    eprintln!("[test 21] PASS: excessive lifetime rejected");
+}
+
+/// 22. valid_clock_skew_accepted
+#[test]
+fn valid_clock_skew_accepted() {
+    let (sk, pk) = fresh_keypair(b"valid-skew");
+    let mut advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    // Set timestamp slightly in the future (within MAX_CLOCK_SKEW).
+    advert.timestamp = now_unix() + 60; // 1 minute in the future — within skew.
+    advert.sign(&sk);
+    assert!(advert.verify_into_verified().is_some(),
+        "timestamp within MAX_CLOCK_SKEW must be accepted");
+    eprintln!("[test 22] PASS: valid clock skew accepted");
+}
+
+/// 23. gateway_without_x25519_key_rejected
+#[test]
+fn gateway_without_x25519_key_rejected() {
+    let (sk, pk) = fresh_keypair(b"gw-no-key");
+    // Gateway capability but NO X25519 key.
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Gateway],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, // MISSING X25519 key!
+        3600, 1,
+    );
+    assert!(advert.verify_into_verified().is_none(),
+        "Gateway capability without X25519 key must be rejected");
+    eprintln!("[test 23] PASS: gateway without X25519 key rejected");
+}
+
+/// 24. relay_with_x25519_key_rejected
+#[test]
+fn relay_with_x25519_key_rejected() {
+    let (sk, pk) = fresh_keypair(b"relay-with-key");
+    let (_x_sk, x_pk) = x25519_static_keypair();
+    // Relay capability but WITH X25519 key (should not have one).
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        Some(x_pk.to_bytes()), // Relays shouldn't have this!
+        3600, 1,
+    );
+    assert!(advert.verify_into_verified().is_none(),
+        "Relay with X25519 key must be rejected");
+    eprintln!("[test 24] PASS: relay with X25519 key rejected");
+}
+
+/// 25. authenticated_node_record_binds_descriptor_and_endpoints
+#[test]
+fn authenticated_node_record_binds_descriptor_and_endpoints() {
+    let (sk, pk) = fresh_keypair(b"record-binding");
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1234"), TransportEndpoint::tcp("127.0.0.1:5678")],
+        None, 3600, 1,
+    );
+    let verified = advert.verify_into_verified().expect("must verify");
+    let record: AuthenticatedNodeRecord = verified.into_record();
+
+    // The record's descriptor and endpoints come from the SAME advertisement.
+    assert_eq!(record.node_id(), derive_node_id(&pk));
+    assert_eq!(record.endpoints.len(), 2);
+    assert_eq!(record.sequence(), 1);
+    assert!(record.expiry() > now_unix());
+
+    // The record's first endpoint matches the advertisement's.
+    assert_eq!(record.first_endpoint(), Some(&TransportEndpoint::tcp("127.0.0.1:1234")));
+    eprintln!("[test 25] PASS: AuthenticatedNodeRecord binds descriptor + endpoints");
+}
+
+/// 26. stateless_verification_accepts_valid_advertisement
+#[test]
+fn stateless_verification_accepts_valid_advertisement() {
+    let (sk, pk) = fresh_keypair(b"stateless-valid");
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 1,
+    );
+    // Stateless verification should accept.
+    assert!(advert.verify_into_verified().is_some(),
+        "valid advertisement must pass stateless verification");
+    eprintln!("[test 26] PASS: stateless verification accepts valid advertisement");
+}
+
+/// 27. replay_guard_rejects_seen_advertisement
+#[test]
+fn replay_guard_rejects_seen_advertisement() {
+    let (sk, pk) = fresh_keypair(b"replay-guard");
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 42,
+    );
+    let verified = advert.verify_into_verified().expect("must verify");
+
+    // First acceptance — OK.
+    let result1 = store.accept(verified.clone());
+    assert!(matches!(result1, AcceptanceResult::Accepted(_)));
+
+    // Second acceptance of the SAME advertisement — must be rejected as duplicate.
+    let result2 = store.accept(verified);
+    assert!(matches!(result2, AcceptanceResult::Duplicate { sequence: 42 }),
+        "replayed advertisement MUST be rejected by the acceptance store");
+    eprintln!("[test 27] PASS: replay guard rejects seen advertisement");
 }

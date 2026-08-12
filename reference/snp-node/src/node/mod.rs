@@ -125,7 +125,10 @@ pub use descriptor::{
     IdentityConsistentNodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
     VerifiedNodeDescriptor,
 };
-pub use node_advert::{NodeAdvertisement, VerifiedNodeAdvertisement};
+pub use node_advert::{
+    AcceptanceResult, AdvertisementAcceptanceStore, AuthenticatedNodeRecord, NodeAdvertisement,
+    VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS, MAX_CLOCK_SKEW_SECS,
+};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

@@ -3581,3 +3581,76 @@ Stage Summary:
 - The dangerous `NodeDescriptor` alias is removed.
 - Route validation works for multi-hop relay→relay→gateway paths with authenticated descriptors at every hop.
 
+
+---
+Task ID: 231-235 (N2.1.0.1 — Node Advertisement Semantics Hardening)
+Agent: Z.ai (main)
+
+Task: N2.1.0 claimed "replay protection" but verify_into_verified() was stateless — a valid advertisement could be replayed during its validity window. This milestone adds sequence numbers, clock validation, role/key consistency, a stateful acceptance store, and AuthenticatedNodeRecord.
+
+Work Log:
+- Added advertisement `sequence` (monotonic, signed) to NodeAdvertisement.
+  * `create_and_sign()` now takes a `sequence` parameter.
+  * The sequence is inside the signed preimage (covered by the signature).
+  * Higher sequence = newer advertisement. Route discovery will use this to determine which advertisement is current.
+
+- Added clock validation to `verify_into_verified()`:
+  * `timestamp <= now + MAX_CLOCK_SKEW_SECS` (300s) — rejects future-dated adverts.
+  * `expiry > now` — rejects expired adverts.
+  * `expiry > timestamp` — rejects nonsensical ordering.
+  * `expiry - timestamp <= MAX_ADVERTISEMENT_LIFETIME_SECS` (86400s = 24h) — rejects immortal adverts.
+
+- Added role/key consistency enforcement to `verify_into_verified()`:
+  * Gateway capability → x25519_circuit_public MUST be Some.
+  * No Gateway capability → x25519_circuit_public MUST be None.
+  * Violations are rejected (returns None).
+
+- Created `AdvertisementAcceptanceStore` (stateful replay prevention):
+  * Tracks highest accepted sequence per NodeId.
+  * `accept(verified_advert)` returns AcceptanceResult:
+    - Accepted: sequence > known (newer) → accept + update store.
+    - Stale: sequence < known (older) → reject.
+    - Duplicate: sequence == known (same) → reject.
+  * `purge_expired()` removes expired records.
+  * `get()` / `highest_sequence()` for querying.
+
+- Created `AuthenticatedNodeRecord`:
+  * Binds VerifiedNodeDescriptor + endpoints + sequence + expiry from the SAME verified advertisement.
+  * `VerifiedNodeAdvertisement::into_record()` produces it.
+  * Prevents accidentally combining descriptor from advert A with endpoints from advert B.
+
+- Separated "freshness material" from "replay prevention":
+  * `verify_into_verified()` is stateless (signature + consistency + clock + role/key).
+  * Replay prevention is in `AdvertisementAcceptanceStore` (stateful).
+  * Documentation explicitly states: "This method does NOT prevent replay."
+
+- Cleaned stale documentation in `descriptor.rs`:
+  * Removed all references to `VerifiedGatewayAdvertisement` as the canonical source.
+  * Updated to say `VerifiedNodeAdvertisement` (the generic path).
+
+- 12 new tests (27 total in n210_node_advert.rs):
+  16. newer_advertisement_supersedes_older
+  17. older_advertisement_rejected_as_stale
+  18. same_sequence_duplicate_rejected
+  19. future_timestamp_rejected
+  20. expiry_before_timestamp_rejected
+  21. excessive_lifetime_rejected
+  22. valid_clock_skew_accepted
+  23. gateway_without_x25519_key_rejected
+  24. relay_with_x25519_key_rejected
+  25. authenticated_node_record_binds_descriptor_and_endpoints
+  26. stateless_verification_accepts_valid_advertisement
+  27. replay_guard_rejects_seen_advertisement
+
+- Test results: 195 passed, 0 failed, 3 ignored (was 183; +12 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Advertisement sequence: monotonic, signed, used for ordering topology state.
+- Clock validation: MAX_CLOCK_SKEW_SECS=300, MAX_ADVERTISEMENT_LIFETIME_SECS=86400.
+- Role/key consistency: Gateway→X25519 required, non-Gateway→X25519 absent. Enforced in verify_into_verified().
+- Replay prevention: STATEFUL via AdvertisementAcceptanceStore (not stateless verifier).
+- AuthenticatedNodeRecord: binds descriptor + endpoints + sequence + expiry from same advert.
+- Stale documentation: cleaned.
+- "Replay protection" is no longer claimed for stateless verification.
+

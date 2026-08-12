@@ -1,103 +1,117 @@
-//! N2.1.0 — Generic Authenticated Node Advertisement.
+//! N2.1.0.1 — Generic Authenticated Node Advertisement (hardened).
 //!
-//! This module introduces a GENERIC signed node advertisement that works for
-//! ALL ShareNet node roles: relays, gateways, and multi-role nodes. It replaces
-//! the N2.0.7.3 gateway-specific authentication pipeline
-//! (`VerifiedGatewayAdvertisement → VerifiedNodeDescriptor`) with a model where
-//! ANY node can produce a signed advertisement that, once verified, yields a
-//! `VerifiedNodeDescriptor`.
+//! ## N2.1.0.1 corrections
+//!
+//! 1. **Advertisement sequence/epoch** — a signed monotonic sequence number
+//!    per node. Newer advertisements have higher sequences. Route discovery
+//!    uses this to determine which advertisement is current.
+//! 2. **Clock validation** — `timestamp <= now + MAX_CLOCK_SKEW`,
+//!    `expiry > timestamp`, `expiry - timestamp <= MAX_ADVERTISEMENT_LIFETIME`.
+//!    Prevents future-dated or immortal advertisements.
+//! 3. **Role/key consistency** — Gateway capability requires X25519 key;
+//!    non-Gateway nodes must NOT have one. Enforced in `verify_into_verified()`.
+//! 4. **Freshness material ≠ replay prevention** — `verify_into_verified()`
+//!    performs stateless validation only (signature + consistency + clock +
+//!    role). Replay prevention is handled by the stateful
+//!    [`AdvertisementAcceptanceStore`], which tracks the highest accepted
+//!    sequence per NodeId and rejects stale or duplicate advertisements.
+//! 5. **`AuthenticatedNodeRecord`** — binds the `VerifiedNodeDescriptor`
+//!    with its authenticated endpoints, sequence, and expiry into a single
+//!    typed structure. Prevents accidentally combining a descriptor from
+//!    advertisement A with an endpoint from advertisement B.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! NodeAdvertisement (signed, covers ALL identity-critical fields)
+//! NodeAdvertisement (signed, covers ALL fields including sequence)
 //!     │
-//!     ↓ verify_into_verified()
+//!     ↓ verify_into_verified() [stateless: sig + I4 + clock + role]
 //!     │
-//! VerifiedNodeAdvertisement (type-level proof: signature checked,
-//!                            NodeId↔Ed25519 consistent, not expired)
+//! VerifiedNodeAdvertisement
 //!     │
-//!     ↓ descriptor()
+//!     ↓ AdvertisementAcceptanceStore::accept() [stateful: sequence check]
 //!     │
-//! VerifiedNodeDescriptor (authenticated identity + capabilities + endpoints)
+//!     │  ├── newer sequence → accept, update store
+//!     │  ├── same sequence  → reject (duplicate)
+//!     │  └── older sequence → reject (stale)
+//!     │
+//! AuthenticatedNodeRecord { descriptor, endpoints, sequence, expiry }
 //! ```
-//!
-//! A `NodeAdvertisement` contains:
-//! - `node_id` — SHA-256("SNP/0.1 node\0" || ed25519_public_key)
-//! - `ed25519_public_key` — the signing key
-//! - `capabilities` — Client, Relay, Gateway (any combination)
-//! - `endpoints` — transport endpoints (AUTHENTICATED — covered by the signature)
-//! - `x25519_circuit_public` — optional, only for gateways
-//! - `timestamp` — when the advertisement was signed
-//! - `expiry` — when the advertisement expires
-//! - `nonce` — 16-byte freshness token (prevents replay)
-//! - `signature` — Ed25519 over SIG_CONTEXTS::NODE_ADVERT ‖ CBOR(preimage)
-//!
-//! ## Freshness / Replay Protection
-//!
-//! Each advertisement carries a `timestamp`, `expiry`, and `nonce`. The
-//! `verify_into_verified()` method checks that the advertisement has not
-//! expired. Callers SHOULD also track seen nonces to prevent replay within
-//! the validity window. The `nonce` is a 16-byte random value generated at
-//! sign time — two advertisements from the same node at different times
-//! will have different nonces.
 
 use super::*;
 use snp_cbor::CborValue;
 use snp_crypto::{derive_node_id, ed25519_sign, ed25519_verify, sha256, sig_contexts};
+use std::collections::HashMap;
+
+// ─── Protocol constants ─────────────────────────────────────────────────────
+
+/// Maximum allowed clock skew (seconds). Advertisements with `timestamp`
+/// more than this many seconds in the future are rejected.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300; // 5 minutes
+
+/// Maximum allowed advertisement lifetime (seconds). Advertisements with
+/// `expiry - timestamp > MAX_ADVERTISEMENT_LIFETIME_SECS` are rejected.
+pub const MAX_ADVERTISEMENT_LIFETIME_SECS: u64 = 86400; // 24 hours
+
+// ─── NodeAdvertisement ──────────────────────────────────────────────────────
 
 /// A generic signed node advertisement. Represents ANY ShareNet node —
-/// relay, gateway, or multi-role — with a signed set of identity-critical
-/// fields including capabilities, endpoints, and optional gateway X25519 key.
+/// relay, gateway, or multi-role.
 ///
 /// The signature covers ALL fields except `signature` itself, under
-/// `SIG_CONTEXTS::NODE_ADVERT`. This means:
-/// - The NodeId is authenticated.
-/// - The Ed25519 public key is authenticated.
-/// - The capabilities are authenticated.
-/// - The endpoints are authenticated (endpoint tampering is detected).
-/// - The gateway X25519 circuit key (if present) is authenticated.
-/// - The timestamp, expiry, and nonce are authenticated (replay protection).
+/// `SIG_CONTEXTS::NODE_ADVERT`. This authenticates:
+/// - NodeId, Ed25519 public key, capabilities, endpoints
+/// - Gateway X25519 circuit key (if present)
+/// - Timestamp, expiry, nonce, and **advertisement sequence**
+///
+/// ## Freshness material vs replay prevention
+///
+/// The `timestamp`, `expiry`, `nonce`, and `sequence` fields constitute
+/// **cryptographic freshness material**. The stateless `verify_into_verified()`
+/// checks signature, NodeId consistency, clock validity, and role/key
+/// consistency — but does NOT prevent replay.
+///
+/// **Replay prevention** is handled by the stateful
+/// [`AdvertisementAcceptanceStore`], which tracks the highest accepted
+/// sequence per NodeId and rejects stale or duplicate advertisements.
 #[derive(Debug, Clone)]
 pub struct NodeAdvertisement {
-    /// The node's NodeId (`SHA-256("SNP/0.1 node\0" || ed25519_public_key)`).
+    /// The node's NodeId.
     pub node_id: [u8; 32],
-    /// The node's Ed25519 identity public key (32 bytes).
+    /// The node's Ed25519 identity public key.
     pub ed25519_public_key: [u8; 32],
-    /// The node's capabilities (any combination of Client, Relay, Gateway).
+    /// The node's capabilities.
     pub capabilities: Vec<Capability>,
-    /// The node's transport endpoints. These are AUTHENTICATED — they are
-    /// inside the signed preimage, so an attacker cannot substitute
-    /// different endpoints without invalidating the signature.
+    /// The node's transport endpoints (authenticated).
     pub endpoints: Vec<TransportEndpoint>,
-    /// The node's STATIC X25519 circuit public key. Only present for nodes
-    /// with the Gateway capability; `None` for pure relays/clients.
+    /// Optional X25519 circuit public key (gateways only).
     pub x25519_circuit_public: Option<[u8; 32]>,
     /// When this advertisement was signed (unix seconds).
     pub timestamp: u64,
     /// When this advertisement expires (unix seconds).
     pub expiry: u64,
-    /// 16-byte freshness nonce. Generated at sign time. Prevents replay
-    /// within the validity window — two advertisements from the same node
-    /// at different times have different nonces.
+    /// 16-byte freshness nonce (unique per advertisement instance).
     pub nonce: [u8; 16],
-    /// Ed25519 signature over `SIG_CONTEXTS::NODE_ADVERT ‖ CBOR(preimage)`.
+    /// **N2.1.0.1.** Monotonic advertisement sequence number. The node
+    /// increments this for each new advertisement. Higher = newer.
+    /// Used by [`AdvertisementAcceptanceStore`] to determine which
+    /// advertisement is current and to reject stale/duplicate ones.
+    pub sequence: u64,
+    /// Ed25519 signature.
     pub signature: [u8; 64],
 }
 
 impl NodeAdvertisement {
-    /// Construct and sign a `NodeAdvertisement` for a node.
-    ///
-    /// The `ed25519_secret_key` is used to sign the advertisement. The
-    /// `node_id` is derived from the `ed25519_public_key` (invariant I4).
+    /// Construct and sign a `NodeAdvertisement`.
     ///
     /// # Parameters
-    /// - `ed25519_secret_key` — the node's Ed25519 secret key.
-    /// - `ed25519_public_key` — the node's Ed25519 public key.
+    /// - `ed25519_secret_key` / `ed25519_public_key` — the node's keypair.
     /// - `capabilities` — the node's capabilities.
-    /// - `endpoints` — the node's transport endpoints (authenticated).
+    /// - `endpoints` — transport endpoints (authenticated).
     /// - `x25519_circuit_public` — `Some` for gateways, `None` for relays.
-    /// - `expiry_secs` — how many seconds from now the advertisement expires.
+    /// - `expiry_secs` — advertisement lifetime in seconds.
+    /// - `sequence` — monotonic sequence number (must be higher than any
+    ///   previous advertisement from this node).
     #[must_use]
     pub fn create_and_sign(
         ed25519_secret_key: &[u8; 32],
@@ -106,6 +120,7 @@ impl NodeAdvertisement {
         endpoints: Vec<TransportEndpoint>,
         x25519_circuit_public: Option<[u8; 32]>,
         expiry_secs: u64,
+        sequence: u64,
     ) -> Self {
         let now = now_unix();
         let node_id = derive_node_id(ed25519_public_key);
@@ -120,6 +135,7 @@ impl NodeAdvertisement {
             timestamp: now,
             expiry: now.saturating_add(expiry_secs),
             nonce,
+            sequence,
             signature: [0u8; 64],
         };
         advert.sign(ed25519_secret_key);
@@ -153,31 +169,35 @@ impl NodeAdvertisement {
             (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
             (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
             (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
+            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.sequence)),
         ])
     }
 
-    /// Sign this advertisement with the given Ed25519 secret key.
-    /// Mutates `self.signature` in place.
+    /// Sign this advertisement.
     pub fn sign(&mut self, ed25519_secret_key: &[u8; 32]) {
         let preimage = self.preimage();
-        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode of NodeAdvertisement preimage never fails");
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails for valid preimage");
         let mut msg = Vec::with_capacity(sig_contexts::NODE_ADVERT.len() + bytes.len());
         msg.extend_from_slice(sig_contexts::NODE_ADVERT);
         msg.extend_from_slice(&bytes);
         self.signature = ed25519_sign(ed25519_secret_key, &msg);
     }
 
-    /// Verify the advertisement's signature, NodeId↔Ed25519 consistency,
-    /// and expiry. If ALL checks pass, returns a `VerifiedNodeAdvertisement`.
-    /// Otherwise returns `None`.
-    ///
-    /// Checks:
-    /// 1. Ed25519 signature is valid under `SIG_CONTEXTS::NODE_ADVERT`.
+    /// **Stateless verification.** Checks:
+    /// 1. Ed25519 signature valid under `SIG_CONTEXTS::NODE_ADVERT`.
     /// 2. `node_id == SHA-256("SNP/0.1 node\0" || ed25519_public_key)` (I4).
-    /// 3. `expiry > now` (not expired).
+    /// 3. Clock validation:
+    ///    - `timestamp <= now + MAX_CLOCK_SKEW_SECS` (no future-dated adverts)
+    ///    - `expiry > now` (not expired)
+    ///    - `expiry > timestamp` (sane ordering)
+    ///    - `expiry - timestamp <= MAX_ADVERTISEMENT_LIFETIME_SECS` (no immortal adverts)
+    /// 4. Role/key consistency:
+    ///    - Gateway capability → `x25519_circuit_public` MUST be `Some`
+    ///    - No Gateway capability → `x25519_circuit_public` MUST be `None`
     ///
-    /// Note: callers SHOULD also track seen nonces to prevent replay within
-    /// the validity window.
+    /// **This method does NOT prevent replay.** A previously valid advertisement
+    /// can be verified again during its validity window. Replay prevention
+    /// requires the stateful [`AdvertisementAcceptanceStore`].
     #[must_use]
     pub fn verify_into_verified(&self) -> Option<VerifiedNodeAdvertisement> {
         // 1. Verify the signature.
@@ -191,14 +211,38 @@ impl NodeAdvertisement {
         if !ed25519_verify(&self.ed25519_public_key, &msg, &self.signature) {
             return None;
         }
-        // 2. Verify NodeId ↔ Ed25519 consistency (I4).
+        // 2. NodeId ↔ Ed25519 consistency (I4).
         let expected_node_id = derive_node_id(&self.ed25519_public_key);
         if self.node_id != expected_node_id {
             return None;
         }
-        // 3. Verify not expired.
+        // 3. Clock validation.
         let now = now_unix();
+        // 3a. No future-dated timestamps.
+        if self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            return None;
+        }
+        // 3b. Not expired.
         if self.expiry <= now {
+            return None;
+        }
+        // 3c. Sane ordering: expiry must be after timestamp.
+        if self.expiry <= self.timestamp {
+            return None;
+        }
+        // 3d. No immortal advertisements.
+        if self.expiry.saturating_sub(self.timestamp) > MAX_ADVERTISEMENT_LIFETIME_SECS {
+            return None;
+        }
+        // 4. Role/key consistency.
+        let has_gateway = self.capabilities.contains(&Capability::Gateway);
+        let has_x25519 = self.x25519_circuit_public.is_some();
+        if has_gateway && !has_x25519 {
+            // Gateway MUST have X25519 key.
+            return None;
+        }
+        if !has_gateway && has_x25519 {
+            // Non-gateway MUST NOT have X25519 key.
             return None;
         }
         Some(VerifiedNodeAdvertisement { advert: self.clone() })
@@ -209,18 +253,22 @@ impl NodeAdvertisement {
     pub fn is_expired(&self, now: u64) -> bool {
         self.expiry <= now
     }
+
+    /// Get the advertisement sequence number.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
 }
 
-/// A `NodeAdvertisement` whose signature has been VERIFIED and whose
-/// NodeId↔Ed25519 consistency has been checked and which has not expired.
+// ─── VerifiedNodeAdvertisement ──────────────────────────────────────────────
+
+/// A `NodeAdvertisement` that has passed **stateless verification**
+/// (signature + NodeId consistency + clock validation + role/key consistency).
 ///
-/// This type can ONLY be constructed by
-/// [`NodeAdvertisement::verify_into_verified`]. The type system enforces
-/// that the routing layer receives authenticated node identity data.
-///
-/// `VerifiedNodeAdvertisement::descriptor()` produces a
-/// [`VerifiedNodeDescriptor`] that carries the authenticated identity +
-/// capabilities + endpoints for ANY node role (relay, gateway, multi-role).
+/// **This type does NOT prove replay prevention.** A `VerifiedNodeAdvertisement`
+/// can be replayed during its validity window. The stateful
+/// [`AdvertisementAcceptanceStore`] is required for replay prevention.
 #[derive(Debug, Clone)]
 pub struct VerifiedNodeAdvertisement {
     advert: NodeAdvertisement,
@@ -228,12 +276,27 @@ pub struct VerifiedNodeAdvertisement {
 
 impl VerifiedNodeAdvertisement {
     /// Derive a `VerifiedNodeDescriptor` from this verified advertisement.
-    /// This is the ONLY way to obtain a `VerifiedNodeDescriptor` — the
-    /// type system enforces that the identity came from a signed, verified
-    /// advertisement.
     #[must_use]
     pub fn descriptor(&self) -> VerifiedNodeDescriptor {
         VerifiedNodeDescriptor::from_verified_advert_internal(&self.advert)
+    }
+
+    /// Create an `AuthenticatedNodeRecord` that binds the descriptor with
+    /// its authenticated endpoints, sequence, and expiry. This prevents
+    /// accidentally combining a descriptor from one advertisement with
+    /// endpoints from another.
+    #[must_use]
+    pub fn into_record(self) -> AuthenticatedNodeRecord {
+        let descriptor = self.descriptor();
+        let endpoints = self.advert.endpoints.clone();
+        let sequence = self.advert.sequence;
+        let expiry = self.advert.expiry;
+        AuthenticatedNodeRecord {
+            descriptor,
+            endpoints,
+            sequence,
+            expiry,
+        }
     }
 
     /// Get the NodeId.
@@ -260,7 +323,7 @@ impl VerifiedNodeAdvertisement {
         &self.advert.endpoints
     }
 
-    /// Get the X25519 circuit public key (for gateways), or `None`.
+    /// Get the X25519 circuit public key (gateways only).
     #[must_use]
     pub fn circuit_x25519_pub(&self) -> Option<&[u8; 32]> {
         self.advert.x25519_circuit_public.as_ref()
@@ -272,10 +335,22 @@ impl VerifiedNodeAdvertisement {
         &self.advert.nonce
     }
 
+    /// Get the sequence number.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.advert.sequence
+    }
+
     /// Get the expiry.
     #[must_use]
     pub fn expiry(&self) -> u64 {
         self.advert.expiry
+    }
+
+    /// Get the timestamp.
+    #[must_use]
+    pub fn timestamp(&self) -> u64 {
+        self.advert.timestamp
     }
 
     /// Check if this node has the Gateway capability.
@@ -290,9 +365,182 @@ impl VerifiedNodeAdvertisement {
         self.advert.capabilities.contains(&Capability::Relay)
     }
 
-    /// Get the inner advertisement (for CBOR serialization, etc.).
+    /// Get the inner advertisement.
     #[must_use]
     pub fn as_ref(&self) -> &NodeAdvertisement {
         &self.advert
+    }
+}
+
+// ─── AuthenticatedNodeRecord ────────────────────────────────────────────────
+
+/// An authenticated snapshot of a node's advertisement, binding together:
+/// - `descriptor` — the `VerifiedNodeDescriptor` (identity + capabilities)
+/// - `endpoints` — the authenticated transport endpoints from the SAME advertisement
+/// - `sequence` — the monotonic advertisement sequence
+/// - `expiry` — when this record expires
+///
+/// This type prevents accidentally combining a descriptor from advertisement A
+/// with endpoints from advertisement B. The endpoints are provably derived
+/// from the same verified advertisement snapshot as the descriptor.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedNodeRecord {
+    /// The authenticated node descriptor.
+    pub descriptor: VerifiedNodeDescriptor,
+    /// The authenticated endpoints from the same advertisement.
+    pub endpoints: Vec<TransportEndpoint>,
+    /// The advertisement sequence number.
+    pub sequence: u64,
+    /// When this record expires.
+    pub expiry: u64,
+}
+
+impl AuthenticatedNodeRecord {
+    /// Get the NodeId.
+    #[must_use]
+    pub fn node_id(&self) -> [u8; 32] {
+        self.descriptor.node_id()
+    }
+
+    /// Get the sequence.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Get the expiry.
+    #[must_use]
+    pub fn expiry(&self) -> u64 {
+        self.expiry
+    }
+
+    /// Check if this record has expired.
+    #[must_use]
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expiry <= now
+    }
+
+    /// Get the first endpoint (for convenience).
+    #[must_use]
+    pub fn first_endpoint(&self) -> Option<&TransportEndpoint> {
+        self.endpoints.first()
+    }
+}
+
+// ─── AdvertisementAcceptanceStore ───────────────────────────────────────────
+
+/// The result of attempting to accept an advertisement.
+#[derive(Debug, Clone)]
+pub enum AcceptanceResult {
+    /// The advertisement was accepted (newer sequence than previously seen).
+    Accepted(AuthenticatedNodeRecord),
+    /// The advertisement was rejected because its sequence is older than
+    /// the previously accepted sequence for this NodeId.
+    Stale {
+        /// The advertisement's sequence.
+        advert_sequence: u64,
+        /// The highest previously accepted sequence.
+        known_sequence: u64,
+    },
+    /// The advertisement was rejected because its sequence matches a
+    /// previously accepted advertisement (duplicate).
+    Duplicate {
+        /// The duplicate sequence.
+        sequence: u64,
+    },
+}
+
+/// A stateful store that tracks the highest accepted advertisement sequence
+/// per NodeId. This provides **replay prevention** — a previously seen
+/// advertisement (same or lower sequence) is rejected.
+///
+/// ## Semantics
+///
+/// - `accept(verified_advert)` checks the advertisement's sequence against
+///   the highest previously accepted sequence for the same NodeId.
+/// - If `sequence > known_sequence`: **accept** and update the store.
+/// - If `sequence == known_sequence`: **reject as duplicate**.
+/// - If `sequence < known_sequence`: **reject as stale**.
+///
+/// This store will be consumed by peer discovery (N2.1.1) to ensure that
+/// only the newest topology information is accepted.
+#[derive(Debug, Clone, Default)]
+pub struct AdvertisementAcceptanceStore {
+    /// Map: NodeId → (highest accepted sequence, AuthenticatedNodeRecord).
+    records: HashMap<[u8; 32], (u64, AuthenticatedNodeRecord)>,
+}
+
+impl AdvertisementAcceptanceStore {
+    /// Create a new empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempt to accept a `VerifiedNodeAdvertisement`.
+    ///
+    /// Returns:
+    /// - `AcceptanceResult::Accepted(record)` if the sequence is newer than
+    ///   any previously seen for this NodeId.
+    /// - `AcceptanceResult::Stale` if the sequence is older.
+    /// - `AcceptanceResult::Duplicate` if the sequence matches a previously
+    ///   accepted advertisement.
+    pub fn accept(&mut self, verified: VerifiedNodeAdvertisement) -> AcceptanceResult {
+        let node_id = verified.node_id();
+        let sequence = verified.sequence();
+        match self.records.get(&node_id) {
+            None => {
+                // First advertisement from this node.
+                let record = verified.into_record();
+                self.records.insert(node_id, (sequence, record.clone()));
+                AcceptanceResult::Accepted(record)
+            }
+            Some((known_seq, _)) if sequence > *known_seq => {
+                // Newer advertisement.
+                let record = verified.into_record();
+                self.records.insert(node_id, (sequence, record.clone()));
+                AcceptanceResult::Accepted(record)
+            }
+            Some((known_seq, _)) if sequence == *known_seq => {
+                // Duplicate.
+                AcceptanceResult::Duplicate { sequence }
+            }
+            Some((known_seq, _)) => {
+                // Stale.
+                AcceptanceResult::Stale {
+                    advert_sequence: sequence,
+                    known_sequence: *known_seq,
+                }
+            }
+        }
+    }
+
+    /// Get the current `AuthenticatedNodeRecord` for a NodeId, if any.
+    #[must_use]
+    pub fn get(&self, node_id: &[u8; 32]) -> Option<&AuthenticatedNodeRecord> {
+        self.records.get(node_id).map(|(_, record)| record)
+    }
+
+    /// Get the highest accepted sequence for a NodeId, if any.
+    #[must_use]
+    pub fn highest_sequence(&self, node_id: &[u8; 32]) -> Option<u64> {
+        self.records.get(node_id).map(|(seq, _)| *seq)
+    }
+
+    /// Remove expired records from the store.
+    pub fn purge_expired(&mut self, now: u64) {
+        self.records.retain(|_, (_, record)| !record.is_expired(now));
+    }
+
+    /// Get the number of records in the store.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Check if the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
     }
 }

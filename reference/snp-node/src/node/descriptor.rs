@@ -1,14 +1,8 @@
-//! N2.0.7.3 — Node identity descriptors with PROPER verified/unverified distinction.
+//! N2.1.0.1 — Node identity descriptors with verified/unverified distinction.
 //!
-//! ## Key distinction (N2.0.7.3 correction)
+//! ## Key distinction
 //!
-//! N2.0.7.2 had a `VerifiedNodeDescriptor` that could be constructed via
-//! `into_verified()` — which only checked NodeId↔Ed25519 consistency, NOT
-//! that the identity came from a signed advertisement. This was misleading:
-//! "verified" implied authentication, but the function only proved internal
-//! consistency.
-//!
-//! N2.0.7.3 fixes this by separating three concepts:
+//! Three concepts are separated:
 //!
 //! 1. **`UnverifiedNodeDescriptor`** — raw identity data. No proof of anything.
 //! 2. **`IdentityConsistentNodeDescriptor`** — NodeId↔Ed25519 consistency
@@ -16,9 +10,14 @@
 //!    via `into_consistent()`. This proves the NodeId is the hash of the public
 //!    key, but does NOT prove the identity is authentic.
 //! 3. **`VerifiedNodeDescriptor`** — the identity came from a VERIFIED
-//!    `GatewayAdvertisement` (signature checked + NodeId↔Ed25519 consistency
-//!    verified). This is the ONLY descriptor type the routing layer accepts.
-//!    It can ONLY be constructed via `VerifiedGatewayAdvertisement::descriptor()`.
+//!    `NodeAdvertisement` (signature checked + NodeId↔Ed25519 consistency
+//!    verified + clock validated + role/key consistency checked). This is
+//!    the ONLY descriptor type the routing layer accepts. It can ONLY be
+//!    constructed via `VerifiedNodeAdvertisement::descriptor()`.
+//!
+//! **N2.1.0:** `VerifiedNodeDescriptor` is NO LONGER gateway-specific. It
+//! works for relays, gateways, and multi-role nodes. The generic
+//! `NodeAdvertisement` (in `node_advert.rs`) is the canonical source.
 
 use super::*;
 use snp_cbor::CborValue;
@@ -177,14 +176,18 @@ impl IdentityConsistentNodeDescriptor {
 // ─── VerifiedNodeDescriptor ──────────────────────────────────────────────────
 
 /// A node descriptor whose identity has been AUTHENTICATED — it came from a
-/// [`VerifiedGatewayAdvertisement`] (signature checked + NodeId↔Ed25519
-/// consistency verified).
+/// [`VerifiedNodeAdvertisement`] (signature checked + NodeId↔Ed25519
+/// consistency verified + clock validated + role/key consistency checked).
 ///
-/// **N2.0.7.3:** This type can ONLY be constructed via
-/// `VerifiedGatewayAdvertisement::descriptor()`. There is NO
+/// This type can ONLY be constructed via
+/// `VerifiedNodeAdvertisement::descriptor()`. There is NO
 /// `into_verified()` path from `UnverifiedNodeDescriptor` or
 /// `IdentityConsistentNodeDescriptor`. The type system enforces that
 /// the routing layer receives authenticated identity data.
+///
+/// **N2.1.0:** `VerifiedNodeDescriptor` is NO LONGER gateway-specific.
+/// It works for relays, gateways, and multi-role nodes. The generic
+/// `NodeAdvertisement` is the canonical source.
 ///
 /// The routing layer (`Route`, `RouteHop`, `send_via_route`) consumes
 /// `VerifiedNodeDescriptor` — it cannot accidentally use unverified or
