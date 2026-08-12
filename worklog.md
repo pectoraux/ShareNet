@@ -2781,3 +2781,25 @@ Stage Summary:
   * The `DISCOVERY_LINK_SEED` constant + `discovery_link_keys_initiator` / `discovery_link_keys_responder` functions are KEPT (with deprecation notes in their doc-comments) for backward compatibility. They are no longer used by any internal code (the new raw discovery protocol does not use AEAD on the discovery link).
   * `Node::discover_gateways` delegates to `BootstrapDiscovery::discover` (the trait is the single source of truth) and re-verifies signature + expiry + I4 cross-check for defence in depth. The re-verification is redundant (BootstrapDiscovery already verifies inside `discover_one`) but protects against a future BootstrapDiscovery implementation that forgets.
   * The `bootstrap_discovery_discovers_real_gateway` and `bootstrap_discovery_discovers_multiple_gateways` tests leak the server threads (they call `std::mem::forget` on the `JoinHandle`s). This is because `serve_discovery_persistent` loops forever on `listener.incoming()` — there is no shutdown signal. A future revision would add a shutdown channel (e.g. `std::sync::mpsc::Receiver<()>` or a `tokio::CancellationToken`) so the tests can clean up gracefully.
+
+---
+Task ID: 166-171 (N2.0.4 Gates D+F+G+I)
+Agent: Z.ai (main — async transport, security, GatewayChoice inventory, integration suite)
+
+Stage Summary:
+- Gate D: Async transport via Tokio — AsyncTcpTransportProvider, AsyncTcpConnection, AsyncTcpListener
+  - 3 async tests: TCP roundtrip, 10 concurrent connections, async relay bidirectional
+  - tokio::io::split for bidirectional relay forwarding
+  - 176 total tests pass (173 sync + 3 async)
+- Gate F: Security tests reviewed — 19 tests covering route, advertisement, SSRF, circuit keys, signatures, TTL, nonce, capability, GatewayChoice
+- Gate G: GatewayChoice inventory:
+  - legacy.rs: 39 refs (ISOLATED)
+  - node/mod.rs: 70 refs (all deprecated constructors + doc comments + static test)
+  - tests: 99 refs (test-only)
+  - main.rs: 0 refs
+  - Production API: 0 GatewayChoice parameters
+- Gate I: Platform Integration Suite defined (10 required tests)
+- 138/138 conformance, 0 disagreements
+
+Remaining N2.0.4 gates:
+- Gate E: Node decomposition (mod.rs still ~4200 lines — route.rs + discovery.rs + transport.rs + async_transport.rs extracted, but mod.rs itself needs further splitting)

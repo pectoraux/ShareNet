@@ -112,6 +112,7 @@ use crate::{
 pub mod route;
 pub mod discovery;
 pub mod transport;
+pub mod async_transport;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError};
