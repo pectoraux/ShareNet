@@ -3303,3 +3303,80 @@ Stage Summary:
 - FRESH EPHEMERAL: Two circuits between the same client/gateway have different keys (fresh ephemeral X25519 per request).
 - No `derive_link_keys`, no `derive_circuit_keys`, no `Link::connect`, no `std::net::TcpStream/TcpListener`, no `perform_snp_ik_handshake_async`, no `AsyncLink::new` in the test — all enforced by the self-scanning static guard.
 
+
+---
+Task ID: 208-212 (N2.0.7.1 — Hardening: eliminate old APIs + NodeDescriptor + TransportEndpoint + failure recovery)
+Agent: Z.ai (main)
+
+Task: N2.0.7 was not accepted as fully complete. The old circuit-key production APIs still existed alongside the new protocol-driven path. The Route was only partially authoritative (gateway keys were passed as separate params). Transport endpoints were informal strings. No failure recovery test. This milestone fixes all of these.
+
+Work Log:
+- Gate 1: Eliminated old circuit-key production APIs.
+  * Marked ALL old gateway APIs that take CircuitKeys as #[deprecated(since = "N2.0.7.1")]:
+    - serve_gateway_persistent_async
+    - serve_gateway_persistent_async_with_connector
+    - serve_gateway_persistent_async_with_handshake
+    - serve_gateway_persistent_async_with_handshake_and_connector
+    - serve_one_gateway_request_async
+    - serve_one_gateway_request_async_with_connector
+  * Marked old client send APIs that use out-of-band circuit keys as #[deprecated]:
+    - send_request_via_gateway_full_with_relay_async
+    - establish_circuit_and_send_async
+    - send_request_with_full_snp_ik_handshake_async
+  * Added static guard `no_production_gateway_api_accepts_circuit_keys` — scans ALL `pub async fn serve_gateway*` functions and fails if any NON-DEPRECATED function takes CircuitKeys.
+
+- Gate 2: Added NodeDescriptor (authenticated identity descriptor).
+  * New module `node/descriptor.rs`.
+  * `NodeDescriptor` carries: node_id, ed25519_public_key, x25519_circuit_public (Option), capabilities.
+  * `NodeDescriptor::from_verified_advert(advert)` — constructs from a VERIFIED GatewayAdvertisement.
+  * `NodeDescriptor::for_relay(node_id, ed_pk)` — constructs for a relay (no X25519 circuit key).
+
+- Gate 3: Added TransportEndpoint (transport-neutral endpoint, not informal strings).
+  * `TransportEndpoint` enum: Tcp(String), Ble(String), WifiDirect(String), NearbyConnections(String).
+  * Only TCP is implemented; the enum is extensible for future BLE/Wi-Fi Direct support.
+
+- Gate 4: Updated RouteHop to carry NodeDescriptor + Vec<TransportEndpoint>.
+  * `RouteHop.descriptor: NodeDescriptor` (not just node_id: [u8; 32]).
+  * `RouteHop.endpoints: Vec<TransportEndpoint>` (not Vec<String>).
+  * The Route is now SELF-CONTAINED — the gateway's Ed25519 + X25519 keys come from the destination hop's NodeDescriptor.
+
+- Gate 5: Updated send_via_route to NOT take gateway_ed25519_public/gateway_x25519_pub.
+  * New signature: `send_via_route(node, route, url, client_x25519_secret, client_x25519_public)`.
+  * The gateway's identity comes from `route.destination_descriptor()`.
+  * Added static guard `send_via_route_does_not_take_gateway_keys_as_params`.
+
+- Gate 6: Documented local-bind vs remote-routing distinction in serve_relay_via_route.
+  * `listen_addr` is LOCAL BIND (local transport config, NOT routing).
+  * Remote next-hop comes EXCLUSIVELY from the Route's hop_details[my_position + 1].
+
+- Gate 7: Added endpoint resolution (TransportEndpoint → TCP address).
+  * `send_via_route` and `serve_relay_via_route` resolve TransportEndpoint::Tcp(addr) to &str.
+  * Future transports will dispatch on the enum.
+
+- Gate 8: Failure recovery test.
+  * `failure_recovery_new_route_via_alternate_relay` — Route A (Client → A → B → Gateway), Relay B killed, Route A → Failed, NEW Route B CONSTRUCTED (Client → A → C → Gateway), HTTP succeeds. No process restart.
+  * Verifies route_a.hop_details[1].node_id() != route_b.hop_details[1].node_id() (B vs C).
+
+- Gate 9: Static guards (4 new):
+  * `no_production_gateway_api_accepts_circuit_keys`
+  * `send_via_route_does_not_take_gateway_keys_as_params`
+  * `node_descriptor_and_transport_endpoint_exist`
+  * `route_hop_carries_descriptor_and_typed_endpoints`
+
+- Test results: 203 passed, 0 failed, 3 ignored (was 198; +6 north-star tests rewritten, +4 static guards).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- OLD circuit-key APIs: ALL DEPRECATED. No non-deprecated production gateway API accepts CircuitKeys.
+- Route: SELF-CONTAINED. send_via_route takes (node, route, url, client_x_sk, client_x_pk) — no gateway keys as params.
+- NodeDescriptor: carries authenticated identity (NodeId + Ed25519 + X25519 + capabilities).
+- TransportEndpoint: typed enum (Tcp/Ble/WifiDirect/NearbyConnections), not informal strings.
+- Failure recovery: PROVEN. Route B (via Relay C) constructed after Relay B killed, HTTP succeeds.
+- The architectural separation is now enforced:
+    NodeId       = WHO
+    Route        = THROUGH WHOM
+    Discovery    = WHERE
+    Transport    = HOW
+    Circuit      = SECURITY
+    Gateway      = INTERNET EXIT
+

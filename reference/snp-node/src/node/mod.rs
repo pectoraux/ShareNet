@@ -112,6 +112,7 @@ pub mod identity;
 pub mod gateway;
 pub mod circuit;
 pub mod session;
+pub mod descriptor;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -119,6 +120,7 @@ pub use discovery::{DiscoveredNode, DiscoveryProvider, StaticDiscovery, Bootstra
 pub use identity::{NodeIdentity, Capability};
 pub use gateway::GatewayAdvertisement;
 pub use circuit::{Circuit, PeerConnection, UpstreamPeer};
+pub use descriptor::{NodeDescriptor, TransportEndpoint};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,
@@ -2398,6 +2400,119 @@ mod tests {
             "Route::new_with_hop_details must exist"
         );
         eprintln!("[static-guard] PASS: Route has hop_details with endpoints");
+    }
+
+    /// N2.0.7.1: NO NON-DEPRECATED production gateway API may accept `CircuitKeys`
+    /// as a parameter. The gateway must derive circuit keys FROM THE PROTOCOL
+    /// (via `open_circuit_payload_with_fresh_eph`), not receive them externally.
+    ///
+    /// This test scans `async_node.rs` for ALL `pub async fn serve_gateway*`
+    /// functions and verifies that any function taking `CircuitKeys` is marked
+    /// `#[deprecated]`.
+    #[test]
+    fn no_production_gateway_api_accepts_circuit_keys() {
+        let source = include_str!("async_node.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            // Look for `pub async fn serve_gateway` (production gateway APIs).
+            if line.contains("pub async fn serve_gateway") {
+                // Scan the function signature (next 15 lines) for CircuitKeys.
+                let sig_end = (i + 15).min(lines.len());
+                let sig: String = lines[i..sig_end].join("\n");
+                if sig.contains("CircuitKeys") {
+                    // The function takes CircuitKeys — it MUST be deprecated.
+                    // Look backwards for #[deprecated].
+                    let mut found_deprecated = false;
+                    for j in (0..i).rev().take(5) {
+                        if lines[j].contains("#[deprecated") {
+                            found_deprecated = true;
+                            break;
+                        }
+                    }
+                    if !found_deprecated {
+                        panic!(
+                            "NON-DEPRECATED production gateway API at line {} takes CircuitKeys \
+                             as a parameter. Circuit keys must be derived from the protocol \
+                             (via open_circuit_payload_with_fresh_eph), not supplied externally. \
+                             Mark the function #[deprecated] or remove the CircuitKeys parameter.\n\
+                             Function signature:\n{sig}",
+                            i + 1
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("[static-guard] PASS: no non-deprecated gateway API accepts CircuitKeys");
+    }
+
+    /// N2.0.7.1: `send_via_route` must NOT take `gateway_ed25519_public` or
+    /// `gateway_x25519_pub` as parameters — the gateway's identity comes from
+    /// the Route's destination `NodeDescriptor`.
+    #[test]
+    fn send_via_route_does_not_take_gateway_keys_as_params() {
+        let source = include_str!("async_node.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("pub async fn send_via_route(") {
+                let sig_end = (i + 12).min(lines.len());
+                let sig: String = lines[i..sig_end].join("\n");
+                assert!(
+                    !sig.contains("gateway_ed25519_public"),
+                    "send_via_route must NOT take gateway_ed25519_public — get it from the Route's NodeDescriptor"
+                );
+                assert!(
+                    !sig.contains("gateway_x25519_pub"),
+                    "send_via_route must NOT take gateway_x25519_pub — get it from the Route's NodeDescriptor"
+                );
+                eprintln!("[static-guard] PASS: send_via_route does not take gateway keys as params");
+                return;
+            }
+        }
+        panic!("send_via_route function not found");
+    }
+
+    /// N2.0.7.1: `NodeDescriptor` and `TransportEndpoint` must exist in
+    /// `descriptor.rs`.
+    #[test]
+    fn node_descriptor_and_transport_endpoint_exist() {
+        let source = include_str!("descriptor.rs");
+        assert!(
+            source.contains("pub struct NodeDescriptor"),
+            "NodeDescriptor struct must exist"
+        );
+        assert!(
+            source.contains("pub enum TransportEndpoint"),
+            "TransportEndpoint enum must exist"
+        );
+        assert!(
+            source.contains("fn from_verified_advert"),
+            "NodeDescriptor::from_verified_advert must exist"
+        );
+        assert!(
+            source.contains("Tcp(String)"),
+            "TransportEndpoint::Tcp variant must exist"
+        );
+        assert!(
+            source.contains("Ble(String)"),
+            "TransportEndpoint::Ble variant must exist (for future BLE support)"
+        );
+        eprintln!("[static-guard] PASS: NodeDescriptor + TransportEndpoint exist");
+    }
+
+    /// N2.0.7.1: `RouteHop` must carry a `NodeDescriptor` (not just a NodeId)
+    /// and `Vec<TransportEndpoint>` (not `Vec<String>`).
+    #[test]
+    fn route_hop_carries_descriptor_and_typed_endpoints() {
+        let source = include_str!("route.rs");
+        assert!(
+            source.contains("pub descriptor: NodeDescriptor"),
+            "RouteHop must carry a NodeDescriptor (not just a NodeId)"
+        );
+        assert!(
+            source.contains("pub endpoints: Vec<TransportEndpoint>"),
+            "RouteHop must carry Vec<TransportEndpoint> (not Vec<String>)"
+        );
+        eprintln!("[static-guard] PASS: RouteHop carries NodeDescriptor + typed endpoints");
     }
 
     #[test]

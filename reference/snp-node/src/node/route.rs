@@ -96,9 +96,9 @@ const ROUTE_DEFAULT_TTL_SECS: u64 = 3600;
 /// Maximum hop count (matches `FRAME_TTL_MAX` from `snp-frames`).
 const ROUTE_MAX_HOPS: usize = 16;
 
-/// **N2.0.7.** A single hop in a [`Route`]. Carries the hop's NodeId (the
-/// stable identity) AND its current transport endpoint(s) (locators that
-/// can change over time).
+/// **N2.0.7.** A single hop in a [`Route`]. Carries the hop's
+/// [`NodeDescriptor`] (the authenticated identity) AND its current
+/// transport endpoint(s) (locators that can change over time).
 ///
 /// This enforces the ShareNet architectural principle:
 ///
@@ -108,53 +108,64 @@ const ROUTE_MAX_HOPS: usize = 16;
 /// A hop may have MULTIPLE endpoints (e.g. Wi-Fi Direct, BLE, TCP) — the
 /// runtime resolves the current endpoint via the transport/discovery
 /// abstraction. The Route does NOT become invalid merely because a
-/// transport endpoint changes; only the NodeId is the stable identity.
+/// transport endpoint changes; only the NodeId (inside the
+/// `NodeDescriptor`) is the stable identity.
+///
+/// **N2.0.7.1:** The `descriptor` field carries the FULL authenticated
+/// identity (NodeId + Ed25519 public key + X25519 circuit public key +
+/// capabilities). This means the Route is SELF-CONTAINED — the client
+/// does NOT need to pass `gateway_ed25519_public` / `gateway_x25519_pub`
+/// as separate parameters to `send_via_route`; they come from the
+/// destination hop's `NodeDescriptor`.
 #[derive(Debug, Clone)]
 pub struct RouteHop {
-    /// The hop's NodeId (`SHA-256("SNP/0.1 node\0" || public_key)`).
-    /// This is the STABLE IDENTITY — it does not change when the transport
-    /// endpoint changes.
-    pub node_id: [u8; 32],
+    /// The hop's authenticated identity descriptor (NodeId + Ed25519 pub +
+    /// X25519 circuit pub + capabilities). Obtained from a VERIFIED
+    /// discovery source (e.g. `GatewayAdvertisement`).
+    pub descriptor: NodeDescriptor,
     /// The hop's current transport endpoint(s). Each entry is a
-    /// transport-specific locator (e.g. `"127.0.0.1:38507"` for TCP,
-    /// `"ble:aa:bb:cc:dd:ee:ff"` for BLE). The runtime tries them in
-    /// order until one connects.
+    /// transport-neutral [`TransportEndpoint`] (NOT an informal string).
+    /// The runtime resolves the current endpoint via the
+    /// transport/discovery abstraction.
     ///
     /// May be empty — in that case, the runtime must resolve the NodeId
     /// to an endpoint via the discovery/transport abstraction before
     /// attempting to connect.
-    pub endpoints: Vec<String>,
-    /// The hop's capabilities (Client, Relay, Gateway). Used by the
-    /// routing runtime to verify that each hop can actually perform its
-    /// role in the route.
-    pub capabilities: Vec<super::Capability>,
+    pub endpoints: Vec<TransportEndpoint>,
 }
 
 impl RouteHop {
-    /// Construct a `RouteHop` with a NodeId + a single TCP endpoint.
+    /// Construct a `RouteHop` with a `NodeDescriptor` + a single TCP endpoint.
     #[must_use]
-    pub fn new(node_id: [u8; 32], endpoint: String) -> Self {
+    pub fn new(descriptor: NodeDescriptor, endpoint: TransportEndpoint) -> Self {
         Self {
-            node_id,
+            descriptor,
             endpoints: vec![endpoint],
-            capabilities: Vec::new(),
         }
     }
 
-    /// Construct a `RouteHop` with a NodeId + multiple endpoints.
+    /// Construct a `RouteHop` with a `NodeDescriptor` + multiple endpoints.
     #[must_use]
-    pub fn with_endpoints(node_id: [u8; 32], endpoints: Vec<String>) -> Self {
+    pub fn with_endpoints(
+        descriptor: NodeDescriptor,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Self {
         Self {
-            node_id,
+            descriptor,
             endpoints,
-            capabilities: Vec::new(),
         }
     }
 
     /// Get the first endpoint (or `None` if empty).
     #[must_use]
-    pub fn first_endpoint(&self) -> Option<&str> {
-        self.endpoints.first().map(|s| s.as_str())
+    pub fn first_endpoint(&self) -> Option<&TransportEndpoint> {
+        self.endpoints.first()
+    }
+
+    /// Get the NodeId (convenience — delegates to the descriptor).
+    #[must_use]
+    pub fn node_id(&self) -> [u8; 32] {
+        self.descriptor.node_id
     }
 }
 
@@ -274,13 +285,14 @@ impl Route {
     }
 
     /// **N2.0.7 production constructor.** Construct a `Route` with
-    /// `RouteHop` entries that carry NodeId + endpoints + capabilities.
+    /// `RouteHop` entries that carry `NodeDescriptor` + `TransportEndpoint`s.
     /// This is the AUTHORITATIVE routing plan — the runtime consumes
-    /// `hop_details` to determine where to connect.
+    /// `hop_details` to determine where to connect AND the cryptographic
+    /// identity of the destination.
     ///
     /// The `hop_details` list MUST include the destination as the last
     /// element (same convention as `hops`). The `hops` field is
-    /// automatically populated from `hop_details[i].node_id`.
+    /// automatically populated from `hop_details[i].descriptor.node_id`.
     ///
     /// # Panics
     /// Never panics for well-formed inputs.
@@ -290,7 +302,7 @@ impl Route {
         destination: [u8; 32],
         hop_details: Vec<RouteHop>,
     ) -> Self {
-        let hops: Vec<[u8; 32]> = hop_details.iter().map(|h| h.node_id).collect();
+        let hops: Vec<[u8; 32]> = hop_details.iter().map(|h| h.node_id()).collect();
         let mut route = Self::new(source, destination, hops);
         route.hop_details = hop_details;
         route
@@ -308,10 +320,19 @@ impl Route {
     /// connects to). Returns `None` if `hop_details` is empty or the first
     /// hop has no endpoints.
     #[must_use]
-    pub fn first_hop_endpoint(&self) -> Option<&str> {
+    pub fn first_hop_endpoint(&self) -> Option<&TransportEndpoint> {
         self.hop_details
             .first()
             .and_then(|h| h.first_endpoint())
+    }
+
+    /// **N2.0.7.1.** Get the destination hop's `NodeDescriptor` (the
+    /// gateway's authenticated identity). This is how `send_via_route`
+    /// obtains the gateway's Ed25519 public key + X25519 circuit public
+    /// key WITHOUT receiving them as separate parameters.
+    #[must_use]
+    pub fn destination_descriptor(&self) -> Option<&NodeDescriptor> {
+        self.hop_details.last().map(|h| &h.descriptor)
     }
 
     /// **N2.0.7.** Check whether this Route has `hop_details` (i.e. was

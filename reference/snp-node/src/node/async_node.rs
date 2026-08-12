@@ -82,6 +82,15 @@ fn async_err_to_node(e: AsyncLinkError) -> NodeError {
 /// # Errors
 /// Returns [`NodeError`] on TCP bind failure. Per-connection errors are
 /// logged and the gateway continues accepting new connections.
+/// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead —
+/// the protocol-driven gateway derives circuit keys FROM the client's ephemeral
+/// public key in each request frame, NOT from an externally supplied
+/// `CircuitKeys` parameter. This function is retained only for backward
+/// compat with N2.0.6 tests and MUST NOT be used by new production code.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
+)]
 pub async fn serve_gateway_persistent_async(
     node: &Node,
     listen_addr: &str,
@@ -150,6 +159,11 @@ pub async fn serve_gateway_persistent_async(
 /// **Production gateways MUST NOT use this function** — production must use
 /// [`serve_gateway_persistent_async`] which calls [`PinnedConnector::new`]
 /// and enforces the SSRF defence.
+/// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
+)]
 pub async fn serve_gateway_persistent_async_with_connector<F>(
     node: &Node,
     listen_addr: &str,
@@ -216,6 +230,15 @@ where
 
 /// Serve ONE transit request on the given async link (production path:
 /// `PinnedConnector::new` SSRF defence).
+///
+/// **N2.0.7.1: DEPRECATED.** This function takes `CircuitKeys` as a parameter —
+/// use the protocol-driven path (`serve_gateway_with_protocol_circuit` →
+/// `serve_one_gateway_request_protocol_circuit`) instead, which derives keys
+/// from the client's ephemeral public key in the frame body.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_one_gateway_request_protocol_circuit` — circuit keys must be derived from the protocol"
+)]
 async fn serve_one_gateway_request_async(
     link: &Arc<AsyncLink>,
     gateway_node_id: [u8; 32],
@@ -224,6 +247,7 @@ async fn serve_one_gateway_request_async(
     seen_req_ids: &mut HashSet<[u8; 16]>,
 ) -> NodeResult<ServeOutcome> {
     // The production factory: PinnedConnector::new (SSRF defence enforced).
+    #[allow(deprecated)]
     serve_one_gateway_request_async_with_connector(
         link,
         gateway_node_id,
@@ -239,6 +263,14 @@ async fn serve_one_gateway_request_async(
 /// Serve ONE transit request with a custom connector factory + explicit
 /// client public key (for dynamic-mesh scenarios where the client identity
 /// is NOT the deterministic N2.0 test identity).
+///
+/// **N2.0.7.1: DEPRECATED.** This function takes `CircuitKeys` as a parameter —
+/// use the protocol-driven path (`serve_gateway_with_protocol_circuit` →
+/// `serve_one_gateway_request_protocol_circuit`) instead.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_one_gateway_request_protocol_circuit` — circuit keys must be derived from the protocol"
+)]
 pub async fn serve_one_gateway_request_async_with_connector<F>(
     link: &Arc<AsyncLink>,
     gateway_node_id: [u8; 32],
@@ -701,6 +733,16 @@ async fn discover_one_async(addr: &str) -> NodeResult<GatewayAdvertisement> {
 ///
 /// # Errors
 /// Returns [`NodeError`] on any failure.
+///
+/// **N2.0.7.1: DEPRECATED.** This function looks up a pre-established
+/// `Circuit` from `node.circuits` (out-of-band circuit keys). Use
+/// [`send_with_protocol_circuit_async`] or [`send_via_route`] instead —
+/// they derive circuit keys FROM the protocol (fresh ephemeral X25519 per
+/// request).
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `send_with_protocol_circuit_async` or `send_via_route` — circuit keys must be derived from the protocol"
+)]
 pub async fn send_request_via_gateway_full_with_relay_async(
     node: &Node,
     url: &str,
@@ -1016,40 +1058,29 @@ where
 // N2.0.6 CANONICAL PRODUCTION ENTRY POINTS — handshake-on-accept variants
 // ════════════════════════════════════════════════════════════════════════════
 //
-// These are the SINGLE canonical production entry points. They perform the
-// SNP-IK/0.1 handshake INTERNALLY — the caller does NOT need to do the
-// handshake, build an AsyncLink, or call any low-level transport function.
+// **N2.0.7.1: ALL FUNCTIONS IN THIS SECTION ARE DEPRECATED.**
 //
-// The north-star integration test (`tests/n205_north_star.rs`) MUST use
-// ONLY these entry points. It MUST NOT call:
-//   - `derive_link_keys` (deterministic seed link keys)
-//   - `derive_circuit_keys` (deterministic seed circuit keys)
-//   - `Link::connect` (sync link)
-//   - `std::net::TcpStream` / `std::net::TcpListener` (raw sync transport)
-//   - `perform_snp_ik_handshake_async` directly (the handshake is internal)
-//   - `async_relay_forward_links` directly (forwarding is internal)
-//   - `serve_one_gateway_request_async_with_connector` directly
-//   - `AsyncLink::new` / `AsyncLink::connect_raw` directly
+// These functions take `CircuitKeys` as a parameter — the gateway receives
+// pre-computed circuit keys externally. This is the OUT-OF-BAND circuit key
+// exchange that N2.0.7 eliminated. New production code MUST use
+// `serve_gateway_with_protocol_circuit` (above), which derives circuit keys
+// FROM the client's ephemeral public key in each request frame body.
 //
-// A self-scanning static guard in the test enforces these constraints.
+// These functions are retained only for backward compat with N2.0.6 tests
+// and MUST NOT be used by new production code. A static architectural guard
+// (`no_production_gateway_api_accepts_circuit_keys`) enforces that no
+// NON-DEPRECATED production gateway API takes `CircuitKeys`.
 
-/// **Canonical production gateway entry point.** Listens on `listen_addr`,
-/// accepts ONE incoming connection from a relay, performs the SNP-IK/0.1
-/// handshake as the RESPONDER (using `node.identity` for Ed25519 signing +
-/// `gateway_x25519_secret`/`gateway_x25519_public` for the X25519 rendezvous),
-/// then serves transit requests in a loop until the relay disconnects.
+/// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead.
 ///
-/// This is the entry point the north-star test uses. The handshake is
-/// INTERNAL — the caller never touches `perform_snp_ik_handshake_async`,
-/// `AsyncLink`, or any low-level transport function.
-///
-/// The `circuit_keys` are the gateway-side circuit keys (derived from the
-/// client↔gateway X25519 DH via `derive_circuit_keys_from_dh`). The
-/// `client_ed25519_public` is the client's Ed25519 public key (used to
-/// verify the `clientSig` on each TransitRequest).
-///
-/// # Errors
-/// Returns [`NodeError`] on TCP bind failure or handshake failure.
+/// This function takes `CircuitKeys` as a parameter — the gateway receives
+/// pre-computed circuit keys externally (out-of-band). The protocol-driven
+/// `serve_gateway_with_protocol_circuit` derives keys FROM the client's
+/// ephemeral public key in each request frame body.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
+)]
 pub async fn serve_gateway_persistent_async_with_handshake(
     node: &Node,
     listen_addr: &str,
@@ -1128,9 +1159,11 @@ pub async fn serve_gateway_persistent_async_with_handshake(
 /// Like [`serve_gateway_persistent_async_with_handshake`] but accepts a
 /// test-only connector factory (to bypass SSRF for a local mock HTTP server).
 ///
-/// **Production gateways MUST NOT use this function** — production must use
-/// [`serve_gateway_persistent_async_with_handshake`] which calls
-/// `PinnedConnector::new` and enforces the SSRF defence.
+/// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
+)]
 pub async fn serve_gateway_persistent_async_with_handshake_and_connector<F>(
     node: &Node,
     listen_addr: &str,
@@ -1313,8 +1346,18 @@ pub async fn serve_relay_persistent_async_with_handshake(
 /// establishment (fresh X25519 DH) + the link handshake + the request send
 /// are all INTERNAL.
 ///
+/// **N2.0.7.1: DEPRECATED.** This function uses a pre-computed DH
+/// (`x25519_dh(client_secret, gateway_public)`) — the client knows the
+/// gateway's X25519 secret-pair out-of-band. Use [`send_via_route`] instead
+/// — it uses `seal_circuit_payload_with_fresh_eph` (fresh ephemeral per
+/// request, protocol-driven).
+///
 /// # Errors
 /// Returns [`NodeError`] on any failure.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `send_via_route` — circuit keys must be derived from the protocol via seal_circuit_payload_with_fresh_eph"
+)]
 pub async fn establish_circuit_and_send_async(
     node: &Node,
     url: &str,
@@ -1367,6 +1410,14 @@ pub async fn establish_circuit_and_send_async(
 ///
 /// # Errors
 /// Returns [`NodeError`] on any failure (handshake, link, AEAD, signature).
+///
+/// **N2.0.7.1: DEPRECATED.** This function looks up a pre-established
+/// `Circuit` from `node.circuits` (out-of-band circuit keys). Use
+/// [`send_with_protocol_circuit_async`] or [`send_via_route`] instead.
+#[deprecated(
+    since = "N2.0.7.1",
+    note = "use `send_with_protocol_circuit_async` or `send_via_route` — circuit keys must be derived from the protocol"
+)]
 pub async fn send_request_with_full_snp_ik_handshake_async(
     node: &Node,
     url: &str,
@@ -1633,20 +1684,24 @@ pub async fn send_with_protocol_circuit_async(
 /// Route causally responsible for the path: change the Route's hop list,
 /// and the traffic follows a different path.
 ///
+/// **N2.0.7.1:** The gateway's Ed25519 public key + X25519 circuit public
+/// key are obtained from the Route's destination `NodeDescriptor` (the last
+/// hop's `descriptor` field) — NOT as separate parameters. The Route is
+/// SELF-CONTAINED.
+///
 /// Internally:
 /// 1. Extracts the first relay's endpoint from `route.hop_details[0]`.
-/// 2. Extracts the gateway's identity from `route.hop_details[last]`.
+/// 2. Extracts the gateway's identity from `route.hop_details[last].descriptor`.
 /// 3. Calls `send_with_protocol_circuit_async` (fresh ephemeral circuit).
 ///
 /// # Errors
 /// Returns [`NodeError`] if the Route has no `hop_details`, if the first
-/// hop has no endpoints, or on any protocol failure.
+/// hop has no endpoints, if the destination has no X25519 circuit key, or
+/// on any protocol failure.
 pub async fn send_via_route(
     node: &Node,
     route: &super::Route,
     url: &str,
-    gateway_ed25519_public: &[u8; 32],
-    gateway_x25519_pub: &snp_crypto::X25519PubKey,
     client_x25519_secret: &snp_crypto::X25519Secret,
     client_x25519_public: &snp_crypto::X25519PubKey,
 ) -> NodeResult<snp_gateway::TransitResponse> {
@@ -1658,16 +1713,35 @@ pub async fn send_via_route(
         ));
     }
     let first_hop = &route.hop_details[0];
-    let relay_addr = first_hop.first_endpoint().ok_or_else(|| {
+    let relay_endpoint = first_hop.first_endpoint().ok_or_else(|| {
         NodeError::Other("send_via_route: first hop has no endpoints".into())
     })?;
-    let relay_node_id = first_hop.node_id;
-
-    // 2. The gateway is the LAST hop.
-    let gateway_hop = route.hop_details.last().ok_or_else(|| {
-        NodeError::Other("send_via_route: route has no gateway hop".into())
+    // Resolve the TransportEndpoint to a TCP address (the only transport
+    // implemented for now — future transports will dispatch on the enum).
+    let relay_addr = relay_endpoint.as_tcp().ok_or_else(|| {
+        NodeError::Other(format!(
+            "send_via_route: first hop endpoint is not TCP (got {:?}) — only TCP is implemented",
+            relay_endpoint
+        ))
     })?;
-    let gateway_node_id = gateway_hop.node_id;
+    let relay_node_id = first_hop.node_id();
+
+    // 2. The gateway is the LAST hop — get its FULL authenticated identity
+    //    from the NodeDescriptor. NO separate gateway_ed25519_public /
+    //    gateway_x25519_pub parameters.
+    let gateway_descriptor = route.destination_descriptor().ok_or_else(|| {
+        NodeError::Other("send_via_route: route has no destination descriptor".into())
+    })?;
+    let gateway_node_id = gateway_descriptor.node_id;
+    let gateway_ed25519_public = gateway_descriptor.ed25519_public_key;
+    let gateway_x25519_pub_bytes = gateway_descriptor.circuit_x25519_pub().ok_or_else(|| {
+        NodeError::Other(
+            "send_via_route: destination descriptor has no X25519 circuit public key \
+             (is this actually a gateway?)"
+                .into(),
+        )
+    })?;
+    let gateway_x25519_pub = snp_crypto::x25519_public_from_bytes(gateway_x25519_pub_bytes);
 
     eprintln!(
         "[send-via-route {}] route: {} hops, first={}, dest={}",
@@ -1682,8 +1756,8 @@ pub async fn send_via_route(
         node,
         url,
         &gateway_node_id,
-        gateway_ed25519_public,
-        gateway_x25519_pub,
+        &gateway_ed25519_public,
+        &gateway_x25519_pub,
         relay_addr,
         &relay_node_id,
         client_x25519_secret,
@@ -1700,11 +1774,22 @@ pub async fn send_via_route(
 /// doesn't receive an explicit `next_hop_addr`; it reads the next hop from
 /// the Route.
 ///
+/// **N2.0.7.1 — local-bind vs remote-routing distinction:**
+///
+/// - `listen_addr` is the LOCAL BIND address — the address this relay
+///   listens on. This is LOCAL transport configuration, NOT routing. A
+///   node needs to know where to bind its listener. This is distinct from
+///   the remote routing decision.
+/// - The REMOTE next-hop (where to forward TO) comes EXCLUSIVELY from the
+///   Route's `hop_details[my_position + 1]`. The relay does NOT receive an
+///   explicit `next_hop_addr` parameter — it reads the next hop from the
+///   Route.
+///
 /// # Parameters
 /// - `route`: The Route this relay is part of.
 /// - `my_position`: The index of this relay in `route.hop_details`.
-/// - `listen_addr`: The address this relay listens on (from its own
-///   `RouteHop.endpoints[0]`).
+/// - `listen_addr`: The LOCAL BIND address (where this relay listens).
+///   This is local transport configuration, NOT a routing decision.
 ///
 /// # Errors
 /// Returns [`NodeError`] on any failure.
@@ -1716,7 +1801,8 @@ pub async fn serve_relay_via_route(
     relay_x25519_secret: &snp_crypto::X25519Secret,
     relay_x25519_public: &snp_crypto::X25519PubKey,
 ) -> NodeResult<()> {
-    // The next hop is at my_position + 1 in the Route.
+    // The REMOTE next hop is at my_position + 1 in the Route.
+    // This comes EXCLUSIVELY from the Route — NOT from a parameter.
     let next_hop = route
         .hop(my_position + 1)
         .ok_or_else(|| {
@@ -1727,10 +1813,17 @@ pub async fn serve_relay_via_route(
                 route.hop_details.len()
             ))
         })?;
-    let next_hop_addr = next_hop.first_endpoint().ok_or_else(|| {
+    let next_hop_endpoint = next_hop.first_endpoint().ok_or_else(|| {
         NodeError::Other("serve_relay_via_route: next hop has no endpoints".into())
     })?;
-    let next_hop_node_id = next_hop.node_id;
+    // Resolve the TransportEndpoint to a TCP address.
+    let next_hop_addr = next_hop_endpoint.as_tcp().ok_or_else(|| {
+        NodeError::Other(format!(
+            "serve_relay_via_route: next hop endpoint is not TCP (got {:?})",
+            next_hop_endpoint
+        ))
+    })?;
+    let next_hop_node_id = next_hop.node_id();
 
     eprintln!(
         "[relay-via-route {}] position {}, next-hop={}",
