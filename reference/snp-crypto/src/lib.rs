@@ -420,6 +420,8 @@ pub mod sig_contexts {
     pub const NODE_DESCRIPTOR: &[u8] = b"SNP/0.1 node-descriptor\0";
     /// GatewayAdvert: `"SNP/0.1 gateway-advert\0"`.
     pub const GATEWAY_ADVERT: &[u8] = b"SNP/0.1 gateway-advert\0";
+    /// NodeAdvert: `"SNP/0.1 node-advert\0"` — N2.1.0 generic node advertisement.
+    pub const NODE_ADVERT: &[u8] = b"SNP/0.1 node-advert\0";
     /// RouteAdvert: `"SNP/0.1 route-advert\0"`.
     pub const ROUTE_ADVERT: &[u8] = b"SNP/0.1 route-advert\0";
     /// Revocation: `"SNP/0.1 revocation\0"`.

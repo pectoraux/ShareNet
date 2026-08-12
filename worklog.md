@@ -3524,3 +3524,60 @@ Stage Summary:
 - RouteCommitment is documented as integrity identifier, NOT authorization.
 - `cargo test` runs ONLY the new production architecture; legacy tests require explicit `--features legacy-circuit-keys`.
 
+
+---
+Task ID: 226-230 (N2.1.0 — Generic Authenticated Node Advertisement Foundation)
+Agent: Z.ai (main)
+
+Task: N2.0.7.3 had a gateway-specific authentication pipeline (VerifiedGatewayAdvertisement → VerifiedNodeDescriptor). This milestone generalizes it so ANY node (relay, gateway, multi-role) can produce a signed advertisement that yields a VerifiedNodeDescriptor.
+
+Work Log:
+- Created `node_advert.rs` with generic `NodeAdvertisement` + `VerifiedNodeAdvertisement`:
+  * `NodeAdvertisement` carries: node_id, ed25519_public_key, capabilities, endpoints (AUTHENTICATED), x25519_circuit_public (Option), timestamp, expiry, nonce (16-byte freshness), signature.
+  * `NodeAdvertisement::create_and_sign()` — signs with Ed25519 under `SIG_CONTEXTS::NODE_ADVERT`.
+  * `NodeAdvertisement::verify_into_verified()` — checks signature + NodeId↔Ed25519 consistency + expiry. Returns `Option<VerifiedNodeAdvertisement>`.
+  * `VerifiedNodeAdvertisement::descriptor()` — produces `VerifiedNodeDescriptor` for ANY node role.
+  * Signature covers ALL identity-critical fields: NodeId, Ed25519 pub, capabilities, endpoints, X25519 key (if present), timestamp, expiry, nonce.
+
+- Refactored `VerifiedNodeDescriptor` in `descriptor.rs`:
+  * `from_verified_advert_internal()` now takes a `NodeAdvertisement` (not `GatewayAdvertisement`).
+  * The gateway-specific path (`VerifiedGatewayAdvertisement::descriptor()`) still exists for backward compat but delegates to the same internal construction.
+  * `VerifiedNodeDescriptor` is NO LONGER gateway-specific — it works for relays, gateways, and multi-role nodes.
+
+- Removed the dangerous `pub type NodeDescriptor = UnverifiedNodeDescriptor` alias.
+  * Developers must use explicit type names: `UnverifiedNodeDescriptor`, `IdentityConsistentNodeDescriptor`, `VerifiedNodeDescriptor`.
+
+- Added `SIG_CONTEXTS::NODE_ADVERT` to `snp-crypto/src/lib.rs`.
+
+- Endpoint authentication: endpoints are INSIDE the signed preimage of `NodeAdvertisement`. Test 7 (`tampered_endpoint_rejected`) proves that modifying an endpoint after signing invalidates the signature.
+
+- Freshness/replay protection: each advertisement carries a `timestamp`, `expiry`, and 16-byte random `nonce`. Test 9 (`replayed_advertisement_rejected`) proves expired advertisements are rejected. Two advertisements from the same node have different nonces (test 14).
+
+- 15 new tests (14 required + 1 static guard):
+  1. authenticated_relay_descriptor
+  2. authenticated_gateway_descriptor
+  3. authenticated_multi_role_descriptor
+  4. invalid_relay_signature_rejected
+  5. invalid_gateway_signature_rejected
+  6. tampered_capabilities_rejected
+  7. tampered_endpoint_rejected
+  8. tampered_gateway_x25519_key_rejected
+  9. replayed_advertisement_rejected
+  10. relay_route_hop_accepts_no_gateway_key
+  11. gateway_route_hop_requires_gateway_key
+  12. multi_hop_route_relay_relay_gateway
+  13. node_descriptor_alias_removed
+  14. cross_platform_advertisement_vectors
+  15. verified_node_descriptor_is_generic (static guard)
+
+- Test results: 183 passed, 0 failed, 3 ignored (was 168; +15 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Generic `NodeAdvertisement` works for relays, gateways, and multi-role nodes.
+- `VerifiedNodeDescriptor` is NO LONGER gateway-specific.
+- Endpoints are authenticated (covered by the signed advertisement).
+- Freshness/replay protection via timestamp + expiry + nonce.
+- The dangerous `NodeDescriptor` alias is removed.
+- Route validation works for multi-hop relay→relay→gateway paths with authenticated descriptors at every hop.
+

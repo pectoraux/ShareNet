@@ -113,6 +113,7 @@ pub mod gateway;
 pub mod circuit;
 pub mod session;
 pub mod descriptor;
+pub mod node_advert;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -121,9 +122,10 @@ pub use identity::{NodeIdentity, Capability};
 pub use gateway::GatewayAdvertisement;
 pub use circuit::{Circuit, PeerConnection, UpstreamPeer};
 pub use descriptor::{
-    IdentityConsistentNodeDescriptor, NodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
-    VerifiedGatewayAdvertisement, VerifiedNodeDescriptor,
+    IdentityConsistentNodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
+    VerifiedNodeDescriptor,
 };
+pub use node_advert::{NodeAdvertisement, VerifiedNodeAdvertisement};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

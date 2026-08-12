@@ -195,23 +195,21 @@ pub struct VerifiedNodeDescriptor {
 }
 
 impl VerifiedNodeDescriptor {
-    /// Construct a `VerifiedNodeDescriptor` from a
-    /// [`VerifiedGatewayAdvertisement`]. This is the ONLY way to obtain a
-    /// `VerifiedNodeDescriptor` — the `VerifiedGatewayAdvertisement` wrapper
-    /// proves the advertisement's signature was checked.
-    ///
-    /// This function ALSO verifies invariant I4 (NodeId↔Ed25519 consistency).
-    /// If the consistency check fails, returns `None`.
+    /// Construct a `VerifiedNodeDescriptor` from a verified
+    /// `NodeAdvertisement` (the generic N2.1.0 path). This is the
+    /// canonical way to obtain a `VerifiedNodeDescriptor` for ANY node
+    /// role (relay, gateway, multi-role).
     #[must_use]
-    pub(crate) fn from_verified_advert_internal(advert: &GatewayAdvertisement) -> Option<Self> {
+    pub(crate) fn from_verified_advert_internal(advert: &super::node_advert::NodeAdvertisement) -> Self {
         let unverified = UnverifiedNodeDescriptor {
             node_id: advert.node_id,
-            ed25519_public_key: advert.public_key,
-            x25519_circuit_public: Some(advert.circuit_x25519_pub),
+            ed25519_public_key: advert.ed25519_public_key,
+            x25519_circuit_public: advert.x25519_circuit_public,
             capabilities: advert.capabilities.clone(),
         };
-        let consistent = unverified.into_consistent()?;
-        Some(VerifiedNodeDescriptor { inner: consistent })
+        let consistent = unverified.into_consistent()
+            .expect("NodeId consistency was already verified by verify_into_verified()");
+        VerifiedNodeDescriptor { inner: consistent }
     }
 
     /// Get the NodeId.
@@ -289,14 +287,22 @@ impl VerifiedGatewayAdvertisement {
         &self.advert
     }
 
-    /// Derive a `VerifiedNodeDescriptor` from this verified advertisement.
-    /// This is the ONLY way to obtain a `VerifiedNodeDescriptor`.
+    /// Derive a `VerifiedNodeDescriptor` from this verified gateway advertisement.
+    /// This is the gateway-specific path; the generic path is via
+    /// `VerifiedNodeAdvertisement::descriptor()`.
     ///
     /// Also verifies NodeId↔Ed25519 consistency (invariant I4). Returns
     /// `None` if the consistency check fails.
     #[must_use]
     pub fn descriptor(&self) -> Option<VerifiedNodeDescriptor> {
-        VerifiedNodeDescriptor::from_verified_advert_internal(&self.advert)
+        let unverified = UnverifiedNodeDescriptor {
+            node_id: self.advert.node_id,
+            ed25519_public_key: self.advert.public_key,
+            x25519_circuit_public: Some(self.advert.circuit_x25519_pub),
+            capabilities: self.advert.capabilities.clone(),
+        };
+        let consistent = unverified.into_consistent()?;
+        Some(VerifiedNodeDescriptor { inner: consistent })
     }
 
     /// Get the gateway's NodeId.
@@ -423,5 +429,9 @@ pub fn verify_node_id_consistency(desc: &VerifiedNodeDescriptor) -> bool {
     desc.verify_node_id_consistency()
 }
 
-// Backward compat: re-export UnverifiedNodeDescriptor as NodeDescriptor.
-pub type NodeDescriptor = UnverifiedNodeDescriptor;
+// N2.1.0: The dangerous backward-compat alias that mapped `NodeDescriptor`
+// to `UnverifiedNodeDescriptor` has been REMOVED. Developers must use
+// explicit type names:
+//   - UnverifiedNodeDescriptor (raw, no proof)
+//   - IdentityConsistentNodeDescriptor (NodeId↔Ed25519 verified)
+//   - VerifiedNodeDescriptor (authenticated from VerifiedNodeAdvertisement)
