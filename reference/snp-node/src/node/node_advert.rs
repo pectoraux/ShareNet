@@ -845,6 +845,21 @@ impl AdvertisementAcceptanceStore {
         self.peers.get(node_id).and_then(|s| s.current_record.as_ref())
     }
 
+    /// **N2.1.2.** Iterate over ALL current (non-expired) accepted records.
+    ///
+    /// This includes records for nodes that have NO links — they are
+    /// authenticated but may not be directly reachable. The route engine
+    /// uses this to discover all gateway candidates, not just those with
+    /// usable links.
+    ///
+    /// Returns references to all `AuthenticatedNodeRecord`s currently held.
+    #[must_use]
+    pub fn all_records(&self) -> impl Iterator<Item = &AuthenticatedNodeRecord> {
+        self.peers
+            .values()
+            .filter_map(|s| s.current_record.as_ref())
+    }
+
     /// Get the highest accepted sequence for a NodeId, if any.
     /// This survives record expiry/purging — the sequence floor is
     /// NOT erased by `purge_expired_records()`.

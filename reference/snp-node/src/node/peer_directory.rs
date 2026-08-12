@@ -166,6 +166,27 @@ impl PeerDirectory {
             .collect()
     }
 
+    /// **N2.1.2.** Get ALL authenticated gateway records, including those
+    /// that do NOT have a usable link.
+    ///
+    /// Unlike `direct_gateways()`, this returns ALL accepted records with
+    /// `Capability::Gateway`, regardless of link state. The route engine
+    /// uses this to discover all gateway candidates — a gateway might be
+    /// reachable through relays even if it has no direct link.
+    ///
+    /// Filters:
+    /// 1. A CURRENT advertisement (not STALE).
+    /// 2. `Capability::Gateway` in capabilities.
+    /// 3. An X25519 circuit public key.
+    #[must_use]
+    pub fn all_gateway_records(&self) -> Vec<&AuthenticatedNodeRecord> {
+        self.acceptance
+            .all_records()
+            .filter(|record| record.descriptor.is_gateway())
+            .filter(|record| record.descriptor.circuit_x25519_pub().is_some())
+            .collect()
+    }
+
     /// Get all directly reachable nodes that advertise Relay capability.
     #[must_use]
     pub fn reachable_relays(&self) -> Vec<&AuthenticatedNodeRecord> {

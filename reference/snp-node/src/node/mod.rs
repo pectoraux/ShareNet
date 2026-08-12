@@ -118,6 +118,7 @@ pub mod link;
 pub mod topology_protocol;
 pub mod peer_directory;
 pub mod topology;
+pub mod route_engine;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -142,6 +143,12 @@ pub use topology_protocol::{
 };
 pub use peer_directory::PeerDirectory;
 pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
+pub use route_engine::{
+    CandidateOrigin, DestinationResolver, HopCountCost, InMemoryResolver, LowLatencyCost,
+    NullResolver, RouteCandidate, RouteCandidateState, RouteCostModel, RouteDiscoveryError,
+    RouteEngine,
+};
+pub use route::RouteCommitment;
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

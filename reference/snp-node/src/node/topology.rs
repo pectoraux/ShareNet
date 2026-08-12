@@ -439,6 +439,17 @@ impl TopologyGraph {
         self.directory.direct_gateways()
     }
 
+    /// **N2.1.2.** Get ALL authenticated gateway records, including those
+    /// without a usable direct link.
+    ///
+    /// Unlike `direct_gateways()`, this returns ALL accepted gateway records.
+    /// The route engine uses this to discover all gateway candidates —
+    /// a gateway might be reachable through relays even without a direct link.
+    #[must_use]
+    pub fn all_gateway_records(&self) -> Vec<&AuthenticatedNodeRecord> {
+        self.directory.all_gateway_records()
+    }
+
     /// Get all directly reachable relays.
     #[must_use]
     pub fn reachable_relays(&self) -> Vec<&AuthenticatedNodeRecord> {
