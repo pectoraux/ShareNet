@@ -494,6 +494,32 @@ pub enum PeerVisibility {
     Stale,
 }
 
+// ─── AcceptanceError ────────────────────────────────────────────────────────
+
+/// Errors from the acceptance store.
+#[derive(Debug)]
+pub enum AcceptanceError {
+    /// Persistence write failed. The in-memory state was NOT advanced —
+    /// the advertisement was NOT accepted. The caller must retry or
+    /// handle the error.
+    PersistenceFailed(std::io::Error),
+    /// The persistence file is corrupted (truncated, malformed, or
+    /// contains duplicate/invalid entries). The store was NOT loaded.
+    /// The caller should quarantine or delete the file.
+    CorruptPersistence(String),
+}
+
+impl std::fmt::Display for AcceptanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PersistenceFailed(e) => write!(f, "persistence failed: {e}"),
+            Self::CorruptPersistence(msg) => write!(f, "corrupt persistence: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptanceError {}
+
 // ─── AdvertisementAcceptanceStore ───────────────────────────────────────────
 
 /// The result of attempting to accept an advertisement.
@@ -525,32 +551,53 @@ pub enum AcceptanceResult {
 ///
 /// The store supports file-backed persistence. When a file path is provided
 /// via `open()`, the acceptance state (NodeId + Ed25519 public key +
-/// highest_accepted_sequence) is persisted to disk after every `accept()`
-/// call. On restart, `open()` loads the persisted state, and old
+/// highest_accepted_sequence) is persisted to disk after every successful
+/// `accept()` call. On restart, `open()` loads the persisted state, and old
 /// advertisements with lower sequences are rejected as stale.
 ///
-/// ## Persistence format
+/// ## Persistence format (N2.1.0.4)
 ///
-/// The file contains a sequence of entries, each:
-/// - 32 bytes: NodeId
-/// - 32 bytes: Ed25519 public key
-/// - 8 bytes: highest_accepted_sequence (little-endian u64)
+/// **Reference-node persistence format; NOT a cross-platform SNP wire format.**
 ///
-/// Total: 72 bytes per peer entry.
+/// The file contains:
+/// - 4 bytes: magic `b"SNPA"` (ShareNet Peer Acceptance)
+/// - 1 byte: version (`1`)
+/// - N × 72-byte entries, each:
+///   - 32 bytes: NodeId
+///   - 32 bytes: Ed25519 public key
+///   - 8 bytes: highest_accepted_sequence (little-endian u64)
 ///
-/// ## Atomicity
+/// Total header: 5 bytes. Total per entry: 72 bytes.
 ///
-/// Persistence uses a write-to-temp-then-rename strategy: the new state is
-/// written to a temporary file, then atomically renamed over the main file.
-/// This ensures that a crash during `persist()` leaves either the old state
-/// or the new state, never a corrupted partial write.
+/// ## Atomicity vs Durability (N2.1.0.4)
 ///
-/// ## Identity binding
+/// **Atomic replacement: YES.** Persistence uses write-to-temp-then-rename.
+/// Readers never see a partially written replacement under normal filesystem
+/// semantics.
 ///
-/// When loading persisted state, each entry's NodeId ↔ Ed25519 public key
-/// consistency is verified (invariant I4: `NodeId == SHA-256("SNP/0.1 node\0"
-/// || ed25519_public_key)`). Entries with inconsistent identity are silently
-/// skipped (treated as corrupted).
+/// **Guaranteed crash/power-loss durability: NOT CLAIMED.** The reference
+/// implementation does not perform `fsync` before rename. A power loss
+/// immediately after `write()` but before the OS flushes to disk may lose
+/// the write. Production implementations should add `fsync(temp) → rename →
+/// fsync(parent_dir)` for full durability.
+///
+/// ## Fail-closed corruption handling (N2.1.0.4)
+///
+/// Loading a persistence file fails closed:
+/// - Files shorter than the 5-byte header → `CorruptPersistence`.
+/// - Files whose data after the header is not a multiple of `ENTRY_SIZE` →
+///   `CorruptPersistence` (trailing bytes are NOT silently ignored).
+/// - Entries with `NodeId ≠ SHA-256("SNP/0.1 node\0" || ed25519_public_key)` →
+///   `CorruptPersistence` (identity-inconsistent entries are NOT silently skipped).
+/// - Duplicate `NodeId` entries → `CorruptPersistence` (NOT silently overwritten).
+///
+/// ## Transactional acceptance (N2.1.0.4)
+///
+/// `accept()` returns `Result<AcceptanceResult, AcceptanceError>`.
+/// When the result would be `Accepted`, the new state is persisted FIRST.
+/// If persistence fails, `AcceptanceError::PersistenceFailed` is returned
+/// and the in-memory state is NOT advanced — the advertisement was NOT
+/// accepted. The caller must retry or handle the error.
 ///
 /// ## Peer visibility states
 ///
@@ -575,6 +622,15 @@ pub struct AdvertisementAcceptanceStore {
 /// On-disk entry format: NodeId (32) + Ed25519 pub (32) + sequence (8) = 72 bytes.
 const ENTRY_SIZE: usize = 72;
 
+/// Persistence file magic: `b"SNPA"` (ShareNet Peer Acceptance).
+const PERSIST_MAGIC: &[u8; 4] = b"SNPA";
+
+/// Persistence file format version.
+const PERSIST_VERSION: u8 = 1;
+
+/// Header size: magic (4) + version (1) = 5 bytes.
+const HEADER_SIZE: usize = 5;
+
 impl AdvertisementAcceptanceStore {
     /// Create a new empty in-memory store (not persisted).
     #[must_use]
@@ -585,13 +641,17 @@ impl AdvertisementAcceptanceStore {
     /// Open a persistent store backed by a file. If the file exists, the
     /// acceptance state is loaded from it. If not, the store starts empty.
     ///
-    /// Entries with corrupted or inconsistent identity (NodeId ≠
-    /// SHA-256("SNP/0.1 node\0" || ed25519_public_key)) are silently
-    /// skipped.
+    /// ## Fail-closed (N2.1.0.4)
+    ///
+    /// If the file is corrupted (truncated, invalid magic/version, trailing
+    /// bytes, duplicate NodeIds, or identity-inconsistent entries), this
+    /// method returns `AcceptanceError::CorruptPersistence`. The caller
+    /// should quarantine or delete the file.
     ///
     /// # Errors
-    /// Returns `io::Error` if the file exists but cannot be read.
-    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    /// Returns `AcceptanceError::CorruptPersistence` for corrupted files.
+    /// Returns `io::Error` (wrapped) for I/O failures.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, AcceptanceError> {
         let path = path.as_ref().to_path_buf();
         let mut store = Self {
             peers: HashMap::new(),
@@ -603,44 +663,92 @@ impl AdvertisementAcceptanceStore {
         Ok(store)
     }
 
-    /// Load acceptance state from the persistence file. Entries with
-    /// inconsistent NodeId ↔ Ed25519 public key are skipped.
-    fn load(&mut self) -> std::io::Result<()> {
-        let data = std::fs::read(&self.path)?;
+    /// Load acceptance state from the persistence file. Fails closed on
+    /// any corruption.
+    fn load(&mut self) -> Result<(), AcceptanceError> {
+        let data = std::fs::read(&self.path)
+            .map_err(|e| AcceptanceError::CorruptPersistence(format!("read error: {e}")))?;
+
+        // Check minimum header size.
+        if data.len() < HEADER_SIZE {
+            return Err(AcceptanceError::CorruptPersistence(
+                format!("file too short: {} bytes < {} header", data.len(), HEADER_SIZE),
+            ));
+        }
+
+        // Check magic.
+        if &data[..4] != PERSIST_MAGIC {
+            return Err(AcceptanceError::CorruptPersistence(
+                format!("invalid magic: expected {:?}, got {:?}", PERSIST_MAGIC, &data[..4]),
+            ));
+        }
+
+        // Check version.
+        if data[4] != PERSIST_VERSION {
+            return Err(AcceptanceError::CorruptPersistence(
+                format!("unsupported version: expected {}, got {}", PERSIST_VERSION, data[4]),
+            ));
+        }
+
+        // Check that remaining data is a multiple of ENTRY_SIZE (no trailing bytes).
+        let entries_data = &data[HEADER_SIZE..];
+        if entries_data.len() % ENTRY_SIZE != 0 {
+            return Err(AcceptanceError::CorruptPersistence(
+                format!("trailing bytes: {} bytes after header is not a multiple of {}", entries_data.len(), ENTRY_SIZE),
+            ));
+        }
+
+        // Parse entries. Fail on duplicates or identity inconsistency.
+        let mut seen_node_ids = std::collections::HashSet::new();
         let mut offset = 0;
-        while offset + ENTRY_SIZE <= data.len() {
+        while offset < entries_data.len() {
             let mut node_id = [0u8; 32];
-            node_id.copy_from_slice(&data[offset..offset + 32]);
+            node_id.copy_from_slice(&entries_data[offset..offset + 32]);
             let mut ed25519_pk = [0u8; 32];
-            ed25519_pk.copy_from_slice(&data[offset + 32..offset + 64]);
+            ed25519_pk.copy_from_slice(&entries_data[offset + 32..offset + 64]);
             let mut seq_buf = [0u8; 8];
-            seq_buf.copy_from_slice(&data[offset + 64..offset + 72]);
+            seq_buf.copy_from_slice(&entries_data[offset + 64..offset + 72]);
             let sequence = u64::from_le_bytes(seq_buf);
             offset += ENTRY_SIZE;
 
-            // Verify NodeId ↔ Ed25519 consistency (I4). Skip corrupted entries.
+            // Check for duplicate NodeId.
+            if !seen_node_ids.insert(node_id) {
+                return Err(AcceptanceError::CorruptPersistence(
+                    format!("duplicate NodeId entry at offset {}", offset - ENTRY_SIZE),
+                ));
+            }
+
+            // Verify NodeId ↔ Ed25519 consistency (I4).
             let expected_node_id = derive_node_id(&ed25519_pk);
             if node_id != expected_node_id {
-                continue;
+                return Err(AcceptanceError::CorruptPersistence(
+                    format!("NodeId↔Ed25519 inconsistency for entry at offset {}", offset - ENTRY_SIZE),
+                ));
             }
 
             self.peers.insert(node_id, PeerAcceptanceState {
                 highest_accepted_sequence: sequence,
                 ed25519_public_key: ed25519_pk,
-                current_record: None, // Records are not persisted.
+                current_record: None,
             });
         }
         Ok(())
     }
 
     /// Persist the acceptance state to the file using an atomic
-    /// write-to-temp-then-rename strategy. Only NodeId + Ed25519 pub +
-    /// highest_accepted_sequence are persisted (current records are not).
+    /// write-to-temp-then-rename strategy.
+    ///
+    /// **Atomic replacement: YES.** Readers never see a partial write.
+    /// **Guaranteed power-loss durability: NOT CLAIMED** (no fsync).
     fn persist(&self) -> std::io::Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
         }
-        let mut data = Vec::with_capacity(self.peers.len() * ENTRY_SIZE);
+        let mut data = Vec::with_capacity(HEADER_SIZE + self.peers.len() * ENTRY_SIZE);
+        // Header.
+        data.extend_from_slice(PERSIST_MAGIC);
+        data.push(PERSIST_VERSION);
+        // Entries.
         for (node_id, state) in &self.peers {
             data.extend_from_slice(node_id);
             data.extend_from_slice(&state.ed25519_public_key);
@@ -655,52 +763,77 @@ impl AdvertisementAcceptanceStore {
 
     /// Attempt to accept a `VerifiedNodeAdvertisement`.
     ///
-    /// Returns:
-    /// - `AcceptanceResult::Accepted(record)` if the sequence is newer than
-    ///   any previously seen for this NodeId.
-    /// - `AcceptanceResult::Stale` if the sequence is older.
-    /// - `AcceptanceResult::Duplicate` if the sequence matches a previously
-    ///   accepted advertisement.
+    /// ## Transactional semantics (N2.1.0.4)
     ///
-    /// If the store is persistent, the acceptance state is written to disk
-    /// after each successful acceptance.
-    pub fn accept(&mut self, verified: VerifiedNodeAdvertisement) -> AcceptanceResult {
+    /// When the result would be `Accepted`:
+    /// 1. Compute the new state.
+    /// 2. Persist the new state to disk.
+    /// 3. Only if persistence succeeds, update the in-memory state.
+    /// 4. Return `Accepted`.
+    ///
+    /// If persistence fails, return `AcceptanceError::PersistenceFailed`
+    /// and do NOT update the in-memory state — the advertisement was NOT
+    /// accepted.
+    ///
+    /// Stale and duplicate results do NOT require persistence (the state
+    /// doesn't change) and are returned directly.
+    ///
+    /// # Errors
+    /// Returns `AcceptanceError::PersistenceFailed` if the state could not
+    /// be persisted. The in-memory state is NOT advanced in this case.
+    pub fn accept(
+        &mut self,
+        verified: VerifiedNodeAdvertisement,
+    ) -> Result<AcceptanceResult, AcceptanceError> {
         let node_id = verified.node_id();
         let sequence = verified.sequence();
         let ed25519_pk = *verified.ed25519_public_key();
         match self.peers.get(&node_id) {
             None => {
-                // First advertisement from this node.
+                // First advertisement from this node — need to persist.
                 let record = verified.into_record();
-                self.peers.insert(node_id, PeerAcceptanceState {
+                let new_state = PeerAcceptanceState {
                     highest_accepted_sequence: sequence,
                     ed25519_public_key: ed25519_pk,
                     current_record: Some(record.clone()),
-                });
-                let _ = self.persist();
-                AcceptanceResult::Accepted(record)
+                };
+                // Transactional: persist FIRST, then update in-memory.
+                // Temporarily insert to compute persist data, then remove if persist fails.
+                self.peers.insert(node_id, new_state);
+                if let Err(e) = self.persist() {
+                    // Rollback: remove the entry we just added.
+                    self.peers.remove(&node_id);
+                    return Err(AcceptanceError::PersistenceFailed(e));
+                }
+                Ok(AcceptanceResult::Accepted(record))
             }
             Some(state) if sequence > state.highest_accepted_sequence => {
-                // Newer advertisement.
+                // Newer advertisement — need to persist.
+                let old_state = state.clone();
                 let record = verified.into_record();
-                self.peers.insert(node_id, PeerAcceptanceState {
+                let new_state = PeerAcceptanceState {
                     highest_accepted_sequence: sequence,
                     ed25519_public_key: ed25519_pk,
                     current_record: Some(record.clone()),
-                });
-                let _ = self.persist();
-                AcceptanceResult::Accepted(record)
+                };
+                self.peers.insert(node_id, new_state);
+                if let Err(e) = self.persist() {
+                    // Rollback: restore the old state.
+                    self.peers.insert(node_id, old_state);
+                    return Err(AcceptanceError::PersistenceFailed(e));
+                }
+                Ok(AcceptanceResult::Accepted(record))
             }
-            Some(state) if sequence == state.highest_accepted_sequence => {
-                // Duplicate.
-                AcceptanceResult::Duplicate { sequence }
+            Some(_) if sequence == self.peers.get(&node_id).map(|s| s.highest_accepted_sequence).unwrap_or(0) => {
+                // Duplicate — no state change, no persistence needed.
+                Ok(AcceptanceResult::Duplicate { sequence })
             }
             Some(state) => {
-                // Stale.
-                AcceptanceResult::Stale {
+                // Stale — no state change, no persistence needed.
+                Ok(AcceptanceResult::Stale {
                     advert_sequence: sequence,
                     known_sequence: state.highest_accepted_sequence,
-                }
+                })
             }
         }
     }
@@ -768,6 +901,11 @@ impl AdvertisementAcceptanceStore {
     /// rotation, or administrative action).
     pub fn remove_peer(&mut self, node_id: &[u8; 32]) {
         self.peers.remove(node_id);
+        // Best-effort persist. remove_peer is an explicit identity-history
+        // deletion — if the persist fails, the in-memory state is still
+        // correct (peer removed), and the next successful persist will
+        // sync. This is less critical than accept() because remove_peer
+        // is not a monotonicity invariant.
         let _ = self.persist();
     }
 
@@ -777,8 +915,8 @@ impl AdvertisementAcceptanceStore {
     /// are NOT persisted — they will be `None` after restart.
     ///
     /// # Errors
-    /// Returns `io::Error` if the file cannot be read.
-    pub fn restart(&self) -> std::io::Result<Self> {
+    /// Returns `AcceptanceError` if the file is corrupted or cannot be read.
+    pub fn restart(&self) -> Result<Self, AcceptanceError> {
         if self.path.as_os_str().is_empty() {
             // In-memory: return a fresh store (simulating data loss).
             return Ok(Self::new());
@@ -880,14 +1018,31 @@ impl AdvertisementSequenceStore {
     }
 
     /// Atomically increment the sequence and return the new value.
-    /// The new value is persisted to the file (if a path was provided).
+    ///
+    /// ## N2.1.0.4: Transactional semantics
+    ///
+    /// 1. Compute `next = sequence + 1`.
+    /// 2. Persist `next` to the file.
+    /// 3. Only if persistence succeeds, update `self.sequence = next`.
+    /// 4. Return `next`.
+    ///
+    /// If persistence fails, the in-memory counter is NOT advanced —
+    /// `self.sequence` remains at its previous value. The caller must
+    /// retry or handle the error.
     ///
     /// # Errors
     /// Returns `io::Error` if the file cannot be written.
     pub fn next_sequence(&mut self) -> std::io::Result<u64> {
-        self.sequence = self.sequence.saturating_add(1);
-        self.persist()?;
-        Ok(self.sequence)
+        let next = self.sequence.saturating_add(1);
+        // Persist the new value FIRST. Only update in-memory if persist succeeds.
+        let old_sequence = self.sequence;
+        self.sequence = next; // temporarily set for persist()
+        if let Err(e) = self.persist() {
+            // Rollback: restore the old sequence.
+            self.sequence = old_sequence;
+            return Err(e);
+        }
+        Ok(next)
     }
 
     /// Persist the current sequence to the file.

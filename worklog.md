@@ -3753,3 +3753,70 @@ Stage Summary:
 - remove_peer() is explicitly an identity-history deletion operation.
 - The advertisement primitive is now fully hardened for peer discovery (N2.1.1).
 
+
+---
+Task ID: 246-250 (N2.1.0.4 — Fail-Closed Persistence and Transactional Acceptance)
+Agent: Z.ai (main)
+
+Task: N2.1.0.3 had three persistence blockers: (1) persist errors silently ignored via `let _ = self.persist()`, (2) truncated/corrupted files silently produce empty/partial stores, (3) duplicate NodeId entries can lower the sequence floor. This milestone fixes all three.
+
+Work Log:
+- Made accept() transactional:
+  * Changed return type to `Result<AcceptanceResult, AcceptanceError>`.
+  * On Accepted path: compute new state → persist → only update in-memory if persist succeeds → rollback on failure.
+  * Stale/Duplicate paths don't require persistence (no state change).
+  * Added `AcceptanceError` enum: `PersistenceFailed(io::Error)`, `CorruptPersistence(String)`.
+
+- Made load() fail-closed:
+  * Files shorter than HEADER_SIZE → CorruptPersistence.
+  * Wrong magic → CorruptPersistence.
+  * Wrong version → CorruptPersistence.
+  * Trailing bytes (data.len() - HEADER_SIZE) % ENTRY_SIZE != 0 → CorruptPersistence.
+  * Duplicate NodeId → CorruptPersistence (NOT silently overwritten).
+  * Identity-inconsistent entries (NodeId ≠ SHA-256(pubkey)) → CorruptPersistence (NOT silently skipped).
+  * Empty file → CorruptPersistence (no header).
+
+- Added persistence format versioning:
+  * Magic: `b"SNPA"` (4 bytes) — ShareNet Peer Acceptance.
+  * Version: `1u8` (1 byte).
+  * Header: 5 bytes. Entries: 72 bytes each.
+  * Documented: "Reference-node persistence format; NOT a cross-platform SNP wire format."
+
+- Made AdvertisementSequenceStore::next_sequence() transactional:
+  * Compute next → persist → only update in-memory if persist succeeds → rollback on failure.
+  * In-memory counter does NOT advance when persist fails.
+
+- Documented atomicity vs durability:
+  * Atomic replacement: YES (write-temp + rename).
+  * Guaranteed power-loss durability: NOT CLAIMED (no fsync).
+  * Production implementations should add fsync(temp) → rename → fsync(parent_dir).
+
+- 10 new tests (50 total in n210_node_advert.rs):
+  41. persist_failure_is_returned
+  42. failed_persist_does_not_advance_accepted_sequence
+  43. truncated_state_is_rejected
+  44. trailing_bytes_are_rejected
+  45. duplicate_node_id_is_rejected
+  46. duplicate_node_id_cannot_lower_sequence_floor
+  47. persistence_format_magic_and_version_checked
+  48. node_sequence_persist_failure_is_returned
+  49. restart_after_successful_persist_restores_floor
+  50. atomic_replacement_test
+
+- Updated 3 existing tests for fail-closed behavior:
+  * corrupted_persistence_truncated_rejected: now expects Err (was: Ok empty store).
+  * corrupted_persistence_invalid_nodeid_rejected: now expects Err (was: Ok empty store).
+  * corrupted_persistence_empty_file_accepted → renamed to corrupted_persistence_empty_file_rejected: now expects Err.
+
+- Test results: 218 passed, 0 failed, 3 ignored (was 208; +10 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Persistence failures are NOT ignored — accept() returns Err.
+- Truncated/corrupted/duplicate persistence fails closed — CorruptPersistence.
+- Persistence format has magic + version header.
+- accept() is transactional — in-memory state not advanced if persist fails.
+- next_sequence() is transactional — counter not advanced if persist fails.
+- Atomic replacement documented as distinct from power-loss durability.
+- The advertisement primitive is now FULLY hardened for peer discovery.
+
