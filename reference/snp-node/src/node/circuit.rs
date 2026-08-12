@@ -64,7 +64,7 @@ pub struct PeerConnection {
     /// The peer's TCP address (e.g. `"127.0.0.1:7002"`).
     pub addr: String,
     /// The AEAD link over the TCP stream.
-    pub link: Arc<Link>,
+    pub link: Arc<snp_link::Link>,
     /// The directional hop keys used for this link.
     pub hop_keys: LinkKeys,
 }

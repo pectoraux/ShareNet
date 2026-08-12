@@ -92,7 +92,7 @@ use snp_gateway::{
     verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
 };
 use snp_link::{
-    decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, Link, LinkKeys,
+    decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, LinkKeys,
 };
 
 use crate::{
@@ -114,6 +114,10 @@ pub mod circuit;
 pub mod session;
 pub mod descriptor;
 pub mod node_advert;
+pub mod link;
+pub mod topology_protocol;
+pub mod peer_directory;
+pub mod topology;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -131,6 +135,12 @@ pub use node_advert::{
     SequenceStoreError, VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS,
     MAX_CLOCK_SKEW_SECS,
 };
+pub use link::{Link, LinkKey, LinkMetrics, LinkState, LinkTable, TransportType};
+pub use topology_protocol::{
+    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, MAX_PEER_SUMMARIES_PER_MESSAGE,
+};
+pub use peer_directory::PeerDirectory;
+pub use topology::{RemoteNodeEntry, TopologyGraph, TopologySnapshot};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,
@@ -379,7 +389,7 @@ impl Node {
                 hex_short(&gateway_node_id),
                 stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
             );
-            let link = Arc::new(Link::new(stream, link_keys));
+            let link = Arc::new(snp_link::Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
             // PERSISTENT LOOP: serve multiple requests over this connection.
             loop {
@@ -460,7 +470,7 @@ impl Node {
                 hex_short(&gateway_node_id),
                 stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
             );
-            let link = Arc::new(Link::new(stream, link_keys));
+            let link = Arc::new(snp_link::Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
             let mut served = 0usize;
             loop {
@@ -1035,14 +1045,14 @@ impl Node {
         &self,
         addr: &str,
         hop_keys: LinkKeys,
-    ) -> NodeResult<Arc<Link>> {
+    ) -> NodeResult<Arc<snp_link::Link>> {
         // Fast path: already connected.
         if let Some(peer) = self.peers.lock().unwrap().get(addr) {
             return Ok(Arc::clone(&peer.link));
         }
         // Slow path: connect and cache.
         eprintln!("[node] establishing persistent connection to {addr}");
-        let link = Arc::new(Link::connect(addr, hop_keys)?);
+        let link = Arc::new(snp_link::Link::connect(addr, hop_keys)?);
         let peer = PeerConnection {
             addr: addr.to_string(),
             link: Arc::clone(&link),
@@ -1166,8 +1176,8 @@ fn serve_relay_persistent_inner(
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let prev_link = Arc::new(Link::new(prev_stream, prev_hop_keys));
-        let next_link = match Link::connect(next_hop_addr, next_hop_keys) {
+        let prev_link = Arc::new(snp_link::Link::new(prev_stream, prev_hop_keys));
+        let next_link = match snp_link::Link::connect(next_hop_addr, next_hop_keys) {
             Ok(l) => Arc::new(l),
             Err(e) => {
                 eprintln!("[relay-persistent] connect to next-hop {next_hop_addr} failed: {e}");
@@ -1277,12 +1287,12 @@ fn serve_relay_multi_upstream_persistent_inner(
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let prev_link = Arc::new(Link::new(prev_stream, prev_hop_keys));
+        let prev_link = Arc::new(snp_link::Link::new(prev_stream, prev_hop_keys));
 
         // Establish persistent connections to ALL upstreams.
-        let mut upstream_links: Vec<([u8; 32], String, Arc<Link>)> = Vec::new();
+        let mut upstream_links: Vec<([u8; 32], String, Arc<snp_link::Link>)> = Vec::new();
         for upstream in upstreams {
-            match Link::connect(&upstream.addr, upstream.hop_keys) {
+            match snp_link::Link::connect(&upstream.addr, upstream.hop_keys) {
                 Ok(l) => {
                     eprintln!(
                         "[relay-multi-upstream] connected to upstream {} at {}",
@@ -1389,7 +1399,7 @@ fn serve_relay_multi_upstream_persistent_inner(
 
 /// Send a Class C "upstream-failure" NACK to the previous hop. The client
 /// recognises this as a failover signal.
-fn send_upstream_failure_nack(prev_link: &Link, req_frame: &Frame) {
+fn send_upstream_failure_nack(prev_link: &snp_link::Link, req_frame: &Frame) {
     let nack = Frame {
         v: FRAME_VERSION,
         cls: b'C',
@@ -1413,7 +1423,7 @@ fn send_upstream_failure_nack(prev_link: &Link, req_frame: &Frame) {
 /// **N2.0.3 production API.** The `gateway_node_id` is passed explicitly
 /// (it comes from `self.identity.node_id` in the caller — NO `GatewayChoice`).
 fn serve_one_gateway_request(
-    link: &Arc<Link>,
+    link: &Arc<snp_link::Link>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
     circuit: &CircuitKeys,
@@ -1464,7 +1474,7 @@ fn default_connector_factory(url: &str) -> NodeResult<PinnedConnector> {
 /// HTTP server (NOT at any private/internal service that could be abused).
 #[doc(hidden)]
 pub fn serve_one_gateway_request_with_connector_factory<F>(
-    link: &Arc<Link>,
+    link: &Arc<snp_link::Link>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
     circuit: &CircuitKeys,
@@ -1518,7 +1528,7 @@ where
 /// I18).
 #[doc(hidden)]
 pub fn serve_one_gateway_request_with_connector_factory_and_client_key<F>(
-    link: &Arc<Link>,
+    link: &Arc<snp_link::Link>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
     client_pk: &[u8; 32],
@@ -1736,8 +1746,8 @@ fn serve_relay_persistent_with_drop_after_inner(
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let prev_link = Arc::new(Link::new(prev_stream, prev_hop_keys));
-        let next_link = match Link::connect(next_hop_addr, next_hop_keys) {
+        let prev_link = Arc::new(snp_link::Link::new(prev_stream, prev_hop_keys));
+        let next_link = match snp_link::Link::connect(next_hop_addr, next_hop_keys) {
             Ok(l) => Arc::new(l),
             Err(e) => {
                 eprintln!("[relay-drop-after] connect to next-hop {next_hop_addr} failed: {e}");

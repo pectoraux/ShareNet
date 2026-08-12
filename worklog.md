@@ -3869,3 +3869,82 @@ Stage Summary:
   * Documented: atomic replacement YES, power-loss durability NOT CLAIMED.
 - The advertisement primitive is now FULLY hardened. Ready for N2.1.1 (Peer Discovery & Topology).
 
+
+---
+Task ID: 256-265 (N2.1.1 — Peer Discovery & Topology Implementation)
+Agent: Z.ai (main)
+
+Task: Implement the N2.1.1 topology architecture (design approved at commit 35e9768, amended to include minimal remote topology propagation in this milestone).
+
+Work Log:
+- Implemented 4 new modules:
+  1. `node/link.rs` — Link, LinkKey, LinkState, LinkMetrics, LinkTable, TransportType
+     * Directed links (A→B does NOT imply B→A)
+     * Per-endpoint (a node can have multiple links over different transports)
+     * Link state machine: Up → Degraded → Down (with auto-transition on failures)
+     * Metrics: RTT, success/failure counts, success_rate(), estimated bandwidth
+     * LinkTable: links_from(), links_to(), usable_links_from(), is_reachable(), purge_dead_links()
+
+  2. `node/topology_protocol.rs` — HELLO, GOODBYE, PeerSummary, PeerSummaryList
+     * HelloMessage: carries NodeAdvertisement (self-authenticating)
+     * GoodbyeMessage: best-effort, signed, NEVER a state transition authority
+     * PeerSummary: bounded summary with node_id, sequence, capabilities, visibility, distance_hint
+     * PeerSummaryList: signed list of summaries, max 256 entries
+     * All use canonical SNP CBOR encoding
+
+  3. `node/peer_directory.rs` — PeerDirectory
+     * Wraps AdvertisementAcceptanceStore (ordering authority) + LinkTable
+     * Does NOT duplicate validation logic
+     * direct_gateways(): CURRENT + Gateway + UP link + X25519
+     * reachable_relays(): CURRENT + Relay + UP link
+     * peer_summaries(): generate summaries for propagation
+     * purge_expired(): records → STALE, dead links removed, identity preserved
+
+  4. `node/topology.rs` — TopologyGraph, TopologySnapshot
+     * Directed graph: nodes + directed links + remote node knowledge
+     * process_peer_summaries(): learn about remote nodes via propagation
+     * generate_peer_summaries(): produce summaries for other peers
+     * all_known_gateways(): direct + remote gateways
+     * snapshot(): immutable point-in-time view for route computation
+     * Node churn: appears/disappears/returns without identity removal
+
+- Fixed Link name collision (snp_link::Link vs node::link::Link)
+- Fixed PeerConnection to use snp_link::Link
+
+- 20 new tests (n211_topology.rs):
+  - link_state_transitions
+  - link_metrics_recorded
+  - link_table_directed
+  - peer_directory_accepts_new_advertisement
+  - peer_directory_rejects_stale_advertisement
+  - peer_directory_rejects_duplicate_advertisement
+  - peer_directory_purge_makes_stale_not_removed
+  - peer_directory_remove_peer_is_explicit
+  - topology_graph_directed_links
+  - topology_graph_reachable_gateways
+  - topology_graph_snapshot_is_immutable
+  - topology_graph_remote_propagation
+  - topology_graph_generate_peer_summaries
+  - node_churn_appears_disappears_returns
+  - goodbye_message_verifies
+  - goodbye_message_tampered_rejected
+  - peer_summary_list_verifies
+  - peer_summary_list_tampered_rejected
+  - peer_summary_from_record
+  - link_failure_makes_node_unreachable_but_known
+
+- Test results: 252 passed, 0 failed, 3 ignored (was 232; +20 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Directed topology graph with authenticated nodes + probed links.
+- Link state machine: Up → Degraded → Down with auto-transition.
+- PeerDirectory wraps AdvertisementAcceptanceStore + LinkTable (no duplication).
+- Minimal remote topology propagation via PeerSummary exchange (in this milestone, not deferred).
+- PeerSummary includes capabilities + distance_hint (not just NodeId + sequence).
+- direct_gateways() vs all_known_gateways() (local vs remote).
+- GOODBYE is optimization only, never state authority.
+- Node churn preserves identity through link failures.
+- TopologySnapshot is immutable for route computation.
+- Gateway is a capability, not a separate subsystem.
+
