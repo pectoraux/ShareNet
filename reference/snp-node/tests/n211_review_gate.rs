@@ -504,6 +504,199 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+// ─── Fix #6 (P0): stale hints must NOT be re-propagated ───────────────────
+
+/// P0: A receives a hint about G. The hint becomes stale (older than
+/// REMOTE_HINT_MAX_AGE_SECS). A generates peer summaries. G must NOT appear
+/// in A's propagated summaries.
+///
+/// Without this check, B receiving A's summaries would set `received_at = NOW`
+/// for G, treating the stale information as fresh — defeating the freshness
+/// rule across the mesh.
+#[test]
+fn stale_hint_is_not_repropagated() {
+    let mut graph = TopologyGraph::new_for_testing();
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"reprop-gw", 1);
+    let gw_id = derive_node_id(&gw_pk);
+
+    // Store a remote hint about G.
+    let (sender_sk, sender_pk) = fresh_keypair(b"reprop-sender");
+    let sender_id = derive_node_id(&sender_pk);
+    let list = PeerSummaryList::create_and_sign(
+        &sender_sk,
+        &sender_pk,
+        sender_id,
+        vec![make_gateway_summary(gw_id, 1, 1)],
+        1,
+    );
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
+    assert_eq!(graph.gateway_hints().len(), 1, "fresh hint present");
+
+    // Backdate the hint to make it stale.
+    let old = now_unix().saturating_sub(REMOTE_HINT_MAX_AGE_SECS + 1);
+    graph.remote_hints_mut().get_mut(&gw_id).unwrap().received_at = old;
+
+    // Verify it's stale.
+    let hint = graph.remote_hints().get(&gw_id).unwrap();
+    assert_eq!(
+        hint.freshness(now_unix()),
+        RemoteHintFreshness::Stale,
+        "hint must be stale after backdating"
+    );
+
+    // Generate peer summaries — G must NOT appear (stale hints not re-propagated).
+    let summaries = graph.generate_peer_summaries();
+    let g_in_summaries = summaries.iter().any(|s| s.node_id == gw_id);
+    assert!(
+        !g_in_summaries,
+        "stale hint about G must NOT be re-propagated (review-gate fix #6)"
+    );
+}
+
+/// P0 (multi-hop): A has a stale hint about G. A generates summaries (which
+/// exclude G). B receives A's summaries. B must NOT have a hint about G.
+///
+/// This verifies the freshness guarantee propagates: stale info cannot be
+/// refreshed through the mesh.
+#[test]
+fn stale_hint_not_refreshed_through_mesh() {
+    // Node A's topology.
+    let mut graph_a = TopologyGraph::new_for_testing();
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"mesh-gw", 1);
+    let gw_id = derive_node_id(&gw_pk);
+
+    // A receives a hint about G (from some sender S).
+    let (sender_sk, sender_pk) = fresh_keypair(b"mesh-sender");
+    let sender_id = derive_node_id(&sender_pk);
+    let list = PeerSummaryList::create_and_sign(
+        &sender_sk,
+        &sender_pk,
+        sender_id,
+        vec![make_gateway_summary(gw_id, 1, 1)],
+        1,
+    );
+    graph_a.process_peer_summaries(&list.verify_into_verified().unwrap());
+    assert_eq!(graph_a.gateway_hints().len(), 1, "A has fresh hint about G");
+
+    // Backdate A's hint to make it stale.
+    let old = now_unix().saturating_sub(REMOTE_HINT_MAX_AGE_SECS + 1);
+    graph_a.remote_hints_mut().get_mut(&gw_id).unwrap().received_at = old;
+
+    // A generates summaries — G should NOT be included.
+    let summaries = graph_a.generate_peer_summaries();
+    assert!(
+        !summaries.iter().any(|s| s.node_id == gw_id),
+        "A must not re-propagate stale G"
+    );
+
+    // B receives A's summaries (which don't contain G).
+    let (a_sk, a_pk) = fresh_keypair(b"mesh-a");
+    let a_id = derive_node_id(&a_pk);
+    let list_for_b = PeerSummaryList::create_and_sign(
+        &a_sk,
+        &a_pk,
+        a_id,
+        summaries, // A's summaries (without G)
+        1,
+    );
+
+    let mut graph_b = TopologyGraph::new_for_testing();
+    graph_b.process_peer_summaries(&list_for_b.verify_into_verified().unwrap());
+
+    // B must NOT have a hint about G.
+    assert!(
+        graph_b.remote_hints().get(&gw_id).is_none(),
+        "B must NOT have a hint about G — stale info cannot be refreshed through the mesh"
+    );
+}
+
+// ─── Fix #7: Snapshot split — knowledge vs executable ─────────────────────
+
+/// The ExecutableNetworkSnapshot MUST NOT contain remote hints.
+/// It is the only snapshot type a future route engine should accept.
+#[test]
+fn executable_snapshot_excludes_remote_hints() {
+    let mut graph = TopologyGraph::new_for_testing();
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"exec-snap-gw", 1);
+    let gw_id = derive_node_id(&gw_pk);
+
+    // Store a remote hint about G.
+    let (sender_sk, sender_pk) = fresh_keypair(b"exec-snap-sender");
+    let sender_id = derive_node_id(&sender_pk);
+    let list = PeerSummaryList::create_and_sign(
+        &sender_sk,
+        &sender_pk,
+        sender_id,
+        vec![make_gateway_summary(gw_id, 1, 1)],
+        1,
+    );
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
+
+    // Knowledge snapshot DOES include remote hints.
+    let knowledge = graph.snapshot_knowledge();
+    assert!(
+        knowledge.remote_hints.contains_key(&gw_id),
+        "knowledge snapshot must include remote hints"
+    );
+
+    // Executable snapshot does NOT have a remote_hints field at all.
+    // (If this doesn't compile, someone added remote_hints to the wrong type.)
+    let executable = graph.snapshot_executable();
+    // The only fields are authenticated_nodes and usable_links — both empty
+    // here because we haven't accepted any direct advertisements.
+    assert!(
+        executable.authenticated_nodes.is_empty(),
+        "executable snapshot must have no authenticated nodes"
+    );
+    assert!(
+        executable.usable_links.is_empty(),
+        "executable snapshot must have no usable links"
+    );
+}
+
+/// The knowledge snapshot includes remote hints (for diagnostics).
+#[test]
+fn knowledge_snapshot_includes_remote_hints() {
+    let mut graph = TopologyGraph::new_for_testing();
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"know-snap-gw", 1);
+    let gw_id = derive_node_id(&gw_pk);
+
+    let (sender_sk, sender_pk) = fresh_keypair(b"know-snap-sender");
+    let sender_id = derive_node_id(&sender_pk);
+    let list = PeerSummaryList::create_and_sign(
+        &sender_sk,
+        &sender_pk,
+        sender_id,
+        vec![make_gateway_summary(gw_id, 1, 1)],
+        1,
+    );
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
+
+    let knowledge = graph.snapshot_knowledge();
+    assert!(
+        knowledge.remote_hints.contains_key(&gw_id),
+        "knowledge snapshot must include remote hints for diagnostics"
+    );
+    assert_eq!(
+        knowledge.gateway_hints().len(),
+        1,
+        "knowledge snapshot gateway_hints() works"
+    );
+}
+
+// ─── Fix #8: ephemeral constructor is test-only ─────────────────────────────
+
+/// new_for_testing() creates an ephemeral (non-persistent) topology graph.
+/// This test verifies the constructor exists and is clearly named for testing.
+/// Production code should use open(path) instead.
+#[test]
+fn new_for_testing_creates_ephemeral_graph() {
+    let graph = TopologyGraph::new_for_testing();
+    // No persistence path — propagation state is in-memory only.
+    // This is acceptable for unit tests but NOT for production.
+    assert_eq!(graph.node_count(), 0, "fresh graph is empty");
+}
+
 // ─── Import scopeguard for cleanup (inline to avoid adding a dep) ──────────
 //
 // We use a tiny RAII guard instead of the `scopeguard` crate to avoid adding

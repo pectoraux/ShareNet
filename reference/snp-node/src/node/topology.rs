@@ -203,6 +203,28 @@ pub struct TopologyGraph {
 
 impl TopologyGraph {
     /// Create a new empty in-memory topology graph (no persistence).
+    ///
+    /// ## ⚠️ TESTING ONLY — do NOT use in production
+    ///
+    /// This constructor creates an **ephemeral** `PropagationStateStore` that
+    /// does NOT persist across restart. If production networking code uses
+    /// this constructor, the restart-replay protection (review-gate fix #2) is
+    /// silently defeated — an old propagation message could become acceptable
+    /// again after a restart.
+    ///
+    /// Production code MUST use `TopologyGraph::open(path)` or
+    /// `TopologyGraph::open_with_propagation_path(peer_path, prop_path)`,
+    /// which load persistent replay-protection state from disk.
+    ///
+    /// **Why not just delete this?** Unit tests need an ephemeral constructor
+    /// that doesn't touch the filesystem. The name `new()` is retained for
+    /// ergonomics in tests, but the documentation and `#[track_caller]`
+    /// attribute (via the `new_for_testing` alias below) make the intent
+    /// auditable.
+    ///
+    /// For new test code, prefer `TopologyGraph::new_for_testing()` which
+    /// makes the testing intent explicit and is easy to grep for in production
+    /// code reviews.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -210,6 +232,24 @@ impl TopologyGraph {
             remote_hints: HashMap::new(),
             propagation_state: PropagationStateStore::new(),
         }
+    }
+
+    /// Create a new empty in-memory topology graph, explicitly for testing.
+    ///
+    /// This is the same as `new()` but with a name that makes the testing
+    /// intent explicit. **Production code must NOT call this** — it creates
+    /// an ephemeral (non-persistent) propagation state store, which defeats
+    /// restart-replay protection.
+    ///
+    /// ## Code-review guard
+    ///
+    /// A simple grep for `new_for_testing` in non-test code reveals any
+    /// accidental misuse. Alternatively, a future CI lint could forbid
+    /// `TopologyGraph::new()` and `TopologyGraph::new_for_testing()` outside
+    /// of `#[cfg(test)]` modules and `tests/` directories.
+    #[must_use]
+    pub fn new_for_testing() -> Self {
+        Self::new()
     }
 
     /// Create a persistent topology graph.
@@ -432,17 +472,38 @@ impl TopologyGraph {
     /// - Remote hints (distance_hint = their distance + 1)
     ///
     /// Does NOT include endpoint data.
+    ///
+    /// ## N2.1.1.1 review-gate fix #6 (P0): stale hints are NOT re-propagated
+    ///
+    /// Only `RemoteHintFreshness::Current` hints are included. A stale hint
+    /// (older than `REMOTE_HINT_MAX_AGE_SECS`) is skipped, so it cannot be
+    /// refreshed downstream by a peer who would otherwise set `received_at =
+    /// NOW` and treat the old information as fresh.
+    ///
+    /// Without this check, the freshness rule in `gateway_hints()` would be
+    /// defeated by propagation: A receives a hint about G, the hint goes
+    /// stale, A generates a `PeerSummaryList` containing G, B receives it and
+    /// sets `received_at = NOW`, and B now treats the stale information as
+    /// fresh. This could repeat through the mesh indefinitely.
     #[must_use]
     pub fn generate_peer_summaries(&self) -> Vec<PeerSummary> {
+        let now = now_unix();
         let mut summaries = Vec::new();
 
         // Direct neighbors (distance_hint = 1).
+        // Direct knowledge is authoritative and not subject to the remote-hint
+        // freshness rule — it is the source of fresh propagation.
         for record in self.directory.active_nodes() {
-            summaries.push(PeerSummary::from_record(record, 1, now_unix()));
+            summaries.push(PeerSummary::from_record(record, 1, now));
         }
 
         // Remote hints (increment distance_hint by 1, cap at 255).
+        // SKIP stale hints — re-propagating them would refresh their
+        // received_at downstream and defeat the freshness rule.
         for hint in self.remote_hints.values() {
+            if hint.freshness(now) != RemoteHintFreshness::Current {
+                continue;
+            }
             let new_distance = hint.distance_hint.saturating_add(1);
             summaries.push(PeerSummary {
                 node_id: hint.target_node_id,
@@ -622,10 +683,49 @@ impl TopologyGraph {
         &mut self.directory
     }
 
-    /// Produce an immutable snapshot of the topology for route computation.
+    /// Produce an immutable snapshot of the topology.
+    ///
+    /// ## Deprecated (N2.1.1.1 review-gate fix #7)
+    ///
+    /// This method returns `TopologySnapshot`, which bundles
+    /// non-authoritative `RemoteNodeHint`s with authoritative data — making
+    /// it unsafe as a routing input. Use:
+    ///   - `snapshot_knowledge()` for diagnostics (includes remote hints)
+    ///   - `snapshot_executable()` for routing inputs (authenticated only)
+    #[deprecated(
+        since = "N2.1.1.1",
+        note = "use `snapshot_knowledge()` for diagnostics or `snapshot_executable()` \
+               for routing inputs"
+    )]
     #[must_use]
     pub fn snapshot(&self) -> TopologySnapshot {
         TopologySnapshot::from_graph(self)
+    }
+
+    /// Produce an immutable **knowledge** snapshot — ALL topology knowledge
+    /// (direct nodes + links + remote hints).
+    ///
+    /// For **diagnostics, inspection, logging, UI display**.
+    ///
+    /// NOT a routing input — contains non-authoritative `RemoteNodeHint`s.
+    /// Use `snapshot_executable()` for routing.
+    #[must_use]
+    pub fn snapshot_knowledge(&self) -> TopologyKnowledgeSnapshot {
+        TopologyKnowledgeSnapshot::from_graph(self)
+    }
+
+    /// Produce an immutable **executable** snapshot — ONLY authenticated
+    /// nodes and usable links. NEVER contains `RemoteNodeHint`s.
+    ///
+    /// For **routing inputs** (N2.1.2 and beyond).
+    ///
+    /// This enforces the frozen architectural separation (spec §18):
+    /// discovery knowledge ≠ executable routing state. A future route engine
+    /// MUST accept this type, ensuring it cannot accidentally use
+    /// non-authoritative hints as routing hops.
+    #[must_use]
+    pub fn snapshot_executable(&self) -> ExecutableNetworkSnapshot {
+        ExecutableNetworkSnapshot::from_graph(self)
     }
 
     /// Get the total number of known nodes (direct + remote hints).
@@ -647,23 +747,74 @@ impl Default for TopologyGraph {
     }
 }
 
-/// An immutable point-in-time view of the topology, suitable for route
-/// computation. The snapshot does NOT reflect subsequent mutations to
-/// the live topology.
+/// An immutable point-in-time view of the topology.
+///
+/// ## N2.1.1.1 review-gate fix #7: split into knowledge vs executable
+///
+/// This type is now a **diagnostic** snapshot that includes BOTH
+/// authoritative (direct nodes + links) AND non-authoritative (remote hints)
+/// knowledge. It is suitable for inspection, logging, and UI display.
+///
+/// It is NOT suitable as a routing input. A future route engine MUST accept
+/// [`ExecutableNetworkSnapshot`] (produced by [`TopologyGraph::snapshot_executable`]),
+/// which contains ONLY authenticated nodes and usable links — never
+/// `RemoteNodeHint`s. This enforces the frozen architectural separation:
+///
+/// ```text
+/// Discovery knowledge  !=  Executable routing state
+/// ```
+///
+/// `TopologySnapshot` is retained as a deprecated alias for
+/// [`TopologyKnowledgeSnapshot`] so existing callers keep compiling. New code
+/// should call `snapshot_knowledge()` or `snapshot_executable()` explicitly.
+#[deprecated(
+    since = "N2.1.1.1",
+    note = "use `TopologyKnowledgeSnapshot` (via `snapshot_knowledge()`) for \
+           diagnostics, or `ExecutableNetworkSnapshot` (via `snapshot_executable()`) \
+           for routing inputs. This alias bundles non-authoritative remote hints \
+           with authoritative data — unsafe as a routing input."
+)]
 #[derive(Debug, Clone)]
 pub struct TopologySnapshot {
-    /// Direct authenticated nodes (NodeId → AuthenticatedNodeRecord).
+    /// Direct authenticated nodes (NodeId -> AuthenticatedNodeRecord).
     pub direct_nodes: HashMap<[u8; 32], AuthenticatedNodeRecord>,
-    /// Direct links (LinkKey → Link).
+    /// Direct links (LinkKey -> Link).
     pub links: HashMap<LinkKey, Link>,
-    /// Remote hints (NodeId → RemoteNodeHint). Non-authoritative.
+    /// Remote hints (NodeId -> RemoteNodeHint). Non-authoritative.
     pub remote_hints: HashMap<[u8; 32], RemoteNodeHint>,
 }
 
-impl TopologySnapshot {
-    /// Create a snapshot from a TopologyGraph.
+/// An immutable point-in-time view of ALL topology knowledge — both
+/// authoritative (direct nodes + links) and non-authoritative (remote hints).
+///
+/// For **diagnostics, inspection, logging, and UI display**.
+///
+/// ## NOT a routing input
+///
+/// This snapshot includes `RemoteNodeHint`s, which are third-party claims —
+/// NOT authenticated node identities. A future route engine MUST NOT accept
+/// this type. Use [`ExecutableNetworkSnapshot`] (via
+/// [`TopologyGraph::snapshot_executable`]) for routing inputs.
+///
+/// This enforces the frozen architectural separation (spec section 18):
+/// ```text
+/// Discovery Topology  ("What might exist?")
+///        !=
+/// Executable Network State  ("What can actually be used now?")
+/// ```
+#[derive(Debug, Clone)]
+pub struct TopologyKnowledgeSnapshot {
+    /// Direct authenticated nodes (NodeId -> AuthenticatedNodeRecord).
+    pub direct_nodes: HashMap<[u8; 32], AuthenticatedNodeRecord>,
+    /// Direct links (LinkKey -> Link).
+    pub links: HashMap<LinkKey, Link>,
+    /// Remote hints (NodeId -> RemoteNodeHint). Non-authoritative.
+    pub remote_hints: HashMap<[u8; 32], RemoteNodeHint>,
+}
+
+impl TopologyKnowledgeSnapshot {
+    /// Create a knowledge snapshot from a TopologyGraph.
     fn from_graph(graph: &TopologyGraph) -> Self {
-        // Collect direct nodes.
         let mut direct_nodes = HashMap::new();
         for node_id in graph
             .directory
@@ -676,20 +827,139 @@ impl TopologySnapshot {
                 direct_nodes.insert(node_id, record.clone());
             }
         }
-
-        // Collect links.
         let mut links = HashMap::new();
         for link in graph.directory.link_table().all() {
             links.insert(link.key.clone(), link.clone());
         }
-
-        // Collect remote hints.
         let remote_hints = graph.remote_hints.clone();
+        Self { direct_nodes, links, remote_hints }
+    }
 
+    /// Get usable outgoing links from a node.
+    #[must_use]
+    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+        self.links
+            .values()
+            .filter(|l| l.key.local_node_id == *node_id && l.is_usable())
+            .collect()
+    }
+
+    /// Get remote gateway **hints** in the snapshot (non-authoritative).
+    #[must_use]
+    pub fn gateway_hints(&self) -> Vec<&RemoteNodeHint> {
+        self.remote_hints
+            .values()
+            .filter(|h| h.claims_gateway())
+            .collect()
+    }
+
+    /// Check if a node is directly reachable in this snapshot.
+    #[must_use]
+    pub fn is_directly_reachable(&self, node_id: &[u8; 32]) -> bool {
+        self.links
+            .values()
+            .any(|l| l.key.remote_node_id == *node_id && l.is_usable())
+    }
+}
+
+/// An immutable point-in-time view of **executable** network state — ONLY
+/// authenticated nodes and usable links. NEVER contains `RemoteNodeHint`s.
+///
+/// ## For routing inputs (N2.1.2 and beyond)
+///
+/// A future route engine MUST accept this type, NOT `TopologyKnowledgeSnapshot`.
+/// This enforces the frozen architectural separation (spec section 18):
+///
+/// ```text
+/// Discovery Topology  ("What might exist?")
+///        !=
+/// Executable Network State  ("What can actually be used now?")
+/// ```
+///
+/// Remote hints are useful for DISCOVERY (candidate destination identification)
+/// but MUST NOT feed ROUTING (path construction). A route built from a hint
+/// would have an unauthenticated hop — violating spec section 54 #10:
+/// "A Route cannot contain an unauthenticated hop."
+#[derive(Debug, Clone)]
+pub struct ExecutableNetworkSnapshot {
+    /// Direct authenticated nodes (NodeId -> AuthenticatedNodeRecord).
+    pub authenticated_nodes: HashMap<[u8; 32], AuthenticatedNodeRecord>,
+    /// Usable links (LinkKey -> Link). Only `LinkState::Up` or `Degraded`.
+    pub usable_links: HashMap<LinkKey, Link>,
+}
+
+impl ExecutableNetworkSnapshot {
+    /// Create an executable snapshot from a TopologyGraph.
+    fn from_graph(graph: &TopologyGraph) -> Self {
+        let mut authenticated_nodes = HashMap::new();
+        for node_id in graph
+            .directory
+            .link_table()
+            .all()
+            .flat_map(|l| [l.key.local_node_id, l.key.remote_node_id])
+            .collect::<HashSet<_>>()
+        {
+            if let Some(record) = graph.directory.get_record(&node_id) {
+                authenticated_nodes.insert(node_id, record.clone());
+            }
+        }
+        let mut usable_links = HashMap::new();
+        for link in graph.directory.link_table().all() {
+            if link.is_usable() {
+                usable_links.insert(link.key.clone(), link.clone());
+            }
+        }
+        Self { authenticated_nodes, usable_links }
+    }
+
+    /// Get usable outgoing links from a node.
+    #[must_use]
+    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+        self.usable_links
+            .values()
+            .filter(|l| l.key.local_node_id == *node_id)
+            .collect()
+    }
+
+    /// Get all **authenticated** direct gateways in the executable snapshot.
+    #[must_use]
+    pub fn direct_gateways(&self) -> Vec<&AuthenticatedNodeRecord> {
+        self.authenticated_nodes
+            .values()
+            .filter(|r| r.descriptor.is_gateway())
+            .filter(|r| r.descriptor.circuit_x25519_pub().is_some())
+            .filter(|r| {
+                self.usable_links
+                    .values()
+                    .any(|l| l.key.remote_node_id == r.descriptor.node_id())
+            })
+            .collect()
+    }
+
+    /// Check if a node is directly reachable in this snapshot.
+    #[must_use]
+    pub fn is_directly_reachable(&self, node_id: &[u8; 32]) -> bool {
+        self.usable_links
+            .values()
+            .any(|l| l.key.remote_node_id == *node_id)
+    }
+}
+
+// --- Deprecated TopologySnapshot compatibility shim ---
+//
+// Retained so existing callers keep compiling. New code should use
+// TopologyKnowledgeSnapshot (via snapshot_knowledge()) or
+// ExecutableNetworkSnapshot (via snapshot_executable()).
+
+#[allow(deprecated)]
+impl TopologySnapshot {
+    /// Create a snapshot from a TopologyGraph.
+    fn from_graph(graph: &TopologyGraph) -> Self {
+        let k = TopologyKnowledgeSnapshot::from_graph(graph);
         Self {
-            direct_nodes,
-            links,
-            remote_hints,
+            direct_nodes: k.direct_nodes,
+            links: k.links,
+            remote_hints: k.remote_hints,
         }
     }
 

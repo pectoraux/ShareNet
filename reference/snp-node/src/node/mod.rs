@@ -145,6 +145,7 @@ pub use peer_directory::PeerDirectory;
 pub use propagation_state::{PropagationStateError, PropagationStateStore};
 pub use topology::{
     PropagationResult, RemoteNodeHint, RemoteHintFreshness, TopologyGraph, TopologySnapshot,
+    TopologyKnowledgeSnapshot, ExecutableNetworkSnapshot,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
