@@ -3698,3 +3698,58 @@ Stage Summary:
 - No stale VerifiedGatewayAdvertisement references in route.rs.
 - Ready for N2.1.1 (peer discovery / topology).
 
+
+---
+Task ID: 241-245 (N2.1.0.3 — Persistent Peer Acceptance State)
+Agent: Z.ai (main)
+
+Task: N2.1.0.2 had in-memory-only peer acceptance state. A process restart lost the sequence floor, allowing old advertisements to be re-accepted. This milestone adds file-backed persistence with identity binding, atomic writes, and corruption handling.
+
+Work Log:
+- Added persistent AdvertisementAcceptanceStore:
+  * `open(path)` — loads persisted state from a file.
+  * Persistence format: 72 bytes per peer (32 NodeId + 32 Ed25519 pub + 8 sequence LE).
+  * `persist()` after every `accept()` and `remove_peer()`.
+  * `restart()` — creates a new store from the same file.
+
+- Identity binding on load:
+  * Each persisted entry's NodeId ↔ Ed25519 public key consistency is verified (I4).
+  * Entries with inconsistent identity are silently skipped (treated as corrupted).
+  * `PeerAcceptanceState` now carries `ed25519_public_key` alongside `highest_accepted_sequence`.
+
+- Atomic write strategy:
+  * Write to temp file (`path.tmp`), then atomic rename to `path`.
+  * A crash during persist leaves either the old state or the new state, never a partial write.
+
+- Peer visibility states (KNOWN/ACTIVE/STALE/REMOVED):
+  * `PeerVisibility` enum: Unknown, Active, Stale.
+  * `visibility()` method returns the current state.
+  * `purge_expired_records()` changes ACTIVE → STALE only (does NOT remove the peer).
+  * `remove_peer()` is the ONLY way to erase the sequence floor.
+  * Documentation explicitly states: remove_peer MUST NOT be used for temporary network loss, expired advertisements, route failure, peer timeout, or ordinary topology churn.
+
+- Updated documentation:
+  * Removed all "reference implementation does not yet persist" warnings.
+  * Added KNOWN/ACTIVE/STALE/REMOVED state model documentation.
+
+- 7 new tests (40 total in n210_node_advert.rs):
+  34. peer_acceptance_state_survives_restart (real persistence, not in-memory)
+  35. corrupted_persistence_truncated_rejected
+  36. corrupted_persistence_invalid_nodeid_rejected
+  37. corrupted_persistence_empty_file_accepted
+  38. peer_visibility_states (Unknown/Active/Stale/Removed)
+  39. remove_peer_does_not_happen_on_expiry
+  40. atomic_write_survives_crash_simulation
+
+- Test results: 208 passed, 0 failed, 3 ignored (was 201; +7 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Peer acceptance state is now PERSISTENT (file-backed, survives restart).
+- Identity binding: NodeId + Ed25519 pub persisted + verified on load.
+- Atomic writes: write-to-temp + rename.
+- Corruption handling: truncated/invalid entries skipped.
+- KNOWN/ACTIVE/STALE/REMOVED state model documented and enforced.
+- remove_peer() is explicitly an identity-history deletion operation.
+- The advertisement primitive is now fully hardened for peer discovery (N2.1.1).
+

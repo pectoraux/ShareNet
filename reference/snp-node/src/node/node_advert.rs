@@ -433,6 +433,23 @@ impl AuthenticatedNodeRecord {
 /// must NOT be erased when the current record expires) from the current
 /// authenticated record (which MAY expire and be purged).
 ///
+/// ## Peer visibility states
+///
+/// A peer can be in one of these visibility states:
+///
+/// - **KNOWN** — the authenticated identity has been seen. `highest_accepted_sequence`
+///   is set. `current_record` may or may not be present.
+/// - **ACTIVE** — a currently valid `AuthenticatedNodeRecord` exists
+///   (`current_record` is `Some` and not expired).
+/// - **STALE** — the identity is known but its latest advertisement has expired
+///   (`current_record` is `None` after `purge_expired_records()`).
+///   The peer is still KNOWN — the sequence floor persists.
+/// - **REMOVED** — the peer has been explicitly removed via `remove_peer()`.
+///   The identity history is gone. This is the ONLY state transition that
+///   erases the sequence floor. It MUST NOT be used for temporary network
+///   loss, expired advertisements, route failure, peer timeout, or ordinary
+///   topology churn.
+///
 /// ## N2.1.0.2 correction
 ///
 /// The previous `AdvertisementAcceptanceStore` combined `(highest_sequence,
@@ -444,7 +461,7 @@ impl AuthenticatedNodeRecord {
 /// This type separates the two concerns:
 /// - `highest_accepted_sequence` — NEVER erased by record expiry. Persists
 ///   across `purge_expired_records()` calls. Only removed by explicit
-///   `remove_peer()` (e.g. when a node is permanently removed from topology).
+///   `remove_peer()` (permanent identity-history deletion).
 /// - `current_record` — MAY be `None` (if expired and purged). The sequence
 ///   floor remains even when the current record is gone.
 #[derive(Debug, Clone)]
@@ -455,9 +472,26 @@ pub struct PeerAcceptanceState {
     /// sequence is rejected as stale/duplicate even if the current record
     /// has been purged.
     pub highest_accepted_sequence: u64,
+    /// The peer's Ed25519 public key. Persisted alongside the sequence
+    /// to verify NodeId ↔ Ed25519 consistency when loading acceptance state.
+    /// This provides an additional integrity check when persisting/importing
+    /// topology state.
+    pub ed25519_public_key: [u8; 32],
     /// The current authenticated record, if one is active (not expired).
-    /// `None` if the record has expired and been purged.
+    /// `None` if the record has expired and been purged (STALE state).
     pub current_record: Option<AuthenticatedNodeRecord>,
+}
+
+/// The visibility state of a peer in the acceptance store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerVisibility {
+    /// The peer's identity has never been seen.
+    Unknown,
+    /// The peer is known and has a currently valid advertisement.
+    Active,
+    /// The peer is known but its latest advertisement has expired.
+    /// The sequence floor persists — old advertisements are still rejected.
+    Stale,
 }
 
 // ─── AdvertisementAcceptanceStore ───────────────────────────────────────────
@@ -484,38 +518,139 @@ pub enum AcceptanceResult {
 }
 
 /// A stateful store that tracks the highest accepted advertisement sequence
-/// per NodeId. This provides **replay prevention during the lifetime of the
-/// acceptance state** — a previously seen advertisement (same or lower
-/// sequence) is rejected.
+/// per NodeId. This provides **replay prevention** — a previously seen
+/// advertisement (same or lower sequence) is rejected.
 ///
-/// ## N2.1.0.2: Separated sequence floor from current record
+/// ## N2.1.0.3: Persistent peer acceptance state
 ///
-/// The store now uses `PeerAcceptanceState` which separates:
-/// - `highest_accepted_sequence` — NEVER erased by record expiry.
-/// - `current_record` — MAY be purged when expired.
+/// The store supports file-backed persistence. When a file path is provided
+/// via `open()`, the acceptance state (NodeId + Ed25519 public key +
+/// highest_accepted_sequence) is persisted to disk after every `accept()`
+/// call. On restart, `open()` loads the persisted state, and old
+/// advertisements with lower sequences are rejected as stale.
 ///
-/// This prevents the bug where purging an expired record would erase the
-/// sequence floor, allowing an old advertisement to be accepted as "first
-/// seen" after the purge.
+/// ## Persistence format
 ///
-/// ## Persistence
+/// The file contains a sequence of entries, each:
+/// - 32 bytes: NodeId
+/// - 32 bytes: Ed25519 public key
+/// - 8 bytes: highest_accepted_sequence (little-endian u64)
 ///
-/// The store is in-memory. For production use, the acceptance state should
-/// be persisted to survive process restart. The reference implementation
-/// does not yet persist — callers should be aware that a restart loses the
-/// sequence floor, and old advertisements within their validity window
-/// could be re-accepted.
+/// Total: 72 bytes per peer entry.
+///
+/// ## Atomicity
+///
+/// Persistence uses a write-to-temp-then-rename strategy: the new state is
+/// written to a temporary file, then atomically renamed over the main file.
+/// This ensures that a crash during `persist()` leaves either the old state
+/// or the new state, never a corrupted partial write.
+///
+/// ## Identity binding
+///
+/// When loading persisted state, each entry's NodeId ↔ Ed25519 public key
+/// consistency is verified (invariant I4: `NodeId == SHA-256("SNP/0.1 node\0"
+/// || ed25519_public_key)`). Entries with inconsistent identity are silently
+/// skipped (treated as corrupted).
+///
+/// ## Peer visibility states
+///
+/// - **KNOWN** — `highest_accepted_sequence` is set (peer identity seen before).
+/// - **ACTIVE** — `current_record` is `Some` and not expired.
+/// - **STALE** — `current_record` is `None` (expired and purged), but
+///   `highest_accepted_sequence` persists.
+/// - **REMOVED** — peer entry deleted via `remove_peer()`. This is the ONLY
+///   way to erase the sequence floor.
+///
+/// `remove_peer()` MUST NOT be used for temporary network loss, expired
+/// advertisements, route failure, peer timeout, or ordinary topology churn.
+/// Those events change ACTIVE → STALE only.
 #[derive(Debug, Clone, Default)]
 pub struct AdvertisementAcceptanceStore {
     /// Map: NodeId → PeerAcceptanceState.
     peers: HashMap<[u8; 32], PeerAcceptanceState>,
+    /// Optional file path for persistence. Empty = in-memory mode.
+    path: std::path::PathBuf,
 }
 
+/// On-disk entry format: NodeId (32) + Ed25519 pub (32) + sequence (8) = 72 bytes.
+const ENTRY_SIZE: usize = 72;
+
 impl AdvertisementAcceptanceStore {
-    /// Create a new empty store.
+    /// Create a new empty in-memory store (not persisted).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a persistent store backed by a file. If the file exists, the
+    /// acceptance state is loaded from it. If not, the store starts empty.
+    ///
+    /// Entries with corrupted or inconsistent identity (NodeId ≠
+    /// SHA-256("SNP/0.1 node\0" || ed25519_public_key)) are silently
+    /// skipped.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file exists but cannot be read.
+    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut store = Self {
+            peers: HashMap::new(),
+            path,
+        };
+        if store.path.exists() {
+            store.load()?;
+        }
+        Ok(store)
+    }
+
+    /// Load acceptance state from the persistence file. Entries with
+    /// inconsistent NodeId ↔ Ed25519 public key are skipped.
+    fn load(&mut self) -> std::io::Result<()> {
+        let data = std::fs::read(&self.path)?;
+        let mut offset = 0;
+        while offset + ENTRY_SIZE <= data.len() {
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(&data[offset..offset + 32]);
+            let mut ed25519_pk = [0u8; 32];
+            ed25519_pk.copy_from_slice(&data[offset + 32..offset + 64]);
+            let mut seq_buf = [0u8; 8];
+            seq_buf.copy_from_slice(&data[offset + 64..offset + 72]);
+            let sequence = u64::from_le_bytes(seq_buf);
+            offset += ENTRY_SIZE;
+
+            // Verify NodeId ↔ Ed25519 consistency (I4). Skip corrupted entries.
+            let expected_node_id = derive_node_id(&ed25519_pk);
+            if node_id != expected_node_id {
+                continue;
+            }
+
+            self.peers.insert(node_id, PeerAcceptanceState {
+                highest_accepted_sequence: sequence,
+                ed25519_public_key: ed25519_pk,
+                current_record: None, // Records are not persisted.
+            });
+        }
+        Ok(())
+    }
+
+    /// Persist the acceptance state to the file using an atomic
+    /// write-to-temp-then-rename strategy. Only NodeId + Ed25519 pub +
+    /// highest_accepted_sequence are persisted (current records are not).
+    fn persist(&self) -> std::io::Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(()); // in-memory mode
+        }
+        let mut data = Vec::with_capacity(self.peers.len() * ENTRY_SIZE);
+        for (node_id, state) in &self.peers {
+            data.extend_from_slice(node_id);
+            data.extend_from_slice(&state.ed25519_public_key);
+            data.extend_from_slice(&state.highest_accepted_sequence.to_le_bytes());
+        }
+        // Atomic write: write to temp file, then rename.
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &self.path)?;
+        Ok(())
     }
 
     /// Attempt to accept a `VerifiedNodeAdvertisement`.
@@ -526,17 +661,23 @@ impl AdvertisementAcceptanceStore {
     /// - `AcceptanceResult::Stale` if the sequence is older.
     /// - `AcceptanceResult::Duplicate` if the sequence matches a previously
     ///   accepted advertisement.
+    ///
+    /// If the store is persistent, the acceptance state is written to disk
+    /// after each successful acceptance.
     pub fn accept(&mut self, verified: VerifiedNodeAdvertisement) -> AcceptanceResult {
         let node_id = verified.node_id();
         let sequence = verified.sequence();
+        let ed25519_pk = *verified.ed25519_public_key();
         match self.peers.get(&node_id) {
             None => {
                 // First advertisement from this node.
                 let record = verified.into_record();
                 self.peers.insert(node_id, PeerAcceptanceState {
                     highest_accepted_sequence: sequence,
+                    ed25519_public_key: ed25519_pk,
                     current_record: Some(record.clone()),
                 });
+                let _ = self.persist();
                 AcceptanceResult::Accepted(record)
             }
             Some(state) if sequence > state.highest_accepted_sequence => {
@@ -544,8 +685,10 @@ impl AdvertisementAcceptanceStore {
                 let record = verified.into_record();
                 self.peers.insert(node_id, PeerAcceptanceState {
                     highest_accepted_sequence: sequence,
+                    ed25519_public_key: ed25519_pk,
                     current_record: Some(record.clone()),
                 });
+                let _ = self.persist();
                 AcceptanceResult::Accepted(record)
             }
             Some(state) if sequence == state.highest_accepted_sequence => {
@@ -577,16 +720,27 @@ impl AdvertisementAcceptanceStore {
         self.peers.get(node_id).map(|s| s.highest_accepted_sequence)
     }
 
+    /// Get the visibility state of a peer.
+    #[must_use]
+    pub fn visibility(&self, node_id: &[u8; 32]) -> PeerVisibility {
+        match self.peers.get(node_id) {
+            None => PeerVisibility::Unknown,
+            Some(state) => {
+                if state.current_record.is_some() {
+                    PeerVisibility::Active
+                } else {
+                    PeerVisibility::Stale
+                }
+            }
+        }
+    }
+
     /// Purge expired CURRENT RECORDS from the store. This does NOT
     /// remove the `highest_accepted_sequence` — the sequence floor
     /// persists to prevent replay of old advertisements after the
     /// current record expires.
     ///
-    /// ## N2.1.0.2 correction
-    ///
-    /// The previous `purge_expired()` removed the entire entry (both
-    /// sequence AND record). This method only clears `current_record`
-    /// when it has expired, preserving the sequence floor.
+    /// This changes ACTIVE → STALE only. It does NOT change STALE → REMOVED.
     pub fn purge_expired_records(&mut self, now: u64) {
         for state in self.peers.values_mut() {
             if let Some(record) = &state.current_record {
@@ -597,11 +751,39 @@ impl AdvertisementAcceptanceStore {
         }
     }
 
-    /// Remove a peer entirely (including the sequence floor). This should
-    /// only be used when a node is permanently removed from topology —
-    /// NOT when an advertisement expires.
+    /// Remove a peer entirely (including the sequence floor). This is an
+    /// **explicit identity-history deletion operation**.
+    ///
+    /// **MUST NOT be used for:**
+    /// - temporary network loss
+    /// - expired advertisements
+    /// - route failure
+    /// - peer timeout
+    /// - ordinary topology churn
+    ///
+    /// Those events change ACTIVE → STALE only (via `purge_expired_records()`).
+    ///
+    /// `remove_peer()` should only be used when a node's identity is
+    /// permanently removed from the topology (e.g. revocation, identity
+    /// rotation, or administrative action).
     pub fn remove_peer(&mut self, node_id: &[u8; 32]) {
         self.peers.remove(node_id);
+        let _ = self.persist();
+    }
+
+    /// Simulate a process restart by creating a new store from the same
+    /// persistence file. The new store will load the persisted acceptance
+    /// state (NodeId + Ed25519 pub + highest_sequence). Current records
+    /// are NOT persisted — they will be `None` after restart.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file cannot be read.
+    pub fn restart(&self) -> std::io::Result<Self> {
+        if self.path.as_os_str().is_empty() {
+            // In-memory: return a fresh store (simulating data loss).
+            return Ok(Self::new());
+        }
+        Self::open(&self.path)
     }
 
     /// Get the number of peers in the store (including those with

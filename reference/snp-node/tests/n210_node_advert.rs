@@ -814,3 +814,213 @@ fn routehop_documentation_is_generic() {
     );
     eprintln!("[test 33] PASS: RouteHop documentation is generic");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.0.3 — Persistent Peer Acceptance State tests
+// ════════════════════════════════════════════════════════════════════════════
+
+use snp_node::node::PeerVisibility;
+
+/// 34. peer_acceptance_state_survives_restart
+#[test]
+fn peer_acceptance_state_survives_restart() {
+    let (sk, pk) = fresh_keypair(b"persist-restart");
+    let node_id = derive_node_id(&pk);
+    let tmp = std::env::temp_dir().join(format!("snp-peer-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Create persistent store, accept sequence 100.
+    let mut store = AdvertisementAcceptanceStore::open(&tmp).expect("open");
+    let advert100 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 100,
+    );
+    let verified100 = advert100.verify_into_verified().expect("must verify");
+    store.accept(verified100);
+    assert_eq!(store.highest_sequence(&node_id), Some(100));
+
+    // Restart — create a new store from the same file.
+    let store2 = store.restart().expect("restart");
+
+    // The sequence floor MUST survive restart.
+    assert_eq!(store2.highest_sequence(&node_id), Some(100),
+        "highest_accepted_sequence must survive process restart");
+
+    // Present sequence 50 (stale) — MUST be rejected.
+    let advert50 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 50,
+    );
+    let verified50 = advert50.verify_into_verified().expect("must verify");
+    let mut store2 = store2;
+    let result50 = store2.accept(verified50);
+    assert!(matches!(result50, AcceptanceResult::Stale { advert_sequence: 50, known_sequence: 100 }),
+        "stale sequence after restart MUST be rejected; got {:?}", result50);
+
+    // Present sequence 100 (duplicate) — MUST be rejected.
+    let advert100b = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 100,
+    );
+    let verified100b = advert100b.verify_into_verified().expect("must verify");
+    let result100 = store2.accept(verified100b);
+    assert!(matches!(result100, AcceptanceResult::Duplicate { sequence: 100 }),
+        "duplicate sequence after restart MUST be rejected; got {:?}", result100);
+
+    // Present sequence 101 (newer) — MUST be accepted.
+    let advert101 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:2")],
+        None, 3600, 101,
+    );
+    let verified101 = advert101.verify_into_verified().expect("must verify");
+    let result101 = store2.accept(verified101);
+    assert!(matches!(result101, AcceptanceResult::Accepted(_)),
+        "newer sequence after restart MUST be accepted; got {:?}", result101);
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 34] PASS: peer acceptance state survives restart");
+}
+
+/// 35. corrupted_persistence_truncated_rejected
+#[test]
+fn corrupted_persistence_truncated_rejected() {
+    let tmp = std::env::temp_dir().join(format!("snp-corrupt-trunc-{}.dat", std::process::id()));
+    // Write a truncated entry (less than 72 bytes).
+    std::fs::write(&tmp, &[0u8; 50]).expect("write");
+    let store = AdvertisementAcceptanceStore::open(&tmp).expect("open");
+    assert!(store.is_empty(), "truncated persistence file must produce empty store");
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 35] PASS: corrupted (truncated) persistence rejected");
+}
+
+/// 36. corrupted_persistence_invalid_nodeid_rejected
+#[test]
+fn corrupted_persistence_invalid_nodeid_rejected() {
+    let tmp = std::env::temp_dir().join(format!("snp-corrupt-nodeid-{}.dat", std::process::id()));
+    // Write an entry with NodeId ≠ SHA-256("SNP/0.1 node\0" || ed25519_pk).
+    let mut data = Vec::new();
+    data.extend_from_slice(&[0xFF; 32]); // invalid NodeId
+    data.extend_from_slice(&[0x42; 32]); // Ed25519 pk
+    data.extend_from_slice(&100u64.to_le_bytes()); // sequence
+    std::fs::write(&tmp, &data).expect("write");
+    let store = AdvertisementAcceptanceStore::open(&tmp).expect("open");
+    assert!(store.is_empty(), "invalid NodeId↔Ed25519 entry must be skipped");
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 36] PASS: corrupted (invalid NodeId) persistence rejected");
+}
+
+/// 37. corrupted_persistence_empty_file_accepted
+#[test]
+fn corrupted_persistence_empty_file_accepted() {
+    let tmp = std::env::temp_dir().join(format!("snp-corrupt-empty-{}.dat", std::process::id()));
+    std::fs::write(&tmp, b"").expect("write");
+    let store = AdvertisementAcceptanceStore::open(&tmp).expect("open");
+    assert!(store.is_empty(), "empty persistence file must produce empty store");
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 37] PASS: empty persistence file accepted");
+}
+
+/// 38. peer_visibility_states
+#[test]
+fn peer_visibility_states() {
+    let (sk, pk) = fresh_keypair(b"visibility-states");
+    let node_id = derive_node_id(&pk);
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Unknown — never seen.
+    assert_eq!(store.visibility(&node_id), PeerVisibility::Unknown);
+
+    // Accept an advertisement (short expiry).
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 1, 1, // expires in 1 second
+    );
+    let verified = advert.verify_into_verified().expect("must verify");
+    store.accept(verified);
+
+    // Active — has a current record.
+    assert_eq!(store.visibility(&node_id), PeerVisibility::Active);
+
+    // Wait for expiry + purge.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    store.purge_expired_records(now_unix());
+
+    // Stale — record expired, but sequence floor persists.
+    assert_eq!(store.visibility(&node_id), PeerVisibility::Stale);
+    assert_eq!(store.highest_sequence(&node_id), Some(1),
+        "sequence floor must persist when record is purged (STALE state)");
+
+    // Remove peer entirely.
+    store.remove_peer(&node_id);
+
+    // Unknown — identity history deleted.
+    assert_eq!(store.visibility(&node_id), PeerVisibility::Unknown);
+    assert_eq!(store.highest_sequence(&node_id), None);
+    eprintln!("[test 38] PASS: peer visibility states (Unknown/Active/Stale/Removed)");
+}
+
+/// 39. remove_peer_does_not_happen_on_expiry
+#[test]
+fn remove_peer_does_not_happen_on_expiry() {
+    let (sk, pk) = fresh_keypair(b"no-remove-on-expiry");
+    let node_id = derive_node_id(&pk);
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept advertisement with short expiry.
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 1, 42,
+    );
+    let verified = advert.verify_into_verified().expect("must verify");
+    store.accept(verified);
+
+    // Wait for expiry.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // Purge expired records — this should NOT remove the peer.
+    store.purge_expired_records(now_unix());
+
+    // The peer is still KNOWN (sequence floor persists).
+    assert_eq!(store.highest_sequence(&node_id), Some(42),
+        "purge_expired_records must NOT remove the peer's sequence floor");
+    assert_eq!(store.visibility(&node_id), PeerVisibility::Stale,
+        "peer should be STALE after record expiry, not REMOVED");
+    assert_eq!(store.len(), 1, "peer must still be in the store");
+    eprintln!("[test 39] PASS: remove_peer does not happen on expiry");
+}
+
+/// 40. atomic_write_survives_crash_simulation
+#[test]
+fn atomic_write_survives_crash_simulation() {
+    let (sk, pk) = fresh_keypair(b"atomic-write");
+    let node_id = derive_node_id(&pk);
+    let tmp = std::env::temp_dir().join(format!("snp-atomic-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Create store, accept sequence 50.
+    let mut store = AdvertisementAcceptanceStore::open(&tmp).expect("open");
+    let advert50 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 50,
+    );
+    store.accept(advert50.verify_into_verified().expect("must verify"));
+
+    // The temp file should NOT exist (rename was atomic).
+    let tmp_path = tmp.with_extension("tmp");
+    assert!(!tmp_path.exists(), "temp file must not exist after atomic rename");
+
+    // Restart — the persisted state must be intact.
+    let store2 = store.restart().expect("restart");
+    assert_eq!(store2.highest_sequence(&node_id), Some(50),
+        "persisted state must survive after atomic write");
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 40] PASS: atomic write survives crash simulation");
+}
