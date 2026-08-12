@@ -151,7 +151,8 @@ pub use topology::{
 pub use route_discovery::{
     CandidateDestination, RouteProposal, RouteAcceptance, CommittedRoute, CommitError,
     DiscoveredPath, ValidatedPath, AuthenticatedHop, PathError, RouteRole, ServiceAgreement,
-    commit_route, discover_path, validate_path,
+    LinkAttestation, LinkEvidence, NextHopCandidate, NextHopDiscovery,
+    commit_route, discover_path, validate_path, assemble_progressive_path,
     ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS, ROUTE_MAX_LIFETIME_SECS,
 };
 pub use session::{
