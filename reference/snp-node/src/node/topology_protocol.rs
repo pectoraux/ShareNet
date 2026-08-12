@@ -311,6 +311,11 @@ impl PeerSummary {
 /// sequences). This enables stateful replay prevention for propagation
 /// messages. A stale/replayed PeerSummaryList (with an older propagation
 /// sequence) is rejected by the topology graph.
+///
+/// **N2.1.1.2:** An UNVERIFIED `PeerSummaryList` MUST NOT be passed to
+/// `TopologyGraph::process_peer_summaries()`. Call `verify_into_verified()`
+/// to obtain a `VerifiedPeerSummaryList` first. The type system enforces
+/// this — an unverified `PeerSummaryList` cannot mutate the topology graph.
 #[derive(Debug, Clone)]
 pub struct PeerSummaryList {
     /// The sender's NodeId.
@@ -328,6 +333,12 @@ pub struct PeerSummaryList {
     /// propagation_sequence than the previous one. This is distinct from
     /// NodeAdvertisement sequences — it is a per-sender propagation message
     /// counter, not a node advertisement counter.
+    ///
+    /// **N2.1.1.2.** The value `0` is reserved as invalid. A valid
+    /// propagation_sequence MUST be `>= 1`. This prevents a zero-sequence
+    /// message from being accepted as the "first" message from a sender
+    /// (which would otherwise set the replay floor to 0 and allow any
+    /// later sequence to be accepted).
     pub propagation_sequence: u64,
     /// Ed25519 signature.
     pub signature: [u8; 64],
@@ -335,6 +346,33 @@ pub struct PeerSummaryList {
 
 /// Maximum number of PeerSummary entries per message.
 pub const MAX_PEER_SUMMARIES_PER_MESSAGE: usize = 256;
+
+/// **N2.1.1.2.** Maximum valid `distance_hint` value in a `PeerSummary`.
+///
+/// Hints claiming a hop distance beyond this are rejected as malformed.
+/// This bounds the effective diameter of the propagation mesh — a hint
+/// at `MAX_DISTANCE_HINT` hops is near-useless for routing and is likely
+/// abuse or a bug. This is NOT a route length; it is a sanity bound on
+/// the discovery heuristic.
+pub const MAX_DISTANCE_HINT: u8 = 64;
+
+/// **N2.1.1.2.** Maximum age (in seconds) of a propagation message's
+/// timestamp before it is considered stale and rejected.
+///
+/// A propagation message with a timestamp older than
+/// `now - MAX_PROPAGATION_MESSAGE_AGE_SECS` is rejected during
+/// `verify_into_verified()`. This prevents replay of very old (but
+/// correctly signed) propagation messages after a process restart
+/// (during which `propagation_state` is lost).
+///
+/// This is a STATELESS staleness bound, distinct from the STATEFUL
+/// `propagation_sequence` replay prevention in `TopologyGraph`. Both
+/// must pass for a message to mutate the topology.
+///
+/// Set to match `MAX_ADVERTISEMENT_LIFETIME_SECS` (24 hours): a
+/// propagation message referencing advertisement data older than the
+/// advertisement lifetime is not useful.
+pub const MAX_PROPAGATION_MESSAGE_AGE_SECS: u64 = 86400;
 
 impl PeerSummaryList {
     /// Create and sign a PeerSummaryList.
@@ -384,7 +422,16 @@ impl PeerSummaryList {
         ])
     }
 
-    fn sign(&mut self, ed25519_secret_key: &[u8; 32]) {
+    /// Re-sign the message in place after mutating fields.
+    ///
+    /// This is intended for cases where a node modifies the summaries or
+    /// other signed fields after `create_and_sign` (e.g., adding summaries
+    /// incrementally before sending). It recomputes the Ed25519 signature
+    /// over the current preimage.
+    ///
+    /// # Panics
+    /// Panics if CBOR encoding fails (it never does for well-formed values).
+    pub fn sign(&mut self, ed25519_secret_key: &[u8; 32]) {
         let preimage = self.preimage();
         let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
         let mut msg = Vec::with_capacity(TOPOLOGY_MSG_CONTEXT.len() + bytes.len());
@@ -393,22 +440,94 @@ impl PeerSummaryList {
         self.signature = ed25519_sign(ed25519_secret_key, &msg);
     }
 
-    /// Verify the signature and sender identity consistency.
+    /// **Stateless verification.** Returns `true` if this message passes
+    /// signature verification, sender identity consistency, and semantic
+    /// validation.
+    ///
+    /// This is a convenience wrapper around `verify_into_verified()`.
+    /// Use `verify_into_verified()` when you need to pass the result to
+    /// `TopologyGraph::process_peer_summaries()`.
     #[must_use]
     pub fn verify(&self) -> bool {
+        self.verify_into_verified().is_some()
+    }
+
+    /// **N2.1.1.2.** Stateless verification into a `VerifiedPeerSummaryList`.
+    ///
+    /// Performs the FULL verification required before a propagation message
+    /// can mutate the topology graph:
+    ///
+    /// 1. **Signature** — Ed25519 signature valid under `TOPOLOGY_MSG_CONTEXT`.
+    /// 2. **Sender identity (I4)** — `sender_node_id == derive_node_id(sender_ed25519_public_key)`.
+    /// 3. **Clock validation**:
+    ///    - `timestamp <= now + MAX_CLOCK_SKEW_SECS` (no future-dated messages)
+    ///    - `timestamp >= now - MAX_PROPAGATION_MESSAGE_AGE_SECS` (not stale)
+    /// 4. **Propagation sequence** — `propagation_sequence >= 1` (zero is invalid).
+    /// 5. **Summary count** — `summaries.len() <= MAX_PEER_SUMMARIES_PER_MESSAGE`.
+    /// 6. **Per-summary semantic validation**:
+    ///    - `distance_hint <= MAX_DISTANCE_HINT`
+    ///    - `visibility` is `"active"` or `"stale"`
+    ///    - `node_id != [0u8; 32]` (all-zero is not a valid NodeId)
+    ///
+    /// **This method does NOT prevent replay.** A previously verified message
+    /// can be verified again. Replay prevention requires the stateful
+    /// `TopologyGraph::process_peer_summaries()` sequence check.
+    ///
+    /// # Returns
+    /// - `Some(VerifiedPeerSummaryList)` if all checks pass.
+    /// - `None` if ANY check fails.
+    #[must_use]
+    pub fn verify_into_verified(&self) -> Option<VerifiedPeerSummaryList> {
+        // 1. Signature verification.
         let preimage = self.preimage();
         let Ok(bytes) = snp_cbor::encode(&preimage) else {
-            return false;
+            return None;
         };
         let mut msg = Vec::with_capacity(TOPOLOGY_MSG_CONTEXT.len() + bytes.len());
         msg.extend_from_slice(TOPOLOGY_MSG_CONTEXT);
         msg.extend_from_slice(&bytes);
         if !ed25519_verify(&self.sender_ed25519_public_key, &msg, &self.signature) {
-            return false;
+            return None;
         }
-        // Verify sender NodeId ↔ Ed25519 consistency (I4).
+        // 2. Sender NodeId ↔ Ed25519 consistency (I4).
         let expected = snp_crypto::derive_node_id(&self.sender_ed25519_public_key);
-        self.sender_node_id == expected
+        if self.sender_node_id != expected {
+            return None;
+        }
+        // 3. Clock validation.
+        let now = now_unix();
+        // 3a. No future-dated timestamps beyond clock skew.
+        if self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            return None;
+        }
+        // 3b. Not stale (older than the propagation message age bound).
+        if self.timestamp < now.saturating_sub(MAX_PROPAGATION_MESSAGE_AGE_SECS) {
+            return None;
+        }
+        // 4. propagation_sequence must be non-zero.
+        if self.propagation_sequence == 0 {
+            return None;
+        }
+        // 5. Summary count bound.
+        if self.summaries.len() > MAX_PEER_SUMMARIES_PER_MESSAGE {
+            return None;
+        }
+        // 6. Per-summary semantic validation.
+        for s in &self.summaries {
+            // 6a. distance_hint within valid range.
+            if s.distance_hint > MAX_DISTANCE_HINT {
+                return None;
+            }
+            // 6b. visibility is a known value.
+            if s.visibility != "active" && s.visibility != "stale" {
+                return None;
+            }
+            // 6c. node_id is not all-zero (not a valid NodeId).
+            if s.node_id == [0u8; 32] {
+                return None;
+            }
+        }
+        Some(VerifiedPeerSummaryList { inner: self.clone() })
     }
 
     /// Get the number of summaries.
@@ -421,5 +540,84 @@ impl PeerSummaryList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.summaries.is_empty()
+    }
+}
+
+// ─── VerifiedPeerSummaryList ────────────────────────────────────────────────
+
+/// A `PeerSummaryList` that has passed **stateless verification** (signature +
+/// sender identity + clock validation + semantic validation).
+///
+/// ## N2.1.1.2 — Type-level enforcement
+///
+/// An UNVERIFIED `PeerSummaryList` CANNOT be passed to
+/// `TopologyGraph::process_peer_summaries()`. The only way to obtain a
+/// `VerifiedPeerSummaryList` is via `PeerSummaryList::verify_into_verified()`,
+/// which performs:
+///
+/// 1. Ed25519 signature verification under `TOPOLOGY_MSG_CONTEXT`.
+/// 2. `sender_node_id == derive_node_id(sender_ed25519_public_key)` (I4).
+/// 3. Clock validation (not future-dated, not stale).
+/// 4. `propagation_sequence >= 1`.
+/// 5. `summaries.len() <= MAX_PEER_SUMMARIES_PER_MESSAGE`.
+/// 6. Per-summary semantic validation (distance_hint, visibility, node_id).
+///
+/// ## This type does NOT prove replay prevention
+///
+/// A `VerifiedPeerSummaryList` can be replayed (same `propagation_sequence`).
+/// Replay prevention requires the stateful `TopologyGraph` sequence check,
+/// which is performed inside `process_peer_summaries()` AFTER the type
+/// guarantee has been established.
+///
+/// ## Construction
+///
+/// The constructor is private. The only way to create a
+/// `VerifiedPeerSummaryList` is via `PeerSummaryList::verify_into_verified()`.
+#[derive(Debug, Clone)]
+pub struct VerifiedPeerSummaryList {
+    inner: PeerSummaryList,
+}
+
+impl VerifiedPeerSummaryList {
+    /// Get the sender's NodeId.
+    #[must_use]
+    pub fn sender_node_id(&self) -> [u8; 32] {
+        self.inner.sender_node_id
+    }
+
+    /// Get the sender's Ed25519 public key.
+    #[must_use]
+    pub fn sender_ed25519_public_key(&self) -> &[u8; 32] {
+        &self.inner.sender_ed25519_public_key
+    }
+
+    /// Get the propagation sequence number.
+    #[must_use]
+    pub fn propagation_sequence(&self) -> u64 {
+        self.inner.propagation_sequence
+    }
+
+    /// Get the message timestamp (unix seconds).
+    #[must_use]
+    pub fn timestamp(&self) -> u64 {
+        self.inner.timestamp
+    }
+
+    /// Get the summaries (immutable).
+    #[must_use]
+    pub fn summaries(&self) -> &[PeerSummary] {
+        &self.inner.summaries
+    }
+
+    /// Get the number of summaries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.summaries.len()
+    }
+
+    /// Check if the list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.summaries.is_empty()
     }
 }

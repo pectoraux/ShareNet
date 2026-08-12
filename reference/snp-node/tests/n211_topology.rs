@@ -6,6 +6,8 @@ use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_static_keypai
 use snp_node::node::{
     Capability, Link, LinkKey, LinkState, NodeAdvertisement, PeerDirectory, PeerSummary,
     PeerSummaryList, PeerVisibility, TopologyGraph, TransportEndpoint,
+    VerifiedPeerSummaryList, MAX_CLOCK_SKEW_SECS, MAX_DISTANCE_HINT,
+    MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,
 };
 
 fn now_unix() -> u64 {
@@ -312,7 +314,8 @@ fn topology_graph_remote_propagation() {
     );
 
     assert!(summary_list.verify(), "summary list must verify");
-    let result = graph.process_peer_summaries(&summary_list);
+    let verified = summary_list.verify_into_verified().expect("must verify into VerifiedPeerSummaryList");
+    let result = graph.process_peer_summaries(&verified);
     assert!(matches!(result, snp_node::node::PropagationResult::Accepted { .. }));
 
     // The remote gateway should be in remote_hints (NOT remote_nodes).
@@ -414,6 +417,11 @@ fn peer_summary_list_verifies() {
     let list = PeerSummaryList::create_and_sign(&sk, &pk, node_id, vec![summary], 1);
     assert!(list.verify(), "PeerSummaryList must verify");
     assert_eq!(list.len(), 1);
+    // N2.1.1.2: verify_into_verified must also succeed for a valid list.
+    let verified = list.verify_into_verified().expect("valid list must verify into VerifiedPeerSummaryList");
+    assert_eq!(verified.sender_node_id(), node_id);
+    assert_eq!(verified.propagation_sequence(), 1);
+    assert_eq!(verified.len(), 1);
 }
 
 #[test]
@@ -431,6 +439,9 @@ fn peer_summary_list_tampered_rejected() {
     let mut list = PeerSummaryList::create_and_sign(&sk, &pk, node_id, vec![summary], 1);
     list.summaries[0].advertisement_sequence = 99; // Tamper.
     assert!(!list.verify(), "tampered PeerSummaryList must fail verification");
+    // N2.1.1.2: verify_into_verified must return None for a tampered list.
+    assert!(list.verify_into_verified().is_none(),
+        "tampered list must NOT produce a VerifiedPeerSummaryList");
 }
 
 #[test]
@@ -493,7 +504,8 @@ fn remote_hint_is_not_authenticated_node() {
     let (sk, pk) = fresh_keypair(b"hint-not-auth");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     // G should be in remote_hints, NOT in authenticated records.
     assert!(graph.remote_hints().contains_key(&fake_gw_id));
@@ -518,7 +530,8 @@ fn fake_gateway_claim_is_not_authenticated() {
     let (sk, pk) = fresh_keypair(b"fake-gw");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     // gateway_hints() should contain the fake claim.
     let hints = graph.gateway_hints();
@@ -558,7 +571,8 @@ fn direct_gateways_excludes_remote_hints() {
     let (sk, pk) = fresh_keypair(b"hint-sender");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![fake_gw], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     // direct_gateways() = 0 (no authenticated gateway with a link).
     assert_eq!(graph.direct_gateways().len(), 0);
@@ -583,7 +597,8 @@ fn gateway_hints_contains_remote_claim() {
     let (sk, pk) = fresh_keypair(b"hint-gw");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     let hints = graph.gateway_hints();
     assert_eq!(hints.len(), 1);
@@ -610,7 +625,8 @@ fn remote_hint_cannot_become_verified_descriptor() {
     let (sk, pk) = fresh_keypair(b"hint-no-convert");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     // There is no API to convert RemoteNodeHint → VerifiedNodeDescriptor.
     // The only way to get a VerifiedNodeDescriptor is via
@@ -670,7 +686,8 @@ fn multi_hop_destination_discovery_without_authentication() {
         vec![c_summary, g_summary],
         1,
     );
-    graph_a.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph_a.process_peer_summaries(&verified);
 
     // A now knows:
     // - B is authenticated and directly reachable (distance 0).
@@ -718,7 +735,8 @@ fn distance_hint_is_not_route() {
     let (sk, pk) = fresh_keypair(b"distance-not-route");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     let hint = graph.remote_hints().get(&target).unwrap();
     assert_eq!(hint.distance_hint, 5);
@@ -748,7 +766,8 @@ fn propagation_sequence_replay_rejected() {
         distance_hint: 1,
     };
     let list1 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary1], 10);
-    let result1 = graph.process_peer_summaries(&list1);
+    let v1 = list1.verify_into_verified().expect("must verify");
+    let result1 = graph.process_peer_summaries(&v1);
     assert!(matches!(result1, PropagationResult::Accepted { .. }));
 
     // Replay with same propagation_sequence = 10.
@@ -761,13 +780,15 @@ fn propagation_sequence_replay_rejected() {
         distance_hint: 1,
     };
     let list2 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary2], 10);
-    let result2 = graph.process_peer_summaries(&list2);
+    let v2 = list2.verify_into_verified().expect("must verify");
+    let result2 = graph.process_peer_summaries(&v2);
     assert!(matches!(result2, PropagationResult::Stale { received_sequence: 10, known_sequence: 10 }),
         "replayed propagation_sequence must be rejected");
 
     // Older propagation_sequence = 5.
     let list3 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 5);
-    let result3 = graph.process_peer_summaries(&list3);
+    let v3 = list3.verify_into_verified().expect("must verify");
+    let result3 = graph.process_peer_summaries(&v3);
     assert!(matches!(result3, PropagationResult::Stale { received_sequence: 5, known_sequence: 10 }),
         "older propagation_sequence must be rejected");
     eprintln!("[test N8] PASS: propagation sequence replay rejected");
@@ -782,17 +803,20 @@ fn stale_propagation_message_rejected() {
 
     // First message (seq 1).
     let list1 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 1);
-    let r1 = graph.process_peer_summaries(&list1);
+    let v1 = list1.verify_into_verified().expect("must verify");
+    let r1 = graph.process_peer_summaries(&v1);
     assert!(matches!(r1, PropagationResult::Accepted { .. }));
 
     // Newer message (seq 5).
     let list5 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 5);
-    let r5 = graph.process_peer_summaries(&list5);
+    let v5 = list5.verify_into_verified().expect("must verify");
+    let r5 = graph.process_peer_summaries(&v5);
     assert!(matches!(r5, PropagationResult::Accepted { .. }));
 
     // Now try seq 3 (stale — between 1 and 5).
     let list3 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 3);
-    let r3 = graph.process_peer_summaries(&list3);
+    let v3 = list3.verify_into_verified().expect("must verify");
+    let r3 = graph.process_peer_summaries(&v3);
     assert!(matches!(r3, PropagationResult::Stale { known_sequence: 5, .. }),
         "seq 3 after seq 5 must be rejected as stale");
     eprintln!("[test N9] PASS: stale propagation message rejected");
@@ -815,7 +839,8 @@ fn provenance_preserved() {
         distance_hint: 3,
     };
     let list = PeerSummaryList::create_and_sign(&sender_sk, &sender_pk, sender_id, vec![summary], 7);
-    graph.process_peer_summaries(&list);
+    let verified = list.verify_into_verified().expect("must verify");
+    graph.process_peer_summaries(&verified);
 
     let hint = graph.remote_hints().get(&target).expect("hint must exist");
     assert_eq!(hint.target_node_id, target);
@@ -826,4 +851,375 @@ fn provenance_preserved() {
     assert_eq!(hint.source_propagation_sequence, 7, "provenance: propagation_sequence must be preserved");
     assert!(hint.received_at > 0, "provenance: received_at must be set");
     eprintln!("[test N10] PASS: provenance preserved");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.1.2 — Authenticate propagation messages before topology mutation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Helper: make a valid PeerSummary for adversarial tests.
+fn make_summary(node_id: [u8; 32], seq: u64) -> PeerSummary {
+    PeerSummary {
+        node_id,
+        advertisement_sequence: seq,
+        capabilities: vec!["relay".to_string()],
+        visibility: "active".to_string(),
+        last_seen: now_unix(),
+        distance_hint: 1,
+    }
+}
+
+/// N11. forged_propagation_message_does_not_advance_replay_state
+///
+/// The mandatory replay/DoS test from the N2.1.1.2 spec:
+/// 1. Real sender has propagation sequence 10.
+/// 2. Attacker constructs a forged list claiming sender identity.
+/// 3. Attacker uses propagation sequence 1,000,000.
+/// 4. Signature verification fails (or identity mismatch).
+/// 5. TopologyGraph rejects the message.
+/// 6. propagation_state for the real sender is unchanged.
+/// 7. Later real sequence 11 is accepted.
+#[test]
+fn forged_propagation_message_does_not_advance_replay_state() {
+    let mut graph = TopologyGraph::new();
+
+    // Real sender keypair.
+    let (real_sk, real_pk) = fresh_keypair(b"forged-real-sender");
+    let real_sender_id = derive_node_id(&real_pk);
+
+    // 1. Real sender sends propagation_sequence = 10.
+    let list10 = PeerSummaryList::create_and_sign(
+        &real_sk, &real_pk, real_sender_id,
+        vec![make_summary([0x11; 32], 1)],
+        10,
+    );
+    let v10 = list10.verify_into_verified().expect("real message must verify");
+    let r10 = graph.process_peer_summaries(&v10);
+    assert!(matches!(r10, PropagationResult::Accepted { .. }));
+    assert_eq!(graph.highest_propagation_sequence(&real_sender_id), Some(10));
+
+    // 2-3. Attacker constructs a forged list claiming to be the real sender
+    // with propagation_sequence = 1,000,000.
+    let (attacker_sk, attacker_pk) = fresh_keypair(b"forged-attacker");
+    let mut forged = PeerSummaryList::create_and_sign(
+        &attacker_sk, &attacker_pk, real_sender_id, // claims to be real sender
+        vec![make_summary([0x22; 32], 1)],
+        1_000_000,
+    );
+    // The attacker signed with their OWN key, but set sender_node_id to
+    // the real sender's NodeId. verify_into_verified() must reject this
+    // because sender_node_id != derive_node_id(attacker_pk).
+    //
+    // Alternatively, the attacker could set sender_ed25519_public_key to
+    // the real sender's pk, but then the signature wouldn't verify (they
+    // don't have the real sender's secret key). Either way, verification
+    // fails.
+    assert!(forged.verify_into_verified().is_none(),
+        "forged message claiming another sender's identity must NOT verify");
+
+    // Also try: attacker sets sender_ed25519_public_key to real sender's pk
+    // but signs with attacker's key.
+    forged.sender_ed25519_public_key = real_pk;
+    forged.sign(&attacker_sk); // re-sign with attacker's key
+    assert!(forged.verify_into_verified().is_none(),
+        "message signed with wrong key must NOT verify");
+
+    // 5-6. The forged message cannot be passed to process_peer_summaries
+    // (no VerifiedPeerSummaryList). propagation_state is unchanged.
+    assert_eq!(graph.highest_propagation_sequence(&real_sender_id), Some(10),
+        "forged message must NOT advance propagation_state");
+
+    // The forged hint must NOT be in remote_hints.
+    assert!(!graph.remote_hints().contains_key(&[0x22; 32]),
+        "forged hint must NOT be stored in topology");
+
+    // 7. Later real sequence 11 is accepted.
+    let list11 = PeerSummaryList::create_and_sign(
+        &real_sk, &real_pk, real_sender_id,
+        vec![make_summary([0x33; 32], 1)],
+        11,
+    );
+    let v11 = list11.verify_into_verified().expect("real seq 11 must verify");
+    let r11 = graph.process_peer_summaries(&v11);
+    assert!(matches!(r11, PropagationResult::Accepted { .. }),
+        "real sequence 11 must be accepted after forged message was rejected");
+    assert_eq!(graph.highest_propagation_sequence(&real_sender_id), Some(11));
+
+    eprintln!("[test N11] PASS: forged propagation message does not advance replay state");
+}
+
+/// N12. invalid_propagation_signature_does_not_mutate_topology
+///
+/// Proves that a message with an invalid signature:
+/// - adds NO RemoteNodeHint,
+/// - updates NO existing hint,
+/// - leaves propagation_state unchanged.
+#[test]
+fn invalid_propagation_signature_does_not_mutate_topology() {
+    let mut graph = TopologyGraph::new();
+
+    // Pre-populate the topology with one existing hint from sender S.
+    let (s_sk, s_pk) = fresh_keypair(b"invalid-sig-sender");
+    let s_id = derive_node_id(&s_pk);
+    let target_a = [0xAA; 32];
+    let list1 = PeerSummaryList::create_and_sign(
+        &s_sk, &s_pk, s_id,
+        vec![make_summary(target_a, 5)],
+        1,
+    );
+    let v1 = list1.verify_into_verified().expect("must verify");
+    let r1 = graph.process_peer_summaries(&v1);
+    assert!(matches!(r1, PropagationResult::Accepted { hints_added: 1, .. }));
+    assert_eq!(graph.remote_hints().len(), 1);
+    assert_eq!(graph.highest_propagation_sequence(&s_id), Some(1));
+
+    // Now construct a second message from S with a TAMPERED signature.
+    let target_b = [0xBB; 32];
+    let mut list2 = PeerSummaryList::create_and_sign(
+        &s_sk, &s_pk, s_id,
+        vec![make_summary(target_b, 9)],
+        2,
+    );
+    // Corrupt the signature.
+    list2.signature[0] ^= 0xFF;
+    assert!(list2.verify_into_verified().is_none(),
+        "message with corrupted signature must NOT verify");
+
+    // The corrupted message cannot produce a VerifiedPeerSummaryList,
+    // so it cannot be passed to process_peer_summaries.
+    // Verify that NO mutation occurred:
+    // - No new hint (target_b) was added.
+    assert!(!graph.remote_hints().contains_key(&target_b),
+        "invalid-signature message must NOT add a hint");
+    // - The existing hint (target_a) is unchanged.
+    let existing = graph.remote_hints().get(&target_a).unwrap();
+    assert_eq!(existing.claimed_sequence, 5,
+        "invalid-signature message must NOT update existing hint");
+    // - propagation_state is unchanged (still 1, not advanced to 2).
+    assert_eq!(graph.highest_propagation_sequence(&s_id), Some(1),
+        "invalid-signature message must NOT advance propagation_state");
+    assert_eq!(graph.remote_hints().len(), 1,
+        "invalid-signature message must NOT change hint count");
+
+    eprintln!("[test N12] PASS: invalid propagation signature does not mutate topology");
+}
+
+/// N13. verified_message_type_required_for_topology_mutation
+///
+/// Proves that an unverified PeerSummaryList cannot be passed to
+/// process_peer_summaries(). The type system enforces this: the method
+/// accepts only &VerifiedPeerSummaryList, which can only be obtained via
+/// verify_into_verified().
+///
+/// This test demonstrates the verification path at runtime. The
+/// compile-time guarantee is self-evident from the function signature:
+///   process_peer_summaries(&mut self, verified: &VerifiedPeerSummaryList)
+/// A raw &PeerSummaryList would not compile.
+#[test]
+fn verified_message_type_required_for_topology_mutation() {
+    let mut graph = TopologyGraph::new();
+    let (sk, pk) = fresh_keypair(b"verified-type");
+    let sender_id = derive_node_id(&pk);
+
+    // Construct a valid PeerSummaryList.
+    let list = PeerSummaryList::create_and_sign(
+        &sk, &pk, sender_id,
+        vec![make_summary([0xCC; 32], 1)],
+        1,
+    );
+
+    // The ONLY way to obtain a VerifiedPeerSummaryList is via verify_into_verified().
+    // There is no public constructor for VerifiedPeerSummaryList.
+    let verified: VerifiedPeerSummaryList = list.verify_into_verified()
+        .expect("valid list must verify into VerifiedPeerSummaryList");
+
+    // The verified type can be passed to process_peer_summaries.
+    let result = graph.process_peer_summaries(&verified);
+    assert!(matches!(result, PropagationResult::Accepted { .. }));
+
+    // The verified type exposes the verified data through accessors.
+    assert_eq!(verified.sender_node_id(), sender_id);
+    assert_eq!(verified.propagation_sequence(), 1);
+    assert_eq!(verified.summaries().len(), 1);
+    assert_eq!(verified.summaries()[0].node_id, [0xCC; 32]);
+
+    // A list that fails verification produces NO VerifiedPeerSummaryList,
+    // and therefore CANNOT be passed to process_peer_summaries.
+    let (sk2, pk2) = fresh_keypair(b"verified-type-bad");
+    let bad_sender_id = derive_node_id(&pk2);
+    let mut bad_list = PeerSummaryList::create_and_sign(
+        &sk2, &pk2, bad_sender_id,
+        vec![make_summary([0xDD; 32], 1)],
+        1,
+    );
+    // Corrupt the signature so verification fails.
+    bad_list.signature[0] ^= 0xFF;
+    assert!(bad_list.verify_into_verified().is_none(),
+        "corrupted list must NOT produce a VerifiedPeerSummaryList");
+    // There is no way to call process_peer_summaries(&bad_list) — it would
+    // not compile because bad_list is PeerSummaryList, not VerifiedPeerSummaryList.
+
+    // The bad list did NOT mutate the topology.
+    assert!(!graph.remote_hints().contains_key(&[0xDD; 32]));
+    assert_eq!(graph.remote_hints().len(), 1); // only the good hint from above
+
+    eprintln!("[test N13] PASS: verified message type required for topology mutation");
+}
+
+/// N14. semantic_validation_rejects_future_dated_propagation
+#[test]
+fn semantic_validation_rejects_future_dated_propagation() {
+    let (sk, pk) = fresh_keypair(b"future-prop");
+    let sender_id = derive_node_id(&pk);
+
+    let mut list = PeerSummaryList::create_and_sign(
+        &sk, &pk, sender_id,
+        vec![make_summary([0x11; 32], 1)],
+        1,
+    );
+    // Set timestamp far in the future (beyond MAX_CLOCK_SKEW_SECS).
+    list.timestamp = now_unix() + MAX_CLOCK_SKEW_SECS + 100;
+    list.sign(&sk); // re-sign with the mutated timestamp.
+
+    assert!(list.verify_into_verified().is_none(),
+        "future-dated propagation message beyond MAX_CLOCK_SKEW must be rejected");
+    eprintln!("[test N14] PASS: future-dated propagation rejected");
+}
+
+/// N15. semantic_validation_rejects_stale_propagation
+#[test]
+fn semantic_validation_rejects_stale_propagation() {
+    let (sk, pk) = fresh_keypair(b"stale-prop-msg");
+    let sender_id = derive_node_id(&pk);
+
+    let mut list = PeerSummaryList::create_and_sign(
+        &sk, &pk, sender_id,
+        vec![make_summary([0x22; 32], 1)],
+        1,
+    );
+    // Set timestamp far in the past (older than MAX_PROPAGATION_MESSAGE_AGE_SECS).
+    list.timestamp = now_unix().saturating_sub(MAX_PROPAGATION_MESSAGE_AGE_SECS + 100);
+    list.sign(&sk); // re-sign with the mutated timestamp.
+
+    assert!(list.verify_into_verified().is_none(),
+        "stale propagation message older than MAX_PROPAGATION_MESSAGE_AGE must be rejected");
+    eprintln!("[test N15] PASS: stale propagation message rejected");
+}
+
+/// N16. semantic_validation_rejects_oversized_summary_list
+///
+/// A message with more than MAX_PEER_SUMMARIES_PER_MESSAGE summaries must
+/// be rejected. This is defense against a malicious sender who constructs
+/// the message manually (bypassing create_and_sign's truncation).
+#[test]
+fn semantic_validation_rejects_oversized_summary_list() {
+    let (sk, pk) = fresh_keypair(b"oversized-prop");
+    let sender_id = derive_node_id(&pk);
+
+    // Construct a list with MAX + 1 summaries (bypassing create_and_sign's truncation).
+    let mut list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 1);
+    let too_many: Vec<PeerSummary> = (0..(MAX_PEER_SUMMARIES_PER_MESSAGE + 1))
+        .map(|i| {
+            let mut id = [0u8; 32];
+            id[0] = ((i >> 24) & 0xFF) as u8;
+            id[1] = ((i >> 16) & 0xFF) as u8;
+            id[2] = ((i >> 8) & 0xFF) as u8;
+            id[3] = (i & 0xFF) as u8;
+            // Ensure non-zero node_id (all-zero is rejected by a different check).
+            if id == [0u8; 32] { id[31] = 1; }
+            make_summary(id, 1)
+        })
+        .collect();
+    list.summaries = too_many;
+    list.sign(&sk); // re-sign with the oversized summaries.
+
+    assert!(list.summaries.len() > MAX_PEER_SUMMARIES_PER_MESSAGE,
+        "test setup: list must have more than MAX summaries");
+    assert!(list.verify_into_verified().is_none(),
+        "oversized summary list must be rejected by semantic validation");
+    eprintln!("[test N16] PASS: oversized summary list rejected");
+}
+
+/// N17. semantic_validation_rejects_invalid_distance_hint
+#[test]
+fn semantic_validation_rejects_invalid_distance_hint() {
+    let (sk, pk) = fresh_keypair(b"bad-distance");
+    let sender_id = derive_node_id(&pk);
+
+    let mut summary = make_summary([0x33; 32], 1);
+    summary.distance_hint = MAX_DISTANCE_HINT + 1; // beyond valid range
+
+    let mut list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
+    // create_and_sign already signed, but we mutated the summary after construction.
+    // Re-sign to ensure the signature matches the mutated data.
+    list.sign(&sk);
+
+    assert!(list.verify_into_verified().is_none(),
+        "distance_hint > MAX_DISTANCE_HINT must be rejected");
+    eprintln!("[test N17] PASS: invalid distance_hint rejected");
+}
+
+/// N18. semantic_validation_rejects_invalid_visibility
+#[test]
+fn semantic_validation_rejects_invalid_visibility() {
+    let (sk, pk) = fresh_keypair(b"bad-visibility");
+    let sender_id = derive_node_id(&pk);
+
+    let mut summary = make_summary([0x44; 32], 1);
+    summary.visibility = "unknown".to_string(); // not "active" or "stale"
+
+    let mut list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
+    list.sign(&sk);
+
+    assert!(list.verify_into_verified().is_none(),
+        "invalid visibility value must be rejected");
+    eprintln!("[test N18] PASS: invalid visibility rejected");
+}
+
+/// N19. propagation_sender_identity_mismatch_rejected
+///
+/// If sender_node_id does not match derive_node_id(sender_ed25519_public_key),
+/// the message must be rejected (I4 consistency).
+#[test]
+fn propagation_sender_identity_mismatch_rejected() {
+    let (sk_a, pk_a) = fresh_keypair(b"identity-mismatch-a");
+    let id_a = derive_node_id(&pk_a);
+    let id_b = [0x99; 32]; // arbitrary, does NOT match derive_node_id(pk_a)
+
+    // Sign as A, but claim to be B (sender_node_id = id_b).
+    let mut list = PeerSummaryList::create_and_sign(
+        &sk_a, &pk_a, id_a, // correct identity
+        vec![make_summary([0x55; 32], 1)],
+        1,
+    );
+    // Mutate sender_node_id to a mismatched value.
+    list.sender_node_id = id_b;
+    list.sign(&sk_a); // re-sign with A's key (which matches pk_a, not id_b).
+
+    assert!(list.verify_into_verified().is_none(),
+        "sender_node_id != derive_node_id(sender_pk) must be rejected (I4)");
+    eprintln!("[test N19] PASS: sender identity mismatch rejected");
+}
+
+/// N20. zero_propagation_sequence_rejected
+///
+/// propagation_sequence = 0 is reserved as invalid. A message with
+/// sequence 0 must be rejected so that it cannot set the replay floor
+/// to 0 (which would allow any later sequence to be accepted).
+#[test]
+fn zero_propagation_sequence_rejected() {
+    let (sk, pk) = fresh_keypair(b"zero-seq");
+    let sender_id = derive_node_id(&pk);
+
+    let mut list = PeerSummaryList::create_and_sign(
+        &sk, &pk, sender_id,
+        vec![make_summary([0x66; 32], 1)],
+        0, // zero sequence — invalid
+    );
+    // create_and_sign may have already signed with seq=0; ensure signature matches.
+    list.sign(&sk);
+
+    assert!(list.verify_into_verified().is_none(),
+        "propagation_sequence == 0 must be rejected (reserved as invalid)");
+    eprintln!("[test N20] PASS: zero propagation_sequence rejected");
 }

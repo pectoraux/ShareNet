@@ -1,5 +1,38 @@
-//! N2.1.1.1 — Topology Graph: directed graph of nodes and links with
-//! non-authoritative remote hints.
+//! N2.1.1.2 — Topology Graph: directed graph of nodes and links with
+//! non-authoritative remote hints, accepting ONLY verified propagation
+//! messages.
+//!
+//! ## N2.1.1.2 correction: Propagation messages MUST be verified before
+//! topology mutation
+//!
+//! `TopologyGraph::process_peer_summaries()` accepts a
+//! `&VerifiedPeerSummaryList` — NOT a raw `PeerSummaryList`. The only way
+//! to obtain a `VerifiedPeerSummaryList` is via
+//! `PeerSummaryList::verify_into_verified()`, which performs:
+//!
+//! 1. Ed25519 signature verification.
+//! 2. Sender NodeId ↔ Ed25519 consistency (I4).
+//! 3. Clock validation (not future-dated, not stale).
+//! 4. `propagation_sequence >= 1`.
+//! 5. Summary count bound.
+//! 6. Per-summary semantic validation.
+//!
+//! An UNVERIFIED `PeerSummaryList` CANNOT mutate the topology graph.
+//! The type system enforces this.
+//!
+//! ## Ordering: verification → freshness check → commit → process
+//!
+//! Inside `process_peer_summaries()`:
+//!
+//! 1. The message is already verified (type guarantee).
+//! 2. Check `propagation_sequence` freshness (read `propagation_state`).
+//! 3. If stale → return `Stale` (NO mutation of `propagation_state` or
+//!    `remote_hints`).
+//! 4. If fresh → commit `propagation_state` (write).
+//! 5. Process summaries (write `remote_hints`).
+//!
+//! An attacker CANNOT advance `propagation_state` using a forged message,
+//! because a forged message cannot produce a `VerifiedPeerSummaryList`.
 //!
 //! ## N2.1.1.1 correction: Remote topology hints are NOT authoritative
 //!
@@ -22,10 +55,13 @@
 //!
 //! `PeerSummaryList` messages carry a `propagation_sequence` (monotonic
 //! per-sender). The `TopologyGraph` tracks the highest propagation_sequence
-//! per sender and rejects stale/replayed lists.
+//! per sender and rejects stale/replayed lists. This replay state is
+//! **process-local** (not persisted) — see `MAX_PROPAGATION_MESSAGE_AGE_SECS`
+//! for the stateless staleness bound that supplements it.
 
 use super::*;
 use crate::node::link::{Link, LinkKey, LinkState, LinkTable, TransportType};
+use crate::node::topology_protocol::VerifiedPeerSummaryList;
 use std::collections::{HashMap, HashSet};
 
 /// A remote node hint — third-party topology knowledge that is NOT
@@ -213,25 +249,44 @@ impl TopologyGraph {
 
     // ─── Remote topology propagation ──────────────────────────────────────
 
-    /// Process a `PeerSummaryList` received from a peer.
+    /// Process a **verified** `PeerSummaryList` received from a peer.
     ///
-    /// ## N2.1.1.1: Non-authoritative storage + replay prevention
+    /// ## N2.1.1.2: Verified message required (type-level enforcement)
     ///
-    /// - The list's `propagation_sequence` is checked against the highest
-    ///   seen from this sender. Stale/duplicate lists are rejected.
-    /// - Remote summaries are stored as `RemoteNodeHint` — NOT as
-    ///   `AuthenticatedNodeRecord`. They cannot be used as authenticated
-    ///   node identities.
-    /// - If a node is both directly known and remotely hinted, the direct
-    ///   knowledge takes precedence (the hint is not stored).
+    /// This method accepts a `&VerifiedPeerSummaryList` — NOT a raw
+    /// `PeerSummaryList`. The caller MUST call
+    /// `PeerSummaryList::verify_into_verified()` first. An unverified
+    /// `PeerSummaryList` cannot be passed to this method (compile error).
+    ///
+    /// ## Ordering: freshness check → commit → process
+    ///
+    /// 1. The message is already verified (signature + identity + semantics).
+    /// 2. Check `propagation_sequence` freshness against `propagation_state`.
+    /// 3. If stale → return `Stale` (NO mutation of any state).
+    /// 4. If fresh → commit `propagation_state[sender] = prop_seq`.
+    /// 5. Process summaries → store `RemoteNodeHint`s.
+    ///
+    /// An attacker CANNOT advance `propagation_state` using a forged message,
+    /// because a forged message cannot produce a `VerifiedPeerSummaryList`.
+    ///
+    /// ## N2.1.1.1: Non-authoritative storage
+    ///
+    /// Remote summaries are stored as `RemoteNodeHint` — NOT as
+    /// `AuthenticatedNodeRecord`. They cannot be used as authenticated
+    /// node identities. If a node is both directly known and remotely
+    /// hinted, the direct knowledge takes precedence (the hint is not stored).
     pub fn process_peer_summaries(
         &mut self,
-        summary_list: &PeerSummaryList,
+        verified: &VerifiedPeerSummaryList,
     ) -> PropagationResult {
-        let sender = summary_list.sender_node_id;
-        let prop_seq = summary_list.propagation_sequence;
+        let sender = verified.sender_node_id();
+        let prop_seq = verified.propagation_sequence();
 
-        // Stateful replay prevention: reject stale/duplicate propagation.
+        // ── Step 2: Freshness check (read propagation_state) ──────────────
+        //
+        // An unverified message cannot reach this point (type enforcement).
+        // A verified but stale message must NOT advance propagation_state
+        // or mutate remote_hints.
         match self.propagation_state.get(&sender) {
             Some(&known) if prop_seq <= known => {
                 return PropagationResult::Stale {
@@ -241,13 +296,22 @@ impl TopologyGraph {
             }
             _ => {}
         }
+
+        // ── Step 4: Commit propagation_state (write) ──────────────────────
+        //
+        // The message is verified AND fresh. Commit the sequence floor
+        // BEFORE processing summaries, so that even if summary processing
+        // were to fail (it cannot in the current implementation — all
+        // operations are infallible HashMap inserts), the replay floor
+        // is advanced and this message cannot be replayed.
         self.propagation_state.insert(sender, prop_seq);
 
+        // ── Step 5: Process summaries (write remote_hints) ────────────────
         let now = now_unix();
         let mut hints_added = 0usize;
         let mut hints_updated = 0usize;
 
-        for summary in &summary_list.summaries {
+        for summary in verified.summaries() {
             // Don't store hints about nodes we already know directly
             // (direct knowledge takes precedence).
             if self.directory.get_record(&summary.node_id).is_some() {

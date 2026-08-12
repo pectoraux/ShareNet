@@ -137,7 +137,8 @@ pub use node_advert::{
 };
 pub use link::{Link, LinkKey, LinkMetrics, LinkState, LinkTable, TransportType};
 pub use topology_protocol::{
-    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, MAX_PEER_SUMMARIES_PER_MESSAGE,
+    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,
+    MAX_DISTANCE_HINT, MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,
 };
 pub use peer_directory::PeerDirectory;
 pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
