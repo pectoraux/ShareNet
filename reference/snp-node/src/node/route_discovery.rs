@@ -54,7 +54,7 @@
 use super::*;
 use crate::node::node_advert::{AuthenticatedNodeRecord, MAX_CLOCK_SKEW_SECS};
 use crate::node::topology::{ExecutableNetworkSnapshot, RemoteNodeHint};
-use crate::node::link::Link;
+use crate::node::link::{Link, LinkState};
 use crate::node::identity::Capability;
 use snp_cbor::CborValue;
 use snp_crypto::{ed25519_sign, ed25519_verify, derive_node_id, sha256};
@@ -322,12 +322,18 @@ pub trait NextHopDiscovery {
 
 /// Evidence backing a hop's incoming link.
 ///
-/// - `Direct`: a link in our local `ExecutableNetworkSnapshot` (strongest).
-/// - `Attested`: a relay's signed `LinkAttestation` (weaker, but cryptographically
-///   traceable to the attester).
+/// - `Direct`: a **locally observed executable link** from the local
+///   `ExecutableNetworkSnapshot` (strongest evidence — we probed it ourselves).
+/// - `Attested`: an **authenticated third-party assertion of link availability**
+///   — a relay's signed `LinkAttestation`. Weaker than direct observation: the
+///   relay signed that it had a usable link at time T, but the link may have
+///   gone stale since. Cryptographically traceable to the attester.
 ///
-/// Both are stronger than unsigned `RemoteLinkHint` gossip. Neither is as
-/// strong as directly observing the link ourselves.
+/// Both are stronger than unsigned `RemoteLinkHint` gossip. Neither `Direct`
+/// nor `Attested` is as strong as directly observing the link ourselves at
+/// circuit-establishment time. The `RouteAcceptance` from each participant
+/// provides additional assurance that the participant confirms their role and
+/// adjacency at signing time.
 #[derive(Debug, Clone)]
 pub enum LinkEvidence {
     /// A directly observed link from our local topology.
@@ -381,7 +387,21 @@ pub struct AuthenticatedHop {
 }
 
 /// A validated path — every hop is authenticated AND every edge is backed by
-/// link evidence (direct or attested).
+/// acceptable link evidence (direct or attested).
+///
+/// ## Terminology (P1 #5 — corrected)
+///
+/// A `ValidatedPath` is an **authenticated path candidate backed by acceptable
+/// evidence** — NOT a guaranteed currently-executable path. The evidence may
+/// be:
+/// - `Direct`: locally observed at validation time (strongest).
+/// - `Attested`: the relay signed at time T that the link was usable (may
+///   have gone stale since).
+///
+/// The subsequent `RouteAcceptance` from each participant provides additional
+/// assurance: the participant confirms their role and adjacency at signing
+/// time. Full current-executability is established at circuit-establishment
+/// time (N2.1.3), not at path-validation time.
 ///
 /// ## Construction
 ///
@@ -403,6 +423,10 @@ pub enum PathError {
     AttestationInvalid { from: [u8; 32], to: [u8; 32] },
     /// The candidate's authenticated NodeId does not match the attestation's remote_node_id.
     CandidateAttestationMismatch { candidate: [u8; 32], attestation_remote: [u8; 32] },
+    /// P0 #1: the attestation's attester_node_id does not match the relay
+    /// being queried (`current`). A discovery provider cannot substitute
+    /// another relay's attestation.
+    AttesterMismatch { current: [u8; 32], attester: [u8; 32] },
 }
 
 impl std::fmt::Display for PathError {
@@ -414,6 +438,7 @@ impl std::fmt::Display for PathError {
             Self::ExcessiveHops { count } => write!(f, "path has too many hops: {count} > {ROUTE_MAX_HOPS}"),
             Self::AttestationInvalid { from, to } => write!(f, "link attestation invalid from {} to {}", hex_short(from), hex_short(to)),
             Self::CandidateAttestationMismatch { candidate, attestation_remote } => write!(f, "candidate {} does not match attestation remote {}", hex_short(candidate), hex_short(attestation_remote)),
+            Self::AttesterMismatch { current, attester } => write!(f, "attestation attester {} does not match queried relay {}", hex_short(attester), hex_short(current)),
         }
     }
 }
@@ -676,47 +701,61 @@ where
             });
         }
 
-        // Pick the first candidate that authenticates successfully.
-        // (A more sophisticated implementation might try multiple candidates.)
-        let candidate = &candidates[0];
-        let attestation = &candidate.link_attestation;
+        // P1 #3: Try ALL candidates until one authenticates successfully.
+        // Do not fail merely because the first candidate is invalid/unreachable.
+        let mut found = false;
+        for candidate in &candidates {
+            let attestation = &candidate.link_attestation;
 
-        // Verify the attestation.
-        if !attestation.verify() {
-            return Err(PathError::AttestationInvalid {
-                from: current,
-                to: candidate.candidate_node_id,
-            });
-        }
+            // Verify the attestation signature + freshness.
+            if !attestation.verify() {
+                continue; // try next candidate
+            }
 
-        // Check that the attestation's remote_node_id matches the candidate.
-        if attestation.remote_node_id != candidate.candidate_node_id {
-            return Err(PathError::CandidateAttestationMismatch {
-                candidate: candidate.candidate_node_id,
-                attestation_remote: attestation.remote_node_id,
-            });
-        }
+            // P0 #1: The attestation's attester MUST be the relay being queried.
+            // A discovery provider cannot substitute another relay's attestation.
+            if attestation.attester_node_id != current {
+                return Err(PathError::AttesterMismatch {
+                    current,
+                    attester: attestation.attester_node_id,
+                });
+            }
 
-        // Authenticate the candidate (fetch + verify advertisement).
-        let candidate_record = authenticate_candidate(&candidate.candidate_node_id)
-            .ok_or(PathError::HopNotAuthenticated {
-                index: hops.len(),
+            // Check that the attestation's remote_node_id matches the candidate.
+            if attestation.remote_node_id != candidate.candidate_node_id {
+                continue; // try next candidate
+            }
+
+            // Authenticate the candidate (fetch + verify advertisement).
+            let candidate_record = match authenticate_candidate(&candidate.candidate_node_id) {
+                Some(record) => record,
+                None => continue, // try next candidate
+            };
+
+            // Add the hop with attested link evidence.
+            let is_destination = candidate.candidate_node_id == *destination;
+            let role = if is_destination { RouteRole::Gateway } else { RouteRole::Relay };
+
+            hops.push(AuthenticatedHop {
                 node_id: candidate.candidate_node_id,
-            })?;
+                record: candidate_record,
+                incoming_link: Some(LinkEvidence::Attested(attestation.clone())),
+                role,
+            });
 
-        // Add the hop with attested link evidence.
-        let is_destination = candidate.candidate_node_id == *destination;
-        let role = if is_destination { RouteRole::Gateway } else { RouteRole::Relay };
+            current = candidate.candidate_node_id;
+            depth += 1;
+            found = true;
+            break;
+        }
 
-        hops.push(AuthenticatedHop {
-            node_id: candidate.candidate_node_id,
-            record: candidate_record,
-            incoming_link: Some(LinkEvidence::Attested(attestation.clone())),
-            role,
-        });
-
-        current = candidate.candidate_node_id;
-        depth += 1;
+        if !found {
+            // No candidate authenticated — dead end.
+            return Err(PathError::NoUsableLink {
+                from: current,
+                to: *destination,
+            });
+        }
     }
 }
 
@@ -825,6 +864,22 @@ impl RouteProposal {
 // ─── RouteAcceptance ───────────────────────────────────────────────────────
 
 /// A participant's signed acceptance of their role in a proposed route.
+///
+/// ## Semantics (N2.1.2 review clarification)
+///
+/// `RouteAcceptance` means the participant accepts the **exact ordered route**,
+/// including its adjacency to the next hop, its assigned role, and the
+/// `ServiceAgreement`, for the signed proposal lifetime. By signing, the
+/// participant confirms:
+///
+/// - It is the node identified by `participant_node_id`.
+/// - It accepts the role (`Relay` or `Gateway`) assigned to its position.
+/// - It acknowledges the ordered hop list (via `proposal_hash` binding).
+/// - It agrees to the `conditions` it specified.
+/// - The acceptance is valid until `expiry`.
+///
+/// The acceptance does NOT independently confirm every link's current
+/// usability — that is established at circuit-establishment time (N2.1.3).
 #[derive(Debug, Clone)]
 pub struct RouteAcceptance {
     pub proposal_hash: [u8; 32],
@@ -899,13 +954,21 @@ impl RouteAcceptance {
 /// produced a valid, typed `RouteAcceptance` AND the route's hop evidence
 /// is retained for circuit establishment.
 ///
+/// ## Terminology (P1 #5 — corrected)
+///
+/// A `CommittedRoute` is a **cryptographically consented route agreement**
+/// backed by validated evidence. It is NOT a guaranteed currently-executable
+/// path — the evidence may include `Attested` links that were usable at
+/// attestation time but may have gone stale. Full current-executability is
+/// established at circuit-establishment time (N2.1.3).
+///
 /// ## P0 #2 — Retains hop evidence
 ///
 /// `CommittedRoute` does NOT degrade to a mere list of NodeIds. It retains:
 /// - The `ValidatedPath`'s `AuthenticatedHop`s (node record + link evidence + role)
 /// - The `RouteProposal` (source's signed belief)
 /// - The `RouteAcceptance`s (participant consent)
-/// - The commitment hash (integrity identifier covering all of the above)
+/// - The commitment hash (canonical CBOR covering ALL of the above)
 ///
 /// This ensures the future circuit layer (N2.1.3) has everything it needs:
 /// node identity, transport endpoint, link evidence, and role for every hop.
@@ -1100,19 +1163,68 @@ pub fn commit_route(
         }
     }
 
-    // 8. Compute commitment (covers proposal + hop evidence).
+    // 8. Compute commitment via canonical CBOR (P0 #2).
+    //
+    // The commitment covers the FULL executable route evidence — not just
+    // NodeIds. For every hop: node_id, record_node_id, role, and the complete
+    // LinkEvidence (Direct link fields or Attested attestation fields).
+    // For every acceptance: the complete canonical acceptance object
+    // (proposal_hash, participant, role, conditions, timestamp, expiry, signature).
+    //
+    // This ensures that two routes with the same NodeIds but different link
+    // evidence produce DIFFERENT commitments — the commitment is a true
+    // integrity identifier for the finalized route agreement.
     let commitment = {
-        let mut input = Vec::new();
-        input.extend_from_slice(&proposal.proposal_hash());
-        for hop in validated_path.hops() {
-            input.extend_from_slice(&hop.node_id);
-            input.extend_from_slice(&hop.record.node_id());
-        }
-        for acc in &acceptances {
-            input.extend_from_slice(&acc.proposal_hash);
-            input.extend_from_slice(&acc.participant_node_id);
-        }
-        sha256(&input)
+        let hops_cbor: Vec<CborValue> = validated_path.hops().iter().map(|hop| {
+            let link_cbor = match &hop.incoming_link {
+                None => CborValue::Null,
+                Some(LinkEvidence::Direct(link)) => CborValue::Map(vec![
+                    (CborValue::TextString("type".into()), CborValue::TextString("direct".into())),
+                    (CborValue::TextString("local".into()), CborValue::ByteString(link.key.local_node_id.to_vec())),
+                    (CborValue::TextString("remote".into()), CborValue::ByteString(link.key.remote_node_id.to_vec())),
+                    (CborValue::TextString("endpoint".into()), link.key.endpoint.canonical_cbor()),
+                    (CborValue::TextString("state".into()), CborValue::TextString(link_state_str(link.state).to_string())),
+                ]),
+                Some(LinkEvidence::Attested(att)) => CborValue::Map(vec![
+                    (CborValue::TextString("type".into()), CborValue::TextString("attested".into())),
+                    (CborValue::TextString("attester".into()), CborValue::ByteString(att.attester_node_id.to_vec())),
+                    (CborValue::TextString("remote".into()), CborValue::ByteString(att.remote_node_id.to_vec())),
+                    (CborValue::TextString("linkState".into()), CborValue::TextString(att.link_state.clone())),
+                    (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(att.timestamp)),
+                    (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(att.expiry)),
+                    (CborValue::TextString("signature".into()), CborValue::ByteString(att.signature.to_vec())),
+                ]),
+            };
+            CborValue::Map(vec![
+                (CborValue::TextString("nodeId".into()), CborValue::ByteString(hop.node_id.to_vec())),
+                (CborValue::TextString("recordNodeId".into()), CborValue::ByteString(hop.record.node_id().to_vec())),
+                (CborValue::TextString("role".into()), CborValue::TextString(hop.role.as_str().to_string())),
+                (CborValue::TextString("linkEvidence".into()), link_cbor),
+            ])
+        }).collect();
+
+        let acceptances_cbor: Vec<CborValue> = acceptances.iter().map(|acc| {
+            let conditions: Vec<CborValue> = acc.conditions.iter().map(|c| CborValue::TextString(c.clone())).collect();
+            CborValue::Map(vec![
+                (CborValue::TextString("proposalHash".into()), CborValue::ByteString(acc.proposal_hash.to_vec())),
+                (CborValue::TextString("participantNodeId".into()), CborValue::ByteString(acc.participant_node_id.to_vec())),
+                (CborValue::TextString("role".into()), CborValue::TextString(acc.role.as_str().to_string())),
+                (CborValue::TextString("conditions".into()), CborValue::Array(conditions)),
+                (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(acc.timestamp)),
+                (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(acc.expiry)),
+                (CborValue::TextString("signature".into()), CborValue::ByteString(acc.signature.to_vec())),
+            ])
+        }).collect();
+
+        let commitment_preimage = CborValue::Map(vec![
+            (CborValue::TextString("version".into()), CborValue::TextString("SNP/0.1 route-commitment v1".into())),
+            (CborValue::TextString("proposalHash".into()), CborValue::ByteString(proposal.proposal_hash().to_vec())),
+            (CborValue::TextString("hops".into()), CborValue::Array(hops_cbor)),
+            (CborValue::TextString("acceptances".into()), CborValue::Array(acceptances_cbor)),
+        ]);
+
+        let encoded = snp_cbor::encode(&commitment_preimage).unwrap_or_default();
+        sha256(&encoded)
     };
 
     Ok(CommittedRoute {
@@ -1175,4 +1287,13 @@ fn hex_short(node_id: &[u8; 32]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// String representation of `LinkState` for CBOR commitment encoding.
+fn link_state_str(state: LinkState) -> &'static str {
+    match state {
+        LinkState::Up => "up",
+        LinkState::Degraded => "degraded",
+        LinkState::Down => "down",
+    }
 }
