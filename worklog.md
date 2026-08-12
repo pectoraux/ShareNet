@@ -4199,3 +4199,65 @@ Stage Summary:
 - RouteCommitment binds the exact authoritative route contents.
 - North-star test proves the full A → B → C → G pipeline works end-to-end.
 - Ready for N2.2 (Internet gateway traffic) or N2.1.3 (route recovery).
+
+---
+Task ID: 301-306 (N2.1.2.1 — Route Correctness and Distributed-Resolution Boundary)
+Agent: Z.ai (main)
+
+Task: Fix three issues identified in the N2.1.2 review: (1) selected link endpoint not propagated to RouteHop, (2) best_route() not selecting actual lowest cost, (3) honest LOCAL vs DISTRIBUTED boundary.
+
+Work Log:
+- Fix #1: Selected link endpoint → RouteHop endpoint
+  * find_path() return type changed from Option<(Vec<[u8;32]>, Vec<Link>)> to Option<(Vec<[u8;32]>, Vec<Link>, u64)> — now returns the computed cost alongside the path and links.
+  * build_route() rewritten: iterates over path.iter().zip(links.iter()) and uses link.key.endpoint for each RouteHop — NOT record.endpoints.first().
+  * The RouteCommitment now binds the EXACT endpoint that was proven usable by Dijkstra.
+  * debug_assert! verifies path.len() == links.len().
+
+- Fix #2: best_route() selects actual lowest cost
+  * RouteCandidateState::RouteReady now stores { route, cost } where cost is the actual computed route cost from RouteCostModel::path_cost().
+  * RouteCandidate::route_cost() accessor added.
+  * best_route() rewritten: uses min_by_key on route_cost() — NOT first ready candidate.
+  * best_route_with_cost() added for callers that need the cost value.
+  * The cost is the actual path cost (hop count, RTT, etc.) — NOT distance_hint (SELF_REPORTED, untrusted).
+
+- Fix #3: Honest LOCAL vs DISTRIBUTED boundary
+  * Module-level docs rewritten with explicit "LOCAL GRAPH PATH COMPUTATION (implemented)" vs "DISTRIBUTED ROUTE DISCOVERY (NOT implemented)" sections.
+  * InMemoryResolver documented as TEST-ONLY (not a production resolver).
+  * DestinationResolver documented as a TRUST BOUNDARY, not merely a lookup interface.
+  * DistributedRouteDiscovery trait added — defines the interface for future production implementation, explicitly unimplemented.
+  * DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED constant (false) allows tests to verify the architecture is honest.
+  * north_star_multi_hop_route test renamed to local_topology_multi_hop_route_with_destination_resolution.
+  * Test docs explicitly state what it does NOT prove (no network queries, no distributed discovery).
+
+- 6 new tests (26 total in n212_route_engine.rs):
+  21. selected_link_endpoint_is_route_endpoint (node advertises 2 endpoints, link uses the second, RouteHop uses the second)
+  22. route_commitment_changes_with_selected_link_endpoint (same gateway, different selected endpoint → different commitment)
+  23. best_route_selects_lowest_computed_cost (3-hop vs 1-hop, best_route selects 1-hop)
+  24. remote_hint_does_not_create_local_link (hint doesn't add links/records to topology)
+  25. in_memory_resolver_is_test_only_route_resolution (resolver returns pre-registered records, no network)
+  26. distributed_route_discovery_is_explicitly_unimplemented (DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED == false, trait exists but no implementation)
+
+- Preserved security properties:
+  * RemoteNodeHint non-authoritativeness (hints never become RouteHops)
+  * VerifiedPeerSummaryList (propagation message authentication)
+  * AuthenticatedNodeRecord (verified identity)
+  * Directed Link model (A→B does not imply B→A)
+  * Route validation (all structural invariants)
+  * RouteCommitment (canonical CBOR hash, now binds selected endpoints)
+  * No unauthenticated RouteHop (type system enforcement)
+
+- Test results:
+  * Default: 299 passed, 0 failed, 3 ignored (was 293; +6 new)
+  * legacy-circuit-keys: 347 passed, 0 failed, 3 ignored
+  * Conformance: 138/138, 0 disagreements
+
+Stage Summary:
+- RouteHop endpoint now matches the selected Link's endpoint (not record.endpoints.first()).
+- RouteCommitment binds the exact endpoint proven usable by Dijkstra.
+- best_route() selects the minimum-computed-cost route, not the first ready candidate.
+- RouteCandidateState::RouteReady stores { route, cost } for cost-aware selection.
+- Architecture honestly distinguishes LOCAL path computation from DISTRIBUTED route discovery.
+- DistributedRouteDiscovery trait defines the future interface (explicitly unimplemented).
+- InMemoryResolver documented as TEST-ONLY.
+- DestinationResolver documented as a TRUST BOUNDARY.
+- Ready for N2.2 (Internet gateway traffic).
