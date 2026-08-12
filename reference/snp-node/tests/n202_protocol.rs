@@ -1202,7 +1202,7 @@ fn test_7c_circuit_v2_state_machine() {
     let gw_id = derive_node_id(&gw_ed_pk);
 
     let mut route = Route::new(client_id, gw_id, vec![]);
-    let mut circuit = CircuitV2::new(client_id, gw_id, route.route_id);
+    let mut circuit = CircuitV2::new(client_id, gw_id, [0u8;32], [0u8;32]);
     assert_eq!(circuit.state, CircuitState::Discovering);
     assert_ne!(circuit.circuit_id, [0u8; 32], "circuit_id must not be all-zero");
 
@@ -1227,12 +1227,12 @@ fn test_7c_circuit_v2_state_machine() {
     assert!(err.to_string().contains("illegal CircuitV2 transition"), "Closed → Active must be rejected: {err}");
 
     // Illegal: Discovering → Active (must go through Establishing).
-    let mut circuit2 = CircuitV2::new(client_id, gw_id, route.route_id);
+    let mut circuit2 = CircuitV2::new(client_id, gw_id, [0u8;32], [0u8;32]);
     let err = circuit2.transition_to(CircuitState::Active).unwrap_err();
     assert!(err.to_string().contains("illegal CircuitV2 transition"), "Discovering → Active must be rejected: {err}");
 
     // Two circuits to the same gateway MUST have different circuit_ids.
-    let circuit3 = CircuitV2::new(client_id, gw_id, route.route_id);
+    let circuit3 = CircuitV2::new(client_id, gw_id, [0u8;32], [0u8;32]);
     assert_ne!(circuit.circuit_id, circuit3.circuit_id, "two circuits must have different circuit_ids");
 }
 

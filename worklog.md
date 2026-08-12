@@ -2803,3 +2803,33 @@ Stage Summary:
 
 Remaining N2.0.4 gates:
 - Gate E: Node decomposition (mod.rs still ~4200 lines — route.rs + discovery.rs + transport.rs + async_transport.rs extracted, but mod.rs itself needs further splitting)
+
+---
+Task ID: 167 (N2.0.4 Gate E: Node decomposition)
+Agent: Z.ai (main — Gate E complete)
+
+Stage Summary:
+- mod.rs: 4675 → 3376 lines (28% reduction)
+- 8 modules extracted:
+  - identity.rs (103) — NodeIdentity, Capability
+  - gateway.rs (280) — GatewayAdvertisement
+  - circuit.rs (109) — Circuit, PeerConnection, UpstreamPeer
+  - session.rs (543) — PeerSession, GatewayDirectory, GatewaySelector, CircuitV2, CircuitState
+  - route.rs (318) — Route, RouteState, RouteMetrics, RouteError
+  - discovery.rs (314) — DiscoveryProvider, StaticDiscovery, BootstrapDiscovery
+  - transport.rs (482) — TransportProvider, TcpTransportProvider
+  - async_transport.rs (318) — AsyncTcpTransportProvider, async relay
+- All types re-exported from mod.rs for backward compatibility
+- 176 tests pass, 0 fail, 3 ignored
+- 138/138 conformance, 0 disagreements
+
+N2.0.4 ALL GATES COMPLETE:
+  A = PASSED (Real BootstrapDiscovery)
+  B = PASSED (TransportProvider + TcpTransportProvider)
+  C = PASSED (SNP-IK fresh keys + static check)
+  D = PASSED (Tokio async networking)
+  E = PASSED (Node decomposition: 8 modules)
+  F = PASSED (Security tests reviewed)
+  G = PASSED (GatewayChoice inventory)
+  H = PASSED (Android contract updated)
+  I = PASSED (Platform integration suite)

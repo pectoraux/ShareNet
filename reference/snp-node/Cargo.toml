@@ -33,6 +33,7 @@ snp-routing.workspace = true
 snp-gateway.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+getrandom = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true
