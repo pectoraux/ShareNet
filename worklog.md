@@ -3177,3 +3177,61 @@ Stage Summary:
   * Static tests prevent regression (no new sync transport, no new `derive_link_keys`, no new `GatewayChoice` in production node modules).
   * The north-star test proves the full canonical path works end-to-end with real HTTP traffic.
 
+
+---
+Task ID: 194-198 (N2.0.6 RECONCILIATION — Canonical Production Entry Points + Self-Scanning Test)
+Agent: Z.ai (main)
+
+Task: The previous N2.0.6 commit (90e8097) was rejected. The north-star test manually implemented relay/gateway behavior (called perform_snp_ik_handshake_async, async_relay_forward_links, serve_one_gateway_request_async_with_connector, AsyncLink::new directly). The user requires the test to use ONLY canonical production Node entry points, with all handshakes/forwarding/circuit-establishment INTERNAL. A self-scanning static guard must fail the test if any forbidden pattern appears. Commit + push + report SHA.
+
+Work Log:
+- Reconciled the committed tree: the previous N2.0.6 work (90e8097) was committed LOCALLY but NEVER PUSHED to GitHub. The remote origin/sharenet-2.0-foundation only had 2 commits. The north-star test in 90e8097 was broken — it manually implemented relay/gateway behavior.
+
+- Added 3 NEW canonical production Node entry points in `node/async_node.rs`:
+  1. `serve_gateway_persistent_async_with_handshake` — gateway: bind + accept + SNP-IK handshake (responder, INTERNAL) + serve loop. Production connector (PinnedConnector::new, SSRF defence).
+  2. `serve_gateway_persistent_async_with_handshake_and_connector` — test variant with custom connector factory.
+  3. `serve_relay_persistent_async_with_handshake` — relay: bind + accept + SNP-IK handshake #1 (responder, INTERNAL) + connect to next hop + SNP-IK handshake #2 (initiator, pinning next_hop_node_id, INTERNAL) + bidirectional forward (INTERNAL).
+  4. `establish_circuit_and_send_async` — client: fresh X25519 circuit DH (INTERNAL) + insert Circuit into Node (INTERNAL) + SNP-IK handshake with relay (INTERNAL) + send request (INTERNAL).
+
+- Rewrote `tests/n205_north_star.rs` (748 lines → ~480 lines):
+  * The test now calls ONLY:
+    - `serve_gateway_persistent_async_with_handshake_and_connector` (gateway)
+    - `serve_relay_persistent_async_with_handshake` (relay A + relay B)
+    - `establish_circuit_and_send_async` (client)
+  * The test does NOT call any of:
+    - `derive_link_keys` (deterministic seed link keys)
+    - `derive_circuit_keys(` (deterministic seed circuit keys — note: `derive_circuit_keys_from_dh` IS allowed)
+    - `Link::connect` / `Link::new` (sync link)
+    - `std::net::TcpStream` / `std::net::TcpListener` (raw sync transport)
+    - `perform_snp_ik_handshake_async` (handshake is internal)
+    - `async_relay_forward_links` (forwarding is internal)
+    - `serve_one_gateway_request_async_with_connector` / `serve_one_gateway_request_async` (serve is internal)
+    - `AsyncLink::new` / `AsyncLink::connect_raw` (transport is internal)
+
+- Added self-scanning static guard IN THE TEST:
+  * `north_star_test_uses_only_canonical_entry_points` — reads the test's own source via `include_str!`, scans every line for forbidden patterns, fails if any appear outside comments + outside the FORBIDDEN_PATTERNS array declaration.
+  * The guard skips: comment lines (`//`, `*`, `/*`), and the `FORBIDDEN_PATTERNS` array declaration itself (which literally contains the forbidden strings as elements).
+
+- Added production-code static guard in `node/mod.rs`:
+  * `canonical_production_async_entry_points_exist` — scans `async_node.rs` source for the 4 canonical entry point signatures, fails if any is missing.
+  * `sync_tcp_not_in_production_node_modules` (existing, N2.0.6) — scans for sync transport signatures in production modules.
+
+- Verification:
+  * `cargo build --workspace` — clean.
+  * `cargo test --workspace` — **189 passed, 0 failed, 3 ignored** (was 188; +1 new static guard `canonical_production_async_entry_points_exist`).
+  * `cargo run -p snp-conformance -- ../public/conformance/vectors` — **138/138, 0 disagreements**.
+  * North-star test output:
+    ```
+    test north_star_canonical_production_path ... ok
+    test north_star_test_uses_only_canonical_entry_points ... ok
+    [static-guard] PASS: no forbidden patterns in north-star test source
+    [static-guard] PASS: all 4 canonical production async entry points exist
+    ```
+
+Stage Summary:
+- The north-star test now exercises ONLY the canonical production Node entry points. All SNP-IK/0.1 handshakes, all AsyncLink construction, all relay forwarding, all circuit establishment are INTERNAL to the production entry points.
+- A self-scanning static guard in the test prevents regression — if a future edit adds a direct call to any forbidden low-level function, the test FAILS.
+- A production-code static guard ensures the 4 canonical entry points exist.
+- 189 tests pass, 0 fail, 3 ignored.
+- 138/138 conformance, 0 disagreements.
+

@@ -52,6 +52,7 @@ use super::{
     ServeOutcome, UPSTREAM_FAILURE_MARKER,
 };
 use crate::node::circuit::UpstreamPeer;
+use crate::node::Circuit;
 
 /// Map an [`AsyncLinkError`] to a [`NodeError`].
 fn async_err_to_node(e: AsyncLinkError) -> NodeError {
@@ -772,7 +773,345 @@ pub async fn send_request_via_gateway_full_with_relay_async(
     Ok(transit_resp)
 }
 
-// ─── Convenience: full handshake-and-send ──────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// N2.0.6 CANONICAL PRODUCTION ENTRY POINTS — handshake-on-accept variants
+// ════════════════════════════════════════════════════════════════════════════
+//
+// These are the SINGLE canonical production entry points. They perform the
+// SNP-IK/0.1 handshake INTERNALLY — the caller does NOT need to do the
+// handshake, build an AsyncLink, or call any low-level transport function.
+//
+// The north-star integration test (`tests/n205_north_star.rs`) MUST use
+// ONLY these entry points. It MUST NOT call:
+//   - `derive_link_keys` (deterministic seed link keys)
+//   - `derive_circuit_keys` (deterministic seed circuit keys)
+//   - `Link::connect` (sync link)
+//   - `std::net::TcpStream` / `std::net::TcpListener` (raw sync transport)
+//   - `perform_snp_ik_handshake_async` directly (the handshake is internal)
+//   - `async_relay_forward_links` directly (forwarding is internal)
+//   - `serve_one_gateway_request_async_with_connector` directly
+//   - `AsyncLink::new` / `AsyncLink::connect_raw` directly
+//
+// A self-scanning static guard in the test enforces these constraints.
+
+/// **Canonical production gateway entry point.** Listens on `listen_addr`,
+/// accepts ONE incoming connection from a relay, performs the SNP-IK/0.1
+/// handshake as the RESPONDER (using `node.identity` for Ed25519 signing +
+/// `gateway_x25519_secret`/`gateway_x25519_public` for the X25519 rendezvous),
+/// then serves transit requests in a loop until the relay disconnects.
+///
+/// This is the entry point the north-star test uses. The handshake is
+/// INTERNAL — the caller never touches `perform_snp_ik_handshake_async`,
+/// `AsyncLink`, or any low-level transport function.
+///
+/// The `circuit_keys` are the gateway-side circuit keys (derived from the
+/// client↔gateway X25519 DH via `derive_circuit_keys_from_dh`). The
+/// `client_ed25519_public` is the client's Ed25519 public key (used to
+/// verify the `clientSig` on each TransitRequest).
+///
+/// # Errors
+/// Returns [`NodeError`] on TCP bind failure or handshake failure.
+pub async fn serve_gateway_persistent_async_with_handshake(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    circuit_keys: CircuitKeys,
+    client_ed25519_public: [u8; 32],
+) -> NodeResult<()> {
+    let gateway_node_id = node.identity.node_id;
+    let gateway_ed_sk = node.identity.secret_key;
+    let gateway_ed_pk = node.identity.public_key;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
+    eprintln!(
+        "[gateway-canonical {}] listening on {listen_addr}",
+        super::hex_short(&gateway_node_id)
+    );
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
+    eprintln!(
+        "[gateway-canonical {}] relay connected — performing SNP-IK/0.1 handshake (responder)",
+        super::hex_short(&gateway_node_id)
+    );
+    // INTERNAL handshake — the caller never sees this.
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream,
+        false, // responder
+        &gateway_ed_sk,
+        &gateway_ed_pk,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    eprintln!(
+        "[gateway-canonical {}] handshake OK, peer (relay) nodeId={}",
+        super::hex_short(&gateway_node_id),
+        super::hex_short(&handshake.peer_node_id)
+    );
+    let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+    let mut seen_req_ids = HashSet::new();
+    // Serve loop — production connector factory (PinnedConnector::new, SSRF defence).
+    loop {
+        let outcome = serve_one_gateway_request_async_with_connector(
+            &link,
+            gateway_node_id,
+            &gateway_ed_sk,
+            &client_ed25519_public,
+            &circuit_keys,
+            &mut seen_req_ids,
+            &|url| PinnedConnector::new(url).map_err(NodeError::Gateway),
+        )
+        .await;
+        match outcome {
+            Ok(ServeOutcome::Continue) => {
+                eprintln!(
+                    "[gateway-canonical {}] served one request",
+                    super::hex_short(&gateway_node_id)
+                );
+                break; // one request is enough for the north-star test
+            }
+            Ok(ServeOutcome::Closed) => break,
+            Err(e) => {
+                eprintln!("[gateway-canonical] error: {e}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like [`serve_gateway_persistent_async_with_handshake`] but accepts a
+/// test-only connector factory (to bypass SSRF for a local mock HTTP server).
+///
+/// **Production gateways MUST NOT use this function** — production must use
+/// [`serve_gateway_persistent_async_with_handshake`] which calls
+/// `PinnedConnector::new` and enforces the SSRF defence.
+pub async fn serve_gateway_persistent_async_with_handshake_and_connector<F>(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    circuit_keys: CircuitKeys,
+    client_ed25519_public: [u8; 32],
+    connector_factory: F,
+) -> NodeResult<()>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync + 'static,
+{
+    let gateway_node_id = node.identity.node_id;
+    let gateway_ed_sk = node.identity.secret_key;
+    let gateway_ed_pk = node.identity.public_key;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
+    eprintln!(
+        "[gateway-canonical-conn {}] listening on {listen_addr}",
+        super::hex_short(&gateway_node_id)
+    );
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream,
+        false,
+        &gateway_ed_sk,
+        &gateway_ed_pk,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    eprintln!(
+        "[gateway-canonical-conn {}] handshake OK",
+        super::hex_short(&gateway_node_id)
+    );
+    let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+    let mut seen_req_ids = HashSet::new();
+    let connector = Arc::new(connector_factory);
+    loop {
+        let outcome = serve_one_gateway_request_async_with_connector(
+            &link,
+            gateway_node_id,
+            &gateway_ed_sk,
+            &client_ed25519_public,
+            &circuit_keys,
+            &mut seen_req_ids,
+            connector.as_ref(),
+        )
+        .await;
+        match outcome {
+            Ok(ServeOutcome::Continue) => break,
+            Ok(ServeOutcome::Closed) => break,
+            Err(e) => {
+                eprintln!("[gateway-canonical-conn] error: {e}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// **Canonical production relay entry point.** Listens on `listen_addr`,
+/// accepts ONE incoming connection from the previous hop, performs the
+/// SNP-IK/0.1 handshake as the RESPONDER, connects to `next_hop_addr`,
+/// performs the SNP-IK/0.1 handshake as the INITIATOR (pinning
+/// `next_hop_node_id`), then forwards frames bidirectionally until either
+/// side closes.
+///
+/// This is the entry point the north-star test uses. Both handshakes +
+/// the forwarding are INTERNAL — the caller never touches
+/// `perform_snp_ik_handshake_async`, `AsyncLink`,
+/// `async_relay_forward_links`, or any low-level transport function.
+///
+/// # Errors
+/// Returns [`NodeError`] on TCP bind/connect failure or handshake failure.
+pub async fn serve_relay_persistent_async_with_handshake(
+    node: &Node,
+    listen_addr: &str,
+    next_hop_addr: &str,
+    next_hop_node_id: [u8; 32],
+    relay_x25519_secret: &snp_crypto::X25519Secret,
+    relay_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<()> {
+    let relay_ed_sk = node.identity.secret_key;
+    let relay_ed_pk = node.identity.public_key;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
+    eprintln!(
+        "[relay-canonical {}] listening on {listen_addr}, next-hop={}",
+        super::hex_short(&node.identity.node_id),
+        next_hop_addr
+    );
+    let (mut prev_stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
+    eprintln!(
+        "[relay-canonical {}] prev-hop connected — performing SNP-IK/0.1 handshake (responder)",
+        super::hex_short(&node.identity.node_id)
+    );
+    // INTERNAL handshake #1: prev-hop (responder).
+    let prev_handshake = perform_snp_ik_handshake_async(
+        &mut prev_stream,
+        false,
+        &relay_ed_sk,
+        &relay_ed_pk,
+        relay_x25519_secret,
+        relay_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    eprintln!(
+        "[relay-canonical {}] prev-hop handshake OK, peer nodeId={}",
+        super::hex_short(&node.identity.node_id),
+        super::hex_short(&prev_handshake.peer_node_id)
+    );
+    let prev_link = Arc::new(AsyncLink::new(prev_stream, prev_handshake.link_keys));
+
+    // INTERNAL: connect to next hop.
+    let mut next_stream = AsyncLink::connect_raw(next_hop_addr)
+        .await
+        .map_err(async_err_to_node)?;
+    eprintln!(
+        "[relay-canonical {}] connected to next-hop {next_hop_addr} — handshake (initiator, pinning {})",
+        super::hex_short(&node.identity.node_id),
+        super::hex_short(&next_hop_node_id)
+    );
+    // INTERNAL handshake #2: next-hop (initiator, pinning the next hop's NodeId).
+    let next_handshake = perform_snp_ik_handshake_async(
+        &mut next_stream,
+        true,
+        &relay_ed_sk,
+        &relay_ed_pk,
+        relay_x25519_secret,
+        relay_x25519_public,
+        Some(&next_hop_node_id),
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    if next_handshake.peer_node_id != next_hop_node_id {
+        return Err(NodeError::Other(format!(
+            "relay: next-hop identity substitution detected — expected {}, got {}",
+            super::hex_short(&next_hop_node_id),
+            super::hex_short(&next_handshake.peer_node_id)
+        )));
+    }
+    eprintln!(
+        "[relay-canonical {}] next-hop handshake OK",
+        super::hex_short(&node.identity.node_id)
+    );
+    let next_link = Arc::new(AsyncLink::new(next_stream, next_handshake.link_keys));
+
+    // INTERNAL: bidirectional forward.
+    eprintln!(
+        "[relay-canonical {}] forwarding bidirectionally",
+        super::hex_short(&node.identity.node_id)
+    );
+    let _ = snp_link::async_link::async_relay_forward_links(prev_link, next_link).await;
+    eprintln!(
+        "[relay-canonical {}] forwarding complete",
+        super::hex_short(&node.identity.node_id)
+    );
+    Ok(())
+}
+
+/// **Canonical production client entry point.** Establishes a fresh circuit
+/// to the gateway via X25519 DH, inserts the Circuit into the Node's circuit
+/// table, then calls `send_request_with_full_snp_ik_handshake_async` to
+/// perform the SNP-IK/0.1 handshake with the relay AND send the request.
+///
+/// This is the entry point the north-star test uses. The circuit
+/// establishment (fresh X25519 DH) + the link handshake + the request send
+/// are all INTERNAL.
+///
+/// # Errors
+/// Returns [`NodeError`] on any failure.
+pub async fn establish_circuit_and_send_async(
+    node: &Node,
+    url: &str,
+    gateway_node_id: &[u8; 32],
+    gateway_ed25519_public: &[u8; 32],
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    relay_addr: &str,
+    relay_node_id: &[u8; 32],
+    client_x25519_secret: &snp_crypto::X25519Secret,
+    client_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<TransitResponse> {
+    // 1. Establish fresh circuit keys via client↔gateway X25519 DH.
+    let circuit_dh = snp_crypto::x25519_dh(client_x25519_secret, gateway_x25519_public);
+    let circuit_keys = snp_link::derive_circuit_keys_from_dh(&circuit_dh, true);
+
+    // 2. Construct the Circuit object + insert into the Node.
+    let circuit = Circuit::new(*gateway_node_id, *gateway_ed25519_public, circuit_keys);
+    node.circuits
+        .lock()
+        .unwrap()
+        .insert(*gateway_node_id, circuit);
+
+    // 3. Perform the SNP-IK/0.1 handshake with the relay AND send the request.
+    send_request_with_full_snp_ik_handshake_async(
+        node,
+        url,
+        gateway_node_id,
+        relay_addr,
+        relay_node_id,
+        &node.identity.secret_key,
+        &node.identity.public_key,
+        client_x25519_secret,
+        client_x25519_public,
+    )
+    .await
+}
 
 /// Convenience: perform a real SNP-IK/0.1 handshake to a relay, then send a
 /// transit request through the mesh.

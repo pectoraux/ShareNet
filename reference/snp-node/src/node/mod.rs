@@ -2250,6 +2250,35 @@ mod tests {
         }
     }
 
+    /// N2.0.6: The canonical production async entry points MUST exist in
+    /// `node/async_node.rs`. These are the SINGLE production path — the
+    /// north-star test uses ONLY these entry points. If a future refactor
+    /// removes or renames them, this test will fail.
+    ///
+    /// The canonical entry points are:
+    /// - `serve_gateway_persistent_async_with_handshake` (gateway: handshake + serve)
+    /// - `serve_gateway_persistent_async_with_handshake_and_connector` (test variant)
+    /// - `serve_relay_persistent_async_with_handshake` (relay: handshake + forward)
+    /// - `establish_circuit_and_send_async` (client: circuit DH + handshake + send)
+    #[test]
+    fn canonical_production_async_entry_points_exist() {
+        let source = include_str!("async_node.rs");
+        let required: &[&str] = &[
+            "pub async fn serve_gateway_persistent_async_with_handshake(",
+            "pub async fn serve_gateway_persistent_async_with_handshake_and_connector",
+            "pub async fn serve_relay_persistent_async_with_handshake(",
+            "pub async fn establish_circuit_and_send_async(",
+        ];
+        for sig in required {
+            assert!(
+                source.contains(sig),
+                "canonical production entry point `{sig}` not found in node/async_node.rs. \
+                 This entry point is REQUIRED — the north-star test depends on it."
+            );
+        }
+        eprintln!("[static-guard] PASS: all 4 canonical production async entry points exist");
+    }
+
     #[test]
     fn gateway_advertisement_signs_and_verifies() {
         let advert = crate::legacy::legacy_advert_for_gateway(
