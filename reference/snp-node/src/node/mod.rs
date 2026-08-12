@@ -150,7 +150,9 @@ pub use topology::{
 };
 pub use route_discovery::{
     CandidateDestination, RouteProposal, RouteAcceptance, CommittedRoute, CommitError,
-    DiscoveredPath, commit_route, discover_path, ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS,
+    DiscoveredPath, ValidatedPath, AuthenticatedHop, PathError, RouteRole, ServiceAgreement,
+    commit_route, discover_path, validate_path,
+    ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS, ROUTE_MAX_LIFETIME_SECS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

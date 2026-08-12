@@ -13,44 +13,57 @@
 //!         ↓
 //! Target Authentication (verify signature + NodeId binding)
 //!         ↓
-//! Next-Hop Discovery (from ExecutableNetworkSnapshot ONLY)
+//! ExecutableNetworkSnapshot
 //!         ↓
-//! Path Validation (every hop authenticated + usable link)
+//! BFS bounded path discovery (discover_path)
 //!         ↓
-//! Capability/Service Negotiation
+//! DiscoveredPath (a possible sequence — NOT yet validated)
 //!         ↓
-//! RouteProposal  (source's belief — NOT participant consent)
+//! validate_path() (every hop authenticated + every edge a usable link)
 //!         ↓
-//! RouteAcceptance (per-participant signed acceptance)
+//! ValidatedPath (authenticated, currently executable)
+//!         ↓
+//! RouteProposal::from_validated_path(...) (source's belief — NOT consent)
+//!         ↓
+//! RouteAcceptance (per-participant signed consent, typed role)
 //!         ↓
 //! CommittedRoute (finalized — ALL required participants accepted)
 //! ```
 //!
-//! ## The two critical architectural invariants (frozen spec §27, §54 #10, #11)
+//! ## The critical architectural invariants
 //!
 //! 1. **`Authenticated topology ≠ Executable route`.**
-//!    An `ExecutableNetworkSnapshot` provides authenticated local network
-//!    facts. It does NOT authorize the route engine to invent a path merely by
-//!    seeing a sequence of nodes. Every hop must be backed by an authenticated,
-//!    currently-usable link.
+//!    `discover_path()` uses ONLY `ExecutableNetworkSnapshot`. A
+//!    `RemoteNodeHint` cannot enter routing. Furthermore, a `DiscoveredPath`
+//!    is just a sequence of NodeIds — it is NOT a route. It must be
+//!    `validate_path()`-d against the snapshot to produce a `ValidatedPath`,
+//!    which carries the authenticated node + usable-link evidence for every
+//!    hop. `RouteProposal` consumes a `ValidatedPath`, not a free-form
+//!    `Vec<NodeId>`.
 //!
 //! 2. **`RouteProposal ≠ CommittedRoute`.**
-//!    A source signing "A → B → C → G" does NOT mean B, C, and G have agreed
-//!    to participate. A `RouteProposal` is the source's belief. A
-//!    `CommittedRoute` can only be constructed after every required
-//!    participant has produced a signed `RouteAcceptance`.
+//!    A source signing a hop list does NOT mean the relays agreed. A
+//!    `CommittedRoute` can only be constructed by `commit_route()` after
+//!    every required participant has produced a typed `RouteAcceptance`.
 //!
-//! ## What is NOT implemented (N2.1.3+)
+//! 3. **Source is the first hop.** A `RouteProposal` where
+//!    `hop_node_ids.first() != source` is rejected.
 //!
-//! - Circuit establishment (session keys, forwarding state) — spec §38.
-//! - Route failure / recovery — spec §39, N2.1.3.
-//! - Route migration — spec §39.
+//! 4. **Typed roles.** `RouteRole::Relay` / `RouteRole::Gateway`. The
+//!    destination must accept Gateway; intermediate hops must accept Relay.
 //!
-//! These are explicitly deferred. N2.1.2 ends at `CommittedRoute`.
+//! 5. **Bounded BFS.** `discover_path()` enforces `ROUTE_MAX_HOPS` during
+//!    search, not just at commitment.
+//!
+//! 6. **Freshness.** Proposals and acceptances follow the same
+//!    timestamp/expiry invariants as `NodeAdvertisement`
+//!    (`timestamp <= now + MAX_CLOCK_SKEW_SECS`, `expiry > now`,
+//!    `expiry > timestamp`, bounded lifetime).
 
 use super::*;
+use crate::node::node_advert::{AuthenticatedNodeRecord, MAX_CLOCK_SKEW_SECS};
 use crate::node::topology::{ExecutableNetworkSnapshot, RemoteNodeHint};
-use crate::node::node_advert::AuthenticatedNodeRecord;
+use crate::node::link::Link;
 use snp_cbor::CborValue;
 use snp_crypto::{ed25519_sign, ed25519_verify, derive_node_id, sha256};
 
@@ -60,39 +73,97 @@ pub const ROUTE_MSG_CONTEXT: &[u8] = b"SNP/0.1 route-msg\0";
 /// Maximum number of hops in a route (spec §28: bounded).
 pub const ROUTE_MAX_HOPS: usize = 16;
 
+/// Maximum lifetime of a route proposal or acceptance (seconds).
+/// Shorter than advertisement lifetime (24h) — routes are more dynamic.
+pub const ROUTE_MAX_LIFETIME_SECS: u64 = 3600; // 1 hour
+
+// ─── RouteRole (typed, P1 #3) ───────────────────────────────────────────────
+
+/// A participant's role in a route.
+///
+/// Replaces the free-form `role: String` from the initial N2.1.2
+/// implementation. The destination (gateway) MUST accept `Gateway`; every
+/// intermediate hop MUST accept `Relay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteRole {
+    /// An intermediate forwarding hop.
+    Relay,
+    /// The terminal hop providing the service (e.g. Internet gateway).
+    Gateway,
+}
+
+impl RouteRole {
+    /// CBOR string representation.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    /// Parse from a CBOR string.
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "relay" => Some(Self::Relay),
+            "gateway" => Some(Self::Gateway),
+            _ => None,
+        }
+    }
+}
+
+// ─── ServiceAgreement (typed, P1 #4) ────────────────────────────────────────
+
+/// A minimally-typed service agreement.
+///
+/// Replaces the free-form `service: String` from the initial N2.1.2
+/// implementation. The agreement captures the negotiated service type and
+/// optional requirements. Full capability negotiation (matching client
+/// requirements against gateway offers per spec §31) is explicitly deferred
+/// — but the type system now ensures the proposal commits to a TYPED
+/// agreement, not an arbitrary string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceAgreement {
+    /// The service type (e.g. "internet-transit", "content-retrieval").
+    pub service_type: String,
+    /// Optional requirements (e.g. "max-latency:500ms", "min-bandwidth:1Mbps").
+    pub requirements: Vec<String>,
+}
+
+impl ServiceAgreement {
+    /// Create a new service agreement.
+    #[must_use]
+    pub fn new(service_type: String, requirements: Vec<String>) -> Self {
+        Self { service_type, requirements }
+    }
+
+    /// CBOR representation.
+    fn to_cbor(&self) -> CborValue {
+        let reqs: Vec<CborValue> = self
+            .requirements
+            .iter()
+            .map(|r| CborValue::TextString(r.clone()))
+            .collect();
+        CborValue::Map(vec![
+            (CborValue::TextString("serviceType".into()), CborValue::TextString(self.service_type.clone())),
+            (CborValue::TextString("requirements".into()), CborValue::Array(reqs)),
+        ])
+    }
+}
+
 // ─── Candidate Destination (spec §23) ─────────────────────────────────────
 
 /// A candidate destination derived from a `RemoteNodeHint`.
 ///
-/// This is the entry point to the route pipeline. A hint suggests a target
-/// MIGHT exist and MIGHT have a capability (e.g. INTERNET_GATEWAY). The
-/// candidate is worth investigating — but it is NOT authenticated yet.
-///
-/// ## CRITICAL: NOT an authenticated destination
-///
-/// A `CandidateDestination` cannot be used as a route destination until
-/// `resolve_candidate()` fetches the target's actual advertisement and
-/// verifies it. This is the same trust-boundary pattern as
-/// `PeerSummaryList → VerifiedPeerSummaryList` in N2.1.1.1.
+/// NOT authenticated — a "maybe, worth investigating" marker.
 #[derive(Debug, Clone)]
 pub struct CandidateDestination {
-    /// The NodeId the hint claims exists.
     pub target_node_id: [u8; 32],
-    /// The capabilities the hint claims the target has.
     pub claimed_capabilities: Vec<String>,
-    /// The hint that produced this candidate (for provenance).
-    pub source_hint: [u8; 32], // learned_from NodeId
-    /// Distance hint (discovery metadata, NOT a route).
+    pub source_hint: [u8; 32],
     pub distance_hint: u8,
 }
 
 impl CandidateDestination {
-    /// Derive a candidate from a `RemoteNodeHint`.
-    ///
-    /// The hint is NOT authenticated — the candidate is a "maybe, worth
-    /// investigating" marker. The caller must resolve the candidate (fetch +
-    /// verify the target's advertisement) before using it as a route
-    /// destination.
     #[must_use]
     pub fn from_hint(hint: &RemoteNodeHint) -> Self {
         Self {
@@ -103,11 +174,239 @@ impl CandidateDestination {
         }
     }
 
-    /// Check if the candidate claims the target is a gateway.
     #[must_use]
     pub fn claims_gateway(&self) -> bool {
         self.claimed_capabilities.iter().any(|c| c == "gateway")
     }
+}
+
+// ─── DiscoveredPath (BFS result, NOT yet validated) ────────────────────────
+
+/// A path discovered by BFS over `ExecutableNetworkSnapshot`.
+///
+/// This is a SEQUENCE of NodeIds — it is NOT yet validated. The caller must
+/// call `validate_path()` to produce a `ValidatedPath` (which carries the
+/// authenticated node + usable-link evidence) before constructing a
+/// `RouteProposal`.
+#[derive(Debug, Clone)]
+pub struct DiscoveredPath {
+    /// Ordered NodeIds from source to destination.
+    pub hops: Vec<[u8; 32]>,
+}
+
+impl DiscoveredPath {
+    #[must_use]
+    pub fn hop_count(&self) -> usize {
+        self.hops.len()
+    }
+}
+
+/// Discover a candidate path using BFS over `ExecutableNetworkSnapshot`.
+///
+/// ## Bounded BFS (P1 #5)
+///
+/// The search depth is bounded by `ROUTE_MAX_HOPS`. Paths longer than
+/// `ROUTE_MAX_HOPS` hops are not discovered (the BFS prunes them during
+/// search, not after).
+///
+/// ## Algorithm choice
+///
+/// BFS (not Dijkstra/A*) — per spec §62: "prioritize correctness,
+/// authentication, bounded state, failure handling over theoretical
+/// optimality." Do NOT replace with Dijkstra.
+#[must_use]
+pub fn discover_path(
+    snapshot: &ExecutableNetworkSnapshot,
+    source: &[u8; 32],
+    destination: &[u8; 32],
+) -> Option<DiscoveredPath> {
+    use std::collections::{HashMap, VecDeque};
+    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut parent: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut depth: HashMap<[u8; 32], usize> = HashMap::new();
+    let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
+    visited.insert(*source);
+    depth.insert(*source, 0);
+    queue.push_back(*source);
+
+    while let Some(current) = queue.pop_front() {
+        if current == *destination {
+            // Reconstruct path.
+            let mut path = vec![*destination];
+            let mut node = *destination;
+            while node != *source {
+                node = *parent.get(&node)?;
+                path.push(node);
+            }
+            path.reverse();
+            return Some(DiscoveredPath { hops: path });
+        }
+        let current_depth = *depth.get(&current).unwrap_or(&0);
+        // P1 #5: bound BFS by ROUTE_MAX_HOPS. If we're already at max depth,
+        // don't expand further.
+        if current_depth >= ROUTE_MAX_HOPS {
+            continue;
+        }
+        // Explore neighbors via usable links.
+        for link in snapshot.usable_links.values() {
+            if link.key.local_node_id == current && !visited.contains(&link.key.remote_node_id) {
+                visited.insert(link.key.remote_node_id);
+                parent.insert(link.key.remote_node_id, current);
+                depth.insert(link.key.remote_node_id, current_depth + 1);
+                queue.push_back(link.key.remote_node_id);
+            }
+        }
+    }
+    None
+}
+
+// ─── ValidatedPath (P0 #1 — authenticated evidence per hop) ────────────────
+
+/// A hop in a `ValidatedPath` — carries the authenticated node record AND
+/// the usable directed link that connects it to the previous hop.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedHop {
+    /// The hop's NodeId.
+    pub node_id: [u8; 32],
+    /// The authenticated node record (verified advertisement).
+    pub record: AuthenticatedNodeRecord,
+    /// The usable directed link from the previous hop to this hop.
+    /// `None` for the source (first hop — no incoming link).
+    pub incoming_link: Option<Link>,
+}
+
+/// A validated path — every hop is authenticated AND every edge is a usable
+/// directed link in the `ExecutableNetworkSnapshot`.
+///
+/// ## Construction
+///
+/// `ValidatedPath` can ONLY be constructed by `validate_path()`, which
+/// checks every hop against `snapshot.authenticated_nodes` and every edge
+/// against `snapshot.usable_links`. The `hops` field is private; callers
+/// access it via `hops()`.
+///
+/// This is the **only** input that `RouteProposal::from_validated_path()`
+/// accepts. A free-form `Vec<NodeId>` is NO LONGER sufficient to construct a
+/// `RouteProposal` — the proposal must be backed by validated executable
+/// topology evidence.
+#[derive(Debug, Clone)]
+pub struct ValidatedPath {
+    hops: Vec<AuthenticatedHop>,
+}
+
+/// Error from `validate_path()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathError {
+    /// The discovered path is empty.
+    Empty,
+    /// A hop in the path is not in `authenticated_nodes`.
+    HopNotAuthenticated { index: usize, node_id: [u8; 32] },
+    /// No usable link exists between two consecutive hops.
+    NoUsableLink { from: [u8; 32], to: [u8; 32] },
+    /// The path exceeds `ROUTE_MAX_HOPS`.
+    ExcessiveHops { count: usize },
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "discovered path is empty"),
+            Self::HopNotAuthenticated { index, node_id } => write!(f, "hop {index} ({}) is not authenticated", hex_short(node_id)),
+            Self::NoUsableLink { from, to } => write!(f, "no usable link from {} to {}", hex_short(from), hex_short(to)),
+            Self::ExcessiveHops { count } => write!(f, "path has too many hops: {count} > {ROUTE_MAX_HOPS}"),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
+
+impl ValidatedPath {
+    /// The ordered authenticated hops.
+    #[must_use]
+    pub fn hops(&self) -> &[AuthenticatedHop] {
+        &self.hops
+    }
+
+    /// The ordered NodeIds (derived from hops).
+    #[must_use]
+    pub fn node_ids(&self) -> Vec<[u8; 32]> {
+        self.hops.iter().map(|h| h.node_id).collect()
+    }
+
+    /// The source NodeId (first hop).
+    #[must_use]
+    pub fn source(&self) -> [u8; 32] {
+        self.hops[0].node_id
+    }
+
+    /// The destination NodeId (last hop).
+    #[must_use]
+    pub fn destination(&self) -> [u8; 32] {
+        self.hops[self.hops.len() - 1].node_id
+    }
+
+    /// The required participants (every hop except the source).
+    #[must_use]
+    pub fn required_participants(&self) -> Vec<[u8; 32]> {
+        self.hops
+            .iter()
+            .skip(1) // skip source
+            .map(|h| h.node_id)
+            .collect()
+    }
+}
+
+/// Validate a `DiscoveredPath` against an `ExecutableNetworkSnapshot`.
+///
+/// Checks:
+/// - Path is non-empty and ≤ `ROUTE_MAX_HOPS`.
+/// - Every hop is in `snapshot.authenticated_nodes`.
+/// - Every consecutive pair has a usable directed link in
+///   `snapshot.usable_links`.
+///
+/// # Errors
+/// Returns `PathError` if any check fails.
+pub fn validate_path(
+    snapshot: &ExecutableNetworkSnapshot,
+    discovered: &DiscoveredPath,
+) -> Result<ValidatedPath, PathError> {
+    if discovered.hops.is_empty() {
+        return Err(PathError::Empty);
+    }
+    if discovered.hops.len() > ROUTE_MAX_HOPS {
+        return Err(PathError::ExcessiveHops { count: discovered.hops.len() });
+    }
+
+    let mut hops = Vec::with_capacity(discovered.hops.len());
+    for (i, &node_id) in discovered.hops.iter().enumerate() {
+        let record = snapshot
+            .authenticated_nodes
+            .get(&node_id)
+            .cloned()
+            .ok_or(PathError::HopNotAuthenticated { index: i, node_id })?;
+
+        let incoming_link: Option<Link> = if i == 0 {
+            None // source has no incoming link
+        } else {
+            let prev = discovered.hops[i - 1];
+            Some(
+                snapshot
+                    .usable_links
+                    .values()
+                    .find(|l| l.key.local_node_id == prev && l.key.remote_node_id == node_id && l.is_usable())
+                    .cloned()
+                    .ok_or(PathError::NoUsableLink { from: prev, to: node_id })?,
+            )
+        };
+
+        hops.push(AuthenticatedHop {
+            node_id,
+            record,
+            incoming_link,
+        });
+    }
+
+    Ok(ValidatedPath { hops })
 }
 
 // ─── RouteProposal (spec §27) ─────────────────────────────────────────────
@@ -116,71 +415,53 @@ impl CandidateDestination {
 ///
 /// ## CRITICAL: NOT a committed route
 ///
-/// A `RouteProposal` is signed by the SOURCE only. It does NOT prove that
-/// any relay or gateway has agreed to participate. The source signs:
+/// Signed by the SOURCE only. Does NOT prove relays agreed. To become a
+/// `CommittedRoute`, every required participant must produce a typed
+/// `RouteAcceptance`.
 ///
-/// - The ordered hop list (NodeIds + verified descriptors)
-/// - The destination
-/// - The negotiated service
-/// - An expiry
+/// ## Construction (P0 #1)
 ///
-/// But the RELAYS and GATEWAY have NOT signed anything yet. To turn a
-/// `RouteProposal` into a `CommittedRoute`, every required participant must
-/// produce a signed `RouteAcceptance`.
-///
-/// ## Construction
-///
-/// `RouteProposal` can be constructed by anyone who has the source's
-/// secret key. But `CommittedRoute` can ONLY be constructed by
-/// `commit_route(proposal, acceptances)` — and only if every required
-/// participant's acceptance is present and valid.
+/// The ONLY constructor is `RouteProposal::from_validated_path()`, which
+/// consumes a `ValidatedPath` (backed by `ExecutableNetworkSnapshot`
+/// evidence). A free-form `Vec<NodeId>` is NO LONGER accepted.
 #[derive(Debug, Clone)]
 pub struct RouteProposal {
-    /// Protocol version.
     pub protocol_version: u8,
-    /// The source NodeId (who proposed this route).
     pub source: [u8; 32],
-    /// The destination NodeId (the gateway, typically).
     pub destination: [u8; 32],
-    /// Ordered hop NodeIds (source → relay1 → ... → destination).
-    /// Each hop MUST be backed by a verified descriptor in `hop_descriptors`.
     pub hop_node_ids: Vec<[u8; 32]>,
-    /// The negotiated service (e.g. "internet-transit", "content-retrieval").
-    pub service: String,
-    /// When the proposal was created (unix seconds).
+    /// The negotiated service agreement (typed, not a free-form string).
+    pub service: ServiceAgreement,
     pub timestamp: u64,
-    /// When the proposal expires (unix seconds).
     pub expiry: u64,
-    /// A nonce for freshness.
     pub nonce: [u8; 16],
-    /// The source's Ed25519 signature over the above fields.
     pub source_signature: [u8; 64],
-    /// The source's Ed25519 public key (for signature verification).
     pub source_public_key: [u8; 32],
 }
 
 impl RouteProposal {
-    /// Create and sign a `RouteProposal`.
+    /// Create and sign a `RouteProposal` from a `ValidatedPath`.
     ///
-    /// The caller provides the source's secret key, the hop list (which MUST
-    /// be backed by verified descriptors — validated separately), and the
-    /// negotiated service.
+    /// This is the ONLY constructor. The path must be validated against an
+    /// `ExecutableNetworkSnapshot` first — the caller cannot pass an
+    /// arbitrary `Vec<NodeId>`.
     #[must_use]
-    pub fn create_and_sign(
+    pub fn from_validated_path(
+        path: &ValidatedPath,
         source_secret_key: &[u8; 32],
         source_public_key: &[u8; 32],
-        source_node_id: [u8; 32],
-        destination: [u8; 32],
-        hop_node_ids: Vec<[u8; 32]>,
-        service: String,
+        service: ServiceAgreement,
         expiry: u64,
     ) -> Self {
         let now = now_unix();
         let mut nonce = [0u8; 16];
         let _ = getrandom::getrandom(&mut nonce);
+        let source = path.source();
+        let destination = path.destination();
+        let hop_node_ids = path.node_ids();
         let mut proposal = Self {
             protocol_version: 1,
-            source: source_node_id,
+            source,
             destination,
             hop_node_ids,
             service,
@@ -194,7 +475,6 @@ impl RouteProposal {
         proposal
     }
 
-    /// Canonical CBOR preimage for signing/verification.
     fn preimage(&self) -> CborValue {
         let hops: Vec<CborValue> = self
             .hop_node_ids
@@ -206,7 +486,7 @@ impl RouteProposal {
             (CborValue::TextString("source".into()), CborValue::ByteString(self.source.to_vec())),
             (CborValue::TextString("destination".into()), CborValue::ByteString(self.destination.to_vec())),
             (CborValue::TextString("hops".into()), CborValue::Array(hops)),
-            (CborValue::TextString("service".into()), CborValue::TextString(self.service.clone())),
+            (CborValue::TextString("service".into()), self.service.to_cbor()),
             (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
             (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
             (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
@@ -227,14 +507,48 @@ impl RouteProposal {
         sha256(&self.preimage_bytes())
     }
 
-    /// Verify the source's signature and NodeId↔pubkey binding.
+    /// Verify the source's signature, NodeId↔pubkey binding, AND freshness
+    /// invariants (P1 #7).
+    ///
+    /// Checks:
+    /// - `source == derive_node_id(source_public_key)` (I4)
+    /// - Ed25519 signature valid
+    /// - `source == hop_node_ids.first()` (P0 #2 — source is first hop)
+    /// - `timestamp <= now + MAX_CLOCK_SKEW_SECS` (not future-dated)
+    /// - `expiry > now` (not expired)
+    /// - `expiry > timestamp` (sane)
+    /// - `expiry - timestamp <= ROUTE_MAX_LIFETIME_SECS` (bounded lifetime)
     #[must_use]
     pub fn verify(&self) -> bool {
-        // Verify NodeId ↔ Ed25519 consistency (I4).
+        self.verify_at(now_unix())
+    }
+
+    /// Verify at a specific time (for testing).
+    #[must_use]
+    pub fn verify_at(&self, now: u64) -> bool {
+        // I4: NodeId ↔ pubkey binding.
         let expected = derive_node_id(&self.source_public_key);
         if self.source != expected {
             return false;
         }
+        // P0 #2: source must be the first hop.
+        if self.hop_node_ids.first() != Some(&self.source) {
+            return false;
+        }
+        // P1 #7: freshness.
+        if self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            return false;
+        }
+        if self.expiry <= now {
+            return false;
+        }
+        if self.expiry <= self.timestamp {
+            return false;
+        }
+        if self.expiry.saturating_sub(self.timestamp) > ROUTE_MAX_LIFETIME_SECS {
+            return false;
+        }
+        // Signature.
         ed25519_verify(
             &self.source_public_key,
             &self.preimage_bytes(),
@@ -242,11 +556,7 @@ impl RouteProposal {
         )
     }
 
-    /// Get the list of participant NodeIds that MUST accept this proposal.
-    ///
-    /// Per spec §27: every hop EXCEPT the source must accept. The source
-    /// is the proposer; the destination (gateway) and all relays must sign
-    /// a `RouteAcceptance` before the route can be committed.
+    /// The required participants (every hop except the source).
     #[must_use]
     pub fn required_participants(&self) -> Vec<[u8; 32]> {
         self.hop_node_ids
@@ -257,53 +567,31 @@ impl RouteProposal {
     }
 }
 
-// ─── RouteAcceptance (spec §27) ────────────────────────────────────────────
+// ─── RouteAcceptance (spec §27, typed role P1 #3) ─────────────────────────
 
-/// A single participant's signed acceptance of their role in a proposed route.
-///
-/// Each relay and the gateway MUST produce a `RouteAcceptance` before the
-/// route can be committed. The acceptance signs:
-///
-/// - The proposal hash (binding it to a specific `RouteProposal`)
-/// - The participant's NodeId (proving WHO is accepting)
-/// - The role they accept (relay / gateway)
-/// - Conditions (e.g. bandwidth, quota, time window)
-/// - An expiry
-///
-/// ## Trust boundary
-///
-/// A `RouteAcceptance` is the participant's cryptographic consent. Without
-/// it, the participant is NOT part of the route — regardless of what the
-/// `RouteProposal` says.
+/// A participant's signed acceptance of their role in a proposed route.
 #[derive(Debug, Clone)]
 pub struct RouteAcceptance {
-    /// The hash of the `RouteProposal` this acceptance is for.
     pub proposal_hash: [u8; 32],
-    /// The accepting participant's NodeId.
     pub participant_node_id: [u8; 32],
-    /// The participant's Ed25519 public key.
     pub participant_public_key: [u8; 32],
-    /// The role the participant accepts ("relay" or "gateway").
-    pub role: String,
-    /// Conditions (e.g. "max-bandwidth:5Mbps", "quota:1GB").
+    /// Typed role (Relay or Gateway) — NOT a free-form string.
+    pub role: RouteRole,
     pub conditions: Vec<String>,
-    /// When the acceptance was created (unix seconds).
     pub timestamp: u64,
-    /// When the acceptance expires (unix seconds).
     pub expiry: u64,
-    /// The participant's Ed25519 signature.
     pub signature: [u8; 64],
 }
 
 impl RouteAcceptance {
-    /// Create and sign a `RouteAcceptance`.
+    /// Create and sign a `RouteAcceptance` with a typed role.
     #[must_use]
     pub fn create_and_sign(
         participant_secret_key: &[u8; 32],
         participant_public_key: &[u8; 32],
         participant_node_id: [u8; 32],
         proposal_hash: [u8; 32],
-        role: String,
+        role: RouteRole,
         conditions: Vec<String>,
         expiry: u64,
     ) -> Self {
@@ -332,7 +620,7 @@ impl RouteAcceptance {
             (CborValue::TextString("proposalHash".into()), CborValue::ByteString(self.proposal_hash.to_vec())),
             (CborValue::TextString("participantNodeId".into()), CborValue::ByteString(self.participant_node_id.to_vec())),
             (CborValue::TextString("participantPublicKey".into()), CborValue::ByteString(self.participant_public_key.to_vec())),
-            (CborValue::TextString("role".into()), CborValue::TextString(self.role.clone())),
+            (CborValue::TextString("role".into()), CborValue::TextString(self.role.as_str().into())),
             (CborValue::TextString("conditions".into()), CborValue::Array(conditions)),
             (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
             (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
@@ -347,11 +635,30 @@ impl RouteAcceptance {
         msg
     }
 
-    /// Verify the participant's signature and NodeId↔pubkey binding.
+    /// Verify signature + NodeId binding + freshness (P1 #7).
     #[must_use]
     pub fn verify(&self) -> bool {
+        self.verify_at(now_unix())
+    }
+
+    /// Verify at a specific time (for testing).
+    #[must_use]
+    pub fn verify_at(&self, now: u64) -> bool {
         let expected = derive_node_id(&self.participant_public_key);
         if self.participant_node_id != expected {
+            return false;
+        }
+        // P1 #7: freshness.
+        if self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            return false;
+        }
+        if self.expiry <= now {
+            return false;
+        }
+        if self.expiry <= self.timestamp {
+            return false;
+        }
+        if self.expiry.saturating_sub(self.timestamp) > ROUTE_MAX_LIFETIME_SECS {
             return false;
         }
         ed25519_verify(
@@ -365,70 +672,35 @@ impl RouteAcceptance {
 // ─── CommittedRoute (spec §27) ────────────────────────────────────────────
 
 /// A finalized route — produced ONLY after every required participant has
-/// produced a valid `RouteAcceptance`.
+/// produced a valid, typed `RouteAcceptance`.
 ///
-/// ## CRITICAL: RouteProposal ≠ CommittedRoute
-///
-/// A `CommittedRoute` CANNOT be constructed from a `RouteProposal` alone.
-/// The ONLY constructor is `commit_route(proposal, acceptances)`, which
-/// verifies:
-///
-/// 1. The proposal's source signature is valid.
-/// 2. The proposal has not expired.
-/// 3. Every required participant (every hop except the source) has a
-///    `RouteAcceptance`.
-/// 4. Each acceptance's signature is valid.
-/// 5. Each acceptance's `participant_node_id` matches a required participant.
-/// 6. Each acceptance has not expired.
-/// 7. Each acceptance's `proposal_hash` matches the proposal.
-///
-/// If ANY of these checks fail, `commit_route` returns `Err` and NO
-/// `CommittedRoute` is produced.
-///
-/// ## Construction is private
-///
-/// `CommittedRoute`'s fields are private. The only way to create one is
-/// `commit_route()`. This makes it impossible to construct a committed route
-/// without the required participant acceptances — the type system enforces
-/// spec §27's invariant: "A source signature alone is insufficient to prove
-/// that every relay agreed to participate."
+/// Fields are private. Only `commit_route()` constructs one.
 #[derive(Debug, Clone)]
 pub struct CommittedRoute {
-    /// The proposal that was committed.
     proposal: RouteProposal,
-    /// The accepted route's commitment hash (integrity identifier).
     commitment: [u8; 32],
-    /// The participant acceptances, keyed by NodeId.
     acceptances: Vec<RouteAcceptance>,
-    /// When the route was committed (unix seconds).
     committed_at: u64,
 }
 
 /// Error from `commit_route()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitError {
-    /// The proposal's source signature is invalid.
     ProposalSignatureInvalid,
-    /// The proposal has expired.
     ProposalExpired { now: u64, expiry: u64 },
-    /// A required participant did not produce an acceptance.
     MissingAcceptance { participant: [u8; 32] },
-    /// An acceptance's signature is invalid.
     AcceptanceSignatureInvalid { participant: [u8; 32] },
-    /// An acceptance is for a different proposal (hash mismatch).
     AcceptanceProposalMismatch { participant: [u8; 32] },
-    /// An acceptance has expired.
     AcceptanceExpired { participant: [u8; 32], now: u64, expiry: u64 },
-    /// An acceptance is from a node that is not a required participant.
     UnexpectedParticipant { participant: [u8; 32] },
-    /// The proposal has no hops.
+    /// P1 #3: the participant's role is wrong for their position.
+    WrongRole { participant: [u8; 32], expected: RouteRole, actual: RouteRole },
     EmptyRoute,
-    /// The proposal has too many hops.
     ExcessiveHops { count: usize },
-    /// The destination is not the last hop.
     DestinationMismatch,
-    /// A hop appears more than once (loop).
     DuplicateHop { node_id: [u8; 32] },
+    /// P0 #2: source is not the first hop.
+    SourceNotFirstHop,
 }
 
 impl std::fmt::Display for CommitError {
@@ -436,48 +708,52 @@ impl std::fmt::Display for CommitError {
         match self {
             Self::ProposalSignatureInvalid => write!(f, "proposal source signature invalid"),
             Self::ProposalExpired { now, expiry } => write!(f, "proposal expired (now={now}, expiry={expiry})"),
-            Self::MissingAcceptance { participant } => write!(f, "missing acceptance from participant {}", hex_short(participant)),
+            Self::MissingAcceptance { participant } => write!(f, "missing acceptance from {}", hex_short(participant)),
             Self::AcceptanceSignatureInvalid { participant } => write!(f, "acceptance signature invalid from {}", hex_short(participant)),
             Self::AcceptanceProposalMismatch { participant } => write!(f, "acceptance from {} is for a different proposal", hex_short(participant)),
             Self::AcceptanceExpired { participant, now, expiry } => write!(f, "acceptance from {} expired (now={now}, expiry={expiry})", hex_short(participant)),
             Self::UnexpectedParticipant { participant } => write!(f, "acceptance from unexpected participant {}", hex_short(participant)),
+            Self::WrongRole { participant, expected, actual } => write!(f, "participant {} has wrong role: expected {:?}, got {:?}", hex_short(participant), expected, actual),
             Self::EmptyRoute => write!(f, "route has no hops"),
             Self::ExcessiveHops { count } => write!(f, "route has too many hops: {count} > {ROUTE_MAX_HOPS}"),
             Self::DestinationMismatch => write!(f, "destination is not the last hop"),
             Self::DuplicateHop { node_id } => write!(f, "duplicate hop: {}", hex_short(node_id)),
+            Self::SourceNotFirstHop => write!(f, "source is not the first hop"),
         }
     }
 }
 
 /// Commit a route proposal into a `CommittedRoute`.
 ///
-/// This is the ONLY way to construct a `CommittedRoute`. It verifies that
-/// every required participant has produced a valid `RouteAcceptance`.
-///
-/// # Errors
-/// Returns `CommitError` if any check fails. No `CommittedRoute` is produced
-/// on error — the caller must fix the issue and retry.
-///
-/// ## Required participants
-///
-/// Every hop EXCEPT the source must accept. The source is the proposer; the
-/// destination (gateway) and all relays must sign.
+/// Verifies:
+/// 1. Proposal signature + freshness (via `proposal.verify()`).
+/// 2. Source is the first hop (P0 #2).
+/// 3. Structural validity (hop count, destination last, no loops).
+/// 4. Every required participant has a valid `RouteAcceptance` with the
+///    correct typed role (P1 #3): destination = Gateway, intermediate = Relay.
+/// 5. Each acceptance's `proposal_hash` matches.
+/// 6. Each acceptance is fresh and not expired.
 pub fn commit_route(
     proposal: RouteProposal,
     acceptances: Vec<RouteAcceptance>,
     now: u64,
 ) -> Result<CommittedRoute, CommitError> {
-    // 1. Verify the proposal's source signature.
-    if !proposal.verify() {
+    // 1. Verify the proposal (signature + freshness + source==first).
+    if !proposal.verify_at(now) {
+        // Distinguish expiry from signature/source for clearer errors.
+        if proposal.expiry <= now {
+            return Err(CommitError::ProposalExpired { now, expiry: proposal.expiry });
+        }
         return Err(CommitError::ProposalSignatureInvalid);
     }
 
-    // 2. Check proposal expiry.
-    if proposal.expiry <= now {
-        return Err(CommitError::ProposalExpired { now, expiry: proposal.expiry });
+    // 2. P0 #2: source must be the first hop (also checked in verify_at, but
+    //    return a distinct error here for clarity).
+    if proposal.hop_node_ids.first() != Some(&proposal.source) {
+        return Err(CommitError::SourceNotFirstHop);
     }
 
-    // 3. Structural validation of the hop list.
+    // 3. Structural validation.
     if proposal.hop_node_ids.is_empty() {
         return Err(CommitError::EmptyRoute);
     }
@@ -494,42 +770,64 @@ pub fn commit_route(
         }
     }
 
-    // 4. Determine required participants (every hop except the source).
-    let required: Vec<[u8; 32]> = proposal.required_participants();
+    // 4. Required participants + expected roles (P1 #3).
+    let required: Vec<([u8; 32], RouteRole)> = proposal
+        .hop_node_ids
+        .iter()
+        .filter(|h| **h != proposal.source)
+        .map(|h| {
+            let role = if *h == proposal.destination {
+                RouteRole::Gateway
+            } else {
+                RouteRole::Relay
+            };
+            (*h, role)
+        })
+        .collect();
 
-    // 5. Verify each acceptance and match it to a required participant.
+    // 5. Verify each acceptance.
     let mut accepted_by: std::collections::HashMap<[u8; 32], &RouteAcceptance> = std::collections::HashMap::new();
     for acc in &acceptances {
-        // 5a. Verify the acceptance's signature.
-        if !acc.verify() {
+        if !acc.verify_at(now) {
+            if acc.expiry <= now {
+                return Err(CommitError::AcceptanceExpired { participant: acc.participant_node_id, now, expiry: acc.expiry });
+            }
             return Err(CommitError::AcceptanceSignatureInvalid { participant: acc.participant_node_id });
         }
-        // 5b. Check acceptance expiry.
-        if acc.expiry <= now {
-            return Err(CommitError::AcceptanceExpired { participant: acc.participant_node_id, now, expiry: acc.expiry });
-        }
-        // 5c. Check the acceptance is for THIS proposal.
         if acc.proposal_hash != proposal.proposal_hash() {
             return Err(CommitError::AcceptanceProposalMismatch { participant: acc.participant_node_id });
         }
-        // 5d. Check the participant is a required participant.
-        if !required.contains(&acc.participant_node_id) {
-            return Err(CommitError::UnexpectedParticipant { participant: acc.participant_node_id });
+        // Check participant is required + role is correct (P1 #3).
+        let expected_role = required
+            .iter()
+            .find(|(id, _)| *id == acc.participant_node_id)
+            .map(|(_, r)| *r);
+        match expected_role {
+            None => {
+                return Err(CommitError::UnexpectedParticipant { participant: acc.participant_node_id });
+            }
+            Some(expected) => {
+                if acc.role != expected {
+                    return Err(CommitError::WrongRole {
+                        participant: acc.participant_node_id,
+                        expected,
+                        actual: acc.role,
+                    });
+                }
+            }
         }
-        // 5e. Store (first acceptance per participant wins; duplicates are ignored).
         accepted_by.entry(acc.participant_node_id).or_insert(acc);
     }
 
-    // 6. Check that EVERY required participant has accepted.
-    for req in &required {
+    // 6. Check every required participant accepted.
+    for (req, _) in &required {
         if !accepted_by.contains_key(req) {
             return Err(CommitError::MissingAcceptance { participant: *req });
         }
     }
 
-    // 7. All checks passed. Construct the CommittedRoute.
+    // 7. Construct.
     let commitment = {
-        // The commitment is the SHA-256 of (proposal_hash || all acceptance hashes).
         let mut input = Vec::new();
         input.extend_from_slice(&proposal.proposal_hash());
         for acc in &acceptances {
@@ -548,142 +846,22 @@ pub fn commit_route(
 }
 
 impl CommittedRoute {
-    /// The proposal that was committed.
     #[must_use]
-    pub fn proposal(&self) -> &RouteProposal {
-        &self.proposal
-    }
-
-    /// The commitment hash (integrity identifier for the committed route).
+    pub fn proposal(&self) -> &RouteProposal { &self.proposal }
     #[must_use]
-    pub fn commitment(&self) -> &[u8; 32] {
-        &self.commitment
-    }
-
-    /// The acceptances that authorized this route.
+    pub fn commitment(&self) -> &[u8; 32] { &self.commitment }
     #[must_use]
-    pub fn acceptances(&self) -> &[RouteAcceptance] {
-        &self.acceptances
-    }
-
-    /// When the route was committed.
+    pub fn acceptances(&self) -> &[RouteAcceptance] { &self.acceptances }
     #[must_use]
-    pub fn committed_at(&self) -> u64 {
-        self.committed_at
-    }
-
-    /// The source NodeId.
+    pub fn committed_at(&self) -> u64 { self.committed_at }
     #[must_use]
-    pub fn source(&self) -> [u8; 32] {
-        self.proposal.source
-    }
-
-    /// The destination NodeId.
+    pub fn source(&self) -> [u8; 32] { self.proposal.source }
     #[must_use]
-    pub fn destination(&self) -> [u8; 32] {
-        self.proposal.destination
-    }
-
-    /// The ordered hop NodeIds.
+    pub fn destination(&self) -> [u8; 32] { self.proposal.destination }
     #[must_use]
-    pub fn hops(&self) -> &[[u8; 32]] {
-        &self.proposal.hop_node_ids
-    }
-
-    /// Check if the committed route has expired.
+    pub fn hops(&self) -> &[[u8; 32]] { &self.proposal.hop_node_ids }
     #[must_use]
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.proposal.expiry <= now
-    }
-}
-
-// ─── Path discovery using ExecutableNetworkSnapshot ────────────────────────
-
-/// Discover a candidate path from source to destination using ONLY
-/// authenticated nodes and usable links from an `ExecutableNetworkSnapshot`.
-///
-/// ## CRITICAL: Authenticated topology ≠ Executable route
-///
-/// This function finds a PATH (a sequence of authenticated NodeIds connected
-/// by usable links). It does NOT construct a `CommittedRoute` — it returns
-/// a `DiscoveredPath` that can be used to build a `RouteProposal` (which
-/// then requires participant acceptances to become a `CommittedRoute`).
-///
-/// The discovered path uses ONLY data from `ExecutableNetworkSnapshot`:
-/// - `authenticated_nodes` (verified `AuthenticatedNodeRecord`s)
-/// - `usable_links` (Up or Degraded links)
-///
-/// It NEVER uses `RemoteNodeHint`s (they are not in the snapshot). This is
-/// the architectural guarantee from spec §18: discovery knowledge ≠
-/// executable routing state.
-///
-/// ## Algorithm
-///
-/// BFS (breadth-first search) from source to destination. BFS is chosen over
-/// Dijkstra/A* deliberately: the frozen spec §62 says "Do not implement
-/// arbitrary global routing algorithms merely because they are well known.
-/// The first route engine should prioritize correctness, authentication,
-/// bounded state, failure handling over theoretical optimality. A simple
-/// valid route is more important than an optimal invalid route."
-///
-/// BFS finds the shortest hop-count path, which is simple, correct, and
-/// bounded. Optimization (latency, bandwidth) is a future concern.
-#[must_use]
-pub fn discover_path(
-    snapshot: &ExecutableNetworkSnapshot,
-    source: &[u8; 32],
-    destination: &[u8; 32],
-) -> Option<DiscoveredPath> {
-    // BFS from source to destination.
-    use std::collections::{HashMap, VecDeque};
-    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut parent: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
-    let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
-    visited.insert(*source);
-    queue.push_back(*source);
-
-    while let Some(current) = queue.pop_front() {
-        if current == *destination {
-            // Reconstruct path.
-            let mut path = vec![*destination];
-            let mut node = *destination;
-            while node != *source {
-                node = *parent.get(&node)?;
-                path.push(node);
-            }
-            path.reverse();
-            return Some(DiscoveredPath { hops: path });
-        }
-        // Explore neighbors via usable links.
-        for link in snapshot.usable_links.values() {
-            if link.key.local_node_id == current && !visited.contains(&link.key.remote_node_id) {
-                visited.insert(link.key.remote_node_id);
-                parent.insert(link.key.remote_node_id, current);
-                queue.push_back(link.key.remote_node_id);
-            }
-        }
-    }
-    None
-}
-
-/// A discovered path — a sequence of authenticated NodeIds connected by
-/// usable links, found by `discover_path()`.
-///
-/// This is NOT a route. It is the INPUT to `RouteProposal::create_and_sign()`.
-/// The caller must verify each hop's descriptor, negotiate service, and
-/// obtain participant acceptances before a `CommittedRoute` can be built.
-#[derive(Debug, Clone)]
-pub struct DiscoveredPath {
-    /// Ordered NodeIds from source to destination.
-    pub hops: Vec<[u8; 32]>,
-}
-
-impl DiscoveredPath {
-    /// Get the hop count.
-    #[must_use]
-    pub fn hop_count(&self) -> usize {
-        self.hops.len()
-    }
+    pub fn is_expired(&self, now: u64) -> bool { self.proposal.expiry <= now }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

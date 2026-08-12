@@ -908,6 +908,13 @@ pub struct ExecutableNetworkSnapshot {
 
 impl ExecutableNetworkSnapshot {
     /// Create an executable snapshot from a TopologyGraph.
+    ///
+    /// ## Invariant (P1 #6 — N2.1.2 review fix)
+    ///
+    /// Every usable link in the snapshot has BOTH endpoints authenticated.
+    /// A link whose remote endpoint is not in `authenticated_nodes` is
+    /// EXCLUDED. This ensures `discover_path()` can safely rely on the
+    /// snapshot — every link it iterates leads to an authenticated node.
     fn from_graph(graph: &TopologyGraph) -> Self {
         let mut authenticated_nodes = HashMap::new();
         for node_id in graph
@@ -924,7 +931,14 @@ impl ExecutableNetworkSnapshot {
         let mut usable_links = HashMap::new();
         for link in graph.directory.link_table().all() {
             if link.is_usable() {
-                usable_links.insert(link.key.clone(), link.clone());
+                // P1 #6: only include links whose BOTH endpoints are
+                // authenticated. A usable link to an unauthenticated node
+                // is NOT executable routing state.
+                let local_auth = authenticated_nodes.contains_key(&link.key.local_node_id);
+                let remote_auth = authenticated_nodes.contains_key(&link.key.remote_node_id);
+                if local_auth && remote_auth {
+                    usable_links.insert(link.key.clone(), link.clone());
+                }
             }
         }
         Self { authenticated_nodes, usable_links }
