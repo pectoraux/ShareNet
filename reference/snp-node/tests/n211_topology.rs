@@ -53,7 +53,7 @@ fn link_state_transitions() {
     let node_a = derive_node_id(&pk_a);
     let node_b = derive_node_id(&pk_b);
     let key = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    let mut link = Link::new_up(key.clone(), None);
+    let mut link = Link::new_up_for_testing(key.clone(), None);
     assert_eq!(link.state, LinkState::Up);
     assert!(link.is_usable());
 
@@ -86,7 +86,7 @@ fn link_metrics_recorded() {
         derive_node_id(&pk_b),
         TransportEndpoint::tcp("127.0.0.1:1"),
     );
-    let mut link = Link::new_up(key, None);
+    let mut link = Link::new_up_for_testing(key, None);
     link.record_success(500);
     link.record_success(750);
     link.record_failure();
@@ -108,7 +108,7 @@ fn link_table_directed() {
     let mut table = LinkTable::new();
     // A → B link.
     let key_ab = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    table.insert(Link::new_up(key_ab.clone(), None));
+    table.insert_for_testing(Link::new_up_for_testing(key_ab.clone(), None));
 
     // links_from(A) should return the A→B link.
     let from_a = table.links_from(&node_a);
@@ -216,7 +216,7 @@ fn topology_graph_directed_links() {
 
     // A → B link only.
     let key_ab = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(key_ab, None));
+    graph.add_link_for_testing(Link::new_up_for_testing(key_ab, None));
 
     // neighbors(A) should return 1 link.
     let neighbors_a = graph.neighbors(&node_a);
@@ -248,7 +248,7 @@ fn topology_graph_reachable_gateways() {
     // Add a link to the gateway (making it directly reachable).
     let local_id = [0xAA; 32]; // Our own NodeId.
     let gw_link_key = LinkKey::new(local_id, gw_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(gw_link_key, None));
+    graph.add_link_for_testing(Link::new_up_for_testing(gw_link_key, None));
 
     // direct_gateways() should return 1 gateway.
     let gateways = graph.direct_gateways();
@@ -270,7 +270,7 @@ fn topology_graph_snapshot_is_immutable() {
 
     let local_id = [0xBB; 32];
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(key.clone(), None));
+    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
 
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.links.len(), 1);
@@ -344,7 +344,7 @@ fn topology_graph_generate_peer_summaries() {
     let (relay_sk, relay_pk) = fresh_keypair(b"tg-gen-relay");
     let relay_id = derive_node_id(&relay_pk);
     let key = LinkKey::new(local_id, relay_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(key, None));
+    graph.add_link_for_testing(Link::new_up_for_testing(key, None));
 
     let summaries = graph.generate_peer_summaries();
     assert!(summaries.len() >= 1, "should generate at least 1 summary");
@@ -362,7 +362,7 @@ fn node_churn_appears_disappears_returns() {
 
     // Node appears: add link.
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(key.clone(), None));
+    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
     assert!(graph.is_directly_reachable(&node_id));
     assert_eq!(graph.visibility(&node_id), PeerVisibility::Active);
 
@@ -467,7 +467,7 @@ fn link_failure_makes_node_unreachable_but_known() {
     let local_id = [0xFF; 32];
 
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link(Link::new_up(key.clone(), None));
+    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
     assert!(graph.is_directly_reachable(&node_id));
     assert!(graph.is_known(&node_id));
 
@@ -554,7 +554,7 @@ fn direct_gateways_excludes_remote_hints() {
     graph.accept_advertisement(relay_advert.verify_into_verified().expect("verify")).expect("accept");
     let relay_id = derive_node_id(&relay_pk);
     let local = [0xCC; 32];
-    graph.add_link(Link::new_up(
+    graph.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, relay_id, TransportEndpoint::tcp("127.0.0.1:1")),
         None,
     ));
@@ -652,7 +652,7 @@ fn multi_hop_destination_discovery_without_authentication() {
     graph_a.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
     let b_id = derive_node_id(&b_pk);
     let a_local = [0x11; 32];
-    graph_a.add_link(Link::new_up(
+    graph_a.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(a_local, b_id, TransportEndpoint::tcp("127.0.0.1:1")),
         None,
     ));

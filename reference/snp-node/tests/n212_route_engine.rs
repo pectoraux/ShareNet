@@ -97,7 +97,7 @@ fn build_chain(num_relays: usize) -> ChainTopology {
             prev_id, relay_id,
             TransportEndpoint::tcp(format!("127.0.0.1:{port}", port = 2000 + i)),
         );
-        topology.add_link(Link::new_up(key, None));
+        topology.add_link_for_testing(Link::new_up_for_testing(key, None));
         relays.push(relay_id);
         prev_id = relay_id;
         prev_label = label.into_bytes();
@@ -114,7 +114,7 @@ fn build_chain(num_relays: usize) -> ChainTopology {
         prev_id, gateway,
         TransportEndpoint::tcp("127.0.0.1:3000"),
     );
-    topology.add_link(Link::new_up(key, None));
+    topology.add_link_for_testing(Link::new_up_for_testing(key, None));
 
     ChainTopology {
         topology,
@@ -144,7 +144,7 @@ fn direct_gateway_route() {
     let gw_id = derive_node_id(&gw_pk);
 
     // Directed link: local → gw
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")),
         None,
     ));
@@ -305,7 +305,7 @@ fn directed_link_required() {
     let (b_advert, _, b_pk) = make_relay_advert(b"dir-relay-b", 1);
     topology.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1")),
         None,
     ));
@@ -350,9 +350,9 @@ fn stale_link_rejected() {
 
     // Link local → gw, but DOWN.
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    let mut link = Link::new_up(key.clone(), None);
+    let mut link = Link::new_up_for_testing(key.clone(), None);
     link.state = LinkState::Down;
-    topology.add_link(link);
+    topology.add_link_for_testing(link);
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -494,7 +494,7 @@ fn gateway_without_x25519_rejected() {
     // Since it can't be verified, it can't be accepted into the topology.
     // So it won't appear as a candidate.
     let gw_id = derive_node_id(&gw_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")),
         None,
     ));
@@ -533,16 +533,16 @@ fn route_commitment_changes_when_hop_changes() {
     let gw_id = derive_node_id(&gw_pk);
 
     // Links: local → r1 → gw, and local → r2 → gw.
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
     ));
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
     ));
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
     ));
 
@@ -695,7 +695,7 @@ fn route_resolution_survives_alternate_candidate() {
     let (g1_advert, _, g1_pk) = make_gateway_advert(b"alt-gw-1", 1);
     topology.accept_advertisement(g1_advert.verify_into_verified().expect("verify")).expect("accept");
     let g1_id = derive_node_id(&g1_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, g1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
 
@@ -745,7 +745,7 @@ fn candidate_gateway_discovery_from_remote_hint() {
     let (b_advert, _, b_pk) = make_relay_advert(b"cand-relay-b", 1);
     topology.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
 
@@ -785,7 +785,7 @@ fn candidate_gateway_discovery_from_remote_hint() {
     // For a complete test, we need to also add a link B → G.
     // In a real system, this link would be discovered through the relay.
     // For this test, we simulate it by adding the link.
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(b_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
     ));
 
@@ -853,7 +853,7 @@ fn local_topology_multi_hop_route_with_destination_resolution() {
     let (b_advert, b_sk, b_pk) = make_relay_advert(b"north-b", 1);
     topology.accept_advertisement(b_advert.verify_into_verified().expect("verify B")).expect("accept B");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(a_id, b_id, TransportEndpoint::tcp("127.0.0.1:1001")), None,
     ));
 
@@ -864,7 +864,7 @@ fn local_topology_multi_hop_route_with_destination_resolution() {
     let (c_advert, _, c_pk) = make_relay_advert(b"north-c", 1);
     topology.accept_advertisement(c_advert.verify_into_verified().expect("verify C")).expect("accept C");
     let c_id = derive_node_id(&c_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(b_id, c_id, TransportEndpoint::tcp("127.0.0.1:1002")), None,
     ));
 
@@ -875,7 +875,7 @@ fn local_topology_multi_hop_route_with_destination_resolution() {
     let g_verified = g_advert.verify_into_verified().expect("G must verify");
 
     // Link C → G (exists in the topology, simulating that C has probed G).
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(c_id, g_id, TransportEndpoint::tcp("127.0.0.1:1003")), None,
     ));
 
@@ -973,7 +973,7 @@ fn candidate_origin_distinguishes_direct_vs_remote() {
     let (gw_advert, _, gw_pk) = make_gateway_advert(b"origin-direct-gw", 1);
     topology.accept_advertisement(gw_advert.verify_into_verified().expect("verify")).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
 
@@ -1028,14 +1028,14 @@ fn distance_hint_does_not_affect_route_cost() {
     let (r_advert, _, r_pk) = make_relay_advert(b"dist-relay", 1);
     topology.accept_advertisement(r_advert.verify_into_verified().expect("verify")).expect("accept");
     let r_id = derive_node_id(&r_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, r_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
 
     let (g_advert, _, g_pk) = make_gateway_advert(b"dist-gw", 1);
     let g_verified = g_advert.verify_into_verified().expect("verify");
     let g_id = derive_node_id(&g_pk);
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(r_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
     ));
 
@@ -1155,30 +1155,30 @@ fn low_latency_cost_model_selects_better_path() {
     let gw_id = derive_node_id(&gw_pk);
 
     // Links with different RTTs.
-    let mut link1 = Link::new_up(
+    let mut link1 = Link::new_up_for_testing(
         LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     );
     link1.record_success(500_000); // 500ms RTT
 
-    let mut link2 = Link::new_up(
+    let mut link2 = Link::new_up_for_testing(
         LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
     );
     link2.record_success(10_000); // 10ms RTT
 
-    topology.add_link(link1);
-    topology.add_link(link2);
+    topology.add_link_for_testing(link1);
+    topology.add_link_for_testing(link2);
 
-    let mut link3 = Link::new_up(
+    let mut link3 = Link::new_up_for_testing(
         LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
     );
     link3.record_success(500_000);
-    topology.add_link(link3);
+    topology.add_link_for_testing(link3);
 
-    let mut link4 = Link::new_up(
+    let mut link4 = Link::new_up_for_testing(
         LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
     );
     link4.record_success(10_000);
-    topology.add_link(link4);
+    topology.add_link_for_testing(link4);
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &LowLatencyCost);
@@ -1256,7 +1256,7 @@ fn selected_link_endpoint_is_route_endpoint() {
 
     // Create a link using the SECOND endpoint (ep2).
     let selected_endpoint = TransportEndpoint::tcp("127.0.0.1:2222");
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, g_id, selected_endpoint.clone()),
         None,
     ));
@@ -1305,13 +1305,13 @@ fn route_commitment_changes_with_selected_link_endpoint() {
     topology2.accept_advertisement(g_verified).expect("accept");
 
     // Topology 1: link via ep1.
-    topology1.add_link(Link::new_up(
+    topology1.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:1111")),
         None,
     ));
 
     // Topology 2: link via ep2.
-    topology2.add_link(Link::new_up(
+    topology2.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:2222")),
         None,
     ));
@@ -1371,13 +1371,13 @@ fn best_route_selects_lowest_computed_cost() {
     topology.accept_advertisement(g1_advert.verify_into_verified().expect("verify")).expect("accept");
     let g1_id = derive_node_id(&g1_pk);
 
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
     ));
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(r1_id, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
     ));
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(r2_id, g1_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
     ));
 
@@ -1386,7 +1386,7 @@ fn best_route_selects_lowest_computed_cost() {
     topology.accept_advertisement(g2_advert.verify_into_verified().expect("verify")).expect("accept");
     let g2_id = derive_node_id(&g2_pk);
 
-    topology.add_link(Link::new_up(
+    topology.add_link_for_testing(Link::new_up_for_testing(
         LinkKey::new(local, g2_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
     ));
 

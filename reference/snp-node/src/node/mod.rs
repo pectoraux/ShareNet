@@ -136,7 +136,10 @@ pub use node_advert::{
     SequenceStoreError, VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS,
     MAX_CLOCK_SKEW_SECS,
 };
-pub use link::{Link, LinkKey, LinkMetrics, LinkState, LinkTable, TransportType};
+pub use link::{
+    AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
+    TransportType,
+};
 pub use topology_protocol::{
     GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,
     MAX_DISTANCE_HINT, MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,

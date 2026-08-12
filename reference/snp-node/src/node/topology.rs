@@ -60,7 +60,7 @@
 //! for the stateless staleness bound that supplements it.
 
 use super::*;
-use crate::node::link::{Link, LinkKey, LinkState, LinkTable, TransportType};
+use crate::node::link::{AuthenticatedLink, Link, LinkKey, LinkState, LinkTable, TransportType};
 use crate::node::topology_protocol::VerifiedPeerSummaryList;
 use std::collections::{HashMap, HashSet};
 
@@ -222,9 +222,32 @@ impl TopologyGraph {
 
     // ─── Link operations ──────────────────────────────────────────────────
 
-    /// Add a link to the topology.
-    pub fn add_link(&mut self, link: Link) {
+    /// **N2.1.2.2: Production path.** Add an authenticated link to the topology.
+    ///
+    /// This is the ONLY public method for adding links in production builds.
+    /// It requires an `AuthenticatedLink`, which can only be constructed
+    /// via `AuthenticatedLink::from_verified_handshake` — proving the remote
+    /// identity was verified and the endpoint was authorized by the remote
+    /// node's authenticated advertisement.
+    pub fn add_authenticated_link(&mut self, auth_link: AuthenticatedLink) {
+        self.directory.add_authenticated_link(auth_link);
+    }
+
+    /// **N2.1.2.2: NOT public in production.** Add a link to the topology.
+    ///
+    /// This method is `pub(crate)` — available only within the `snp-node`
+    /// crate. In production, use `add_authenticated_link()`.
+    pub(crate) fn add_link(&mut self, link: Link) {
         self.directory.add_link(link);
+    }
+
+    /// Add a link to the topology without authentication.
+    ///
+    /// This is available ONLY when the `test-support` Cargo feature is enabled.
+    /// **Production code MUST NOT use this.**
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_link_for_testing(&mut self, link: Link) {
+        self.directory.add_link_for_testing(link);
     }
 
     /// Update a link's state.
