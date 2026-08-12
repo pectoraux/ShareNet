@@ -121,7 +121,8 @@ pub use identity::{NodeIdentity, Capability};
 pub use gateway::GatewayAdvertisement;
 pub use circuit::{Circuit, PeerConnection, UpstreamPeer};
 pub use descriptor::{
-    NodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor, VerifiedNodeDescriptor,
+    IdentityConsistentNodeDescriptor, NodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
+    VerifiedGatewayAdvertisement, VerifiedNodeDescriptor,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
@@ -1065,6 +1066,14 @@ impl Node {
     /// Returns [`NodeError::Other`] wrapping a [`RouteError`] if the
     /// constructed route fails validation (e.g. too many hops, or a
     /// duplicate relay NodeId).
+    /// **N2.0.7.3: DEPRECATED.** This method used the old `Route::new`
+    /// constructor which has been removed. Use `Route::new_with_hop_details`
+    /// with `VerifiedNodeDescriptor` + `TransportEndpoint` entries instead.
+    #[deprecated(
+        since = "N2.0.7.3",
+        note = "use Route::new_with_hop_details with VerifiedNodeDescriptor entries"
+    )]
+    #[cfg(feature = "legacy-circuit-keys")]
     pub fn construct_route(
         &self,
         relay_node_ids: &[[u8; 32]],
@@ -1075,14 +1084,23 @@ impl Node {
             hops.push(*relay);
         }
         hops.push(gateway_node_id);
+        #[allow(deprecated)]
         let route = Route::new(self.identity.node_id, gateway_node_id, hops);
-        // Validate the route before returning it (the caller may still
-        // attempt to use an invalid route, but we surface validation
-        // errors eagerly).
         route
             .validate()
             .map_err(|e| NodeError::Other(format!("construct_route: route validation failed: {e}")))?;
         Ok(route)
+    }
+
+    #[cfg(not(feature = "legacy-circuit-keys"))]
+    pub fn construct_route(
+        &self,
+        _relay_node_ids: &[[u8; 32]],
+        _gateway_node_id: [u8; 32],
+    ) -> NodeResult<Route> {
+        Err(NodeError::Other(
+            "construct_route is not available in production — use Route::new_with_hop_details".into()
+        ))
     }
 }
 
@@ -2628,10 +2646,10 @@ mod tests {
             "RouteCommitment::compute must exist"
         );
         assert!(
-            source.contains("canonical_encoding"),
-            "RouteCommitment must use canonical encoding"
+            source.contains("canonical_cbor"),
+            "RouteCommitment must use canonical CBOR encoding"
         );
-        eprintln!("[static-guard] PASS: RouteCommitment exists and is canonical");
+        eprintln!("[static-guard] PASS: RouteCommitment exists and uses canonical CBOR");
     }
 
     /// N2.0.7.2: VerifiedNodeDescriptor must exist and enforce NodeId consistency.
@@ -2647,14 +2665,22 @@ mod tests {
             "UnverifiedNodeDescriptor must exist"
         );
         assert!(
-            source.contains("fn into_verified"),
-            "UnverifiedNodeDescriptor::into_verified must exist"
+            source.contains("fn into_consistent"),
+            "UnverifiedNodeDescriptor::into_consistent must exist"
         );
         assert!(
             source.contains("verify_node_id_consistency"),
             "NodeId consistency check must exist"
         );
-        eprintln!("[static-guard] PASS: VerifiedNodeDescriptor enforces NodeId consistency");
+        assert!(
+            source.contains("pub struct VerifiedGatewayAdvertisement"),
+            "VerifiedGatewayAdvertisement must exist (N2.0.7.3)"
+        );
+        assert!(
+            source.contains("fn verify_into_verified"),
+            "GatewayAdvertisement::verify_into_verified must exist (N2.0.7.3)"
+        );
+        eprintln!("[static-guard] PASS: VerifiedNodeDescriptor + VerifiedGatewayAdvertisement enforce consistency");
     }
 
     #[test]
@@ -2794,6 +2820,7 @@ mod tests {
         snp_crypto::sha256(seed)
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_valid_construction_passes_validation() {
         let client = node_id_from_seed(b"client");
@@ -2817,6 +2844,7 @@ mod tests {
         assert!(route.expires_at() > route.created_at());
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_empty_rejected() {
         let client = node_id_from_seed(b"client");
@@ -2827,6 +2855,7 @@ mod tests {
         assert_eq!(err, RouteError::Empty, "empty route must be rejected");
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_source_mismatch_rejected() {
         let gateway = node_id_from_seed(b"gateway");
@@ -2843,6 +2872,7 @@ mod tests {
         assert_eq!(err, RouteError::SourceMismatch, "all-zero source must be rejected");
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_destination_mismatch_rejected() {
         let client = node_id_from_seed(b"client");
@@ -2859,6 +2889,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_duplicate_hop_rejected() {
         let client = node_id_from_seed(b"client");
@@ -2878,6 +2909,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_excessive_hop_count_rejected() {
         let client = node_id_from_seed(b"client");
@@ -2896,6 +2928,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_expired_detected() {
         let client = node_id_from_seed(b"client");
@@ -2913,6 +2946,7 @@ mod tests {
         // above proves the expiration logic works.
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_state_machine_legal_transitions() {
         let client = node_id_from_seed(b"client sm");
@@ -2938,6 +2972,7 @@ mod tests {
         route.transition(RouteState::Closed).expect("Failed → Closed");
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
     fn route_state_machine_illegal_transitions() {
         let client = node_id_from_seed(b"client illegal");
@@ -2976,7 +3011,9 @@ mod tests {
 
     // ─── N2.0.3 (GATE E): dynamic route construction tests ───────────────
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
+    #[allow(deprecated)]
     fn construct_route_with_random_identities() {
         // Generate random Ed25519 keypairs for Client, Relay A, Relay B,
         // Relay C, Gateway. The NodeIds are derived from the public keys
@@ -3035,7 +3072,9 @@ mod tests {
         let _ = (relay_a_sk, relay_b_sk, relay_c_sk); // silence unused warnings
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
+    #[allow(deprecated)]
     fn construct_route_rejects_duplicate_relay() {
         let (client_sk, _) = ed25519_keypair_for_test(b"client dup relay");
         let (relay_sk, _) = ed25519_keypair_for_test(b"relay dup");
@@ -3057,7 +3096,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-circuit-keys")]
     #[test]
+    #[allow(deprecated)]
     fn construct_route_rejects_excessive_hops() {
         let (client_sk, _) = ed25519_keypair_for_test(b"client too many hops");
         let (gw_sk, _) = ed25519_keypair_for_test(b"gateway too many hops");

@@ -887,7 +887,6 @@ dependencies = [
  "snp-gateway",
  "snp-identity",
  "snp-link",
- "snp-node",
  "snp-object",
  "snp-routing",
  "thiserror",

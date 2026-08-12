@@ -3466,3 +3466,61 @@ Stage Summary:
 - VALIDATION: 14 checks including NodeId↔Ed25519 consistency, gateway capability, X25519 key presence, relay X25519 absence, endpoint presence.
 - MUTABILITY: Controlled via `transition()`, `increment_epoch()`, `update_metrics()`. Identity fields non-mutable.
 
+
+---
+Task ID: 221-225 (N2.0.7.3 — Remove False Security/Authority Boundaries)
+Agent: Z.ai (main)
+
+Task: N2.0.7.2 had two false claims: (1) "ONE authoritative representation" but `legacy_hops` still existed, (2) "VerifiedNodeDescriptor" but `into_verified()` only checked NodeId consistency, NOT authentication. This milestone fixes both.
+
+Work Log:
+- Gate 1: Removed legacy_hops from production Route.
+  * `legacy_hops` field is now behind `#[cfg(feature = "legacy-circuit-keys")]`.
+  * `Route::new()` constructor is behind `#[cfg(feature = "legacy-circuit-keys")]`.
+  * `hops()` and `validate()` have legacy branches ONLY behind the feature.
+  * The PRODUCTION BUILD has NO legacy_hops, NO Route::new(), NO legacy branch.
+  * Static guard `route_has_no_public_hops_field` verifies `pub hops:` does not appear.
+
+- Gate 2: Fixed VerifiedNodeDescriptor meaning.
+  * Renamed the old `into_verified()` to `into_consistent()` — returns `IdentityConsistentNodeDescriptor` (NodeId↔Ed25519 consistency verified, but NOT authenticated).
+  * `VerifiedNodeDescriptor` can ONLY be constructed from `VerifiedGatewayAdvertisement::descriptor()`.
+  * There is NO `into_verified()` path from `UnverifiedNodeDescriptor`.
+  * `RouteHop.descriptor` is `VerifiedNodeDescriptor` — the routing layer cannot use unverified or merely-consistent data.
+
+- Gate 3: Created VerifiedGatewayAdvertisement wrapper.
+  * `GatewayAdvertisement::verify_into_verified()` checks the Ed25519 signature and returns `Option<VerifiedGatewayAdvertisement>`.
+  * `VerifiedGatewayAdvertisement::descriptor()` returns `Option<VerifiedNodeDescriptor>` (also checks NodeId↔Ed25519 consistency).
+  * An arbitrary `GatewayAdvertisement` CANNOT directly become a `VerifiedNodeDescriptor` — the verification step is enforced by the type system.
+
+- Gate 4: Endpoint binding.
+  * `RouteHop` requires `VerifiedNodeDescriptor` — unverified data cannot enter the routing layer.
+  * The test helpers (`gateway_descriptor()`, `relay_descriptor()`) construct verified descriptors via signed + verified advertisements.
+
+- Gate 5: Canonical RouteCommitment using CBOR.
+  * `RouteCommitment::compute()` uses `snp_cbor::encode()` (canonical CBOR) instead of manual byte concatenation.
+  * The canonical encoding is a CBOR Map: protocolVersion, source, destination, epoch, hops (array of {descriptor: {nodeId, publicKey, x25519CircuitPub, capabilities}, endpoints: [{type, addr}]}).
+  * Cross-platform reproducible — the same route encoded by Rust, Kotlin, Python produces the same commitment.
+
+- Gate 6: Documented commitment vs authorization.
+  * `RouteCommitment` is explicitly documented as an integrity identifier (fingerprint), NOT a signature or authorization.
+  * When cryptographic authorization is needed (Civic Points, relay accounting), a separate `RouteAuthorization` type will be introduced.
+
+- Gate 7: Legacy test isolation.
+  * Removed `[dev-dependencies.snp-node] features = ["legacy-circuit-keys"]` from Cargo.toml.
+  * `cargo test` = NEW architecture only (168 passed, 0 failed).
+  * `cargo test --features legacy-circuit-keys` = explicit legacy compatibility suite (216 passed, 0 failed).
+  * Old test files (n202, n203_security, n203_mesh_failure, n205) are behind `#![cfg(feature = "legacy-circuit-keys")]`.
+
+- Test results:
+  * `cargo test` (no legacy): 168 passed, 0 failed, 3 ignored.
+  * `cargo test --features legacy-circuit-keys`: 216 passed, 0 failed, 3 ignored.
+  * Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- PRODUCTION Route has NO legacy_hops field, NO Route::new() constructor, NO legacy validation branch.
+- VerifiedNodeDescriptor can ONLY come from VerifiedGatewayAdvertisement (signature checked + NodeId consistent).
+- IdentityConsistentNodeDescriptor replaces the old misleading "VerifiedNodeDescriptor" from `into_verified()`.
+- RouteCommitment uses canonical CBOR encoding (cross-platform reproducible).
+- RouteCommitment is documented as integrity identifier, NOT authorization.
+- `cargo test` runs ONLY the new production architecture; legacy tests require explicit `--features legacy-circuit-keys`.
+

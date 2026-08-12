@@ -1,51 +1,48 @@
-//! N2.0.7.2 — NodeDescriptor + TransportEndpoint + VerifiedNodeDescriptor.
+//! N2.0.7.3 — Node identity descriptors with PROPER verified/unverified distinction.
 //!
-//! These types enforce the ShareNet architectural separation:
+//! ## Key distinction (N2.0.7.3 correction)
 //!
-//! > **NodeId answers "who?" — transport endpoint answers "where can I
-//! > reach them now?"**
+//! N2.0.7.2 had a `VerifiedNodeDescriptor` that could be constructed via
+//! `into_verified()` — which only checked NodeId↔Ed25519 consistency, NOT
+//! that the identity came from a signed advertisement. This was misleading:
+//! "verified" implied authentication, but the function only proved internal
+//! consistency.
 //!
-//! ## N2.0.7.2 changes
+//! N2.0.7.3 fixes this by separating three concepts:
 //!
-//! - `NodeDescriptor` is now `UnverifiedNodeDescriptor` — it carries identity
-//!   data but does NOT prove the data is authentic.
-//! - `VerifiedNodeDescriptor` is a wrapper that can ONLY be constructed from
-//!   a verified `GatewayAdvertisement` (signature checked). The routing layer
-//!   consumes `VerifiedNodeDescriptor` — it cannot accidentally use unverified
-//!   identity data.
-//! - `VerifiedNodeDescriptor::verify_node_id()` enforces invariant I4:
-//!   `NodeId == SHA-256("SNP/0.1 node\0" || ed25519_public_key)`. A descriptor
-//!   with a mismatched NodeId/public-key pair is REJECTED at construction time.
-//! - `TransportEndpoint` is a typed enum (Tcp/Ble/WifiDirect/NearbyConnections).
+//! 1. **`UnverifiedNodeDescriptor`** — raw identity data. No proof of anything.
+//! 2. **`IdentityConsistentNodeDescriptor`** — NodeId↔Ed25519 consistency
+//!    verified (invariant I4). Can be constructed from `UnverifiedNodeDescriptor`
+//!    via `into_consistent()`. This proves the NodeId is the hash of the public
+//!    key, but does NOT prove the identity is authentic.
+//! 3. **`VerifiedNodeDescriptor`** — the identity came from a VERIFIED
+//!    `GatewayAdvertisement` (signature checked + NodeId↔Ed25519 consistency
+//!    verified). This is the ONLY descriptor type the routing layer accepts.
+//!    It can ONLY be constructed via `VerifiedGatewayAdvertisement::descriptor()`.
 
 use super::*;
+use snp_cbor::CborValue;
 use snp_crypto::{derive_node_id, sha256};
 
-/// **N2.0.7.2.** An UNVERIFIED node identity descriptor. Carries identity
-/// data but does NOT prove the data is authentic. Use
-/// [`VerifiedNodeDescriptor::from_verified_advert`] to obtain a verified
-/// descriptor from a checked advertisement.
-///
-/// The routing layer MUST NOT consume `UnverifiedNodeDescriptor` directly —
-/// it requires [`VerifiedNodeDescriptor`]. This type exists for internal
-/// construction (e.g. building a relay descriptor for a known peer) and
-/// for test fixtures.
+// ─── UnverifiedNodeDescriptor ────────────────────────────────────────────────
+
+/// Raw node identity data. No proof of authenticity or consistency.
+/// This type exists for internal construction and test fixtures.
+/// The routing layer MUST NOT consume it.
 #[derive(Debug, Clone)]
 pub struct UnverifiedNodeDescriptor {
-    /// The node's NodeId (`SHA-256("SNP/0.1 node\0" || ed25519_public_key)`).
+    /// The node's NodeId.
     pub node_id: [u8; 32],
-    /// The node's Ed25519 identity public key (32 bytes, raw wire form per I3).
+    /// The node's Ed25519 identity public key (32 bytes).
     pub ed25519_public_key: [u8; 32],
-    /// The node's STATIC X25519 circuit public key (32 bytes). Only present
-    /// for gateway nodes; `None` for relays/clients.
+    /// The node's STATIC X25519 circuit public key. `None` for non-gateways.
     pub x25519_circuit_public: Option<[u8; 32]>,
-    /// The node's capabilities (Client, Relay, Gateway).
+    /// The node's capabilities.
     pub capabilities: Vec<Capability>,
 }
 
 impl UnverifiedNodeDescriptor {
-    /// Construct an `UnverifiedNodeDescriptor` for a relay (no X25519
-    /// circuit key — relays don't terminate circuits).
+    /// Construct for a relay (no X25519 circuit key).
     #[must_use]
     pub fn for_relay(node_id: [u8; 32], ed25519_public_key: [u8; 32]) -> Self {
         Self {
@@ -56,8 +53,7 @@ impl UnverifiedNodeDescriptor {
         }
     }
 
-    /// Construct an `UnverifiedNodeDescriptor` for a gateway (with X25519
-    /// circuit key).
+    /// Construct for a gateway (with X25519 circuit key).
     #[must_use]
     pub fn for_gateway(
         node_id: [u8; 32],
@@ -72,82 +68,51 @@ impl UnverifiedNodeDescriptor {
         }
     }
 
-    /// Verify the NodeId ↔ Ed25519 public key consistency (invariant I4):
+    /// Verify NodeId↔Ed25519 consistency (invariant I4):
     /// `NodeId == SHA-256("SNP/0.1 node\0" || ed25519_public_key)`.
-    ///
-    /// Returns `true` if the NodeId matches the hash of the public key.
     #[must_use]
     pub fn verify_node_id_consistency(&self) -> bool {
         let expected = derive_node_id(&self.ed25519_public_key);
         self.node_id == expected
     }
 
-    /// Convert to a `VerifiedNodeDescriptor` after verifying the NodeId ↔
-    /// public key consistency. Returns `None` if the consistency check fails.
+    /// Convert to an `IdentityConsistentNodeDescriptor` after verifying the
+    /// NodeId↔Ed25519 consistency. Returns `None` if the check fails.
     ///
-    /// Note: this does NOT verify that the identity data came from a signed
-    /// advertisement — it only verifies the cryptographic relationship
-    /// between NodeId and Ed25519 public key. For full verification, use
-    /// [`VerifiedNodeDescriptor::from_verified_advert`].
+    /// **N2.0.7.3:** This is NOT `into_verified()` — it does NOT produce a
+    /// `VerifiedNodeDescriptor`. It produces an
+    /// `IdentityConsistentNodeDescriptor`, which proves the NodeId is the
+    /// hash of the public key but does NOT prove the identity is authentic.
+    /// Only `VerifiedGatewayAdvertisement::descriptor()` produces a
+    /// `VerifiedNodeDescriptor`.
     #[must_use]
-    pub fn into_verified(self) -> Option<VerifiedNodeDescriptor> {
+    pub fn into_consistent(self) -> Option<IdentityConsistentNodeDescriptor> {
         if !self.verify_node_id_consistency() {
             return None;
         }
-        Some(VerifiedNodeDescriptor { inner: self })
-    }
-
-    /// Get the X25519 circuit public key, or `None` if this node is not a
-    /// gateway.
-    #[must_use]
-    pub fn circuit_x25519_pub(&self) -> Option<&[u8; 32]> {
-        self.x25519_circuit_public.as_ref()
+        Some(IdentityConsistentNodeDescriptor { inner: self })
     }
 }
 
-/// **N2.0.7.2.** A VERIFIED node identity descriptor. This type can ONLY be
-/// constructed by:
+// ─── IdentityConsistentNodeDescriptor ────────────────────────────────────────
+
+/// A node descriptor whose NodeId↔Ed25519 consistency has been verified
+/// (invariant I4: `NodeId == SHA-256("SNP/0.1 node\0" || ed25519_public_key)`).
 ///
-/// 1. [`VerifiedNodeDescriptor::from_verified_advert`] — from a
-///    `GatewayAdvertisement` whose signature has been checked AND whose
-///    NodeId ↔ Ed25519 consistency has been verified.
-/// 2. [`UnverifiedNodeDescriptor::into_verified`] — after verifying the
-///    NodeId ↔ Ed25519 consistency.
+/// **N2.0.7.3:** This type replaces the N2.0.7.2 `VerifiedNodeDescriptor`
+/// that was produced by `into_verified()`. The old name was misleading —
+/// "verified" implied authentication, but the function only proved
+/// internal consistency.
 ///
-/// The routing layer (`Route`, `send_via_route`, `serve_relay_via_route`)
-/// consumes `VerifiedNodeDescriptor` — it cannot accidentally use unverified
-/// identity data. This is the type-system enforcement of the security
-/// invariant that the routing layer requires authenticated node identity.
+/// This type does NOT prove the identity came from a signed advertisement.
+/// For authenticated identity, use [`VerifiedNodeDescriptor`] (which can
+/// only be constructed from a [`VerifiedGatewayAdvertisement`]).
 #[derive(Debug, Clone)]
-pub struct VerifiedNodeDescriptor {
+pub struct IdentityConsistentNodeDescriptor {
     inner: UnverifiedNodeDescriptor,
 }
 
-impl VerifiedNodeDescriptor {
-    /// Construct a `VerifiedNodeDescriptor` from a VERIFIED
-    /// [`GatewayAdvertisement`]. The advertisement's signature MUST be
-    /// verified BEFORE calling this function (via `advert.verify()`).
-    ///
-    /// This function ALSO verifies invariant I4 (NodeId ↔ Ed25519 public
-    /// key consistency). If the advertisement's NodeId does not match
-    /// `SHA-256("SNP/0.1 node\0" || public_key)`, this function returns
-    /// `None`.
-    ///
-    /// # Errors
-    /// Returns `None` if the NodeId ↔ Ed25519 consistency check fails.
-    /// (Signature verification is the caller's responsibility — this
-    /// function trusts that `advert.verify()` was already called.)
-    #[must_use]
-    pub fn from_verified_advert(advert: &GatewayAdvertisement) -> Option<Self> {
-        let unverified = UnverifiedNodeDescriptor {
-            node_id: advert.node_id,
-            ed25519_public_key: advert.public_key,
-            x25519_circuit_public: Some(advert.circuit_x25519_pub),
-            capabilities: advert.capabilities.clone(),
-        };
-        unverified.into_verified()
-    }
-
+impl IdentityConsistentNodeDescriptor {
     /// Get the NodeId.
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -160,7 +125,7 @@ impl VerifiedNodeDescriptor {
         &self.inner.ed25519_public_key
     }
 
-    /// Get the X25519 circuit public key (for gateways), or `None` for relays.
+    /// Get the X25519 circuit public key (for gateways), or `None`.
     #[must_use]
     pub fn circuit_x25519_pub(&self) -> Option<&[u8; 32]> {
         self.inner.x25519_circuit_public.as_ref()
@@ -184,52 +149,222 @@ impl VerifiedNodeDescriptor {
         self.inner.capabilities.contains(&Capability::Relay)
     }
 
-    /// Compute the canonical encoding of this descriptor for RouteCommitment.
-    /// This is a deterministic encoding that includes ALL identity-critical
-    /// fields (NodeId + Ed25519 pub + X25519 circuit pub + capabilities).
+    /// Compute the canonical CBOR encoding of this descriptor for
+    /// RouteCommitment. Uses the existing `snp-cbor` canonical encoding
+    /// (NOT manual concatenation).
     #[must_use]
-    pub fn canonical_encoding(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + 32 + 32 + 16);
-        buf.extend_from_slice(&self.inner.node_id);
-        buf.extend_from_slice(&self.inner.ed25519_public_key);
-        if let Some(x25519) = &self.inner.x25519_circuit_public {
-            buf.push(1);
-            buf.extend_from_slice(x25519);
-        } else {
-            buf.push(0);
-        }
-        // Capabilities (sorted for determinism).
-        let mut caps: Vec<&str> = self
-            .inner
-            .capabilities
-            .iter()
-            .map(|c| c.as_str())
-            .collect();
-        caps.sort();
-        for cap in caps {
-            buf.extend_from_slice(cap.as_bytes());
-            buf.push(0); // null-terminate
-        }
-        buf
+    pub fn canonical_cbor(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.inner.node_id.to_vec())),
+            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.inner.ed25519_public_key.to_vec())),
+            (
+                CborValue::TextString("x25519CircuitPub".into()),
+                match &self.inner.x25519_circuit_public {
+                    Some(k) => CborValue::ByteString(k.to_vec()),
+                    None => CborValue::Null,
+                },
+            ),
+            (
+                CborValue::TextString("capabilities".into()),
+                CborValue::Array(
+                    self.inner.capabilities.iter().map(|c| CborValue::TextString(c.as_str().to_string())).collect(),
+                ),
+            ),
+        ])
     }
 }
 
-/// **N2.0.7.1.** A transport-neutral endpoint locator. Not an informal
-/// string — a typed enum that the [`TransportProvider`] resolves into a
-/// connection.
+// ─── VerifiedNodeDescriptor ──────────────────────────────────────────────────
+
+/// A node descriptor whose identity has been AUTHENTICATED — it came from a
+/// [`VerifiedGatewayAdvertisement`] (signature checked + NodeId↔Ed25519
+/// consistency verified).
 ///
-/// **N2.0.7.2:** Endpoints must be bound to a `VerifiedNodeDescriptor` via
-/// the `RouteHop` structure. An endpoint is only usable for Node X if it
-/// was obtained through an authenticated/verified discovery record or an
-/// authenticated route construction mechanism. The `RouteHop` enforces this
-/// by carrying the endpoint alongside the `VerifiedNodeDescriptor`.
+/// **N2.0.7.3:** This type can ONLY be constructed via
+/// `VerifiedGatewayAdvertisement::descriptor()`. There is NO
+/// `into_verified()` path from `UnverifiedNodeDescriptor` or
+/// `IdentityConsistentNodeDescriptor`. The type system enforces that
+/// the routing layer receives authenticated identity data.
 ///
-/// [`TransportProvider`]: super::transport::TransportProvider
+/// The routing layer (`Route`, `RouteHop`, `send_via_route`) consumes
+/// `VerifiedNodeDescriptor` — it cannot accidentally use unverified or
+/// merely-consistent identity data.
+#[derive(Debug, Clone)]
+pub struct VerifiedNodeDescriptor {
+    inner: IdentityConsistentNodeDescriptor,
+}
+
+impl VerifiedNodeDescriptor {
+    /// Construct a `VerifiedNodeDescriptor` from a
+    /// [`VerifiedGatewayAdvertisement`]. This is the ONLY way to obtain a
+    /// `VerifiedNodeDescriptor` — the `VerifiedGatewayAdvertisement` wrapper
+    /// proves the advertisement's signature was checked.
+    ///
+    /// This function ALSO verifies invariant I4 (NodeId↔Ed25519 consistency).
+    /// If the consistency check fails, returns `None`.
+    #[must_use]
+    pub(crate) fn from_verified_advert_internal(advert: &GatewayAdvertisement) -> Option<Self> {
+        let unverified = UnverifiedNodeDescriptor {
+            node_id: advert.node_id,
+            ed25519_public_key: advert.public_key,
+            x25519_circuit_public: Some(advert.circuit_x25519_pub),
+            capabilities: advert.capabilities.clone(),
+        };
+        let consistent = unverified.into_consistent()?;
+        Some(VerifiedNodeDescriptor { inner: consistent })
+    }
+
+    /// Get the NodeId.
+    #[must_use]
+    pub fn node_id(&self) -> [u8; 32] {
+        self.inner.node_id()
+    }
+
+    /// Get the Ed25519 public key.
+    #[must_use]
+    pub fn ed25519_public_key(&self) -> &[u8; 32] {
+        self.inner.ed25519_public_key()
+    }
+
+    /// Get the X25519 circuit public key (for gateways), or `None`.
+    #[must_use]
+    pub fn circuit_x25519_pub(&self) -> Option<&[u8; 32]> {
+        self.inner.circuit_x25519_pub()
+    }
+
+    /// Get the capabilities.
+    #[must_use]
+    pub fn capabilities(&self) -> &[Capability] {
+        self.inner.capabilities()
+    }
+
+    /// Check if this descriptor has the Gateway capability.
+    #[must_use]
+    pub fn is_gateway(&self) -> bool {
+        self.inner.is_gateway()
+    }
+
+    /// Check if this descriptor has the Relay capability.
+    #[must_use]
+    pub fn is_relay(&self) -> bool {
+        self.inner.is_relay()
+    }
+
+    /// Verify NodeId↔Ed25519 consistency (defence in depth — should always
+    /// be true since it was checked at construction).
+    #[must_use]
+    pub fn verify_node_id_consistency(&self) -> bool {
+        self.inner.inner.verify_node_id_consistency()
+    }
+
+    /// Compute the canonical CBOR encoding of this descriptor for
+    /// RouteCommitment.
+    #[must_use]
+    pub fn canonical_cbor(&self) -> CborValue {
+        self.inner.canonical_cbor()
+    }
+}
+
+// ─── VerifiedGatewayAdvertisement ────────────────────────────────────────────
+
+/// A `GatewayAdvertisement` whose signature has been VERIFIED.
+///
+/// **N2.0.7.3:** This wrapper can ONLY be constructed by calling
+/// [`GatewayAdvertisement::verify_into_verified`], which checks the Ed25519
+/// signature. An arbitrary `GatewayAdvertisement` CANNOT be directly
+/// converted to a `VerifiedGatewayAdvertisement` — the verification step
+/// is enforced by the type system.
+///
+/// This is the authenticated source from which `VerifiedNodeDescriptor`s
+/// are derived.
+#[derive(Debug, Clone)]
+pub struct VerifiedGatewayAdvertisement {
+    advert: GatewayAdvertisement,
+}
+
+impl VerifiedGatewayAdvertisement {
+    /// Get the inner advertisement.
+    #[must_use]
+    pub fn as_ref(&self) -> &GatewayAdvertisement {
+        &self.advert
+    }
+
+    /// Derive a `VerifiedNodeDescriptor` from this verified advertisement.
+    /// This is the ONLY way to obtain a `VerifiedNodeDescriptor`.
+    ///
+    /// Also verifies NodeId↔Ed25519 consistency (invariant I4). Returns
+    /// `None` if the consistency check fails.
+    #[must_use]
+    pub fn descriptor(&self) -> Option<VerifiedNodeDescriptor> {
+        VerifiedNodeDescriptor::from_verified_advert_internal(&self.advert)
+    }
+
+    /// Get the gateway's NodeId.
+    #[must_use]
+    pub fn node_id(&self) -> [u8; 32] {
+        self.advert.node_id
+    }
+
+    /// Get the gateway's Ed25519 public key.
+    #[must_use]
+    pub fn public_key(&self) -> &[u8; 32] {
+        &self.advert.public_key
+    }
+
+    /// Get the gateway's X25519 circuit public key.
+    #[must_use]
+    pub fn circuit_x25519_pub(&self) -> &[u8; 32] {
+        &self.advert.circuit_x25519_pub
+    }
+
+    /// Get the gateway's listen address.
+    #[must_use]
+    pub fn listen_addr(&self) -> &str {
+        &self.advert.listen_addr
+    }
+
+    /// Get the gateway's discovery address.
+    #[must_use]
+    pub fn discovery_addr(&self) -> &str {
+        &self.advert.discovery_addr
+    }
+}
+
+/// Verify a `GatewayAdvertisement`'s signature and return a
+/// `VerifiedGatewayAdvertisement` wrapper.
+///
+/// This is the ONLY way to construct a `VerifiedGatewayAdvertisement`.
+/// The signature is checked against the advertisement's `public_key` under
+/// `SIG_CONTEXTS::GATEWAY_ADVERT`.
+impl GatewayAdvertisement {
+    /// Verify the advertisement's signature. If valid, return a
+    /// [`VerifiedGatewayAdvertisement`] wrapper. If invalid, return `None`.
+    ///
+    /// This is the entry point for authenticated identity — the resulting
+    /// `VerifiedGatewayAdvertisement` can produce a `VerifiedNodeDescriptor`
+    /// via `descriptor()`.
+    #[must_use]
+    pub fn verify_into_verified(&self) -> Option<VerifiedGatewayAdvertisement> {
+        if !self.verify() {
+            return None;
+        }
+        Some(VerifiedGatewayAdvertisement {
+            advert: self.clone(),
+        })
+    }
+}
+
+// ─── TransportEndpoint ───────────────────────────────────────────────────────
+
+/// A transport-neutral endpoint locator. Not an informal string — a typed
+/// enum. Endpoints are bound to a `VerifiedNodeDescriptor` via the `RouteHop`
+/// structure; an endpoint is only usable for Node X if it was obtained
+/// through an authenticated route construction mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TransportEndpoint {
     /// A TCP endpoint (e.g. `"127.0.0.1:38507"`).
     Tcp(String),
-    /// A BLE endpoint (e.g. `"ble:aa:bb:cc:dd:ee:ff"`). NOT YET IMPLEMENTED.
+    /// A BLE endpoint. NOT YET IMPLEMENTED.
     Ble(String),
     /// A Wi-Fi Direct endpoint. NOT YET IMPLEMENTED.
     WifiDirect(String),
@@ -264,35 +399,20 @@ impl TransportEndpoint {
         }
     }
 
-    /// Compute the canonical encoding of this endpoint for RouteCommitment.
+    /// Compute the canonical CBOR encoding of this endpoint for
+    /// RouteCommitment. Uses `snp-cbor` canonical encoding.
     #[must_use]
-    pub fn canonical_encoding(&self) -> Vec<u8> {
-        match self {
-            Self::Tcp(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len());
-                buf.push(0x01);
-                buf.extend_from_slice(s.as_bytes());
-                buf
-            }
-            Self::Ble(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len());
-                buf.push(0x02);
-                buf.extend_from_slice(s.as_bytes());
-                buf
-            }
-            Self::WifiDirect(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len());
-                buf.push(0x03);
-                buf.extend_from_slice(s.as_bytes());
-                buf
-            }
-            Self::NearbyConnections(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len());
-                buf.push(0x04);
-                buf.extend_from_slice(s.as_bytes());
-                buf
-            }
-        }
+    pub fn canonical_cbor(&self) -> CborValue {
+        let (type_tag, addr) = match self {
+            Self::Tcp(s) => ("tcp", s),
+            Self::Ble(s) => ("ble", s),
+            Self::WifiDirect(s) => ("wifi-direct", s),
+            Self::NearbyConnections(s) => ("nearby", s),
+        };
+        CborValue::Map(vec![
+            (CborValue::TextString("type".into()), CborValue::TextString(type_tag.to_string())),
+            (CborValue::TextString("addr".into()), CborValue::TextString(addr.to_string())),
+        ])
     }
 }
 
@@ -300,12 +420,8 @@ impl TransportEndpoint {
 /// `Route::validate()` for defence in depth.
 #[must_use]
 pub fn verify_node_id_consistency(desc: &VerifiedNodeDescriptor) -> bool {
-    let expected = derive_node_id(desc.ed25519_public_key());
-    desc.node_id() == expected
+    desc.verify_node_id_consistency()
 }
 
 // Backward compat: re-export UnverifiedNodeDescriptor as NodeDescriptor.
-// This allows existing code that references `NodeDescriptor` to continue
-// working. New code should use `UnverifiedNodeDescriptor` or
-// `VerifiedNodeDescriptor` explicitly.
 pub type NodeDescriptor = UnverifiedNodeDescriptor;

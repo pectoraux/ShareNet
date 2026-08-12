@@ -1,3 +1,7 @@
+#![cfg(feature = "legacy-circuit-keys")]
+//! N2.0.7.3: This test uses the legacy Route::new() constructor.
+//! Run with: cargo test --features legacy-circuit-keys
+
 //! N2.0.3 Gate L — Security Regression Tests
 //!
 //! Tests every security invariant has an executable check.

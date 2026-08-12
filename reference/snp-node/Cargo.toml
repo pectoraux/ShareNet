@@ -47,10 +47,8 @@ getrandom = "0.2"
 serde_json.workspace = true
 url.workspace = true
 
-# N2.0.7.2: Enable the legacy-circuit-keys feature for the test suite, so
-# that the old N2.0.6/N2.0.7 tests (which haven't been migrated yet) can
-# still compile. The PRODUCTION BUILD (`cargo build`) does NOT enable this
-# feature — the old APIs are physically absent from the production binary.
-[dev-dependencies.snp-node]
-path = "."
-features = ["legacy-circuit-keys"]
+# N2.0.7.3: The legacy-circuit-keys feature is NOT enabled by default for
+# tests. `cargo test` runs ONLY the new production architecture. To run the
+# legacy compatibility suite:
+#   cargo test --features legacy-circuit-keys
+# Legacy tests are isolated in tests/legacy/ and require the explicit flag.
