@@ -303,8 +303,14 @@ impl PeerSummary {
 
 /// A PeerSummaryList message — a bounded list of PeerSummaries from the sender.
 ///
-/// Used for anti-entropy: peers exchange summary lists to learn about
+/// Used for topology propagation: peers exchange summary lists to learn about
 /// remote nodes. The list is bounded by a maximum number of entries.
+///
+/// **N2.1.1.1:** Added `propagation_sequence` — a monotonic per-sender
+/// sequence for the summary list itself (distinct from NodeAdvertisement
+/// sequences). This enables stateful replay prevention for propagation
+/// messages. A stale/replayed PeerSummaryList (with an older propagation
+/// sequence) is rejected by the topology graph.
 #[derive(Debug, Clone)]
 pub struct PeerSummaryList {
     /// The sender's NodeId.
@@ -317,6 +323,12 @@ pub struct PeerSummaryList {
     pub timestamp: u64,
     /// 16-byte freshness nonce.
     pub nonce: [u8; 16],
+    /// **N2.1.1.1.** Monotonic propagation sequence number for this sender.
+    /// Each new PeerSummaryList from the same sender MUST have a higher
+    /// propagation_sequence than the previous one. This is distinct from
+    /// NodeAdvertisement sequences — it is a per-sender propagation message
+    /// counter, not a node advertisement counter.
+    pub propagation_sequence: u64,
     /// Ed25519 signature.
     pub signature: [u8; 64],
 }
@@ -332,6 +344,7 @@ impl PeerSummaryList {
         ed25519_public_key: &[u8; 32],
         node_id: [u8; 32],
         summaries: Vec<PeerSummary>,
+        propagation_sequence: u64,
     ) -> Self {
         let now = now_unix();
         let mut nonce = [0u8; 16];
@@ -348,6 +361,7 @@ impl PeerSummaryList {
             summaries,
             timestamp: now,
             nonce,
+            propagation_sequence,
             signature: [0u8; 64],
         };
         msg.sign(ed25519_secret_key);
@@ -366,6 +380,7 @@ impl PeerSummaryList {
             (CborValue::TextString("summaries".into()), CborValue::Array(summaries)),
             (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
             (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
+            (CborValue::TextString("propagationSequence".into()), CborValue::UnsignedInt(self.propagation_sequence)),
         ])
     }
 

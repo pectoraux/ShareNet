@@ -140,7 +140,7 @@ pub use topology_protocol::{
     GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, MAX_PEER_SUMMARIES_PER_MESSAGE,
 };
 pub use peer_directory::PeerDirectory;
-pub use topology::{RemoteNodeEntry, TopologyGraph, TopologySnapshot};
+pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

@@ -3948,3 +3948,63 @@ Stage Summary:
 - TopologySnapshot is immutable for route computation.
 - Gateway is a capability, not a separate subsystem.
 
+
+---
+Task ID: 266-270 (N2.1.1.1 — Non-authoritative Remote Hints)
+Agent: Z.ai (main)
+
+Task: N2.1.1 stored remote summaries as RemoteNodeEntry and exposed them via remote_gateways()/all_known_gateways() — conflating third-party claims with authenticated node identity. This milestone makes remote hints explicitly non-authoritative.
+
+Work Log:
+- Replaced RemoteNodeEntry with RemoteNodeHint:
+  * Explicitly documented as NON-authoritative third-party claim.
+  * Fields renamed: target_node_id, claimed_sequence, claimed_capabilities, claimed_visibility, claimed_last_seen, distance_hint, learned_from, received_at, source_propagation_sequence.
+  * Methods: claims_gateway(), claims_relay() — names explicitly say "claims", not "is".
+  * NO method to convert to VerifiedNodeDescriptor or AuthenticatedNodeRecord.
+
+- Removed all_known_gateways() — it conflated authenticated gateways with remote claims.
+- Added gateway_hints() — returns RemoteNodeHint (non-authoritative).
+- direct_gateways() remains — returns AuthenticatedNodeRecord (authoritative).
+- Added is_authenticated() — distinguishes direct knowledge from remote hints.
+
+- Added propagation_sequence to PeerSummaryList:
+  * Monotonic per-sender, distinct from NodeAdvertisement sequence.
+  * Signed (inside the preimage).
+  * TopologyGraph tracks highest propagation_sequence per sender.
+  * process_peer_summaries() returns PropagationResult::Accepted or Stale.
+  * Stale/duplicate propagation messages are rejected.
+
+- Preserved provenance:
+  * RemoteNodeHint carries learned_from, received_at, source_propagation_sequence.
+  * The hint answers: WHO claimed this? WHEN? WHAT sequence? HOW MANY HOPS?
+
+- Documented distance_hint semantics:
+  * distance_hint != route, != verified path, != next hop.
+  * It is a discovery heuristic only.
+
+- 10 new tests (30 total in n211_topology.rs):
+  N1. remote_hint_is_not_authenticated_node
+  N2. fake_gateway_claim_is_not_authenticated
+  N3. direct_gateways_excludes_remote_hints
+  N4. gateway_hints_contains_remote_claim
+  N5. remote_hint_cannot_become_verified_descriptor
+  N6. multi_hop_destination_discovery_without_authentication
+  N7. distance_hint_is_not_route
+  N8. propagation_sequence_replay_rejected
+  N9. stale_propagation_message_rejected
+  N10. provenance_preserved
+
+- Test results: 262 passed, 0 failed, 3 ignored (was 252; +10 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Remote topology hints are explicitly non-authoritative (RemoteNodeHint).
+- Type system prevents RemoteNodeHint → VerifiedNodeDescriptor conversion.
+- direct_gateways() returns ONLY authenticated gateways.
+- gateway_hints() returns remote claims (clearly named as hints).
+- all_known_gateways() removed (was conflating the two).
+- Propagation messages have monotonic sequence + stateful replay prevention.
+- Provenance preserved (learned_from, received_at, source_propagation_sequence).
+- Multi-hop destination discovery works: A learns G exists at ~3 hops via B, but G is NOT authenticated.
+- Ready for N2.1.2 (route computation).
+
