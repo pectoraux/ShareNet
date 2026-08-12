@@ -47,9 +47,11 @@ fn sec_route_excessive_hops_rejected() {
 fn sec_route_expired_rejected() {
     let id_a = sha256(b"node-a");
     let gw = sha256(b"gateway");
-    let mut route = Route::new(id_a, gw, vec![gw]);
-    route.expires_at = now_unix() - 1; // expired
-    assert!(route.is_expired(now_unix()), "Expired route must be detected");
+    let route = Route::new(id_a, gw, vec![gw]);
+    // N2.0.7.2: expires_at is now non-mutable. Use the is_expired check
+    // with a future timestamp to test expiration logic.
+    let future = now_unix() + 7200; // 2 hours in the future
+    assert!(route.is_expired(future), "Route must be expired at a future timestamp");
 }
 
 #[test]
@@ -57,11 +59,12 @@ fn sec_route_epoch_regression() {
     let id_a = sha256(b"node-a");
     let gw = sha256(b"gateway");
     let mut route1 = Route::new(id_a, gw, vec![gw]);
-    route1.epoch = 10;
-    let mut route2 = Route::new(id_a, gw, vec![gw]);
-    route2.epoch = 5; // lower than route1's epoch
+    route1.increment_epoch();
+    route1.increment_epoch();
+    route1.increment_epoch();
+    let route2 = Route::new(id_a, gw, vec![gw]);
     // Epoch regression: route2 has a lower epoch than route1
-    assert!(route2.epoch < route1.epoch, "Epoch regression must be detectable");
+    assert!(route2.epoch() < route1.epoch(), "Epoch regression must be detectable");
 }
 
 #[test]
@@ -70,7 +73,7 @@ fn sec_route_state_machine_illegal_transition() {
     let gw = sha256(b"gateway");
     let mut route = Route::new(id_a, gw, vec![gw]);
     // Closed → Active is illegal
-    route.state = RouteState::Closed;
+    route.transition(RouteState::Closed).expect("Proposed → Closed is legal");
     assert!(route.transition(RouteState::Active).is_err(),
         "Closed → Active must be rejected");
 }

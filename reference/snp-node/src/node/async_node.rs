@@ -87,6 +87,11 @@ fn async_err_to_node(e: AsyncLinkError) -> NodeError {
 /// public key in each request frame, NOT from an externally supplied
 /// `CircuitKeys` parameter. This function is retained only for backward
 /// compat with N2.0.6 tests and MUST NOT be used by new production code.
+///
+/// **N2.0.7.2:** This function is now behind the `legacy-circuit-keys` Cargo
+/// feature. The production build (`cargo build` without `--features
+/// legacy-circuit-keys`) does NOT compile this function.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
@@ -160,6 +165,9 @@ pub async fn serve_gateway_persistent_async(
 /// [`serve_gateway_persistent_async`] which calls [`PinnedConnector::new`]
 /// and enforces the SSRF defence.
 /// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
@@ -235,6 +243,9 @@ where
 /// use the protocol-driven path (`serve_gateway_with_protocol_circuit` →
 /// `serve_one_gateway_request_protocol_circuit`) instead, which derives keys
 /// from the client's ephemeral public key in the frame body.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_one_gateway_request_protocol_circuit` — circuit keys must be derived from the protocol"
@@ -267,6 +278,9 @@ async fn serve_one_gateway_request_async(
 /// **N2.0.7.1: DEPRECATED.** This function takes `CircuitKeys` as a parameter —
 /// use the protocol-driven path (`serve_gateway_with_protocol_circuit` →
 /// `serve_one_gateway_request_protocol_circuit`) instead.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_one_gateway_request_protocol_circuit` — circuit keys must be derived from the protocol"
@@ -739,6 +753,9 @@ async fn discover_one_async(addr: &str) -> NodeResult<GatewayAdvertisement> {
 /// [`send_with_protocol_circuit_async`] or [`send_via_route`] instead —
 /// they derive circuit keys FROM the protocol (fresh ephemeral X25519 per
 /// request).
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `send_with_protocol_circuit_async` or `send_via_route` — circuit keys must be derived from the protocol"
@@ -1077,6 +1094,9 @@ where
 /// pre-computed circuit keys externally (out-of-band). The protocol-driven
 /// `serve_gateway_with_protocol_circuit` derives keys FROM the client's
 /// ephemeral public key in each request frame body.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
@@ -1160,6 +1180,9 @@ pub async fn serve_gateway_persistent_async_with_handshake(
 /// test-only connector factory (to bypass SSRF for a local mock HTTP server).
 ///
 /// **N2.0.6: DEPRECATED.** Use [`serve_gateway_with_protocol_circuit`] instead.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `serve_gateway_with_protocol_circuit` — circuit keys must be derived from the protocol, not supplied externally"
@@ -1352,8 +1375,11 @@ pub async fn serve_relay_persistent_async_with_handshake(
 /// — it uses `seal_circuit_payload_with_fresh_eph` (fresh ephemeral per
 /// request, protocol-driven).
 ///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+///
 /// # Errors
 /// Returns [`NodeError`] on any failure.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `send_via_route` — circuit keys must be derived from the protocol via seal_circuit_payload_with_fresh_eph"
@@ -1414,6 +1440,9 @@ pub async fn establish_circuit_and_send_async(
 /// **N2.0.7.1: DEPRECATED.** This function looks up a pre-established
 /// `Circuit` from `node.circuits` (out-of-band circuit keys). Use
 /// [`send_with_protocol_circuit_async`] or [`send_via_route`] instead.
+///
+/// **N2.0.7.2:** Behind `legacy-circuit-keys` feature — not in production build.
+#[cfg(feature = "legacy-circuit-keys")]
 #[deprecated(
     since = "N2.0.7.1",
     note = "use `send_with_protocol_circuit_async` or `send_via_route` — circuit keys must be derived from the protocol"
@@ -1690,7 +1719,7 @@ pub async fn send_with_protocol_circuit_async(
 /// SELF-CONTAINED.
 ///
 /// Internally:
-/// 1. Extracts the first relay's endpoint from `route.hop_details[0]`.
+/// 1. Extracts the first relay's endpoint from `route.hop_details()[0]`.
 /// 2. Extracts the gateway's identity from `route.hop_details[last].descriptor`.
 /// 3. Calls `send_with_protocol_circuit_async` (fresh ephemeral circuit).
 ///
@@ -1707,12 +1736,12 @@ pub async fn send_via_route(
 ) -> NodeResult<snp_gateway::TransitResponse> {
     // 1. The Route is AUTHORITATIVE — extract the first relay's endpoint
     //    from hop_details[0].
-    if route.hop_details.is_empty() {
+    if route.hop_details().is_empty() {
         return Err(NodeError::Other(
             "send_via_route: route has no hop_details (use Route::new_with_hop_details)".into(),
         ));
     }
-    let first_hop = &route.hop_details[0];
+    let first_hop = &route.hop_details()[0];
     let relay_endpoint = first_hop.first_endpoint().ok_or_else(|| {
         NodeError::Other("send_via_route: first hop has no endpoints".into())
     })?;
@@ -1732,8 +1761,8 @@ pub async fn send_via_route(
     let gateway_descriptor = route.destination_descriptor().ok_or_else(|| {
         NodeError::Other("send_via_route: route has no destination descriptor".into())
     })?;
-    let gateway_node_id = gateway_descriptor.node_id;
-    let gateway_ed25519_public = gateway_descriptor.ed25519_public_key;
+    let gateway_node_id = gateway_descriptor.node_id();
+    let gateway_ed25519_public = *gateway_descriptor.ed25519_public_key();
     let gateway_x25519_pub_bytes = gateway_descriptor.circuit_x25519_pub().ok_or_else(|| {
         NodeError::Other(
             "send_via_route: destination descriptor has no X25519 circuit public key \
@@ -1746,7 +1775,7 @@ pub async fn send_via_route(
     eprintln!(
         "[send-via-route {}] route: {} hops, first={}, dest={}",
         super::hex_short(&node.identity.node_id),
-        route.hop_details.len(),
+        route.hop_details().len(),
         super::hex_short(&relay_node_id),
         super::hex_short(&gateway_node_id)
     );
@@ -1810,7 +1839,7 @@ pub async fn serve_relay_via_route(
                 "serve_relay_via_route: no hop at position {} (my_position={}, route has {} hops)",
                 my_position + 1,
                 my_position,
-                route.hop_details.len()
+                route.hop_details().len()
             ))
         })?;
     let next_hop_endpoint = next_hop.first_endpoint().ok_or_else(|| {

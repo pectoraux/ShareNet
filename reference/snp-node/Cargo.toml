@@ -13,6 +13,14 @@ default = []
 # Enable legacy N1.9/N2.0 demo code (GatewayChoice, deterministic seeds).
 # This is NOT needed for production — it exists only for backward-compat tests.
 legacy-demo = []
+# N2.0.7.2: Enable the OLD circuit-key gateway/client APIs that accept
+# externally-supplied CircuitKeys. These APIs are OUT OF BAND — the gateway
+# receives pre-computed circuit keys instead of deriving them from the
+# protocol. They exist ONLY for backward-compat with N2.0.6/N2.0.7 tests
+# that haven't been migrated yet. The PRODUCTION BUILD (`cargo build`)
+# does NOT enable this feature — the old APIs are physically absent from
+# the production binary.
+legacy-circuit-keys = []
 
 [[bin]]
 name = "snp-node"
@@ -38,3 +46,11 @@ getrandom = "0.2"
 [dev-dependencies]
 serde_json.workspace = true
 url.workspace = true
+
+# N2.0.7.2: Enable the legacy-circuit-keys feature for the test suite, so
+# that the old N2.0.6/N2.0.7 tests (which haven't been migrated yet) can
+# still compile. The PRODUCTION BUILD (`cargo build`) does NOT enable this
+# feature — the old APIs are physically absent from the production binary.
+[dev-dependencies.snp-node]
+path = "."
+features = ["legacy-circuit-keys"]

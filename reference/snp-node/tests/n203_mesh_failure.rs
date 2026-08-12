@@ -591,8 +591,8 @@ fn setup_mesh_topology(relay_b_drop_after: usize, gateway_a_drop_after: usize) -
         .expect("Establishing → Active is legal");
     println!(
         "[topology] Primary route validated + Active: {} hops, route_id={}",
-        primary_route.hops.len(),
-        hex_short(&primary_route.route_id)
+        primary_route.hops().len(),
+        hex_short(primary_route.route_commitment().as_bytes())
     );
 
     let alternate_route = Route::new(
@@ -607,8 +607,8 @@ fn setup_mesh_topology(relay_b_drop_after: usize, gateway_a_drop_after: usize) -
     alternate_route.validate().expect("alternate route must validate");
     println!(
         "[topology] Alternate route validated: {} hops, route_id={}",
-        alternate_route.hops.len(),
-        hex_short(&alternate_route.route_id)
+        alternate_route.hops().len(),
+        hex_short(alternate_route.route_commitment().as_bytes())
     );
 
     // ─── 6. Start the local HTTP server ────────────────────────────────

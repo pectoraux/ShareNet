@@ -302,7 +302,7 @@ async fn north_star_canonical_production_path() {
     );
     route.validate().expect("route must be valid");
     route.transition(RouteState::Establishing).expect("Proposed → Establishing");
-    eprintln!("[north-star] route: {} hops (relay A → relay B → gateway)", route.hops.len());
+    eprintln!("[north-star] route: {} hops (relay A → relay B → gateway)", route.hops().len());
 
     // ═══ 5. Start the GATEWAY via the canonical production entry point ═══
     // `serve_gateway_persistent_async_with_handshake_and_connector` does:
@@ -440,8 +440,8 @@ async fn north_star_canonical_production_path() {
 
     // ═══ 10. Drive the route to Active + verify the Circuit ═══
     route.transition(RouteState::Active).expect("Establishing → Active");
-    assert_eq!(route.state, RouteState::Active);
-    assert_eq!(route.metrics.hop_count, 3, "route has 3 hops");
+    assert_eq!(route.state(), RouteState::Active);
+    assert_eq!(route.metrics().hop_count, 3, "route has 3 hops");
 
     let circuit = client_node
         .circuits
@@ -467,7 +467,7 @@ async fn north_star_canonical_production_path() {
     eprintln!("  SNP-IK/0.1 handshakes: 3 (all INTERNAL to the production entry points)");
     eprintln!("  Canonical async transport: AsyncLink (INTERNAL)");
     eprintln!("  Fresh X25519 circuit establishment: client↔gateway DH (INTERNAL)");
-    eprintln!("  Dynamic Route: {:?} → {} hops", route.state, route.hops.len());
+    eprintln!("  Dynamic Route: {:?} → {} hops", route.state(), route.hops().len());
     eprintln!("  Dynamic Circuit: in Node's circuit table (active=true)");
     eprintln!("  HTTP traffic: real (status=200, body=\"Hello, ShareNet!\")");
     eprintln!("  Body integrity: objectId = SHA-256(\"Hello, ShareNet!\") (verified)");

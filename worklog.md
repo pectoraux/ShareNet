@@ -3380,3 +3380,89 @@ Stage Summary:
     Circuit      = SECURITY
     Gateway      = INTERNET EXIT
 
+
+---
+Task ID: 213-220 (N2.0.7.2 — Hardening: Type-System Enforcement)
+Agent: Z.ai (main)
+
+Task: N2.0.7.1 was migration, not elimination. Old APIs still existed in production. Route had two competing representations. No RouteCommitment. No VerifiedNodeDescriptor. This milestone makes the boundaries mathematically and structurally impossible to violate.
+
+Work Log:
+- Gate 1: Old CircuitKeys APIs behind `legacy-circuit-keys` Cargo feature.
+  * ALL old gateway/client APIs that take CircuitKeys are now `#[cfg(feature = "legacy-circuit-keys")]`.
+  * The PRODUCTION BUILD (`cargo build` without `--features legacy-circuit-keys`) does NOT compile them.
+  * The test suite enables the feature via dev-dependencies for backward compat.
+  * Static guard `old_circuit_key_apis_are_behind_legacy_feature` verifies all 8 old APIs have the cfg attribute.
+
+- Gate 2: Route has ONE authoritative representation.
+  * Removed the public `hops` field. It is now a derived method `route.hops()` computed from `hop_details` (or `legacy_hops` for legacy routes).
+  * `hop_details` is the SINGLE authoritative routing plan.
+  * Static guard `route_has_no_public_hops_field` verifies `pub hops:` does not appear.
+
+- Gate 3: Route validation validates hop_details (14 checks).
+  * `Route::validate()` now checks: hop_details non-empty, hop count ≤ 16, source non-zero, destination non-zero, last hop NodeId == destination, no duplicate hops, NodeId ↔ Ed25519 consistency (I4), destination has Gateway capability, destination has X25519 circuit key, relay hops do NOT have X25519 circuit key, every hop has at least one endpoint, not expired.
+
+- Gate 4: NodeId ↔ Ed25519 consistency enforced.
+  * `UnverifiedNodeDescriptor::verify_node_id_consistency()` checks `NodeId == SHA-256("SNP/0.1 node\0" || ed25519_public_key)`.
+  * `UnverifiedNodeDescriptor::into_verified()` returns `None` if the consistency check fails.
+  * `VerifiedNodeDescriptor::from_verified_advert()` also checks consistency.
+  * `Route::validate()` checks consistency again for defence in depth.
+
+- Gate 5: VerifiedNodeDescriptor vs UnverifiedNodeDescriptor.
+  * `UnverifiedNodeDescriptor` — carries identity data but does NOT prove it's authentic.
+  * `VerifiedNodeDescriptor` — a wrapper that can ONLY be constructed via `from_verified_advert` (from a checked advertisement) or `into_verified` (after consistency check).
+  * `RouteHop.descriptor` is now `VerifiedNodeDescriptor` (not `UnverifiedNodeDescriptor`).
+  * The routing layer consumes `VerifiedNodeDescriptor` — it cannot accidentally use unverified data.
+
+- Gate 6: RouteCommitment.
+  * `RouteCommitment::compute(source, destination, epoch, hop_details)` produces a canonical hash.
+  * The hash commits to: protocol version, source NodeId, destination NodeId, epoch, ordered hop identities (NodeId + Ed25519 + X25519 + capabilities), selected transport endpoints.
+  * Two routes with different relay hops produce DIFFERENT commitments.
+  * Changing a selected endpoint changes the commitment.
+
+- Gate 7: Route mutability — identity-critical fields non-mutable.
+  * `route_commitment`, `source`, `destination`, `hop_details`, `epoch` are all PRIVATE.
+  * Accessor methods: `route_commitment()`, `source()`, `destination()`, `hop_details()`, `epoch()`, `hops()`, `state()`, etc.
+  * Controlled mutation: `transition()` (state machine), `increment_epoch()` (recomputes commitment), `update_metrics()`.
+  * Static guard `route_identity_fields_are_private` verifies no `pub` on identity fields.
+
+- Gate 8: Failure recovery test (renamed + documented).
+  * `failure_recovery_new_route_via_alternate_relay` — proves the runtime can consume a new Route object after failure. Explicitly documented as "route replacement consumption" not "automatic failure recovery."
+
+- Gate 9: Endpoint ↔ identity binding.
+  * `RouteHop` carries `VerifiedNodeDescriptor` + `Vec<TransportEndpoint>` — the endpoint is bound to the identity via the RouteHop structure.
+  * An endpoint is only usable for Node X if it was obtained through an authenticated route construction mechanism.
+
+- Gate 10: Gateway identity binding adversarial test.
+  * `gateway_identity_binding_adversarial` — proves the gateway's X25519 key is bound to its Ed25519 identity via the signed advertisement.
+  * `gateway_x25519_identity_binding_substitution_fails` — proves substituting a different X25519 key invalidates the signature.
+
+- Gate 11: Static guards (5 new):
+  * `old_circuit_key_apis_are_behind_legacy_feature`
+  * `route_has_no_public_hops_field`
+  * `route_identity_fields_are_private`
+  * `route_commitment_exists_and_is_canonical`
+  * `verified_node_descriptor_enforces_consistency`
+
+- New security tests (8 new in n207_north_star.rs):
+  * `node_id_inconsistent_descriptor_rejected`
+  * `route_commitment_differs_for_different_routes`
+  * `route_commitment_differs_for_different_endpoints`
+  * `route_validation_rejects_gateway_without_circuit_key`
+  * `route_validation_rejects_relay_with_circuit_key`
+  * `route_validation_rejects_hop_without_endpoint`
+  * `gateway_identity_binding_adversarial`
+  * `route_identity_fields_non_mutable`
+
+- Test results: 216 passed, 0 failed, 3 ignored (was 203; +13 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- OLD CIRCUIT APIS: Behind `legacy-circuit-keys` Cargo feature. Production build does NOT compile them.
+- ROUTE: ONE authoritative representation (`hop_details`). No public `hops` field. Identity-critical fields are PRIVATE.
+- ROUTECOMMITMENT: Canonical hash of the authoritative route representation. Different routes/endpoints produce different commitments.
+- VERIFIEDNODEDESCRIPTOR: Type-level enforcement. Cannot be constructed from inconsistent data. Routing layer consumes verified data.
+- NODEID CONSISTENCY: Enforced at construction time + checked again in validate() for defence in depth.
+- VALIDATION: 14 checks including NodeId↔Ed25519 consistency, gateway capability, X25519 key presence, relay X25519 absence, endpoint presence.
+- MUTABILITY: Controlled via `transition()`, `increment_epoch()`, `update_metrics()`. Identity fields non-mutable.
+

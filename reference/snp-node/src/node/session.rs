@@ -77,6 +77,12 @@ pub struct PeerSession {
 }
 
 impl PeerSession {
+    /// Get the session state.
+    #[must_use]
+    pub fn state(&self) -> PeerSessionState {
+        self.state
+    }
+
     /// Construct a new `PeerSession` in the `New` state. The `send_key` and
     /// `recv_key` are zeroed — they are populated when the session transitions
     /// to `Established` (via [`PeerSession::establish`]).
@@ -226,6 +232,14 @@ pub struct GatewayDirectoryEntry {
     pub observed_reliability: Option<f64>,
     /// The current state of this entry.
     pub state: GatewayState,
+}
+
+impl GatewayDirectoryEntry {
+    /// Get the gateway state.
+    #[must_use]
+    pub fn state(&self) -> GatewayState {
+        self.state
+    }
 }
 
 /// A directory of known gateways, populated by [`DiscoveryProvider`]s and
@@ -475,6 +489,12 @@ pub struct CircuitV2 {
 }
 
 impl CircuitV2 {
+    /// Get the circuit state.
+    #[must_use]
+    pub fn state(&self) -> CircuitState {
+        self.state
+    }
+
     pub fn new(
         client_node_id: [u8; 32],
         gateway_node_id: [u8; 32],

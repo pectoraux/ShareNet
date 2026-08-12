@@ -658,7 +658,7 @@ fn test_4_peer_session_state_machine() {
 
     // Create a session in the New state.
     let mut session = PeerSession::new(peer_node_id, peer_ed_pk);
-    assert_eq!(session.state, PeerSessionState::New, "new session is in New state");
+    assert_eq!(session.state(), PeerSessionState::New, "new session is in New state");
     assert!(!session.is_alive(), "New session is not alive");
 
     // Illegal: New → Established (must go through Handshaking first).
@@ -671,7 +671,7 @@ fn test_4_peer_session_state_machine() {
 
     // Legal: New → Handshaking.
     session.begin_handshake().expect("New → Handshaking should succeed");
-    assert_eq!(session.state, PeerSessionState::Handshaking);
+    assert_eq!(session.state(), PeerSessionState::Handshaking);
 
     // Illegal: Handshaking → Degraded (must establish first).
     let err = session.transition_to(PeerSessionState::Degraded).unwrap_err();
@@ -705,7 +705,7 @@ fn test_4_peer_session_state_machine() {
 
     // Legal: Handshaking → Established.
     session.establish(&handshake).expect("Handshaking → Established should succeed");
-    assert_eq!(session.state, PeerSessionState::Established);
+    assert_eq!(session.state(), PeerSessionState::Established);
     assert!(session.is_alive(), "Established session is alive");
     assert_eq!(session.send_key, handshake.link_keys.send_key, "session has the handshake send_key");
     assert_eq!(session.recv_key, handshake.link_keys.recv_key, "session has the handshake recv_key");
@@ -718,7 +718,7 @@ fn test_4_peer_session_state_machine() {
 
     // Legal: Established → Closing → Closed.
     session.close().expect("close should succeed (Established → Closing → Closed)");
-    assert_eq!(session.state, PeerSessionState::Closed);
+    assert_eq!(session.state(), PeerSessionState::Closed);
     assert!(!session.is_alive(), "Closed session is not alive");
 
     // Illegal: Closed → Established (cannot revive a closed session).
@@ -1134,17 +1134,17 @@ fn test_7a_gateway_directory_basic() {
     // Lookup by NodeId.
     let entry = directory.get(&advert_a.node_id).expect("gw A should be in directory");
     assert_eq!(entry.advertisement.node_id, advert_a.node_id);
-    assert_eq!(entry.state, GatewayState::Discovered);
+    assert_eq!(entry.state(), GatewayState::Discovered);
 
     // Mark unreachable.
     directory.mark_unreachable(&advert_a.node_id);
     let entry = directory.get(&advert_a.node_id).expect("gw A still in directory");
-    assert_eq!(entry.state, GatewayState::Unreachable);
+    assert_eq!(entry.state(), GatewayState::Unreachable);
 
     // Mark active.
     directory.mark_active(&advert_a.node_id);
     let entry = directory.get(&advert_a.node_id).expect("gw A still in directory");
-    assert_eq!(entry.state, GatewayState::Active);
+    assert_eq!(entry.state(), GatewayState::Active);
 
     // FirstAvailableSelector skips Unreachable entries.
     directory.mark_unreachable(&advert_a.node_id);
@@ -1162,14 +1162,14 @@ fn test_7b_route_state_machine() {
     let gw_id = derive_node_id(&gw_ed_pk);
 
     let mut route = Route::new(client_id, gw_id, vec![]);
-    assert_eq!(route.state, RouteState::Proposed);
-    assert_eq!(route.hops, Vec::<[u8; 32]>::new());
-    assert_ne!(route.route_id, [0u8; 32], "route_id must not be all-zero");
+    assert_eq!(route.state(), RouteState::Proposed);
+    assert_eq!(route.hops(), Vec::<[u8; 32]>::new());
+    assert_ne!(route.route_commitment().as_bytes(), &[0u8; 32], "route_id must not be all-zero");
 
     // Legal: Proposed → Establishing → Active.
     route.transition_to(RouteState::Establishing).expect("Proposed → Establishing");
     route.transition_to(RouteState::Active).expect("Establishing → Active");
-    assert!(route.last_validated > 0, "Active route has a non-zero last_validated");
+    assert!(route.last_validated() > 0, "Active route has a non-zero last_validated");
 
     // Legal: Active → Degraded → Active (recovery).
     route.transition_to(RouteState::Degraded).expect("Active → Degraded");
@@ -1203,7 +1203,7 @@ fn test_7c_circuit_v2_state_machine() {
 
     let mut route = Route::new(client_id, gw_id, vec![]);
     let mut circuit = CircuitV2::new(client_id, gw_id, [0u8;32], [0u8;32]);
-    assert_eq!(circuit.state, CircuitState::Discovering);
+    assert_eq!(circuit.state(), CircuitState::Discovering);
     assert_ne!(circuit.circuit_id, [0u8; 32], "circuit_id must not be all-zero");
 
     // Legal: Discovering → Establishing → Active.
