@@ -32,34 +32,15 @@ impl NodeIdentity {
         Self::from_secret(client_secret_key())
     }
 
-    /// Construct a gateway identity for the given choice.
+    /// Construct a gateway identity from an X25519 keypair in addition to
+    /// the Ed25519 identity.
     ///
-    /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code.
-    /// New production code MUST use [`NodeIdentity::from_secret`] with an
-    /// arbitrary Ed25519 secret key — gateways are NOT required to be one of
-    /// the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B` identities.
-    ///
-    /// **Why not `#[cfg(test)]`?** The N2.0.3 task spec suggested marking
-    /// this constructor `#[cfg(test)]` so it cannot leak into production
-    /// builds. However, `#[cfg(test)]` on a `pub fn` in a library crate
-    /// makes it invisible to INTEGRATION tests (in `tests/`), which are
-    /// separate crates. The integration tests in `tests/n201_sessions.rs`
-    /// and `tests/n202_protocol.rs` still use this constructor (they are
-    /// explicitly testing the N2.0/N2.0.1 backward-compat path). The
-    /// `#[deprecated]` attribute is sufficient to discourage production
-    /// use; the static test `gateway_choice_not_in_production_code` at the
-    /// bottom of this file enforces that `GatewayChoice` is NOT imported
-    /// at the top level of `node.rs` (so production code in this module
-    /// cannot construct a `GatewayChoice` value to pass to this function).
-    #[deprecated(
-        since = "N2.0.2",
-        note = "Use NodeIdentity::from_secret(arbitrary_secret) instead. \
-                The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
-    )]
+    /// **N2.0.5:** This is the canonical production constructor for gateway
+    /// nodes. The Ed25519 keypair provides the node's signing identity; the
+    /// X25519 keypair provides the static key for the SNP-IK/0.1 handshake.
     #[must_use]
-    pub fn gateway(gw: crate::legacy::GatewayChoice) -> Self {
-        Self::from_secret(crate::legacy::gateway_secret_for(gw))
+    pub fn new_with_x25519(secret_key: [u8; 32]) -> Self {
+        Self::from_secret(secret_key)
     }
 }
 

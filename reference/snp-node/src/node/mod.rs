@@ -2135,7 +2135,7 @@ mod tests {
 
     #[test]
     fn gateway_advertisement_signs_and_verifies() {
-        let advert = GatewayAdvertisement::for_gateway(
+        let advert = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
@@ -2145,7 +2145,7 @@ mod tests {
 
     #[test]
     fn forged_advertisement_is_rejected() {
-        let mut advert = GatewayAdvertisement::for_gateway(
+        let mut advert = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
@@ -2157,7 +2157,7 @@ mod tests {
 
     #[test]
     fn tampered_advertisement_is_rejected() {
-        let mut advert = GatewayAdvertisement::for_gateway(
+        let mut advert = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
@@ -2169,7 +2169,7 @@ mod tests {
 
     #[test]
     fn expired_advertisement_is_rejected() {
-        let mut advert = GatewayAdvertisement::for_gateway(
+        let mut advert = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
@@ -2181,7 +2181,7 @@ mod tests {
 
     #[test]
     fn advertisement_cbor_round_trip() {
-        let advert = GatewayAdvertisement::for_gateway(
+        let advert = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[test]
     fn node_identity_gateway_a_matches_n20_constants() {
-        let identity = NodeIdentity::gateway(GatewayChoice::A);
+        let identity = crate::legacy::legacy_identity_for_gateway(GatewayChoice::A);
         assert_eq!(identity.public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
         assert_eq!(identity.node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
     }
@@ -2224,7 +2224,7 @@ mod tests {
 
     #[test]
     fn circuit_for_gateway_a_uses_correct_keys() {
-        let circuit = Circuit::for_gateway(GatewayChoice::A);
+        let circuit = crate::legacy::legacy_circuit_for_gateway(GatewayChoice::A);
         assert_eq!(circuit.gateway_node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
         assert_eq!(circuit.gateway_public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
         assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_a().send_key);
@@ -2233,23 +2233,23 @@ mod tests {
 
     #[test]
     fn circuit_for_gateway_b_uses_correct_keys() {
-        let circuit = Circuit::for_gateway(GatewayChoice::B);
+        let circuit = crate::legacy::legacy_circuit_for_gateway(GatewayChoice::B);
         assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_b().send_key);
         assert_ne!(
-            Circuit::for_gateway(GatewayChoice::A).circuit_keys.send_key,
-            Circuit::for_gateway(GatewayChoice::B).circuit_keys.send_key,
+            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::A).circuit_keys.send_key,
+            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::B).circuit_keys.send_key,
             "Ca and Cb MUST differ (proves failover switches circuit keys)"
         );
     }
 
     #[test]
     fn gateway_advertisement_for_a_and_b_have_distinct_node_ids() {
-        let advert_a = GatewayAdvertisement::for_gateway(
+        let advert_a = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::A,
             "127.0.0.1:7001",
             "127.0.0.1:7002",
         );
-        let advert_b = GatewayAdvertisement::for_gateway(
+        let advert_b = crate::legacy::legacy_advert_for_gateway(
             GatewayChoice::B,
             "127.0.0.1:7003",
             "127.0.0.1:7004",

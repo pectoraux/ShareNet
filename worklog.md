@@ -2946,3 +2946,25 @@ Remaining N2.0.5 items (deferred to next session):
 
 FOUNDATION STATUS: YELLOW
 The reference implementation has one canonical async transport, static tests prevent deterministic keys from leaking into production modules, and identity substitution is proven to be rejected by SNP-IK. However, the production runtime still uses synchronous I/O for serve/send methods (the async transport exists but is not yet wired into all Node methods), and the Circuit::for_gateway deprecated constructor still exists in the canonical circuit.rs module.
+
+---
+Task ID: 174 (N2.0.5 Gate 3: Remove GatewayChoice from Circuit)
+Agent: Z.ai (main)
+
+Stage Summary:
+- Circuit::for_gateway(GatewayChoice) REMOVED from circuit.rs
+- GatewayAdvertisement::for_gateway(GatewayChoice) REMOVED from gateway.rs
+- NodeIdentity::gateway(GatewayChoice) REMOVED from identity.rs
+- Legacy constructors added to legacy.rs: legacy_circuit_for_gateway, legacy_advert_for_gateway, legacy_identity_for_gateway
+- All test files updated to use crate::legacy:: / snp_node::legacy:: versions
+- 181 tests pass, 0 fail, 3 ignored
+- 138/138 conformance, 0 disagreements
+
+Production node/ modules now have ZERO GatewayChoice references (except comments and the static test itself).
+Production node/ modules now have ZERO for_gateway constructors.
+Production node/ modules now have ZERO derive_link_keys calls (except the static test that enforces their absence).
+
+GatewayChoice is confined to:
+- legacy.rs (the isolated legacy module)
+- tests/ (test-only code)
+- mod.rs test mod (the static test that enforces the boundary)

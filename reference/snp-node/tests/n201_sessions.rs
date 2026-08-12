@@ -116,7 +116,7 @@ fn test_1_multiple_requests_one_session() {
         vec![snp_node::node::Capability::Client],
         relay_a_addr.to_string(),
     );
-    let advert = GatewayAdvertisement::for_gateway(
+    let advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         &gw_addr.to_string(),
         "127.0.0.1:0",
@@ -126,7 +126,7 @@ fn test_1_multiple_requests_one_session() {
         .circuits
         .lock()
         .unwrap()
-        .insert(gateway_node_id_for(GatewayChoice::A), Circuit::for_gateway(GatewayChoice::A));
+        .insert(gateway_node_id_for(GatewayChoice::A), snp_node::legacy::legacy_circuit_for_gateway(GatewayChoice::A));
 
     // Send 3 requests.
     let url = "http://stub.example/test1";
@@ -274,7 +274,7 @@ fn test_2_gateway_discovery() {
     // constructor is acceptable).
     client_node.circuits.lock().unwrap().insert(
         gateway_node_id_for(GatewayChoice::A),
-        Circuit::for_gateway(GatewayChoice::A),
+        snp_node::legacy::legacy_circuit_for_gateway(GatewayChoice::A),
     );
 
     // Select the gateway.
@@ -422,11 +422,11 @@ fn test_3_genuine_failover() {
     // constructor (this is a test of the N2.0.1 backward-compat path).
     client_node.circuits.lock().unwrap().insert(
         gateway_node_id_for(GatewayChoice::A),
-        Circuit::for_gateway(GatewayChoice::A),
+        snp_node::legacy::legacy_circuit_for_gateway(GatewayChoice::A),
     );
     client_node.circuits.lock().unwrap().insert(
         gateway_node_id_for(GatewayChoice::B),
-        Circuit::for_gateway(GatewayChoice::B),
+        snp_node::legacy::legacy_circuit_for_gateway(GatewayChoice::B),
     );
 
     // ── Request 1: via Gateway A (the first discovered gateway). ──
@@ -508,7 +508,7 @@ fn test_3_genuine_failover() {
 #[test]
 fn test_4_advertisement_security() {
     // ── 4a: A legitimately-signed advertisement verifies. ──
-    let valid_advert = GatewayAdvertisement::for_gateway(
+    let valid_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -517,7 +517,7 @@ fn test_4_advertisement_security() {
     assert!(!valid_advert.is_expired(now_unix()), "fresh advertisement must not be expired");
 
     // ── 4b: A forged signature is rejected. ──
-    let mut forged_advert = GatewayAdvertisement::for_gateway(
+    let mut forged_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -527,7 +527,7 @@ fn test_4_advertisement_security() {
     assert!(!forged_advert.verify(), "forged signature must NOT verify");
 
     // ── 4c: A tampered field (listenAddr) is rejected. ──
-    let mut tampered_advert = GatewayAdvertisement::for_gateway(
+    let mut tampered_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -536,7 +536,7 @@ fn test_4_advertisement_security() {
     assert!(!tampered_advert.verify(), "tampered advertisement must NOT verify");
 
     // ── 4d: An expired advertisement is detected. ──
-    let mut expired_advert = GatewayAdvertisement::for_gateway(
+    let mut expired_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -552,7 +552,7 @@ fn test_4_advertisement_security() {
 
     // ── 4e: A re-signed expired advertisement verifies the signature but is
     //         still rejected by is_expired(). ──
-    let mut re_signed_expired = GatewayAdvertisement::for_gateway(
+    let mut re_signed_expired = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -564,7 +564,7 @@ fn test_4_advertisement_security() {
 
     // ── 4f: A different gateway's secret key produces a signature that
     //         doesn't verify against this advertisement's public_key. ──
-    let mut wrong_key_advert = GatewayAdvertisement::for_gateway(
+    let mut wrong_key_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -578,7 +578,7 @@ fn test_4_advertisement_security() {
 
     // ── 4g: NodeId mismatch (I4 violation) — the advertisement's nodeId
     //         doesn't match SHA-256("SNP/0.1 node\\0" || publicKey). ──
-    let mut mismatched_advert = GatewayAdvertisement::for_gateway(
+    let mut mismatched_advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         "127.0.0.1:7001",
         "127.0.0.1:7002",
@@ -656,7 +656,7 @@ fn test_5_persistent_relay() {
         vec![snp_node::node::Capability::Client],
         relay_a_addr.to_string(),
     );
-    let advert = GatewayAdvertisement::for_gateway(
+    let advert = snp_node::legacy::legacy_advert_for_gateway(
         GatewayChoice::A,
         &gw_addr.to_string(),
         "127.0.0.1:0",
@@ -666,7 +666,7 @@ fn test_5_persistent_relay() {
         .circuits
         .lock()
         .unwrap()
-        .insert(gateway_node_id_for(GatewayChoice::A), Circuit::for_gateway(GatewayChoice::A));
+        .insert(gateway_node_id_for(GatewayChoice::A), snp_node::legacy::legacy_circuit_for_gateway(GatewayChoice::A));
 
     // Send 3 requests.
     let url = "http://stub.example/test5";
@@ -825,7 +825,7 @@ fn stub_discovery_persistent(
     gw: GatewayChoice,
     transit_listen_addr: &str,
 ) {
-    let advert = GatewayAdvertisement::for_gateway(gw, transit_listen_addr, &listener.local_addr().unwrap().to_string());
+    let advert = snp_node::legacy::legacy_advert_for_gateway(gw, transit_listen_addr, &listener.local_addr().unwrap().to_string());
     let advert_bytes = advert.encode_cbor().expect("encode advert");
     let len_bytes = u32::try_from(advert_bytes.len())
         .expect("advertisement fits in u32")

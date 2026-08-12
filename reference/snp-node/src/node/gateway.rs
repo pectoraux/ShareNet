@@ -220,29 +220,6 @@ impl GatewayAdvertisement {
     /// (`GATEWAY_A_SECRET` / `GATEWAY_B_SECRET`); production would use a
     /// persistent on-disk keypair.
     ///
-    /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code.
-    /// New production code MUST use [`GatewayAdvertisement::for_identity`]
-    /// with an arbitrary [`NodeIdentity`] — gateways are NOT required to be
-    /// one of the two pre-N2.0.2 `GatewayChoice::A`/`GatewayChoice::B`
-    /// identities. See [`NodeIdentity::gateway`] for why this is NOT also
-    /// `#[cfg(test)]`.
-    #[deprecated(
-        since = "N2.0.2",
-        note = "Use GatewayAdvertisement::for_identity(identity, listen, discovery) instead. \
-                The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
-    )]
-    #[must_use]
-    pub fn for_gateway(
-        gw: crate::legacy::GatewayChoice,
-        listen_addr: &str,
-        discovery_addr: &str,
-    ) -> Self {
-        #[allow(deprecated)]
-        let identity = NodeIdentity::gateway(gw);
-        Self::for_identity(&identity, listen_addr, discovery_addr)
-    }
-
     /// **N2.0.2 production constructor.** Build a signed advertisement for
     /// an ARBITRARY gateway identity (no `GatewayChoice` lookup).
     ///

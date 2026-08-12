@@ -1731,3 +1731,44 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
 
     Ok(())
 }
+
+// ─── N2.0.5: Legacy constructors moved from node/ modules ───────────────────
+//
+// These constructors were removed from the canonical node/ modules
+// (circuit.rs, gateway.rs, identity.rs) because they depend on GatewayChoice
+// and deterministic test seeds. They are preserved here for backward-compat
+// with tests that explicitly test the legacy N1.9/N2.0 path.
+
+/// Legacy Circuit constructor using GatewayChoice + deterministic keys.
+#[allow(deprecated)]
+#[must_use]
+pub fn legacy_circuit_for_gateway(gw: GatewayChoice) -> crate::node::Circuit {
+    let circuit_keys = match gw {
+        GatewayChoice::A => client_circuit_keys_a(),
+        GatewayChoice::B => client_circuit_keys_b(),
+    };
+    crate::node::Circuit::new(
+        gateway_node_id_for(gw),
+        gateway_public_key_for(gw),
+        circuit_keys,
+    )
+}
+
+/// Legacy GatewayAdvertisement constructor using GatewayChoice.
+#[allow(deprecated)]
+#[must_use]
+pub fn legacy_advert_for_gateway(
+    gw: GatewayChoice,
+    listen_addr: &str,
+    discovery_addr: &str,
+) -> crate::node::GatewayAdvertisement {
+    let identity = crate::node::NodeIdentity::from_secret(gateway_secret_for(gw));
+    crate::node::GatewayAdvertisement::for_identity(&identity, listen_addr, discovery_addr)
+}
+
+/// Legacy NodeIdentity constructor using GatewayChoice.
+#[allow(deprecated)]
+#[must_use]
+pub fn legacy_identity_for_gateway(gw: GatewayChoice) -> crate::node::NodeIdentity {
+    crate::node::NodeIdentity::from_secret(gateway_secret_for(gw))
+}

@@ -1,12 +1,20 @@
 //! Extracted from node/mod.rs for N2.0.4 Gate E (node decomposition).
+//!
+//! N2.0.5: The deprecated `Circuit::for_gateway(GatewayChoice)` constructor
+//! has been REMOVED from this module. It now lives in `crate::legacy`.
+//! The canonical Circuit API is `Circuit::new(gateway_node_id,
+//! gateway_public_key, circuit_keys)` — no GatewayChoice, no deterministic
+//! seeds. Legacy tests that need `for_gateway` should use
+//! `crate::legacy::Circuit::for_gateway` instead.
 use super::*;
 
 // ─── Circuit ─────────────────────────────────────────────────────────────────
 
 /// An active end-to-end circuit between a client and a gateway. The circuit
-/// keys are derived from a shared seed (Ca for Gateway A, Cb for Gateway B in
-/// N2.0.1). Production would derive the circuit seed from the SNP-IK/0.1
-/// handshake transcript between client and gateway.
+/// keys MUST be derived from a fresh client↔gateway X25519 DH (via
+/// [`snp_link::seal_circuit_payload_with_fresh_eph`] /
+/// [`snp_link::open_circuit_payload_with_fresh_eph`]), NOT from deterministic
+/// test seeds.
 #[derive(Debug, Clone)]
 pub struct Circuit {
     /// The gateway's NodeId this circuit reaches.
@@ -21,36 +29,6 @@ pub struct Circuit {
 }
 
 impl Circuit {
-    /// Construct a circuit for the given gateway choice, using the N2.0.1
-    /// deterministic client-side circuit keys.
-    ///
-    /// **N2.0.3: DEPRECATED.** This constructor uses
-    /// [`crate::legacy::GatewayChoice`], which is now confined to legacy/demo code
-    /// (per the N2.0.2 task spec). New production code MUST use
-    /// [`Circuit::new`] with explicit `(gateway_node_id,
-    /// gateway_public_key, circuit_keys)` parameters — the keys come from
-    /// the SNP-IK/0.1 handshake and the client↔gateway circuit DH, NOT from
-    /// a `GatewayChoice` lookup. See [`NodeIdentity::gateway`] for why this
-    /// is NOT also `#[cfg(test)]`.
-    #[deprecated(
-        since = "N2.0.2",
-        note = "Use Circuit::new(gateway_node_id, gateway_public_key, circuit_keys) instead. \
-                The GatewayChoice-based constructor is retained for N2.0/N2.0.1 backward compat."
-    )]
-    #[must_use]
-    pub fn for_gateway(gw: crate::legacy::GatewayChoice) -> Self {
-        let circuit_keys = match gw {
-            crate::legacy::GatewayChoice::A => client_circuit_keys_a(),
-            crate::legacy::GatewayChoice::B => client_circuit_keys_b(),
-        };
-        Self {
-            gateway_node_id: crate::legacy::gateway_node_id_for(gw),
-            gateway_public_key: crate::legacy::gateway_public_key_for(gw),
-            circuit_keys,
-            active: true,
-        }
-    }
-
     /// **N2.0.2 production constructor.** Construct a circuit with EXPLICIT
     /// `(gateway_node_id, gateway_public_key, circuit_keys)` parameters — no
     /// `GatewayChoice` lookup, no deterministic test seeds.
@@ -60,8 +38,7 @@ impl Circuit {
     ///   [`GatewayAdvertisement`]).
     /// - Deriving the `circuit_keys` from a fresh client↔gateway DH (see
     ///   [`snp_link::seal_circuit_payload_with_fresh_eph`] /
-    ///   [`snp_link::open_circuit_payload_with_fresh_eph`]) OR from a
-    ///   pre-shared seed (legacy N1.9/N2.0 mode).
+    ///   [`snp_link::open_circuit_payload_with_fresh_eph`]).
     ///
     /// The returned circuit is `active = true` by default. The caller can
     /// mark it inactive by setting `circuit.active = false` after a failure.
