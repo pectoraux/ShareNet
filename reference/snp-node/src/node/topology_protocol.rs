@@ -13,8 +13,11 @@
 //!   transition a link to Down. The actual link state and advertisement
 //!   freshness remain authoritative.
 //! - **PeerSummary**: A bounded summary of the sender's known topology.
-//!   Used for anti-entropy — peers exchange summaries to learn about
-//!   nodes they cannot directly discover. Does NOT expose endpoint data.
+//!   Used for **bounded topology propagation** — peers exchange summaries to
+//!   learn about nodes they cannot directly discover. This is NOT a full
+//!   anti-entropy / request-response convergence protocol; it is one-way
+//!   gossiped propagation with sequence-based replay protection. Does NOT
+//!   expose endpoint data.
 
 use super::*;
 use snp_cbor::CborValue;
@@ -22,6 +25,17 @@ use snp_crypto::{ed25519_sign, ed25519_verify, sig_contexts};
 
 /// The SIG_CONTEXT for topology messages (GOODBYE, PeerSummary).
 pub const TOPOLOGY_MSG_CONTEXT: &[u8] = b"SNP/0.1 topology-msg\0";
+
+/// Maximum age of a `RemoteNodeHint` before it is considered stale.
+///
+/// A hint's freshness is determined by `now - hint.received_at`, NOT by the
+/// hint's `claimed_visibility`. A third-party claim like "the target is
+/// active" is a HISTORICAL claim — it cannot mean "the target is currently
+/// active indefinitely." (N2.1.1.1 review-gate fix #3.)
+///
+/// Default: 1 hour. Hints older than this are marked STALE and excluded from
+/// `gateway_hints()` until refreshed by a newer propagation message.
+pub const REMOTE_HINT_MAX_AGE_SECS: u64 = 3600;
 
 /// A HELLO message — carries a full `NodeAdvertisement`.
 ///
@@ -230,7 +244,8 @@ impl GoodbyeMessage {
     }
 }
 
-/// A bounded summary of a single known peer, used for anti-entropy.
+/// A bounded summary of a single known peer, used for bounded topology
+/// propagation (NOT full anti-entropy convergence — see the module docs).
 ///
 /// PeerSummaries are exchanged between peers to learn about nodes they
 /// cannot directly discover. They do NOT expose endpoint data — only
@@ -396,19 +411,59 @@ impl PeerSummaryList {
     /// Verify the signature and sender identity consistency.
     #[must_use]
     pub fn verify(&self) -> bool {
+        self.verify_into_verified().is_ok()
+    }
+
+    /// Verify the signature and sender identity consistency, returning a
+    /// `VerifiedPeerSummaryList` on success.
+    ///
+    /// ## Trust boundary (N2.1.1.1 review-gate fix)
+    ///
+    /// `TopologyGraph::process_peer_summaries()` accepts **only**
+    /// `&VerifiedPeerSummaryList`. This makes it impossible for an unverified
+    /// or forged `PeerSummaryList` to mutate topology state: the only path
+    /// from a raw `PeerSummaryList` to topology mutation goes through this
+    /// method, which performs:
+    ///   1. Ed25519 signature verification under `TOPOLOGY_MSG_CONTEXT`
+    ///   2. sender NodeId ↔ Ed25519 public key binding verification (I4)
+    ///
+    /// This mirrors the `NodeAdvertisement → VerifiedNodeAdvertisement →
+    /// AuthenticatedNodeRecord` pattern: the verified type's constructor is
+    /// private, so only a successful cryptographic verification can produce
+    /// one.
+    ///
+    /// # Errors
+    /// Returns `PropagationVerifyError` if verification fails. The error
+    /// variant indicates WHY (invalid signature, NodeId mismatch, or CBOR
+    /// encoding failure) without leaking signing-key material.
+    pub fn verify_into_verified(
+        &self,
+    ) -> Result<VerifiedPeerSummaryList, PropagationVerifyError> {
         let preimage = self.preimage();
-        let Ok(bytes) = snp_cbor::encode(&preimage) else {
-            return false;
-        };
+        let bytes = snp_cbor::encode(&preimage)
+            .map_err(|e| PropagationVerifyError::CborEncodeFailed(e.to_string()))?;
         let mut msg = Vec::with_capacity(TOPOLOGY_MSG_CONTEXT.len() + bytes.len());
         msg.extend_from_slice(TOPOLOGY_MSG_CONTEXT);
         msg.extend_from_slice(&bytes);
         if !ed25519_verify(&self.sender_ed25519_public_key, &msg, &self.signature) {
-            return false;
+            return Err(PropagationVerifyError::InvalidSignature);
         }
         // Verify sender NodeId ↔ Ed25519 consistency (I4).
         let expected = snp_crypto::derive_node_id(&self.sender_ed25519_public_key);
-        self.sender_node_id == expected
+        if self.sender_node_id != expected {
+            return Err(PropagationVerifyError::NodeIdKeyMismatch);
+        }
+        Ok(VerifiedPeerSummaryList {
+            inner: PeerSummaryList {
+                sender_node_id: self.sender_node_id,
+                sender_ed25519_public_key: self.sender_ed25519_public_key,
+                summaries: self.summaries.clone(),
+                timestamp: self.timestamp,
+                nonce: self.nonce,
+                propagation_sequence: self.propagation_sequence,
+                signature: self.signature,
+            },
+        })
     }
 
     /// Get the number of summaries.
@@ -421,5 +476,89 @@ impl PeerSummaryList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.summaries.is_empty()
+    }
+}
+
+/// Verification error for `PeerSummaryList::verify_into_verified()`.
+///
+/// The variants do NOT leak signing-key material. They describe the class of
+/// failure for observability and conformance testing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropagationVerifyError {
+    /// The Ed25519 signature did not verify under `TOPOLOGY_MSG_CONTEXT`.
+    InvalidSignature,
+    /// The claimed `sender_node_id` does not match
+    /// `derive_node_id(sender_ed25519_public_key)` (invariant I4).
+    NodeIdKeyMismatch,
+    /// Canonical CBOR encoding of the preimage failed (should be impossible
+    /// for well-formed `PeerSummaryList`; indicates internal corruption).
+    CborEncodeFailed(String),
+}
+
+impl std::fmt::Display for PropagationVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature => write!(f, "invalid propagation signature"),
+            Self::NodeIdKeyMismatch => write!(f, "sender NodeId does not match Ed25519 public key"),
+            Self::CborEncodeFailed(msg) => write!(f, "CBOR encode failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PropagationVerifyError {}
+
+/// A `PeerSummaryList` that has passed cryptographic verification.
+///
+/// ## Trust boundary (N2.1.1.1 review-gate fix)
+///
+/// This type is the ONLY input `TopologyGraph::process_peer_summaries()`
+/// accepts. It cannot be constructed directly — the inner field is private,
+/// and the only constructor is `PeerSummaryList::verify_into_verified()`,
+/// which performs Ed25519 signature verification and NodeId↔pubkey binding
+/// verification.
+///
+/// This mirrors the `VerifiedNodeAdvertisement` pattern: the type system
+/// makes it impossible for an unverified message to reach topology mutation.
+/// An attacker who manufactures a `PeerSummaryList` with an invalid signature
+/// cannot obtain a `VerifiedPeerSummaryList`, and therefore cannot mutate
+/// `remote_hints`, `propagation_state`, or any other topology state.
+///
+/// The `__t` / struct-name discriminator is NOT a security boundary — an
+/// attacker can manufacture any struct name on the wire. The security
+/// boundary is the private constructor + cryptographic verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedPeerSummaryList {
+    inner: PeerSummaryList,
+}
+
+impl VerifiedPeerSummaryList {
+    /// The sender's NodeId.
+    #[must_use]
+    pub fn sender_node_id(&self) -> [u8; 32] {
+        self.inner.sender_node_id
+    }
+
+    /// The sender's Ed25519 public key.
+    #[must_use]
+    pub fn sender_ed25519_public_key(&self) -> [u8; 32] {
+        self.inner.sender_ed25519_public_key
+    }
+
+    /// The propagation sequence number.
+    #[must_use]
+    pub fn propagation_sequence(&self) -> u64 {
+        self.inner.propagation_sequence
+    }
+
+    /// The summaries (verified to be signed by the sender).
+    #[must_use]
+    pub fn summaries(&self) -> &[PeerSummary] {
+        &self.inner.summaries
+    }
+
+    /// The message timestamp.
+    #[must_use]
+    pub fn timestamp(&self) -> u64 {
+        self.inner.timestamp
     }
 }

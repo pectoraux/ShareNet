@@ -118,6 +118,7 @@ pub mod link;
 pub mod topology_protocol;
 pub mod peer_directory;
 pub mod topology;
+pub mod propagation_state;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -137,10 +138,14 @@ pub use node_advert::{
 };
 pub use link::{Link, LinkKey, LinkMetrics, LinkState, LinkTable, TransportType};
 pub use topology_protocol::{
-    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, MAX_PEER_SUMMARIES_PER_MESSAGE,
+    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,
+    PropagationVerifyError, MAX_PEER_SUMMARIES_PER_MESSAGE, REMOTE_HINT_MAX_AGE_SECS,
 };
 pub use peer_directory::PeerDirectory;
-pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
+pub use propagation_state::{PropagationStateError, PropagationStateStore};
+pub use topology::{
+    PropagationResult, RemoteNodeHint, RemoteHintFreshness, TopologyGraph, TopologySnapshot,
+};
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

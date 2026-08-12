@@ -26,7 +26,23 @@
 
 use super::*;
 use crate::node::link::{Link, LinkKey, LinkState, LinkTable, TransportType};
+use crate::node::propagation_state::PropagationStateStore;
+use crate::node::topology_protocol::{REMOTE_HINT_MAX_AGE_SECS, VerifiedPeerSummaryList};
 use std::collections::{HashMap, HashSet};
+
+/// Format a 32-byte NodeId as lowercase hex for diagnostic logs.
+fn hex(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+/// Helper to format a `[u8; 32]` owned value as hex (for log calls).
+fn hex_owned(b: [u8; 32]) -> String {
+    hex(&b)
+}
 
 /// A remote node hint — third-party topology knowledge that is NOT
 /// authoritative.
@@ -110,6 +126,43 @@ impl RemoteNodeHint {
     pub fn target_node_id(&self) -> [u8; 32] {
         self.target_node_id
     }
+
+    /// Compute the freshness state of this hint relative to `now`.
+    ///
+    /// N2.1.1.1 review-gate fix #3: freshness is determined by
+    /// `now - hint.received_at`, NOT by `hint.claimed_visibility`. A
+    /// third-party claim like "the target is active" is a HISTORICAL claim —
+    /// it cannot mean "the target is currently active indefinitely."
+    ///
+    /// - `Current`: `now - received_at <= REMOTE_HINT_MAX_AGE_SECS`
+    /// - `Stale`: `now - received_at > REMOTE_HINT_MAX_AGE_SECS`
+    ///
+    /// Stale hints are excluded from `gateway_hints()` and may be purged by
+    /// `purge_expired()`.
+    #[must_use]
+    pub fn freshness(&self, now: u64) -> RemoteHintFreshness {
+        let age = now.saturating_sub(self.received_at);
+        if age <= REMOTE_HINT_MAX_AGE_SECS {
+            RemoteHintFreshness::Current
+        } else {
+            RemoteHintFreshness::Stale
+        }
+    }
+}
+
+/// Freshness state of a `RemoteNodeHint`.
+///
+/// N2.1.1.1 review-gate fix #3: this is computed from the hint's
+/// `received_at` timestamp, NOT from the third-party `claimed_visibility`.
+/// A remote claim of "active" cannot grant indefinite freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteHintFreshness {
+    /// `now - received_at <= REMOTE_HINT_MAX_AGE_SECS` — the hint is recent
+    /// enough to be considered for discovery.
+    Current,
+    /// `now - received_at > REMOTE_HINT_MAX_AGE_SECS` — the hint is too old
+    /// to be trusted for discovery. Excluded from `gateway_hints()`.
+    Stale,
 }
 
 /// The result of processing a PeerSummaryList.
@@ -141,29 +194,61 @@ pub struct TopologyGraph {
     remote_hints: HashMap<[u8; 32], RemoteNodeHint>,
     /// Highest propagation_sequence seen per sender NodeId.
     /// Used for stateful replay prevention of PeerSummaryList messages.
-    propagation_state: HashMap<[u8; 32], u64>,
+    ///
+    /// N2.1.1.1 review-gate fix #2: this is now a `PropagationStateStore`,
+    /// which persists across restart (when a path is configured via
+    /// `TopologyGraph::open()` or `open_with_propagation_path()`).
+    propagation_state: PropagationStateStore,
 }
 
 impl TopologyGraph {
-    /// Create a new empty topology graph.
+    /// Create a new empty in-memory topology graph (no persistence).
     #[must_use]
     pub fn new() -> Self {
         Self {
             directory: PeerDirectory::new(),
             remote_hints: HashMap::new(),
-            propagation_state: HashMap::new(),
+            propagation_state: PropagationStateStore::new(),
         }
     }
 
     /// Create a persistent topology graph.
     ///
+    /// Loads both the peer directory AND the propagation sequence state from
+    /// disk. (N2.1.1.1 review-gate fix #2: propagation state is now
+    /// persistent, so replay attacks cannot succeed across restart.)
+    ///
+    /// The propagation state is stored in a sibling file with a `.prop`
+    /// extension added to `path`.
+    ///
     /// # Errors
-    /// Returns `AcceptanceError` if the persistence file is corrupted.
+    /// Returns `AcceptanceError` if the peer-directory persistence file is
+    /// corrupted.
+    /// Returns `PropagationStateError` (wrapped in `AcceptanceError`) if the
+    /// propagation-state file is corrupted.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, AcceptanceError> {
+        let peer_path = path.as_ref().to_path_buf();
+        let mut prop_path = peer_path.clone();
+        prop_path.set_extension("prop");
+        Self::open_with_propagation_path(peer_path, prop_path)
+    }
+
+    /// Create a persistent topology graph with explicit paths for the peer
+    /// directory and the propagation state.
+    ///
+    /// # Errors
+    /// Returns `AcceptanceError` if either persistence file is corrupted.
+    pub fn open_with_propagation_path(
+        peer_path: impl AsRef<std::path::Path>,
+        propagation_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, AcceptanceError> {
+        let directory = PeerDirectory::open(peer_path)?;
+        let propagation_state = PropagationStateStore::open(propagation_path)
+            .map_err(|e| AcceptanceError::CorruptPersistence(format!("propagation: {e}")))?;
         Ok(Self {
-            directory: PeerDirectory::open(path)?,
+            directory,
             remote_hints: HashMap::new(),
-            propagation_state: HashMap::new(),
+            propagation_state,
         })
     }
 
@@ -173,15 +258,29 @@ impl TopologyGraph {
     ///
     /// # Errors
     /// Returns `AcceptanceError` if persistence fails.
+    ///
+    /// ## Transaction order (N2.1.1.1 review-gate fix #4)
+    ///
+    /// If a remote hint for this node exists, it is removed ONLY AFTER the
+    /// directory's `accept_advertisement` succeeds. This preserves the
+    /// "persist → then mutate" invariant: a persistence failure leaves the
+    /// remote hint in place rather than leaving the topology in a partially
+    /// mutated state.
     pub fn accept_advertisement(
         &mut self,
         verified: VerifiedNodeAdvertisement,
     ) -> Result<AcceptanceResult, AcceptanceError> {
-        // If we previously had a remote hint about this node, remove it —
-        // direct knowledge takes precedence.
+        // NOTE: do NOT remove the remote hint yet — wait for the directory
+        // to successfully persist the authenticated record first.
         let node_id = verified.node_id();
-        self.remote_hints.remove(&node_id);
-        self.directory.accept_advertisement(verified)
+        let result = self.directory.accept_advertisement(verified);
+        // Only remove the superseded remote hint if the direct acceptance
+        // succeeded. On persistence failure, the hint is retained so the
+        // topology remains in its pre-call state.
+        if result.is_ok() {
+            self.remote_hints.remove(&node_id);
+        }
+        result
     }
 
     // ─── Link operations ──────────────────────────────────────────────────
@@ -213,7 +312,24 @@ impl TopologyGraph {
 
     // ─── Remote topology propagation ──────────────────────────────────────
 
-    /// Process a `PeerSummaryList` received from a peer.
+    /// Process a **verified** `PeerSummaryList` received from a peer.
+    ///
+    /// ## Trust boundary (N2.1.1.1 review-gate fix #1 — P0 blocker)
+    ///
+    /// This method accepts **only** `&VerifiedPeerSummaryList`. The only way
+    /// to obtain a `VerifiedPeerSummaryList` is
+    /// `PeerSummaryList::verify_into_verified()`, which performs Ed25519
+    /// signature verification and sender NodeId↔pubkey binding verification.
+    ///
+    /// An attacker who manufactures a `PeerSummaryList` with an invalid
+    /// signature, or with a `sender_node_id` that does not match the
+    /// `derive_node_id(sender_ed25519_public_key)`, CANNOT obtain a
+    /// `VerifiedPeerSummaryList` and therefore CANNOT mutate `remote_hints`,
+    /// `propagation_state`, or any other topology state.
+    ///
+    /// This mirrors the `NodeAdvertisement → VerifiedNodeAdvertisement →
+    /// AuthenticatedNodeRecord` trust-boundary pattern: the type system makes
+    /// unverified → trusted conversion impossible without cryptography.
     ///
     /// ## N2.1.1.1: Non-authoritative storage + replay prevention
     ///
@@ -224,16 +340,18 @@ impl TopologyGraph {
     ///   node identities.
     /// - If a node is both directly known and remotely hinted, the direct
     ///   knowledge takes precedence (the hint is not stored).
+    /// - Propagation sequence state is persisted (if a persistence path was
+    ///   configured via `TopologyGraph::open()`).
     pub fn process_peer_summaries(
         &mut self,
-        summary_list: &PeerSummaryList,
+        verified_list: &VerifiedPeerSummaryList,
     ) -> PropagationResult {
-        let sender = summary_list.sender_node_id;
-        let prop_seq = summary_list.propagation_sequence;
+        let sender = verified_list.sender_node_id();
+        let prop_seq = verified_list.propagation_sequence();
 
         // Stateful replay prevention: reject stale/duplicate propagation.
-        match self.propagation_state.get(&sender) {
-            Some(&known) if prop_seq <= known => {
+        match self.propagation_state.highest_sequence(&sender) {
+            Some(known) if prop_seq <= known => {
                 return PropagationResult::Stale {
                     received_sequence: prop_seq,
                     known_sequence: known,
@@ -241,13 +359,36 @@ impl TopologyGraph {
             }
             _ => {}
         }
-        self.propagation_state.insert(sender, prop_seq);
+
+        // Persist the propagation sequence floor BEFORE mutating remote_hints
+        // (Section 51 critical mutation sequence: persist → verify → mutate).
+        // If persistence fails, the sequence is NOT advanced and no hints are
+        // stored — we return Stale so the caller can retry without corruption.
+        if let Err(e) = self.propagation_state.accept_sequence(sender, prop_seq) {
+            // Persistence failed — fail closed. Do NOT mutate remote_hints.
+            // Return Stale so the caller sees a non-Accepted result; the
+            // topology is unchanged.
+            eprintln!(
+                "[sharenet] propagation state persistence failed for sender \
+                 {}: {} — topology NOT mutated (fail-closed)",
+                hex_owned(sender),
+                e
+            );
+            return PropagationResult::Stale {
+                received_sequence: prop_seq,
+                // known_sequence reflects the persisted floor (unchanged on failure)
+                known_sequence: self
+                    .propagation_state
+                    .highest_sequence(&sender)
+                    .unwrap_or(0),
+            };
+        }
 
         let now = now_unix();
         let mut hints_added = 0usize;
         let mut hints_updated = 0usize;
 
-        for summary in &summary_list.summaries {
+        for summary in verified_list.summaries() {
             // Don't store hints about nodes we already know directly
             // (direct knowledge takes precedence).
             if self.directory.get_record(&summary.node_id).is_some() {
@@ -327,23 +468,50 @@ impl TopologyGraph {
         &self.remote_hints
     }
 
+    /// Get a mutable reference to all remote hints.
+    ///
+    /// Exposed for diagnostic and test purposes (e.g., backdating a hint's
+    /// `received_at` to simulate aging for freshness tests). Production code
+    /// should not mutate hints directly — hints are managed by
+    /// `process_peer_summaries()` and `purge_expired()`.
+    pub fn remote_hints_mut(&mut self) -> &mut HashMap<[u8; 32], RemoteNodeHint> {
+        &mut self.remote_hints
+    }
+
     /// Get remote hints that CLAIM the target is a gateway.
     ///
     /// **These are CLAIMS, not authenticated facts.**
     /// A malicious relay can claim anything. Use `direct_gateways()` for
     /// authenticated gateway identities.
+    ///
+    /// N2.1.1.1 review-gate fix #3: stale hints (older than
+    /// `REMOTE_HINT_MAX_AGE_SECS`) are EXCLUDED. A third-party claim of
+    /// "active" cannot grant indefinite freshness.
     #[must_use]
     pub fn gateway_hints(&self) -> Vec<&RemoteNodeHint> {
+        let now = now_unix();
         self.remote_hints
             .values()
-            .filter(|h| h.claims_gateway())
+            .filter(|h| h.claims_gateway() && h.freshness(now) == RemoteHintFreshness::Current)
             .collect()
     }
 
+    /// Get ALL remote gateway hints, including stale ones.
+    ///
+    /// This is for diagnostic/observability only — callers that use hints
+    /// for discovery should call `gateway_hints()` (which excludes stale).
+    #[must_use]
+    pub fn gateway_hints_including_stale(&self) -> Vec<&RemoteNodeHint> {
+        self.remote_hints.values().filter(|h| h.claims_gateway()).collect()
+    }
+
     /// Get the highest propagation_sequence seen from a sender.
+    ///
+    /// N2.1.1.1 review-gate fix #2: this value is now persisted across
+    /// restart when a propagation path was configured.
     #[must_use]
     pub fn highest_propagation_sequence(&self, sender: &[u8; 32]) -> Option<u64> {
-        self.propagation_state.get(sender).copied()
+        self.propagation_state.highest_sequence(sender)
     }
 
     // ─── Queries ──────────────────────────────────────────────────────────
@@ -424,13 +592,22 @@ impl TopologyGraph {
     }
 
     /// Purge expired records, dead links, and stale remote hints.
+    ///
+    /// N2.1.1.1 review-gate fix #3: remote hints are purged based on their
+    /// AGE (`now - received_at > REMOTE_HINT_MAX_AGE_SECS`), NOT based on
+    /// their `claimed_visibility`. A third-party claim of "active" cannot
+    /// grant indefinite freshness — the previous implementation retained
+    /// such hints forever, contradicting the architecture's freshness
+    /// requirement.
+    ///
+    /// Hints that have aged past `REMOTE_HINT_MAX_AGE_SECS` are removed. If
+    /// a fresher propagation message arrives later, a new hint will be
+    /// stored (subject to the propagation-sequence replay check).
     pub fn purge_expired(&mut self, now: u64) {
         self.directory.purge_expired(now);
-        // Purge remote hints that claim "stale" and are older than
-        // the advertisement lifetime.
-        let cutoff = now.saturating_sub(MAX_ADVERTISEMENT_LIFETIME_SECS);
+        // Purge remote hints whose AGE exceeds the freshness window.
         self.remote_hints.retain(|_, hint| {
-            hint.claimed_visibility == "active" || hint.received_at > cutoff
+            hint.freshness(now) == RemoteHintFreshness::Current
         });
     }
 

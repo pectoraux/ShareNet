@@ -312,7 +312,7 @@ fn topology_graph_remote_propagation() {
     );
 
     assert!(summary_list.verify(), "summary list must verify");
-    let result = graph.process_peer_summaries(&summary_list);
+    let result = graph.process_peer_summaries(&summary_list.verify_into_verified().unwrap());
     assert!(matches!(result, snp_node::node::PropagationResult::Accepted { .. }));
 
     // The remote gateway should be in remote_hints (NOT remote_nodes).
@@ -493,7 +493,7 @@ fn remote_hint_is_not_authenticated_node() {
     let (sk, pk) = fresh_keypair(b"hint-not-auth");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     // G should be in remote_hints, NOT in authenticated records.
     assert!(graph.remote_hints().contains_key(&fake_gw_id));
@@ -518,7 +518,7 @@ fn fake_gateway_claim_is_not_authenticated() {
     let (sk, pk) = fresh_keypair(b"fake-gw");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     // gateway_hints() should contain the fake claim.
     let hints = graph.gateway_hints();
@@ -558,7 +558,7 @@ fn direct_gateways_excludes_remote_hints() {
     let (sk, pk) = fresh_keypair(b"hint-sender");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![fake_gw], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     // direct_gateways() = 0 (no authenticated gateway with a link).
     assert_eq!(graph.direct_gateways().len(), 0);
@@ -583,7 +583,7 @@ fn gateway_hints_contains_remote_claim() {
     let (sk, pk) = fresh_keypair(b"hint-gw");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     let hints = graph.gateway_hints();
     assert_eq!(hints.len(), 1);
@@ -610,7 +610,7 @@ fn remote_hint_cannot_become_verified_descriptor() {
     let (sk, pk) = fresh_keypair(b"hint-no-convert");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     // There is no API to convert RemoteNodeHint → VerifiedNodeDescriptor.
     // The only way to get a VerifiedNodeDescriptor is via
@@ -670,7 +670,7 @@ fn multi_hop_destination_discovery_without_authentication() {
         vec![c_summary, g_summary],
         1,
     );
-    graph_a.process_peer_summaries(&list);
+    graph_a.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     // A now knows:
     // - B is authenticated and directly reachable (distance 0).
@@ -718,7 +718,7 @@ fn distance_hint_is_not_route() {
     let (sk, pk) = fresh_keypair(b"distance-not-route");
     let sender_id = derive_node_id(&pk);
     let list = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary], 1);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     let hint = graph.remote_hints().get(&target).unwrap();
     assert_eq!(hint.distance_hint, 5);
@@ -748,7 +748,7 @@ fn propagation_sequence_replay_rejected() {
         distance_hint: 1,
     };
     let list1 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary1], 10);
-    let result1 = graph.process_peer_summaries(&list1);
+    let result1 = graph.process_peer_summaries(&list1.verify_into_verified().unwrap());
     assert!(matches!(result1, PropagationResult::Accepted { .. }));
 
     // Replay with same propagation_sequence = 10.
@@ -761,13 +761,13 @@ fn propagation_sequence_replay_rejected() {
         distance_hint: 1,
     };
     let list2 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![summary2], 10);
-    let result2 = graph.process_peer_summaries(&list2);
+    let result2 = graph.process_peer_summaries(&list2.verify_into_verified().unwrap());
     assert!(matches!(result2, PropagationResult::Stale { received_sequence: 10, known_sequence: 10 }),
         "replayed propagation_sequence must be rejected");
 
     // Older propagation_sequence = 5.
     let list3 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 5);
-    let result3 = graph.process_peer_summaries(&list3);
+    let result3 = graph.process_peer_summaries(&list3.verify_into_verified().unwrap());
     assert!(matches!(result3, PropagationResult::Stale { received_sequence: 5, known_sequence: 10 }),
         "older propagation_sequence must be rejected");
     eprintln!("[test N8] PASS: propagation sequence replay rejected");
@@ -782,17 +782,17 @@ fn stale_propagation_message_rejected() {
 
     // First message (seq 1).
     let list1 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 1);
-    let r1 = graph.process_peer_summaries(&list1);
+    let r1 = graph.process_peer_summaries(&list1.verify_into_verified().unwrap());
     assert!(matches!(r1, PropagationResult::Accepted { .. }));
 
     // Newer message (seq 5).
     let list5 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 5);
-    let r5 = graph.process_peer_summaries(&list5);
+    let r5 = graph.process_peer_summaries(&list5.verify_into_verified().unwrap());
     assert!(matches!(r5, PropagationResult::Accepted { .. }));
 
     // Now try seq 3 (stale — between 1 and 5).
     let list3 = PeerSummaryList::create_and_sign(&sk, &pk, sender_id, vec![], 3);
-    let r3 = graph.process_peer_summaries(&list3);
+    let r3 = graph.process_peer_summaries(&list3.verify_into_verified().unwrap());
     assert!(matches!(r3, PropagationResult::Stale { known_sequence: 5, .. }),
         "seq 3 after seq 5 must be rejected as stale");
     eprintln!("[test N9] PASS: stale propagation message rejected");
@@ -815,7 +815,7 @@ fn provenance_preserved() {
         distance_hint: 3,
     };
     let list = PeerSummaryList::create_and_sign(&sender_sk, &sender_pk, sender_id, vec![summary], 7);
-    graph.process_peer_summaries(&list);
+    graph.process_peer_summaries(&list.verify_into_verified().unwrap());
 
     let hint = graph.remote_hints().get(&target).expect("hint must exist");
     assert_eq!(hint.target_node_id, target);
