@@ -644,3 +644,173 @@ fn replay_guard_rejects_seen_advertisement() {
         "replayed advertisement MUST be rejected by the acceptance store");
     eprintln!("[test 27] PASS: replay guard rejects seen advertisement");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.0.2 — Persistence and replay-state hardening tests
+// ════════════════════════════════════════════════════════════════════════════
+
+use snp_node::node::{AdvertisementSequenceStore, PeerAcceptanceState};
+
+/// 28. expired_record_does_not_reset_sequence_floor
+#[test]
+fn expired_record_does_not_reset_sequence_floor() {
+    let (sk, pk) = fresh_keypair(b"purge-floor");
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept sequence 100.
+    let advert100 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 1, 100, // expires in 1 second
+    );
+    let verified100 = advert100.verify_into_verified().expect("must verify");
+    store.accept(verified100);
+
+    // Wait for expiry.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // Purge expired records.
+    let now = now_unix();
+    store.purge_expired_records(now);
+
+    // The sequence floor MUST still be 100.
+    assert_eq!(store.highest_sequence(&derive_node_id(&pk)), Some(100),
+        "sequence floor must NOT be erased by purge_expired_records");
+    assert!(store.get(&derive_node_id(&pk)).is_none(),
+        "current record should be purged (None)");
+    eprintln!("[test 28] PASS: expired record does not reset sequence floor");
+}
+
+/// 29. stale_replay_after_purge_rejected
+#[test]
+fn stale_replay_after_purge_rejected() {
+    let (sk, pk) = fresh_keypair(b"stale-after-purge");
+    let node_id = derive_node_id(&pk);
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept sequence 100 (with short expiry).
+    let advert100 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 1, 100,
+    );
+    let verified100 = advert100.verify_into_verified().expect("must verify");
+    store.accept(verified100);
+
+    // Wait for expiry + purge.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    store.purge_expired_records(now_unix());
+
+    // Now present sequence 50 (stale) — MUST be rejected.
+    let advert50 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 3600, 50,
+    );
+    let verified50 = advert50.verify_into_verified().expect("must verify");
+    let result = store.accept(verified50);
+    assert!(matches!(result, AcceptanceResult::Stale { advert_sequence: 50, known_sequence: 100 }),
+        "stale sequence after purge MUST be rejected; got {:?}", result);
+    eprintln!("[test 29] PASS: stale replay after purge rejected");
+}
+
+/// 30. newer_sequence_after_purge_accepted
+#[test]
+fn newer_sequence_after_purge_accepted() {
+    let (sk, pk) = fresh_keypair(b"newer-after-purge");
+    let node_id = derive_node_id(&pk);
+    let mut store = AdvertisementAcceptanceStore::new();
+
+    // Accept sequence 100 (with short expiry).
+    let advert100 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1")],
+        None, 1, 100,
+    );
+    let verified100 = advert100.verify_into_verified().expect("must verify");
+    store.accept(verified100);
+
+    // Wait for expiry + purge.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    store.purge_expired_records(now_unix());
+
+    // Now present sequence 101 (newer) — MUST be accepted.
+    let advert101 = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:2")],
+        None, 3600, 101,
+    );
+    let verified101 = advert101.verify_into_verified().expect("must verify");
+    let result = store.accept(verified101);
+    assert!(matches!(result, AcceptanceResult::Accepted(_)),
+        "newer sequence after purge MUST be accepted; got {:?}", result);
+    eprintln!("[test 30] PASS: newer sequence after purge accepted");
+}
+
+/// 31. node_sequence_survives_restart
+#[test]
+fn node_sequence_survives_restart() {
+    let tmp = std::env::temp_dir().join(format!("snp-seq-test-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Create store, issue sequences 1, 2, 3.
+    let mut store = AdvertisementSequenceStore::open(&tmp).expect("open");
+    let seq1 = store.next_sequence().expect("next 1");
+    let seq2 = store.next_sequence().expect("next 2");
+    let seq3 = store.next_sequence().expect("next 3");
+    assert_eq!((seq1, seq2, seq3), (1, 2, 3));
+
+    // Simulate restart — create a new store from the same file.
+    let store2 = store.restart().expect("restart");
+    assert_eq!(store2.current_sequence(), 3,
+        "sequence must survive restart");
+
+    // Issue the next sequence after restart.
+    let mut store2 = store2;
+    let seq4 = store2.next_sequence().expect("next 4");
+    assert_eq!(seq4, 4, "next sequence after restart must be > last issued");
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 31] PASS: node sequence survives restart");
+}
+
+/// 32. node_sequence_never_regresses
+#[test]
+fn node_sequence_never_regresses() {
+    let tmp = std::env::temp_dir().join(format!("snp-seq-regress-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    // Issue up to sequence 100.
+    let mut store = AdvertisementSequenceStore::open(&tmp).expect("open");
+    for _ in 0..100 {
+        store.next_sequence().expect("next");
+    }
+    assert_eq!(store.current_sequence(), 100);
+
+    // Restart.
+    let store2 = store.restart().expect("restart");
+    assert_eq!(store2.current_sequence(), 100);
+
+    // Next must be 101, not 1.
+    let mut store2 = store2;
+    let next = store2.next_sequence().expect("next after restart");
+    assert_eq!(next, 101, "sequence must never regress after restart");
+
+    let _ = std::fs::remove_file(&tmp);
+    eprintln!("[test 32] PASS: node sequence never regresses");
+}
+
+/// 33. routehop_documentation_is_generic
+#[test]
+fn routehop_documentation_is_generic() {
+    let source = include_str!("../src/node/route.rs");
+    assert!(
+        !source.contains("VerifiedGatewayAdvertisement"),
+        "route.rs must NOT reference VerifiedGatewayAdvertisement — use VerifiedNodeAdvertisement"
+    );
+    assert!(
+        source.contains("VerifiedNodeAdvertisement"),
+        "route.rs must reference VerifiedNodeAdvertisement (the generic path)"
+    );
+    eprintln!("[test 33] PASS: RouteHop documentation is generic");
+}

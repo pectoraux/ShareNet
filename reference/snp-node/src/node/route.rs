@@ -176,7 +176,7 @@ impl RouteCommitment {
 #[derive(Debug, Clone)]
 pub struct RouteHop {
     /// The hop's VERIFIED identity descriptor. Can ONLY be constructed from
-    /// a `VerifiedGatewayAdvertisement` (signature checked + NodeId↔Ed25519
+    /// a `VerifiedNodeAdvertisement` (signature checked + NodeId↔Ed25519
     /// consistency verified).
     pub descriptor: VerifiedNodeDescriptor,
     /// The hop's transport endpoint(s).

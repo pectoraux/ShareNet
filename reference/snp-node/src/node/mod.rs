@@ -126,8 +126,9 @@ pub use descriptor::{
     VerifiedNodeDescriptor,
 };
 pub use node_advert::{
-    AcceptanceResult, AdvertisementAcceptanceStore, AuthenticatedNodeRecord, NodeAdvertisement,
-    VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS, MAX_CLOCK_SKEW_SECS,
+    AcceptanceResult, AdvertisementAcceptanceStore, AdvertisementSequenceStore,
+    AuthenticatedNodeRecord, NodeAdvertisement, PeerAcceptanceState, VerifiedNodeAdvertisement,
+    MAX_ADVERTISEMENT_LIFETIME_SECS, MAX_CLOCK_SKEW_SECS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

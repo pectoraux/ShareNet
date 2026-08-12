@@ -3654,3 +3654,47 @@ Stage Summary:
 - Stale documentation: cleaned.
 - "Replay protection" is no longer claimed for stateless verification.
 
+
+---
+Task ID: 236-240 (N2.1.0.2 — Advertisement Ordering Persistence and Replay-State Hardening)
+Agent: Z.ai (main)
+
+Task: N2.1.0.1 had a bug where purge_expired() erased the entire map entry (both sequence floor AND current record), allowing old advertisements to be re-accepted after purge. Also, node-side sequence was not persistent across restarts. This milestone fixes both.
+
+Work Log:
+- Fixed acceptance-state purging:
+  * Created `PeerAcceptanceState` with `highest_accepted_sequence: u64` and `current_record: Option<AuthenticatedNodeRecord>`.
+  * `purge_expired_records()` clears ONLY `current_record` when expired — the `highest_accepted_sequence` persists.
+  * `remove_peer()` is the ONLY way to erase the sequence floor (for permanent topology removal).
+  * This prevents the bug: sequence 100 accepted → record expires → purged → sequence 50 arrives → REJECTED as stale (was: accepted as "first seen").
+
+- Created `AdvertisementSequenceStore` (node-side persistence):
+  * File-backed: stores the last-issued sequence as a little-endian u64.
+  * `open(path)` — loads the persisted sequence.
+  * `next_sequence()` — atomically increments + persists.
+  * `restart()` — simulates process restart by loading from the same file.
+  * `in_memory()` / `in_memory_starting_at()` — for tests.
+  * Invariant: after restart, `next_sequence() > last_issued_sequence`.
+
+- Cleaned stale documentation:
+  * `route.rs` line 179: "VerifiedGatewayAdvertisement" → "VerifiedNodeAdvertisement".
+  * `descriptor.rs`: already cleaned in N2.1.0.1.
+
+- 6 new tests (33 total in n210_node_advert.rs):
+  28. expired_record_does_not_reset_sequence_floor
+  29. stale_replay_after_purge_rejected
+  30. newer_sequence_after_purge_accepted
+  31. node_sequence_survives_restart
+  32. node_sequence_never_regresses
+  33. routehop_documentation_is_generic
+
+- Test results: 201 passed, 0 failed, 3 ignored (was 195; +6 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- Sequence floor survives record expiry/purging (PeerAcceptanceState separation).
+- Node-side sequence is persistent across restart (AdvertisementSequenceStore).
+- Stale advertisements rejected even after current record is purged.
+- No stale VerifiedGatewayAdvertisement references in route.rs.
+- Ready for N2.1.1 (peer discovery / topology).
+

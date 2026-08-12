@@ -427,6 +427,39 @@ impl AuthenticatedNodeRecord {
     }
 }
 
+// ─── PeerAcceptanceState ────────────────────────────────────────────────────
+
+/// Per-peer acceptance state. Separates the monotonic sequence floor (which
+/// must NOT be erased when the current record expires) from the current
+/// authenticated record (which MAY expire and be purged).
+///
+/// ## N2.1.0.2 correction
+///
+/// The previous `AdvertisementAcceptanceStore` combined `(highest_sequence,
+/// AuthenticatedNodeRecord)` in a single map entry. When `purge_expired()`
+/// removed the entry, the sequence floor disappeared — allowing an old
+/// advertisement with a lower sequence to be accepted as "first seen" after
+/// the purge.
+///
+/// This type separates the two concerns:
+/// - `highest_accepted_sequence` — NEVER erased by record expiry. Persists
+///   across `purge_expired_records()` calls. Only removed by explicit
+///   `remove_peer()` (e.g. when a node is permanently removed from topology).
+/// - `current_record` — MAY be `None` (if expired and purged). The sequence
+///   floor remains even when the current record is gone.
+#[derive(Debug, Clone)]
+pub struct PeerAcceptanceState {
+    /// The highest advertisement sequence ever accepted from this peer.
+    /// This is a MONOTONIC FLOOR — it never decreases, and it survives
+    /// record expiry/purging. An advertisement with a lower or equal
+    /// sequence is rejected as stale/duplicate even if the current record
+    /// has been purged.
+    pub highest_accepted_sequence: u64,
+    /// The current authenticated record, if one is active (not expired).
+    /// `None` if the record has expired and been purged.
+    pub current_record: Option<AuthenticatedNodeRecord>,
+}
+
 // ─── AdvertisementAcceptanceStore ───────────────────────────────────────────
 
 /// The result of attempting to accept an advertisement.
@@ -451,23 +484,31 @@ pub enum AcceptanceResult {
 }
 
 /// A stateful store that tracks the highest accepted advertisement sequence
-/// per NodeId. This provides **replay prevention** — a previously seen
-/// advertisement (same or lower sequence) is rejected.
+/// per NodeId. This provides **replay prevention during the lifetime of the
+/// acceptance state** — a previously seen advertisement (same or lower
+/// sequence) is rejected.
 ///
-/// ## Semantics
+/// ## N2.1.0.2: Separated sequence floor from current record
 ///
-/// - `accept(verified_advert)` checks the advertisement's sequence against
-///   the highest previously accepted sequence for the same NodeId.
-/// - If `sequence > known_sequence`: **accept** and update the store.
-/// - If `sequence == known_sequence`: **reject as duplicate**.
-/// - If `sequence < known_sequence`: **reject as stale**.
+/// The store now uses `PeerAcceptanceState` which separates:
+/// - `highest_accepted_sequence` — NEVER erased by record expiry.
+/// - `current_record` — MAY be purged when expired.
 ///
-/// This store will be consumed by peer discovery (N2.1.1) to ensure that
-/// only the newest topology information is accepted.
+/// This prevents the bug where purging an expired record would erase the
+/// sequence floor, allowing an old advertisement to be accepted as "first
+/// seen" after the purge.
+///
+/// ## Persistence
+///
+/// The store is in-memory. For production use, the acceptance state should
+/// be persisted to survive process restart. The reference implementation
+/// does not yet persist — callers should be aware that a restart loses the
+/// sequence floor, and old advertisements within their validity window
+/// could be re-accepted.
 #[derive(Debug, Clone, Default)]
 pub struct AdvertisementAcceptanceStore {
-    /// Map: NodeId → (highest accepted sequence, AuthenticatedNodeRecord).
-    records: HashMap<[u8; 32], (u64, AuthenticatedNodeRecord)>,
+    /// Map: NodeId → PeerAcceptanceState.
+    peers: HashMap<[u8; 32], PeerAcceptanceState>,
 }
 
 impl AdvertisementAcceptanceStore {
@@ -488,59 +529,204 @@ impl AdvertisementAcceptanceStore {
     pub fn accept(&mut self, verified: VerifiedNodeAdvertisement) -> AcceptanceResult {
         let node_id = verified.node_id();
         let sequence = verified.sequence();
-        match self.records.get(&node_id) {
+        match self.peers.get(&node_id) {
             None => {
                 // First advertisement from this node.
                 let record = verified.into_record();
-                self.records.insert(node_id, (sequence, record.clone()));
+                self.peers.insert(node_id, PeerAcceptanceState {
+                    highest_accepted_sequence: sequence,
+                    current_record: Some(record.clone()),
+                });
                 AcceptanceResult::Accepted(record)
             }
-            Some((known_seq, _)) if sequence > *known_seq => {
+            Some(state) if sequence > state.highest_accepted_sequence => {
                 // Newer advertisement.
                 let record = verified.into_record();
-                self.records.insert(node_id, (sequence, record.clone()));
+                self.peers.insert(node_id, PeerAcceptanceState {
+                    highest_accepted_sequence: sequence,
+                    current_record: Some(record.clone()),
+                });
                 AcceptanceResult::Accepted(record)
             }
-            Some((known_seq, _)) if sequence == *known_seq => {
+            Some(state) if sequence == state.highest_accepted_sequence => {
                 // Duplicate.
                 AcceptanceResult::Duplicate { sequence }
             }
-            Some((known_seq, _)) => {
+            Some(state) => {
                 // Stale.
                 AcceptanceResult::Stale {
                     advert_sequence: sequence,
-                    known_sequence: *known_seq,
+                    known_sequence: state.highest_accepted_sequence,
                 }
             }
         }
     }
 
-    /// Get the current `AuthenticatedNodeRecord` for a NodeId, if any.
+    /// Get the current `AuthenticatedNodeRecord` for a NodeId, if any
+    /// (and if not expired).
     #[must_use]
     pub fn get(&self, node_id: &[u8; 32]) -> Option<&AuthenticatedNodeRecord> {
-        self.records.get(node_id).map(|(_, record)| record)
+        self.peers.get(node_id).and_then(|s| s.current_record.as_ref())
     }
 
     /// Get the highest accepted sequence for a NodeId, if any.
+    /// This survives record expiry/purging — the sequence floor is
+    /// NOT erased by `purge_expired_records()`.
     #[must_use]
     pub fn highest_sequence(&self, node_id: &[u8; 32]) -> Option<u64> {
-        self.records.get(node_id).map(|(seq, _)| *seq)
+        self.peers.get(node_id).map(|s| s.highest_accepted_sequence)
     }
 
-    /// Remove expired records from the store.
-    pub fn purge_expired(&mut self, now: u64) {
-        self.records.retain(|_, (_, record)| !record.is_expired(now));
+    /// Purge expired CURRENT RECORDS from the store. This does NOT
+    /// remove the `highest_accepted_sequence` — the sequence floor
+    /// persists to prevent replay of old advertisements after the
+    /// current record expires.
+    ///
+    /// ## N2.1.0.2 correction
+    ///
+    /// The previous `purge_expired()` removed the entire entry (both
+    /// sequence AND record). This method only clears `current_record`
+    /// when it has expired, preserving the sequence floor.
+    pub fn purge_expired_records(&mut self, now: u64) {
+        for state in self.peers.values_mut() {
+            if let Some(record) = &state.current_record {
+                if record.is_expired(now) {
+                    state.current_record = None;
+                }
+            }
+        }
     }
 
-    /// Get the number of records in the store.
+    /// Remove a peer entirely (including the sequence floor). This should
+    /// only be used when a node is permanently removed from topology —
+    /// NOT when an advertisement expires.
+    pub fn remove_peer(&mut self, node_id: &[u8; 32]) {
+        self.peers.remove(node_id);
+    }
+
+    /// Get the number of peers in the store (including those with
+    /// expired/purged records but retained sequence floors).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.peers.len()
     }
 
     /// Check if the store is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.peers.is_empty()
+    }
+}
+
+// ─── AdvertisementSequenceStore (node-side persistence) ─────────────────────
+
+/// A persistent store for a node's own advertisement sequence counter.
+/// Ensures the sequence never regresses across process restarts.
+///
+/// ## N2.1.0.2
+///
+/// The advertisement sequence is monotonic per NodeId. A node restart
+/// must not reset its sequence counter — otherwise other peers will
+/// reject the new (lower-sequence) advertisement as stale.
+///
+/// This abstraction provides:
+/// - `next_sequence()` — atomically increment and return the next sequence.
+/// - `current_sequence()` — get the current sequence without incrementing.
+/// - Persistence via a file-backed implementation.
+///
+/// ## Reference implementation
+///
+/// The reference implementation uses a simple file (`sequence.dat`)
+/// containing the last-issued sequence as a little-endian `u64`. This is
+/// sufficient for a single-process reference node. Production implementations
+/// should use a more robust persistence mechanism (e.g. SQLite, SharedPreferences
+/// on Android).
+#[derive(Debug)]
+pub struct AdvertisementSequenceStore {
+    /// The current sequence counter (in-memory cache of the persisted value).
+    sequence: u64,
+    /// The file path where the sequence is persisted.
+    path: std::path::PathBuf,
+}
+
+impl AdvertisementSequenceStore {
+    /// Create a new `AdvertisementSequenceStore` backed by a file.
+    /// If the file exists, the sequence is loaded from it. If not,
+    /// the sequence starts at 0.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file exists but cannot be read.
+    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let sequence = if path.exists() {
+            let data = std::fs::read(&path)?;
+            if data.len() >= 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8]);
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        Ok(Self { sequence, path })
+    }
+
+    /// Create an in-memory store (for tests). Not persisted.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            sequence: 0,
+            path: std::path::PathBuf::new(), // empty path = no persistence
+        }
+    }
+
+    /// Create an in-memory store starting at a specific sequence (for tests).
+    #[must_use]
+    pub fn in_memory_starting_at(sequence: u64) -> Self {
+        Self {
+            sequence,
+            path: std::path::PathBuf::new(),
+        }
+    }
+
+    /// Get the current sequence without incrementing.
+    #[must_use]
+    pub fn current_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Atomically increment the sequence and return the new value.
+    /// The new value is persisted to the file (if a path was provided).
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file cannot be written.
+    pub fn next_sequence(&mut self) -> std::io::Result<u64> {
+        self.sequence = self.sequence.saturating_add(1);
+        self.persist()?;
+        Ok(self.sequence)
+    }
+
+    /// Persist the current sequence to the file.
+    fn persist(&self) -> std::io::Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(()); // in-memory mode
+        }
+        let data = self.sequence.to_le_bytes();
+        std::fs::write(&self.path, data)
+    }
+
+    /// Simulate a process restart by creating a new store from the same file.
+    /// The new store will load the persisted sequence.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file cannot be read.
+    pub fn restart(&self) -> std::io::Result<Self> {
+        if self.path.as_os_str().is_empty() {
+            // In-memory: return a fresh store (simulating data loss).
+            return Ok(Self::in_memory());
+        }
+        Self::open(&self.path)
     }
 }
