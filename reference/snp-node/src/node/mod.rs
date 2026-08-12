@@ -128,7 +128,8 @@ pub use descriptor::{
 pub use node_advert::{
     AcceptanceError, AcceptanceResult, AdvertisementAcceptanceStore, AdvertisementSequenceStore,
     AuthenticatedNodeRecord, NodeAdvertisement, PeerAcceptanceState, PeerVisibility,
-    VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS, MAX_CLOCK_SKEW_SECS,
+    SequenceStoreError, VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS,
+    MAX_CLOCK_SKEW_SECS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

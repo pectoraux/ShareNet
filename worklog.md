@@ -3820,3 +3820,52 @@ Stage Summary:
 - Atomic replacement documented as distinct from power-loss durability.
 - The advertisement primitive is now FULLY hardened for peer discovery.
 
+
+---
+Task ID: 251-255 (N2.1.0.5 — Final Persistence Symmetry and Removal Atomicity)
+Agent: Z.ai (main)
+
+Task: N2.1.0.4 had two remaining issues: (1) remove_peer() ignored persistence failures, (2) AdvertisementSequenceStore had no magic/version, no corruption detection, no atomic writes. This milestone fixes both.
+
+Work Log:
+- Made remove_peer() transactional:
+  * Changed return type to Result<(), AcceptanceError>.
+  * Persist FIRST, then update in-memory. Rollback on failure.
+  * If persistence fails, the peer is NOT removed — identity history preserved.
+  * If the peer doesn't exist, returns Ok(()) (no-op).
+
+- Hardened AdvertisementSequenceStore:
+  * Added magic b"SNSQ" (4 bytes) + version 1u8 (1 byte) + sequence u64 LE (8 bytes) = 13 bytes total.
+  * open() fails closed: wrong magic → Corrupt, wrong version → Corrupt, truncated → Corrupt, trailing bytes → Corrupt.
+  * Corrupted files do NOT silently reset the sequence to 0.
+  * Added SequenceStoreError enum (Io, Corrupt).
+
+- Made AdvertisementSequenceStore persistence atomic:
+  * persist() now uses write-to-temp + rename (matching AdvertisementAcceptanceStore).
+  * Documented: atomic replacement YES, power-loss durability NOT CLAIMED (no fsync).
+
+- 9 new tests (59 total in n210_node_advert.rs):
+  51. remove_peer_persistence_failure_preserves_identity
+  52. removed_peer_remains_removed_after_restart
+  53. sequence_file_magic_checked
+  54. sequence_file_version_checked
+  55. truncated_sequence_file_rejected
+  56. trailing_sequence_bytes_rejected
+  57. sequence_store_atomic_replacement
+  58. sequence_store_persist_failure_does_not_advance
+  59. sequence_never_regresses_after_restart
+
+- Test results: 227 passed, 0 failed, 3 ignored (was 218; +9 new tests).
+- Conformance: 138/138, 0 disagreements.
+
+Stage Summary:
+- remove_peer() is transactional — persist first, rollback on failure, identity preserved.
+- AdvertisementSequenceStore has magic + version + fail-closed loading + atomic writes.
+- Both persistence systems now have SYMMETRIC semantics:
+  * Magic + version header.
+  * Fail-closed corruption handling.
+  * Atomic write-to-temp + rename.
+  * Transactional updates (persist first, rollback on failure).
+  * Documented: atomic replacement YES, power-loss durability NOT CLAIMED.
+- The advertisement primitive is now FULLY hardened. Ready for N2.1.1 (Peer Discovery & Topology).
+

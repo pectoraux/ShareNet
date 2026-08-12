@@ -899,14 +899,33 @@ impl AdvertisementAcceptanceStore {
     /// `remove_peer()` should only be used when a node's identity is
     /// permanently removed from the topology (e.g. revocation, identity
     /// rotation, or administrative action).
-    pub fn remove_peer(&mut self, node_id: &[u8; 32]) {
-        self.peers.remove(node_id);
-        // Best-effort persist. remove_peer is an explicit identity-history
-        // deletion — if the persist fails, the in-memory state is still
-        // correct (peer removed), and the next successful persist will
-        // sync. This is less critical than accept() because remove_peer
-        // is not a monotonicity invariant.
-        let _ = self.persist();
+    ///
+    /// ## N2.1.0.5: Transactional
+    ///
+    /// `remove_peer()` is transactional: the peer is removed from the
+    /// persistence file FIRST. Only if persistence succeeds is the
+    /// in-memory state updated. If persistence fails, the peer is
+    /// NOT removed — the identity history is preserved.
+    ///
+    /// # Errors
+    /// Returns `AcceptanceError::PersistenceFailed` if the state could not
+    /// be persisted. The peer is NOT removed in this case.
+    pub fn remove_peer(&mut self, node_id: &[u8; 32]) -> Result<(), AcceptanceError> {
+        // Check if the peer exists.
+        if !self.peers.contains_key(node_id) {
+            return Ok(()); // Already removed — no-op.
+        }
+        // Save the old state for rollback.
+        let old_state = self.peers.remove(node_id);
+        // Persist the new state (without the peer).
+        if let Err(e) = self.persist() {
+            // Rollback: restore the peer.
+            if let Some(state) = old_state {
+                self.peers.insert(*node_id, state);
+            }
+            return Err(AcceptanceError::PersistenceFailed(e));
+        }
+        Ok(())
     }
 
     /// Simulate a process restart by creating a new store from the same
@@ -943,24 +962,37 @@ impl AdvertisementAcceptanceStore {
 /// A persistent store for a node's own advertisement sequence counter.
 /// Ensures the sequence never regresses across process restarts.
 ///
-/// ## N2.1.0.2
+/// ## N2.1.0.5: Hardened persistence
 ///
-/// The advertisement sequence is monotonic per NodeId. A node restart
-/// must not reset its sequence counter — otherwise other peers will
-/// reject the new (lower-sequence) advertisement as stale.
+/// The persistence format now includes a magic + version header and uses
+/// atomic write-to-temp-then-rename, matching the discipline of
+/// `AdvertisementAcceptanceStore`. Corrupted files fail closed — they
+/// do NOT silently reset the sequence to 0.
 ///
-/// This abstraction provides:
-/// - `next_sequence()` — atomically increment and return the next sequence.
-/// - `current_sequence()` — get the current sequence without incrementing.
-/// - Persistence via a file-backed implementation.
+/// ## Persistence format (N2.1.0.5)
 ///
-/// ## Reference implementation
+/// **Reference-node persistence format; NOT a cross-platform SNP wire format.**
 ///
-/// The reference implementation uses a simple file (`sequence.dat`)
-/// containing the last-issued sequence as a little-endian `u64`. This is
-/// sufficient for a single-process reference node. Production implementations
-/// should use a more robust persistence mechanism (e.g. SQLite, SharedPreferences
-/// on Android).
+/// - 4 bytes: magic `b"SNSQ"` (ShareNet Node Sequence)
+/// - 1 byte: version (`1`)
+/// - 8 bytes: sequence (little-endian u64)
+///
+/// Total: 13 bytes.
+///
+/// ## Atomicity vs Durability
+///
+/// **Atomic replacement: YES.** Uses write-to-temp-then-rename.
+/// **Guaranteed power-loss durability: NOT CLAIMED** (no fsync).
+///
+/// ## Fail-closed corruption handling (N2.1.0.5)
+///
+/// Loading a persistence file fails closed:
+/// - Files shorter than 13 bytes → error.
+/// - Wrong magic → error.
+/// - Wrong version → error.
+/// - Trailing bytes after the 13-byte record → error.
+///
+/// Corrupted files do NOT silently reset the sequence to 0.
 #[derive(Debug)]
 pub struct AdvertisementSequenceStore {
     /// The current sequence counter (in-memory cache of the persisted value).
@@ -969,24 +1001,88 @@ pub struct AdvertisementSequenceStore {
     path: std::path::PathBuf,
 }
 
+/// Magic for the sequence store file: `b"SNSQ"`.
+const SEQ_MAGIC: &[u8; 4] = b"SNSQ";
+/// Version for the sequence store file.
+const SEQ_VERSION: u8 = 1;
+/// Header: magic (4) + version (1) = 5 bytes.
+const SEQ_HEADER_SIZE: usize = 5;
+/// Total file size: header (5) + sequence (8) = 13 bytes.
+const SEQ_FILE_SIZE: usize = SEQ_HEADER_SIZE + 8;
+
+/// Error from the sequence store.
+#[derive(Debug)]
+pub enum SequenceStoreError {
+    /// I/O error.
+    Io(std::io::Error),
+    /// The persistence file is corrupted.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for SequenceStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Corrupt(msg) => write!(f, "corrupt sequence store: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SequenceStoreError {}
+
+impl From<std::io::Error> for SequenceStoreError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 impl AdvertisementSequenceStore {
     /// Create a new `AdvertisementSequenceStore` backed by a file.
     /// If the file exists, the sequence is loaded from it. If not,
     /// the sequence starts at 0.
     ///
+    /// ## Fail-closed (N2.1.0.5)
+    ///
+    /// If the file is corrupted (wrong magic, wrong version, truncated,
+    /// trailing bytes), this method returns `SequenceStoreError::Corrupt`.
+    /// The caller should quarantine or delete the file. The sequence is
+    /// NOT silently reset to 0.
+    ///
     /// # Errors
-    /// Returns `io::Error` if the file exists but cannot be read.
-    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    /// Returns `SequenceStoreError::Corrupt` for corrupted files.
+    /// Returns `SequenceStoreError::Io` for I/O failures.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, SequenceStoreError> {
         let path = path.as_ref().to_path_buf();
         let sequence = if path.exists() {
             let data = std::fs::read(&path)?;
-            if data.len() >= 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&data[..8]);
-                u64::from_le_bytes(buf)
-            } else {
-                0
+            // Check minimum size.
+            if data.len() < SEQ_FILE_SIZE {
+                return Err(SequenceStoreError::Corrupt(format!(
+                    "file too short: {} bytes < {} expected", data.len(), SEQ_FILE_SIZE
+                )));
             }
+            // Check magic.
+            if &data[..4] != SEQ_MAGIC {
+                return Err(SequenceStoreError::Corrupt(format!(
+                    "invalid magic: expected {:?}, got {:?}", SEQ_MAGIC, &data[..4]
+                )));
+            }
+            // Check version.
+            if data[4] != SEQ_VERSION {
+                return Err(SequenceStoreError::Corrupt(format!(
+                    "unsupported version: expected {}, got {}", SEQ_VERSION, data[4]
+                )));
+            }
+            // Check for trailing bytes.
+            if data.len() > SEQ_FILE_SIZE {
+                return Err(SequenceStoreError::Corrupt(format!(
+                    "trailing bytes: {} bytes > {} expected", data.len(), SEQ_FILE_SIZE
+                )));
+            }
+            // Read the sequence.
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&data[SEQ_HEADER_SIZE..SEQ_FILE_SIZE]);
+            u64::from_le_bytes(buf)
         } else {
             0
         };
@@ -1019,49 +1115,54 @@ impl AdvertisementSequenceStore {
 
     /// Atomically increment the sequence and return the new value.
     ///
-    /// ## N2.1.0.4: Transactional semantics
+    /// ## Transactional semantics (N2.1.0.4)
     ///
     /// 1. Compute `next = sequence + 1`.
     /// 2. Persist `next` to the file.
     /// 3. Only if persistence succeeds, update `self.sequence = next`.
     /// 4. Return `next`.
     ///
-    /// If persistence fails, the in-memory counter is NOT advanced —
-    /// `self.sequence` remains at its previous value. The caller must
-    /// retry or handle the error.
+    /// If persistence fails, the in-memory counter is NOT advanced.
     ///
     /// # Errors
     /// Returns `io::Error` if the file cannot be written.
     pub fn next_sequence(&mut self) -> std::io::Result<u64> {
         let next = self.sequence.saturating_add(1);
-        // Persist the new value FIRST. Only update in-memory if persist succeeds.
         let old_sequence = self.sequence;
         self.sequence = next; // temporarily set for persist()
         if let Err(e) = self.persist() {
-            // Rollback: restore the old sequence.
-            self.sequence = old_sequence;
+            self.sequence = old_sequence; // rollback
             return Err(e);
         }
         Ok(next)
     }
 
-    /// Persist the current sequence to the file.
+    /// Persist the current sequence to the file using atomic
+    /// write-to-temp-then-rename.
+    ///
+    /// **Atomic replacement: YES.** Readers never see a partial write.
+    /// **Guaranteed power-loss durability: NOT CLAIMED** (no fsync).
     fn persist(&self) -> std::io::Result<()> {
         if self.path.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
         }
-        let data = self.sequence.to_le_bytes();
-        std::fs::write(&self.path, data)
+        let mut data = Vec::with_capacity(SEQ_FILE_SIZE);
+        data.extend_from_slice(SEQ_MAGIC);
+        data.push(SEQ_VERSION);
+        data.extend_from_slice(&self.sequence.to_le_bytes());
+        // Atomic write: write to temp file, then rename.
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &self.path)?;
+        Ok(())
     }
 
     /// Simulate a process restart by creating a new store from the same file.
-    /// The new store will load the persisted sequence.
     ///
     /// # Errors
-    /// Returns `io::Error` if the file cannot be read.
-    pub fn restart(&self) -> std::io::Result<Self> {
+    /// Returns `SequenceStoreError` if the file is corrupted or cannot be read.
+    pub fn restart(&self) -> Result<Self, SequenceStoreError> {
         if self.path.as_os_str().is_empty() {
-            // In-memory: return a fresh store (simulating data loss).
             return Ok(Self::in_memory());
         }
         Self::open(&self.path)
