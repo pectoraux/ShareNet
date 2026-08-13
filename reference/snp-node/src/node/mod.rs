@@ -165,7 +165,7 @@ pub use distributed_circuit::{
     ActiveCircuit, RelayHandshakeRequest, RelayHandshakeResponse, RelayForwardingState,
     CircuitAcceptanceStore, SignedHopAuthorization, DistributedCircuitError,
     RelayHandshakeTransport, establish_distributed_circuit, accept_relay_handshake,
-    derive_signed_hop_authorizations, compute_authorization_root_from_route,
+    derive_signed_hop_authorizations, compute_authorization_root,
     authorization_in_root, verify_dh_proof,
 };
 pub use session::{

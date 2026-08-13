@@ -246,7 +246,7 @@ impl CircuitHandshake {
         ])
     }
 
-    fn preimage_bytes(&self) -> Result<Vec<u8>, RouteSerializationError> {
+    pub fn preimage_bytes(&self) -> Result<Vec<u8>, RouteSerializationError> {
         let cbor = snp_cbor::encode(&self.preimage())
             .map_err(|_| RouteSerializationError::CborEncodingFailed)?;
         let mut msg = Vec::with_capacity(CIRCUIT_MSG_CONTEXT.len() + cbor.len());

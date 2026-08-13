@@ -284,6 +284,18 @@ pub struct RelayHandshakeRequest {
     /// fields (P0 #2). The relay verifies the source signature using
     /// `handshake.source_public_key` before installing forwarding state.
     pub authorization: SignedHopAuthorization,
+    /// P0: The complete set of all authorization hashes for this circuit.
+    /// The relay uses this to verify that its authorization is a member of
+    /// the set committed by `handshake.authorization_root`.
+    ///
+    /// The relay verifies:
+    /// 1. SHA-256(authorization.canonical_preimage_bytes()) is in this list.
+    /// 2. SHA-256(concat(all hashes in this list)) == handshake.authorization_root.
+    ///
+    /// This prevents split-view attacks where an intermediary substitutes
+    /// a different validly-signed authorization for the same relay/circuit.
+    /// The relay rejects the substitution BEFORE installing forwarding state.
+    pub authorization_hashes: Vec<[u8; 32]>,
 }
 
 /// A relay's signed response proving X25519 key possession + acknowledging
@@ -621,10 +633,16 @@ pub fn establish_distributed_circuit(
     // verifies the source signature using handshake.source_public_key.
     let authorizations = derive_signed_hop_authorizations(route, handshake, source_secret_key)?;
 
-    // P0: compute the authorization_root from the committed route's hop
-    // structure and verify it matches the handshake's authorization_root.
-    // This ensures the handshake commits to the EXACT set of relay positions.
-    let computed_root = compute_authorization_root_from_route(route)?;
+    // P0: compute the authorization_root from the signed authorizations
+    // and verify it matches the handshake's authorization_root. This ensures
+    // the handshake commits to the EXACT set of authorization objects.
+    let mut auth_hashes_concat = Vec::new();
+    for auth in &authorizations {
+        let preimage = auth.canonical_preimage_bytes()
+            .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
+        auth_hashes_concat.extend_from_slice(&sha256(&preimage));
+    }
+    let computed_root = sha256(&auth_hashes_concat);
     if computed_root != handshake.authorization_root {
         return Err(DistributedCircuitError::InconsistentInputs);
     };
@@ -633,12 +651,22 @@ pub fn establish_distributed_circuit(
 
     // For each authorization (one per non-source hop), send a handshake
     // request and verify the response.
+    // P0: compute all authorization hashes for the membership proof.
+    // Each relay receives the full set so it can verify its authorization
+    // is in the set committed by handshake.authorization_root.
+    let all_auth_hashes: Vec<[u8; 32]> = authorizations.iter().map(|a| {
+        let preimage = a.canonical_preimage_bytes()
+            .expect("CBOR encoding must not fail for well-formed authorizations");
+        sha256(&preimage)
+    }).collect();
+
     for auth in &authorizations {
         // Construct the request — send the ACTUAL CircuitHandshake + the
-        // SignedHopAuthorization derived from the committed route.
+        // SignedHopAuthorization + the full authorization hash set.
         let request = RelayHandshakeRequest {
             handshake: handshake.clone(),
             authorization: auth.clone(),
+            authorization_hashes: all_auth_hashes.clone(),
         };
 
         // Send the request.
@@ -965,18 +993,35 @@ pub fn accept_relay_handshake(
         });
     }
 
-    // 3b. P0: verify the relay's authorization hash is included in the
-    //     handshake's authorization_root. The relay computes
-    //     SHA-256(authorization.canonical_preimage_bytes()) and checks it
-    //     against the root. Since the root is SHA-256 of all authorization
-    //     hashes concatenated, the relay cannot verify membership directly
-    //     without the full set. Instead, the relay trusts the source's
-    //     signature on the authorization + the handshake's signed
-    //     authorization_root. The source-side establish_distributed_circuit()
-    //     verifies the root matches the derived authorization set.
-    //     For relay-side defense-in-depth: the relay verifies the authorization's
-    //     own hash is self-consistent (it can compute it). Full membership
-    //     verification happens source-side.
+    // 3b. P0: verify the relay's authorization is a member of the
+    //     authorization set committed by handshake.authorization_root.
+    //     The request carries the full set of authorization hashes.
+    //     The relay verifies:
+    //     1. SHA-256(authorization.canonical_preimage_bytes()) is in the set.
+    //     2. SHA-256(concat(all hashes)) == handshake.authorization_root.
+    //     This prevents split-view attacks where an intermediary substitutes
+    //     a different validly-signed authorization for the same relay/circuit.
+    //     The relay rejects BEFORE installing forwarding state.
+    let auth_preimage = auth.canonical_preimage_bytes()
+        .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
+    let auth_hash = sha256(&auth_preimage);
+    let in_set = request.authorization_hashes.iter().any(|h| h == &auth_hash);
+    if !in_set {
+        return Err(DistributedCircuitError::AuthorizationNotInRoot {
+            relay_node_id: auth.relay_node_id,
+        });
+    }
+    // Verify the hash set matches the handshake's authorization_root.
+    let mut concat = Vec::new();
+    for h in &request.authorization_hashes {
+        concat.extend_from_slice(h);
+    }
+    let computed_root = sha256(&concat);
+    if computed_root != handshake.authorization_root {
+        return Err(DistributedCircuitError::AuthorizationNotInRoot {
+            relay_node_id: auth.relay_node_id,
+        });
+    }
 
     // 4. Verify the CircuitHandshake (signature + freshness + NodeId binding).
     if !handshake.verify_at(now) {
@@ -1064,49 +1109,64 @@ pub fn verify_dh_proof(
     expected_proof == response.dh_proof
 }
 
-/// Compute the authorization_root from a committed route's hop structure.
+/// Compute the authorization_root from a committed route + handshake.
 ///
-/// The root is `SHA-256(hop_data_1 || hop_data_2 || ... || hop_data_n)`
-/// where each `hop_data_i` is the canonical CBOR encoding of the hop's
-/// position information (relay_node_id, predecessor, successor, role,
-/// hop_index, relay_x25519_public_key) — WITHOUT circuit_id or
-/// commitment_hash (which come from the handshake).
+/// The root is `SHA-256(hash(auth_1) || hash(auth_2) || ... || hash(auth_n))`
+/// where each `hash(auth_i) = SHA-256(auth_i.canonical_preimage_bytes())`.
 ///
-/// This makes the root independent of the handshake's circuit_id, so it
-/// can be computed BEFORE the handshake is created. The handshake signs
-/// the root, committing the source to the exact set of relay positions.
+/// This includes circuit_id and commitment_hash from the handshake, so the
+/// root commits to the EXACT authorization objects (not just position data).
+/// The root is included in the handshake's signed preimage, so the source's
+/// signature commits to the exact set of relay authorizations.
+///
+/// Note: this creates a circular dependency (the handshake needs the root,
+/// but the root needs the handshake's circuit_id). The resolution is:
+/// 1. Generate circuit_id first (random).
+/// 2. Compute the root using that circuit_id.
+/// 3. Create the handshake with that circuit_id + root.
+/// This is handled by `create_handshake_with_authorization_root()`.
 #[must_use]
-pub fn compute_authorization_root_from_route(
+pub fn compute_authorization_root(
     route: &CommittedRoute,
-) -> Result<[u8; 32], DistributedCircuitError> {
+    circuit_id: [u8; 32],
+    commitment_hash: [u8; 32],
+    source_secret_key: &[u8; 32],
+) -> Result<([u8; 32], Vec<SignedHopAuthorization>), DistributedCircuitError> {
+    // Derive the authorizations (unsigned first, to compute hashes).
     let hops = route.validated_hops();
-    let mut concat = Vec::new();
+    let mut authorizations = Vec::new();
     for (i, hop) in hops.iter().enumerate() {
-        if i == 0 { continue; } // skip source
+        if i == 0 { continue; }
         let x25519_key = hop.record.descriptor.circuit_x25519_pub()
             .ok_or(DistributedCircuitError::HopMissingCircuitKey {
-                hop_index: i,
-                node_id: hop.node_id,
+                hop_index: i, node_id: hop.node_id,
             })?;
         let predecessor = hops[i - 1].node_id;
         let successor = hops.get(i + 1).map(|h| h.node_id);
-        let role = hop.role;
-        let hop_data = CborValue::Map(vec![
-            (CborValue::TextString("relayNodeId".into()), CborValue::ByteString(hop.node_id.to_vec())),
-            (CborValue::TextString("predecessorNodeId".into()), CborValue::ByteString(predecessor.to_vec())),
-            (CborValue::TextString("successorNodeId".into()), match successor {
-                Some(s) => CborValue::ByteString(s.to_vec()),
-                None => CborValue::Null,
-            }),
-            (CborValue::TextString("role".into()), CborValue::TextString(role.as_str().into())),
-            (CborValue::TextString("hopIndex".into()), CborValue::UnsignedInt(i as u64)),
-            (CborValue::TextString("relayX25519PublicKey".into()), CborValue::ByteString(x25519_key.to_vec())),
-        ]);
-        let encoded = snp_cbor::encode(&hop_data)
+        let mut auth = SignedHopAuthorization {
+            circuit_id,
+            commitment_hash,
+            relay_node_id: hop.node_id,
+            predecessor_node_id: predecessor,
+            successor_node_id: successor,
+            role: hop.role,
+            hop_index: i,
+            relay_x25519_public_key: *x25519_key,
+            source_signature: [0u8; 64],
+        };
+        let preimage = auth.canonical_preimage_bytes()
             .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
-        concat.extend_from_slice(&sha256(&encoded));
+        auth.source_signature = ed25519_sign(source_secret_key, &preimage);
+        authorizations.push(auth);
     }
-    Ok(sha256(&concat))
+    // Compute the root from the signed authorizations.
+    let mut concat = Vec::new();
+    for auth in &authorizations {
+        let preimage = auth.canonical_preimage_bytes()
+            .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
+        concat.extend_from_slice(&sha256(&preimage));
+    }
+    Ok((sha256(&concat), authorizations))
 }
 
 /// Verify that a relay's authorization hash is part of the authorization_root.
