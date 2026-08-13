@@ -120,6 +120,7 @@ pub mod peer_directory;
 pub mod topology;
 pub mod route_engine;
 pub mod route_discovery_protocol;
+pub mod tcp_route_transport;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -160,6 +161,9 @@ pub use route_discovery_protocol::{
     RecursiveRouteResponse, RoutingAssertion, SignedResponseStep, MAX_PENDING_ROUTE_QUERIES,
     MAX_RESPONSE_HOPS, MAX_ROUTE_CLOCK_SKEW_SECS, MAX_ROUTE_QUERY_AGE_SECS,
     MAX_ROUTE_RESPONSE_AGE_SECS, ROUTE_DISCOVERY_MSG_CONTEXT,
+};
+pub use tcp_route_transport::{
+    PeerInfo, TcpForwardingServer, TcpRecursiveTransport, MAX_FRAME_SIZE,
 };
 pub use route::RouteCommitment;
 pub use session::{

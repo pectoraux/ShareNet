@@ -53,6 +53,40 @@ pub const MAX_CLOCK_SKEW_SECS: u64 = 300; // 5 minutes
 /// `expiry - timestamp > MAX_ADVERTISEMENT_LIFETIME_SECS` are rejected.
 pub const MAX_ADVERTISEMENT_LIFETIME_SECS: u64 = 86400; // 24 hours
 
+// ─── N2.2.1 CBOR helpers (local copies; tiny, not worth a shared module) ───
+
+/// Look up a text-keyed field in a CBOR map.
+fn cbor_map_get<'a>(map: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a CborValue> {
+    for (k, v) in map {
+        if let CborValue::TextString(s) = k {
+            if s == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Extract a fixed-size byte array from a `CborValue::ByteString`.
+fn cbor_get_fixed_bytes<const N: usize>(value: &CborValue) -> Option<[u8; N]> {
+    if let CborValue::ByteString(bytes) = value {
+        if bytes.len() == N {
+            let mut out = [0u8; N];
+            out.copy_from_slice(bytes);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Extract a `u64` from a `CborValue::UnsignedInt`.
+fn cbor_get_u64(value: &CborValue) -> Option<u64> {
+    match value {
+        CborValue::UnsignedInt(n) => Some(*n),
+        _ => None,
+    }
+}
+
 // ─── NodeAdvertisement ──────────────────────────────────────────────────────
 
 /// A generic signed node advertisement. Represents ANY ShareNet node —
@@ -259,6 +293,124 @@ impl NodeAdvertisement {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+
+    /// **N2.2.1.** Canonical CBOR encoding of the COMPLETE `NodeAdvertisement`
+    /// (every field, including `signature`). Used for wire transmission.
+    ///
+    /// This is `preimage()` + the `signature` field. The signature itself
+    /// is NOT covered by the signature (it IS the signature). The wire
+    /// format carries the signature so receivers can independently verify
+    /// the advertisement via `verify_into_verified()`.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
+        let caps: Vec<CborValue> = self
+            .capabilities
+            .iter()
+            .map(|c| CborValue::TextString(c.as_str().to_string()))
+            .collect();
+        let endpoints: Vec<CborValue> = self
+            .endpoints
+            .iter()
+            .map(|e| e.canonical_cbor())
+            .collect();
+        CborValue::Map(vec![
+            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.node_id.to_vec())),
+            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
+            (CborValue::TextString("capabilities".into()), CborValue::Array(caps)),
+            (CborValue::TextString("endpoints".into()), CborValue::Array(endpoints)),
+            (
+                CborValue::TextString("x25519CircuitPub".into()),
+                match &self.x25519_circuit_public {
+                    Some(k) => CborValue::ByteString(k.to_vec()),
+                    None => CborValue::Null,
+                },
+            ),
+            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
+            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
+            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.sequence)),
+            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+        ])
+    }
+
+    /// **N2.2.1.** Decode a `NodeAdvertisement` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing required fields,
+    /// or has fields of the wrong type/length. The caller MUST still call
+    /// `verify_into_verified()` before trusting the advertisement — this
+    /// method only checks the structural shape, not the signature.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = match value {
+            CborValue::Map(entries) => entries.as_slice(),
+            _ => return None,
+        };
+        let node_id = cbor_get_fixed_bytes(cbor_map_get(map, "nodeId")?)?;
+        let ed25519_public_key = cbor_get_fixed_bytes(cbor_map_get(map, "publicKey")?)?;
+        // Capabilities: array of text strings.
+        let caps_arr = match cbor_map_get(map, "capabilities")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut capabilities = Vec::with_capacity(caps_arr.len());
+        for item in caps_arr {
+            let s = match item {
+                CborValue::TextString(s) => s.as_str(),
+                _ => return None,
+            };
+            capabilities.push(Capability::from_str(s)?);
+        }
+        // Endpoints: array of {type, addr} maps.
+        let eps_arr = match cbor_map_get(map, "endpoints")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut endpoints = Vec::with_capacity(eps_arr.len());
+        for item in eps_arr {
+            endpoints.push(TransportEndpoint::from_cbor_map(item)?);
+        }
+        let x25519_circuit_public = match cbor_map_get(map, "x25519CircuitPub")? {
+            CborValue::Null => None,
+            CborValue::ByteString(bytes) if bytes.len() == 32 => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(bytes);
+                Some(k)
+            }
+            _ => return None,
+        };
+        let timestamp = cbor_get_u64(cbor_map_get(map, "timestamp")?)?;
+        let expiry = cbor_get_u64(cbor_map_get(map, "expiry")?)?;
+        let nonce = cbor_get_fixed_bytes(cbor_map_get(map, "nonce")?)?;
+        let sequence = cbor_get_u64(cbor_map_get(map, "sequence")?)?;
+        let signature = cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?;
+        Some(Self {
+            node_id,
+            ed25519_public_key,
+            capabilities,
+            endpoints,
+            x25519_circuit_public,
+            timestamp,
+            expiry,
+            nonce,
+            sequence,
+            signature,
+        })
+    }
+
+    /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for NodeAdvertisement")
+    }
+
+    /// **N2.2.1.** Decode from canonical CBOR bytes. Returns `None` if the
+    /// bytes are not well-formed canonical CBOR or do not decode to a valid
+    /// `NodeAdvertisement` shape. The caller MUST still call
+    /// `verify_into_verified()` before trusting the advertisement.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        Self::from_cbor_map(&snp_cbor::decode(bytes).ok()?)
+    }
 }
 
 // ─── VerifiedNodeAdvertisement ──────────────────────────────────────────────
@@ -291,11 +443,16 @@ impl VerifiedNodeAdvertisement {
         let endpoints = self.advert.endpoints.clone();
         let sequence = self.advert.sequence;
         let expiry = self.advert.expiry;
+        // **N2.2.1:** Retain the underlying advertisement so the record can
+        // be re-serialized to canonical CBOR for wire transmission. The
+        // receiver re-verifies the advertisement's signature on decode.
+        let advert = self.advert;
         AuthenticatedNodeRecord {
             descriptor,
             endpoints,
             sequence,
             expiry,
+            advert,
         }
     }
 
@@ -379,6 +536,9 @@ impl VerifiedNodeAdvertisement {
 /// - `endpoints` — the authenticated transport endpoints from the SAME advertisement
 /// - `sequence` — the monotonic advertisement sequence
 /// - `expiry` — when this record expires
+/// - `advert` — the underlying signed `NodeAdvertisement` (N2.2.1: retained
+///   for wire serialization so receivers can independently re-verify the
+///   signature; not accessed by the routing layer).
 ///
 /// This type prevents accidentally combining a descriptor from advertisement A
 /// with endpoints from advertisement B. The endpoints are provably derived
@@ -393,6 +553,13 @@ pub struct AuthenticatedNodeRecord {
     pub sequence: u64,
     /// When this record expires.
     pub expiry: u64,
+    /// **N2.2.1.** The underlying signed `NodeAdvertisement` from which this
+    /// record was derived. Retained so the record can be serialized to canonical
+    /// CBOR for wire transmission (`encode_cbor()` emits this advertisement;
+    /// the receiver re-verifies it via `verify_into_verified()` and reconstructs
+    /// the record via `into_record()`). The routing layer does NOT access this
+    /// field — it consumes `descriptor` and `endpoints`.
+    pub advert: NodeAdvertisement,
 }
 
 impl AuthenticatedNodeRecord {
@@ -424,6 +591,42 @@ impl AuthenticatedNodeRecord {
     #[must_use]
     pub fn first_endpoint(&self) -> Option<&TransportEndpoint> {
         self.endpoints.first()
+    }
+
+    /// **N2.2.1.** Get the underlying signed `NodeAdvertisement`. Used by
+    /// wire-serialization code (`encode_cbor()`).
+    #[must_use]
+    pub fn advert(&self) -> &NodeAdvertisement {
+        &self.advert
+    }
+
+    /// **N2.2.1.** Canonical CBOR encoding of this record for wire
+    /// transmission. Emits the underlying signed `NodeAdvertisement` —
+    /// the receiver re-verifies the signature via `verify_into_verified()`
+    /// and reconstructs the record via `into_record()`. This means the
+    /// record's authority is the advertisement's signature, NOT the
+    /// unsigned envelope.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        self.advert.encode_cbor()
+    }
+
+    /// **N2.2.1.** Decode an `AuthenticatedNodeRecord` from canonical CBOR
+    /// bytes.
+    ///
+    /// The bytes MUST be a canonical-CBOR-encoded `NodeAdvertisement`. The
+    /// advertisement is re-verified via `verify_into_verified()` (signature +
+    /// NodeId consistency + clock + role/key consistency). If verification
+    /// fails, `None` is returned — the record is rejected.
+    ///
+    /// This ensures a malicious transport cannot substitute a forged
+    /// advertisement: the signature MUST verify under the embedded public
+    /// key, and the NodeId MUST match `derive_node_id(public_key)`.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        let advert = NodeAdvertisement::decode_cbor(bytes)?;
+        let verified = advert.verify_into_verified()?;
+        Some(verified.into_record())
     }
 }
 

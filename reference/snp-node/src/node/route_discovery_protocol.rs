@@ -96,12 +96,26 @@
 //!
 //! ## What is NOT implemented
 //!
-//! - Real network transport (only `InMemoryRecursiveTransport`).
-//!   N2.2.1 will implement `TcpRecursiveTransport`.
-//! - Wire serialization/deserialization.
-//!   N2.2.1 will add canonical CBOR encode/decode for protocol messages.
+//! - ~~Real network transport (only `InMemoryRecursiveTransport`).~~
+//!   **N2.2.1:** `TcpRecursiveTransport` is implemented in
+//!   `tcp_route_transport.rs` — a production `RecursiveNextHopTransport`
+//!   that uses real TCP sockets, SNP-IK/0.1 authentication, and the
+//!   canonical CBOR serialization added below.
+//! - ~~Wire serialization/deserialization.~~
+//!   **N2.2.1:** canonical CBOR `encode_cbor()` / `decode_cbor()` are
+//!   implemented on `ForwardedQuery`, `RecursiveRouteResponse`,
+//!   `SignedResponseStep`, `RoutingAssertion`, `NodeAdvertisement`,
+//!   `AuthenticatedNodeRecord`, and `QueryStep`. The wire format for
+//!   `ForwardedQuery` is byte-identical to `compute_hash()`'s preimage,
+//!   preserving the `parent_query_hash` binding across wire round-trips.
 //! - Proof that the responder has a usable link to the next hop
 //!   (the response is a routing assertion, not a link proof).
+//! - AEAD encryption of the frame payload. The SNP-IK handshake derives
+//!   directional link keys, but the frame payload is sent in plaintext
+//!   (it carries its own Ed25519 signatures). Future: encrypt the frame
+//!   payload with the derived link keys for confidentiality.
+//! - Connection pooling. Each `forward_query` call opens a fresh TCP
+//!   connection and tears it down after one query/response.
 //!
 //! ## N2.1.3.1.1: Stateful composition
 //!
@@ -118,6 +132,97 @@ use snp_crypto::{ed25519_sign, ed25519_verify, sha256, sig_contexts};
 
 /// The SIG_CONTEXT for route-discovery messages.
 pub const ROUTE_DISCOVERY_MSG_CONTEXT: &[u8] = b"SNP/0.1 route-discovery\0";
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.2.1 — Canonical CBOR encode/decode helpers
+//
+// Small helpers used by the encode_cbor / decode_cbor implementations on the
+// protocol message types. The canonical-CBOR wire format and the canonical
+// CBOR used for hash preimages (e.g. `ForwardedQuery::compute_hash()`) MUST be
+// byte-identical — see the security note on `ForwardedQuery::compute_hash()`.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Get the entries of a `CborValue::Map` as a slice. Returns `None` for
+/// non-map values.
+fn cbor_map_entries(value: &CborValue) -> Option<&[(CborValue, CborValue)]> {
+    match value {
+        CborValue::Map(entries) => Some(entries.as_slice()),
+        _ => None,
+    }
+}
+
+/// Look up a text-keyed field in a CBOR map. Linear scan — these maps are
+/// tiny (≤16 entries) so a HashMap is not worth the allocation.
+fn cbor_map_get<'a>(map: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a CborValue> {
+    for (k, v) in map {
+        if let CborValue::TextString(s) = k {
+            if s == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Extract a fixed-size byte array from a `CborValue::ByteString`. Returns
+/// `None` if the value is not a byte string or has the wrong length.
+fn cbor_get_fixed_bytes<const N: usize>(value: &CborValue) -> Option<[u8; N]> {
+    if let CborValue::ByteString(bytes) = value {
+        if bytes.len() == N {
+            let mut out = [0u8; N];
+            out.copy_from_slice(bytes);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Extract a `Vec<[u8; 32]>` from a `CborValue::Array` of `ByteString(32)`.
+fn cbor_get_byte_array(value: &CborValue) -> Option<Vec<[u8; 32]>> {
+    let arr = match value {
+        CborValue::Array(items) => items,
+        _ => return None,
+    };
+    arr.iter().map(cbor_get_fixed_bytes::<32>).collect()
+}
+
+/// Extract a `u64` from a `CborValue::UnsignedInt`.
+fn cbor_get_u64(value: &CborValue) -> Option<u64> {
+    match value {
+        CborValue::UnsignedInt(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Extract a `bool` from a `CborValue::Bool`.
+fn cbor_get_bool(value: &CborValue) -> Option<bool> {
+    match value {
+        CborValue::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Extract a `String` from a `CborValue::TextString`.
+fn cbor_get_string(value: &CborValue) -> Option<String> {
+    match value {
+        CborValue::TextString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Extract an `Option<[u8; 32]>` from a CBOR value: `Null` → `None`,
+/// `ByteString(32)` → `Some`.
+fn cbor_get_optional_bytes_32(value: &CborValue) -> Option<Option<[u8; 32]>> {
+    match value {
+        CborValue::Null => Some(None),
+        CborValue::ByteString(bytes) if bytes.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(bytes);
+            Some(Some(out))
+        }
+        _ => None,
+    }
+}
 
 /// Maximum number of NextHopResponse hops allowed in a single response
 /// chain (prevents amplification). Reserved for future recursive forwarding.
@@ -388,6 +493,43 @@ impl QueryProvenance {
 impl Default for QueryProvenance {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl QueryStep {
+    /// **N2.2.1.** Canonical CBOR encoding of this `QueryStep`.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
+            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("remainingHops".into()), CborValue::UnsignedInt(u64::from(self.remaining_hops))),
+        ])
+    }
+
+    /// **N2.2.1.** Decode a `QueryStep` from a canonical CBOR map.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = cbor_map_entries(value)?;
+        Some(Self {
+            source_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "sourceNodeId")?)?,
+            responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "responderNodeId")?)?,
+            query_id: cbor_get_fixed_bytes(cbor_map_get(map, "queryId")?)?,
+            remaining_hops: u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHops")?)?).ok()?,
+        })
+    }
+
+    /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for QueryStep")
+    }
+
+    /// **N2.2.1.** Decode from canonical CBOR bytes.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        Self::from_cbor_map(&snp_cbor::decode(bytes).ok()?)
     }
 }
 
@@ -922,6 +1064,59 @@ impl RoutingAssertion {
     #[must_use]
     pub fn claims_destination_reached(&self) -> bool {
         self.is_destination && self.next_hop_node_id == self.destination_node_id
+    }
+
+    /// **N2.2.1.** Canonical CBOR encoding of the COMPLETE `RoutingAssertion`
+    /// (every field, including `signature`). Used for wire transmission.
+    ///
+    /// Note: this is `preimage()` + the `signature` field. The bytes produced
+    /// by `snp_cbor::encode(&self.to_cbor_map())` are NOT the signature
+    /// preimage — the signature preimage excludes `signature`. But the wire
+    /// format must carry the signature so receivers can verify it.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
+            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
+            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
+            (CborValue::TextString("isDestination".into()), CborValue::Bool(self.is_destination)),
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
+            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+        ])
+    }
+
+    /// **N2.2.1.** Decode a `RoutingAssertion` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing required fields,
+    /// or has fields of the wrong type/length. The caller MUST still call
+    /// `verify_signature()` before trusting the assertion.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = cbor_map_entries(value)?;
+        Some(Self {
+            responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "responderNodeId")?)?,
+            destination_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "destinationNodeId")?)?,
+            next_hop_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "nextHopNodeId")?)?,
+            is_destination: cbor_get_bool(cbor_map_get(map, "isDestination")?)?,
+            query_id: cbor_get_fixed_bytes(cbor_map_get(map, "queryId")?)?,
+            timestamp: cbor_get_u64(cbor_map_get(map, "timestamp")?)?,
+            ed25519_public_key: cbor_get_fixed_bytes(cbor_map_get(map, "responderPublicKey")?)?,
+            signature: cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?,
+        })
+    }
+
+    /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for RoutingAssertion")
+    }
+
+    /// **N2.2.1.** Decode from canonical CBOR bytes.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        Self::from_cbor_map(&snp_cbor::decode(bytes).ok()?)
     }
 }
 
@@ -1507,16 +1702,29 @@ impl ForwardedQuery {
     ///   `query_id`, `timestamp`, `max_hops`, `signature` (NextHopQuery sig),
     /// - `parent_query_id`, `parent_responder_node_id`, `parent_query_hash`,
     ///   `visited_nodes`, `parent_signature`.
+    ///
+    /// **N2.2.1:** The hash preimage is the SAME canonical CBOR used for
+    /// wire transmission (`to_cbor_map()` → `encode_cbor()`). This is
+    /// security-critical: the `parent_query_hash` binding between hops
+    /// depends on the wire bytes being byte-identical to the hash preimage.
+    /// If they differed, a parent's `compute_hash()` would not match the
+    /// child's `parent_query_hash` after a wire round-trip.
     #[must_use]
     pub fn compute_hash(&self) -> [u8; 32] {
-        let preimage = self.canonical_cbor();
+        let preimage = self.to_cbor_map();
         let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
         sha256(&bytes)
     }
 
-    /// Canonical CBOR encoding of the COMPLETE `ForwardedQuery` (all fields,
-    /// including both signatures). Used by `compute_hash`.
-    fn canonical_cbor(&self) -> CborValue {
+    /// **N2.2.1.** Canonical CBOR encoding of the COMPLETE `ForwardedQuery`
+    /// (all fields, including both signatures). Used by `compute_hash()` and
+    /// by `encode_cbor()` for wire transmission.
+    ///
+    /// The bytes produced by `snp_cbor::encode(&self.to_cbor_map())` are
+    /// IDENTICAL to the hash preimage used by `compute_hash()`. This is
+    /// security-critical — see the docstring on `compute_hash()`.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
         CborValue::Map(vec![
             (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
             (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
@@ -1533,6 +1741,49 @@ impl ForwardedQuery {
             )),
             (CborValue::TextString("parentSignature".into()), CborValue::ByteString(self.parent_signature.to_vec())),
         ])
+    }
+
+    /// **N2.2.1.** Decode a `ForwardedQuery` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing required fields,
+    /// or has fields of the wrong type/length. The caller MUST still call
+    /// `verify_all()` to verify both signatures before trusting the query.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = cbor_map_entries(value)?;
+        Some(Self {
+            source_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "sourceNodeId")?)?,
+            source_ed25519_public_key: cbor_get_fixed_bytes(cbor_map_get(map, "sourcePublicKey")?)?,
+            destination_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "destinationNodeId")?)?,
+            query_id: cbor_get_fixed_bytes(cbor_map_get(map, "queryId")?)?,
+            timestamp: cbor_get_u64(cbor_map_get(map, "timestamp")?)?,
+            max_hops: u8::try_from(cbor_get_u64(cbor_map_get(map, "maxHops")?)?).ok()?,
+            signature: cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?,
+            parent_query_id: cbor_get_fixed_bytes(cbor_map_get(map, "parentQueryId")?)?,
+            parent_responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "parentResponderNodeId")?)?,
+            parent_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "parentQueryHash")?)?,
+            visited_nodes: cbor_get_byte_array(cbor_map_get(map, "visitedNodes")?)?,
+            parent_signature: cbor_get_fixed_bytes(cbor_map_get(map, "parentSignature")?)?,
+        })
+    }
+
+    /// **N2.2.1.** Encode this `ForwardedQuery` to canonical CBOR bytes for
+    /// wire transmission. The output is byte-identical to the hash preimage
+    /// used by `compute_hash()`.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for canonical ForwardedQuery map")
+    }
+
+    /// **N2.2.1.** Decode a `ForwardedQuery` from canonical CBOR bytes.
+    ///
+    /// Returns `None` if the bytes are not well-formed canonical CBOR or
+    /// do not decode to a valid `ForwardedQuery`. The caller MUST still call
+    /// `verify_all()` before trusting the query.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        let value = snp_cbor::decode(bytes).ok()?;
+        Self::from_cbor_map(&value)
     }
 
     /// Sign the NextHopQuery preimage (compatible with NextHopQuery::sign).
@@ -1818,6 +2069,58 @@ impl SignedResponseStep {
         let expected = snp_crypto::derive_node_id(&self.responder_ed25519_public_key);
         self.responder_node_id == expected
     }
+
+    /// **N2.2.1.** Canonical CBOR encoding of the COMPLETE `SignedResponseStep`
+    /// (every field, including `signature`). Used for wire transmission.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
+            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.responder_ed25519_public_key.to_vec())),
+            (CborValue::TextString("receivedQueryId".into()), CborValue::ByteString(self.received_query_id.to_vec())),
+            (CborValue::TextString("receivedQueryHash".into()), CborValue::ByteString(self.received_query_hash.to_vec())),
+            (CborValue::TextString("sentQueryHash".into()), CborValue::ByteString(self.sent_query_hash.to_vec())),
+            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
+            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
+            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
+            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
+            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+        ])
+    }
+
+    /// **N2.2.1.** Decode a `SignedResponseStep` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing required fields,
+    /// or has fields of the wrong type/length. The caller MUST still call
+    /// `verify_signature()` before trusting the step.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = cbor_map_entries(value)?;
+        Some(Self {
+            responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "responderNodeId")?)?,
+            responder_ed25519_public_key: cbor_get_fixed_bytes(cbor_map_get(map, "responderPublicKey")?)?,
+            received_query_id: cbor_get_fixed_bytes(cbor_map_get(map, "receivedQueryId")?)?,
+            received_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "receivedQueryHash")?)?,
+            sent_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "sentQueryHash")?)?,
+            destination_reached: cbor_get_bool(cbor_map_get(map, "destinationReached")?)?,
+            next_hop_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "nextHopNodeId")?)?,
+            remaining_hop_budget: u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHopBudget")?)?).ok()?,
+            not_found: cbor_get_bool(cbor_map_get(map, "notFound")?)?,
+            signature: cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?,
+        })
+    }
+
+    /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for SignedResponseStep")
+    }
+
+    /// **N2.2.1.** Decode from canonical CBOR bytes.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        Self::from_cbor_map(&snp_cbor::decode(bytes).ok()?)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1955,6 +2258,150 @@ pub trait RecursiveNextHopTransport {
         neighbor_node_id: &[u8; 32],
         query: &ForwardedQuery,
     ) -> Option<RecursiveRouteResponse>;
+}
+
+impl RecursiveRouteResponse {
+    /// **N2.2.1.** Canonical CBOR encoding of the COMPLETE `RecursiveRouteResponse`
+    /// envelope (all fields, including the signed `RoutingAssertion`s,
+    /// `SignedResponseStep`s, and `NodeAdvertisement`s). Used for wire
+    /// transmission.
+    ///
+    /// The encoded bytes carry:
+    /// - The unsigned envelope fields (`destination_node_id`,
+    ///   `destination_reached`, `remaining_hop_budget`, `not_found`).
+    /// - The signed `accumulated_assertions` (each carries its own signature).
+    /// - The signed `accumulated_records` (each carries the underlying
+    ///   advertisement's signature; the receiver re-verifies).
+    /// - The signed `response_steps` (each carries its own signature).
+    /// - The signed `destination_advertisement` (if present).
+    /// - The unsigned `query_chain` (verified against the signed
+    ///   `response_steps` by `DistributedRouteResolution::verify()`).
+    ///
+    /// The unsigned envelope fields are checked for consistency against the
+    /// signed data by `DistributedRouteResolution::verify()`. A malicious
+    /// transport cannot substitute signed data without invalidating the
+    /// signatures.
+    #[must_use]
+    pub fn to_cbor_map(&self) -> CborValue {
+        let destination_advert_cbor = match &self.destination_advertisement {
+            Some(advert) => CborValue::Array(vec![advert.to_cbor_map()]),
+            None => CborValue::Array(Vec::new()),
+        };
+        CborValue::Map(vec![
+            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
+            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
+            (CborValue::TextString("destinationAdvertisement".into()), destination_advert_cbor),
+            (
+                CborValue::TextString("accumulatedAssertions".into()),
+                CborValue::Array(self.accumulated_assertions.iter().map(|a| a.to_cbor_map()).collect()),
+            ),
+            (
+                CborValue::TextString("accumulatedRecords".into()),
+                CborValue::Array(self.accumulated_records.iter().map(|r| r.advert().to_cbor_map()).collect()),
+            ),
+            (
+                CborValue::TextString("queryChain".into()),
+                CborValue::Array(self.query_chain.iter().map(|q| q.to_cbor_map()).collect()),
+            ),
+            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
+            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
+            (
+                CborValue::TextString("responseSteps".into()),
+                CborValue::Array(self.response_steps.iter().map(|s| s.to_cbor_map()).collect()),
+            ),
+        ])
+    }
+
+    /// **N2.2.1.** Decode a `RecursiveRouteResponse` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing required fields,
+    /// or any nested signed object (assertion, response step, advertisement)
+    /// fails to decode. The caller MUST still independently verify every
+    /// signature via `DistributedRouteResolution::verify()` before trusting
+    /// the response — this method only checks structural shape.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = cbor_map_entries(value)?;
+        let destination_node_id = cbor_get_fixed_bytes(cbor_map_get(map, "destinationNodeId")?)?;
+        let destination_reached = cbor_get_bool(cbor_map_get(map, "destinationReached")?)?;
+        // destinationAdvertisement: empty array → None, single-element array → Some.
+        let dest_advert_arr = match cbor_map_get(map, "destinationAdvertisement")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let destination_advertisement = if dest_advert_arr.is_empty() {
+            None
+        } else if dest_advert_arr.len() == 1 {
+            Some(NodeAdvertisement::from_cbor_map(&dest_advert_arr[0])?)
+        } else {
+            return None;
+        };
+        // accumulatedAssertions: array of RoutingAssertion maps.
+        let assertions_arr = match cbor_map_get(map, "accumulatedAssertions")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut accumulated_assertions = Vec::with_capacity(assertions_arr.len());
+        for item in assertions_arr {
+            accumulated_assertions.push(RoutingAssertion::from_cbor_map(item)?);
+        }
+        // accumulatedRecords: array of NodeAdvertisement maps (re-verified on decode).
+        let records_arr = match cbor_map_get(map, "accumulatedRecords")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut accumulated_records = Vec::with_capacity(records_arr.len());
+        for item in records_arr {
+            let advert = NodeAdvertisement::from_cbor_map(item)?;
+            // Re-verify the advertisement signature before constructing the record.
+            // This ensures a malicious transport cannot substitute forged records.
+            let verified = advert.verify_into_verified()?;
+            accumulated_records.push(verified.into_record());
+        }
+        // queryChain: array of QueryStep maps.
+        let chain_arr = match cbor_map_get(map, "queryChain")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut query_chain = Vec::with_capacity(chain_arr.len());
+        for item in chain_arr {
+            query_chain.push(QueryStep::from_cbor_map(item)?);
+        }
+        let remaining_hop_budget = u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHopBudget")?)?).ok()?;
+        let not_found = cbor_get_bool(cbor_map_get(map, "notFound")?)?;
+        // responseSteps: array of SignedResponseStep maps.
+        let steps_arr = match cbor_map_get(map, "responseSteps")? {
+            CborValue::Array(items) => items,
+            _ => return None,
+        };
+        let mut response_steps = Vec::with_capacity(steps_arr.len());
+        for item in steps_arr {
+            response_steps.push(SignedResponseStep::from_cbor_map(item)?);
+        }
+        Some(Self {
+            destination_node_id,
+            destination_reached,
+            destination_advertisement,
+            accumulated_assertions,
+            accumulated_records,
+            query_chain,
+            remaining_hop_budget,
+            not_found,
+            response_steps,
+        })
+    }
+
+    /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
+    #[must_use]
+    pub fn encode_cbor(&self) -> Vec<u8> {
+        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for RecursiveRouteResponse")
+    }
+
+    /// **N2.2.1.** Decode from canonical CBOR bytes.
+    #[must_use]
+    pub fn decode_cbor(bytes: &[u8]) -> Option<Self> {
+        Self::from_cbor_map(&snp_cbor::decode(bytes).ok()?)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3001,8 +3448,12 @@ pub struct ForwardingNode {
     /// Known neighbors: NodeId → NodeAdvertisement. Used to find next hops
     /// and to construct records for the accumulated chain.
     neighbors: HashMap<[u8; 32], NodeAdvertisement>,
-    /// Transport to reach other nodes (shared with other ForwardingNodes).
-    transport: Arc<InMemoryRecursiveTransport>,
+    /// Transport to reach other nodes. **N2.2.1:** Generalised from
+    /// `Arc<InMemoryRecursiveTransport>` to `Arc<dyn RecursiveNextHopTransport +
+    /// Send + Sync>` so the SAME `ForwardingNode` logic works over either
+    /// the in-memory transport (tests) or a real TCP transport
+    /// (`TcpRecursiveTransport`, production).
+    transport: Arc<dyn RecursiveNextHopTransport + Send + Sync>,
 }
 
 impl ForwardingNode {
@@ -3010,6 +3461,11 @@ impl ForwardingNode {
     ///
     /// The node's `self_advert` is constructed from the provided keypair
     /// and capabilities.
+    ///
+    /// **N2.2.1:** The `transport` parameter is now `Arc<dyn
+    /// RecursiveNextHopTransport + Send + Sync>` (was `Arc<InMemoryRecursiveTransport>`).
+    /// Existing call sites that pass `Arc<InMemoryRecursiveTransport>` continue
+    /// to compile via Rust's unsizing coercion.
     #[must_use]
     pub fn new(
         ed25519_secret: [u8; 32],
@@ -3017,7 +3473,7 @@ impl ForwardingNode {
         capabilities: Vec<Capability>,
         endpoints: Vec<TransportEndpoint>,
         x25519_circuit_public: Option<[u8; 32]>,
-        transport: Arc<InMemoryRecursiveTransport>,
+        transport: Arc<dyn RecursiveNextHopTransport + Send + Sync>,
     ) -> Self {
         let node_id = derive_node_id(&ed25519_public);
         let self_advert = NodeAdvertisement::create_and_sign(
@@ -3043,6 +3499,20 @@ impl ForwardingNode {
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
         self.node_id
+    }
+
+    /// **N2.2.1.** Get this node's Ed25519 secret key. Used by
+    /// `TcpForwardingServer` to perform the SNP-IK handshake as responder.
+    #[must_use]
+    pub fn ed25519_secret(&self) -> &[u8; 32] {
+        &self.ed25519_secret
+    }
+
+    /// **N2.2.1.** Get this node's Ed25519 public key. Used by
+    /// `TcpForwardingServer` to perform the SNP-IK handshake as responder.
+    #[must_use]
+    pub fn ed25519_public(&self) -> &[u8; 32] {
+        &self.ed25519_public
     }
 
     /// Get this node's own advertisement (signed). Used by tests to set up

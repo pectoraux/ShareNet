@@ -423,6 +423,49 @@ impl TransportEndpoint {
             (CborValue::TextString("addr".into()), CborValue::TextString(addr.to_string())),
         ])
     }
+
+    /// **N2.2.1.** Decode a `TransportEndpoint` from a canonical CBOR map.
+    ///
+    /// Returns `None` if the value is not a map, is missing `type`/`addr`,
+    /// or has an unknown `type` tag.
+    #[must_use]
+    pub fn from_cbor_map(value: &CborValue) -> Option<Self> {
+        let map = match value {
+            CborValue::Map(entries) => entries.as_slice(),
+            _ => return None,
+        };
+        let type_tag = {
+            let mut found: Option<&str> = None;
+            for (k, v) in map {
+                if let (CborValue::TextString(k_s), CborValue::TextString(v_s)) = (k, v) {
+                    if k_s == "type" {
+                        found = Some(v_s.as_str());
+                        break;
+                    }
+                }
+            }
+            found?
+        };
+        let addr = {
+            let mut found: Option<&str> = None;
+            for (k, v) in map {
+                if let (CborValue::TextString(k_s), CborValue::TextString(v_s)) = (k, v) {
+                    if k_s == "addr" {
+                        found = Some(v_s.as_str());
+                        break;
+                    }
+                }
+            }
+            found?
+        };
+        match type_tag {
+            "tcp" => Some(Self::Tcp(addr.to_string())),
+            "ble" => Some(Self::Ble(addr.to_string())),
+            "wifi-direct" => Some(Self::WifiDirect(addr.to_string())),
+            "nearby" => Some(Self::NearbyConnections(addr.to_string())),
+            _ => None,
+        }
+    }
 }
 
 /// Verify a `VerifiedNodeDescriptor`'s NodeId consistency. Used by
