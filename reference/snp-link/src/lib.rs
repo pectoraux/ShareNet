@@ -438,7 +438,22 @@ pub(crate) fn encode_handshake_message(
 pub(crate) fn decode_handshake_message(
     bytes: &[u8],
 ) -> LinkResult<([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 64])> {
-    let value = snp_cbor::decode(bytes)?;
+    // N2.3 security gate: bound the CBOR decoder at the head before any Vec
+    // allocation. A handshake message arrives from a remote peer at link
+    // establishment — attacker-controlled input.
+    let limits = snp_cbor::CborLimits {
+        // 5 fields (nodeId, pubKey, ephPub, staticPub, sig). 8 allows headroom.
+        max_map_entries: 8,
+        // No arrays in a handshake message.
+        max_array_items: 4,
+        // sig=64 is the longest byte string.
+        max_byte_string_len: 128,
+        // keys like "staticPub" (9 chars).
+        max_text_string_len: 16,
+        // flat map of byte strings (depth 1).
+        max_nesting_depth: 4,
+    };
+    let value = snp_cbor::decode_with_limits(bytes, &limits)?;
     let entries = match value {
         CborValue::Map(e) => e,
         other => {

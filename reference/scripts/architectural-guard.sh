@@ -72,6 +72,40 @@ if [ -n "$matches" ]; then
     REPORT+=$'\n'"[VIOLATION] new_for_testing() in production source (testing-only):"$'\n'"$matches"$'\n'
 fi
 
+# ───────────────────────────────────────────────────────────────────────
+# N2.3 security gate: forbid unbounded snp_cbor::decode() in production
+# source.
+#
+# Every network-facing CBOR decoder MUST use snp_cbor::decode_with_limits()
+# with an explicit CborLimits profile, so an attacker-controlled wire message
+# cannot force unbounded allocation at the CBOR head. The bare
+# snp_cbor::decode() (which internally uses CborLimits::NONE = unbounded) is
+# forbidden in production source.
+#
+# The pattern 'snp_cbor::decode(' (with the open paren) precisely matches the
+# unbounded invocation and NOT 'snp_cbor::decode_with_limits('.
+#
+# Allowed locations (excluded from the scan):
+#   - snp-cbor/src/         — the definition crate itself
+#   - snp-conformance/src/  — golden-vector test harness (uses aliased decode)
+#   - tests/ directories    — test code
+#
+# Inline #[cfg(test)] modules inside src/ must use
+# decode_with_limits(.., &CborLimits::NONE) for trusted-local bytes.
+# ───────────────────────────────────────────────────────────────────────
+ALL_REFERENCE_SRC="$REPO_ROOT/reference"
+WIRE_DECODE_MATCHES=$(grep -rnE 'snp_cbor::decode\(' "$ALL_REFERENCE_SRC" \
+    --include="*.rs" \
+    --exclude-dir="target" \
+    | grep -v '/snp-cbor/src/' \
+    | grep -v '/snp-conformance/src/' \
+    | grep -v '/tests/' \
+    || true)
+if [ -n "$WIRE_DECODE_MATCHES" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT+=$'\n'"[VIOLATION] unbounded snp_cbor::decode() in production source (N2.3 wire-decode gate):"$'\n'"$WIRE_DECODE_MATCHES"$'\n'
+fi
+
 if [ "$VIOLATIONS" -gt 0 ]; then
     echo "========================================" >&2
     echo "ARCHITECTURAL GUARD: $VIOLATIONS violation(s) found" >&2
@@ -84,6 +118,7 @@ if [ "$VIOLATIONS" -gt 0 ]; then
     echo "  - TopologyGraph::default() (removed — use open(path))" >&2
     echo "  - TopologyGraph::new() (private — use new_for_testing() in tests, open() in prod)" >&2
     echo "  - new_for_testing() (testing-only — production uses open(path))" >&2
+    echo "  - snp_cbor::decode() (N2.3 gate — network decoders must use decode_with_limits())" >&2
     exit 1
 fi
 

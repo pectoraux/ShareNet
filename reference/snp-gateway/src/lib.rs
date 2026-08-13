@@ -262,9 +262,32 @@ pub fn encode_transit_request(req: &TransitRequest) -> GatewayResult<Vec<u8>> {
     Ok(snp_cbor::encode(&CborValue::Map(entries))?)
 }
 
+/// Wire-level CBOR resource profile for gateway transit messages
+/// (TransitRequest / TransitResponse). Both arrive from a remote peer over
+/// the mesh — attacker-controlled input — so the decoder is bounded at the
+/// CBOR head before any Vec allocation (N2.3 security gate).
+///
+/// These limits are generous for legitimate HTTP transit (URLs, header
+/// values) while keeping per-message allocation bounded. The frame layer's
+/// [`snp_frames::MAX_FRAME_BODY_BYTES`] additionally caps the total message
+/// size when transit messages ride inside a frame body.
+const GATEWAY_WIRE_LIMITS: snp_cbor::CborLimits = snp_cbor::CborLimits {
+    // TransitRequest (~9 fields) + headers map; TransitResponse (~7 fields)
+    // + headers map. HTTP headers can be numerous — 128 is bounded yet
+    // permissive.
+    max_map_entries: 128,
+    max_array_items: 128,
+    // signatures (64), ids (16-32).
+    max_byte_string_len: 256,
+    // URLs and header values can be long; 8 KiB is a bounded maximum.
+    max_text_string_len: 8_192,
+    // top map → headers map → text; depth 2-3.
+    max_nesting_depth: 6,
+};
+
 /// Decode a TransitRequest from canonical CBOR bytes.
 pub fn decode_transit_request(bytes: &[u8]) -> GatewayResult<TransitRequest> {
-    let value = snp_cbor::decode(bytes)?;
+    let value = snp_cbor::decode_with_limits(bytes, &GATEWAY_WIRE_LIMITS)?;
     let entries = match value {
         CborValue::Map(entries) => entries,
         other => {
@@ -338,7 +361,7 @@ pub fn encode_transit_response(resp: &TransitResponse) -> GatewayResult<Vec<u8>>
 
 /// Decode a TransitResponse from canonical CBOR bytes.
 pub fn decode_transit_response(bytes: &[u8]) -> GatewayResult<TransitResponse> {
-    let value = snp_cbor::decode(bytes)?;
+    let value = snp_cbor::decode_with_limits(bytes, &GATEWAY_WIRE_LIMITS)?;
     let entries = match value {
         CborValue::Map(entries) => entries,
         other => {

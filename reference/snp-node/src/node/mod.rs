@@ -3780,7 +3780,11 @@ mod tests {
         let bytes = advert.encode_cbor().expect("encode");
 
         // Manually decode the CBOR, add the observedRtt key, re-encode.
-        let value = snp_cbor::decode(&bytes).expect("decode raw");
+        // Uses decode_with_limits(CborLimits::NONE) — semantically identical
+        // to decode() but keeps the wire-decode guard clean (test-local
+        // trusted bytes, not network input).
+        let value = snp_cbor::decode_with_limits(&bytes, &snp_cbor::CborLimits::NONE)
+            .expect("decode raw");
         let mut entries = match value {
             snp_cbor::CborValue::Map(entries) => entries,
             _ => panic!("expected a CBOR map"),

@@ -88,7 +88,23 @@ impl HelloMessage {
     /// # Errors
     /// Returns `NodeError` if the bytes are not a valid HELLO message.
     pub fn decode_cbor(bytes: &[u8]) -> NodeResult<Self> {
-        let value = snp_cbor::decode(bytes)?;
+        // N2.3 security gate: bound the CBOR decoder at the head before any
+        // Vec allocation. A HELLO message arrives from a remote peer over the
+        // topology protocol — attacker-controlled input.
+        let limits = snp_cbor::CborLimits {
+            // Top-level map (messageType, advertisement) + nested advert map
+            // (~12 keys). 32 allows forward-compat.
+            max_map_entries: 32,
+            // capabilities / endpoints arrays in the nested advert.
+            max_array_items: 32,
+            // signature=64 is the longest byte string.
+            max_byte_string_len: 128,
+            // addresses / endpoint strings.
+            max_text_string_len: 256,
+            // top map → advert map → array → text; depth 3-4.
+            max_nesting_depth: 6,
+        };
+        let value = snp_cbor::decode_with_limits(bytes, &limits)?;
         let entries = match value {
             CborValue::Map(e) => e,
             other => {

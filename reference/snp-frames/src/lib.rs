@@ -79,6 +79,34 @@ pub const FRAME_VERSION: u8 = 1;
 /// Maximum TTL a frame may carry (I7). Frozen at 16.
 pub const FRAME_TTL_MAX: u8 = 16;
 
+/// Normative maximum length of `Frame.body` in bytes (N2.3 security gate).
+///
+/// The Frame is THE structural unit that crosses every SNP link, so its
+/// body byte string is attacker-controlled the moment a relay reads a frame
+/// off the wire. This constant caps the body at the CBOR decoder head —
+/// BEFORE `Vec` allocation — so an attacker cannot force the decoder to
+/// materialize an oversized body. It is enforced by
+/// [`Frame::decode_cbor`] via [`snp_cbor::decode_with_limits`].
+///
+/// # Value and rationale
+///
+/// Frozen at 65 536 (64 KiB). This is generous for every current SNP
+/// protocol message that rides inside a frame body (Class A object-protocol
+/// messages, Class B AEAD ciphertext chunks, Class C control messages) while
+/// keeping per-frame allocation bounded. A frame whose declared body length
+/// exceeds this is rejected at decode time with
+/// [`FrameError::Cbor`](`FrameError::Cbor`) carrying
+/// [`snp_cbor::CborError::LimitExceeded`] — it never reaches
+/// [`validate`](`Frame::validate`) and the body `Vec` is never allocated.
+///
+/// # Wire-level vs semantic bounds
+///
+/// This is a **wire-level** bound: it protects the decoder itself. It is
+/// distinct from, and runs before, any **semantic** validation of the body's
+/// contents (which is the higher-layer protocol's job, performed on the
+/// already-bounded `body` bytes).
+pub const MAX_FRAME_BODY_BYTES: usize = 65_536;
+
 /// Length of the flow/circuit id in bytes. Frozen at 8.
 pub const FRAME_FLOW_ID_BYTES: usize = 8;
 
@@ -214,17 +242,65 @@ impl Frame {
         Ok(snp_cbor::encode(&map)?)
     }
 
-    /// Decode a Frame from canonical CBOR bytes.
+    /// Decode a Frame from canonical CBOR bytes, with an explicit
+    /// **wire-level** resource bound (N2.3 security gate).
     ///
-    /// The decoder rejects trailing bytes, non-canonical key order, duplicate
-    /// keys, and non-shortest integer encodings. Anything that survives is
-    /// well-formed SNP-CBOR; this function then verifies it is Frame-shaped
-    /// (exactly 8 known keys, correct value types) and runs [`validate`].
+    /// The decoder uses [`snp_cbor::decode_with_limits`] with a Frame-specific
+    /// [`snp_cbor::CborLimits`] profile. The most important bound is
+    /// [`MAX_FRAME_BODY_BYTES`]: the `body` byte string is capped at the CBOR
+    /// head — BEFORE `Vec` allocation — so an attacker cannot force the
+    /// decoder to materialize an oversized body. Map entries, array items,
+    /// text-string length, and nesting depth are likewise bounded at the head.
+    ///
+    /// After bounded parsing succeeds, the decoder rejects trailing bytes,
+    /// non-canonical key order, duplicate keys, and non-shortest integer
+    /// encodings (inherited from the canonical CBOR decoder). Anything that
+    /// survives is well-formed SNP-CBOR; this function then verifies it is
+    /// Frame-shaped (exactly 8 known keys, correct value types) and runs
+    /// [`validate`](`Frame::validate`).
+    ///
+    /// # Pipeline
+    ///
+    /// ```text
+    /// wire bytes
+    ///     ↓
+    /// bounded CBOR decoder (body/map/array/depth rejected at head)
+    ///     ↓
+    /// well-formed CborValue
+    ///     ↓
+    /// Frame shape check (8 keys, correct types)
+    ///     ↓
+    /// validate() (v, cls, ttl ranges)
+    /// ```
     ///
     /// # Errors
-    /// Returns [`FrameError`] on any decode or validation failure (I20).
+    /// Returns [`FrameError::Cbor`] (wrapping
+    /// [`snp_cbor::CborError::LimitExceeded`]) when a declared structure
+    /// exceeds the wire profile — rejected before allocation. Returns
+    /// [`FrameError::Shape`] for wrong map shape, and [`FrameError::Malformed`]
+    /// for out-of-range fields. Never silently accepts (I20).
     pub fn decode_cbor(bytes: &[u8]) -> FrameResult<Self> {
-        let value = snp_cbor::decode(bytes)?;
+        // Wire-level resource profile for a SNP Frame. Every limit is enforced
+        // at the CBOR head, before any Vec allocation proportional to the
+        // declared length. See MAX_FRAME_BODY_BYTES for the body bound.
+        let limits = snp_cbor::CborLimits {
+            // Frame map has exactly FRAME_KEY_COUNT (8) keys. Allow decode of
+            // maps up to 16 entries so the shape check (entries.len() != 8)
+            // still produces FrameError::Shape for extra-key vectors, rather
+            // than a CBOR map-limit error (preserves the rejects_extra_keys
+            // conformance behaviour).
+            max_map_entries: 16,
+            // Frames carry no arrays. A tiny cap rejects any array at the head.
+            max_array_items: 8,
+            // The normative body-size bound — the protection that matters most.
+            max_byte_string_len: MAX_FRAME_BODY_BYTES as u64,
+            // Frame map keys are 1-4 chars ("v".."body"); the cls value is
+            // 1 char ("A"/"B"/"C").
+            max_text_string_len: 8,
+            // A frame is a flat map of scalar/byte-string values (depth 1).
+            max_nesting_depth: 4,
+        };
+        let value = snp_cbor::decode_with_limits(bytes, &limits)?;
         let entries = match value {
             snp_cbor::CborValue::Map(entries) => entries,
             other => {
@@ -546,5 +622,98 @@ mod tests {
         let encoded = frame.encode_cbor().unwrap();
         let decoded = Frame::decode_cbor(&encoded).unwrap();
         assert_eq!(decoded.cls, b'C');
+    }
+
+    // ─── N2.3 security gate: wire-level resource bounds ────────────────────
+    //
+    // Frame.body is attacker-controlled the moment a relay reads a frame off
+    // the wire. These tests verify the body byte string (and map/array
+    // structure) is capped at the CBOR head — BEFORE Vec allocation — so an
+    // attacker cannot force the decoder to materialize an oversized frame.
+
+    #[test]
+    fn oversized_body_rejected_at_decode() {
+        // A frame whose body exceeds MAX_FRAME_BODY_BYTES is rejected at the
+        // CBOR byte-string head — before the body Vec is allocated.
+        let mut frame = sample_frame();
+        frame.body = vec![0u8; MAX_FRAME_BODY_BYTES + 1];
+        // Encoding is unrestricted — the bound is enforced on decode.
+        let encoded = frame.encode_cbor().unwrap();
+        let err = Frame::decode_cbor(&encoded).unwrap_err();
+        // The rejection surfaces as a CborError::LimitExceeded wrapped in
+        // FrameError::Cbor. The body Vec was never allocated by the decoder.
+        match err {
+            FrameError::Cbor(cbor_err) => {
+                match cbor_err {
+                    snp_cbor::CborError::LimitExceeded { kind, actual, max } => {
+                        assert_eq!(kind, "byte_string");
+                        assert_eq!(actual, (MAX_FRAME_BODY_BYTES + 1) as u64);
+                        assert_eq!(max, MAX_FRAME_BODY_BYTES as u64);
+                    }
+                    other => panic!("expected LimitExceeded, got {other:?}"),
+                }
+            }
+            other => panic!("expected FrameError::Cbor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_at_limit_decodes() {
+        // A frame whose body is exactly MAX_FRAME_BODY_BYTES is ACCEPTED —
+        // the bound is inclusive.
+        let mut frame = sample_frame();
+        frame.body = vec![0xa5u8; MAX_FRAME_BODY_BYTES];
+        let encoded = frame.encode_cbor().unwrap();
+        let decoded = Frame::decode_cbor(&encoded).unwrap();
+        assert_eq!(decoded.body.len(), MAX_FRAME_BODY_BYTES);
+        assert_eq!(decoded.body[0], 0xa5);
+    }
+
+    #[test]
+    fn oversized_map_rejected_at_decode() {
+        // A CBOR map with more entries than the frame profile allows is
+        // rejected at the CBOR map head — before allocating the entries Vec.
+        // (17 entries > max_map_entries=16.)
+        let mut entries: Vec<(snp_cbor::CborValue, snp_cbor::CborValue)> = Vec::new();
+        for i in 0..17u64 {
+            // All distinct text keys; the encoder sorts them canonically.
+            entries.push((s(&format!("k{i}")), u(i)));
+        }
+        let bytes = snp_cbor::encode(&snp_cbor::CborValue::Map(entries)).unwrap();
+        let err = Frame::decode_cbor(&bytes).unwrap_err();
+        match err {
+            FrameError::Cbor(snp_cbor::CborError::LimitExceeded { kind, actual, max }) => {
+                assert_eq!(kind, "map");
+                assert_eq!(actual, 17);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected Cbor LimitExceeded(map), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_keys_still_rejected_as_shape() {
+        // A 9-key map (within max_map_entries=16) must still be rejected by
+        // the Frame shape check, NOT by the CBOR map limit. This proves the
+        // wire bound and the semantic shape check are correctly layered:
+        // the CBOR limit is permissive enough (16) to let the 9-key map
+        // decode, then the shape check (entries.len() != 8) fires.
+        let entries = snp_cbor::CborValue::Map(vec![
+            (s("v"), u(1)),
+            (s("cls"), s("B")),
+            (s("dst"), b(&[0u8; 32])),
+            (s("src"), b(&[0u8; 32])),
+            (s("ttl"), u(16)),
+            (s("fid"), b(&[0u8; 8])),
+            (s("seq"), u(1)),
+            (s("body"), b(&[])),
+            (s("extra"), u(99)),
+        ]);
+        let bytes = snp_cbor::encode(&entries).unwrap();
+        let err = Frame::decode_cbor(&bytes).unwrap_err();
+        assert!(
+            matches!(err, FrameError::Shape(_)),
+            "9-key map must be rejected as Shape (not as a CBOR limit), got {err:?}"
+        );
     }
 }

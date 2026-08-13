@@ -167,7 +167,24 @@ impl GatewayAdvertisement {
     /// Returns [`NodeError::Other`] if the bytes are not a valid
     /// GatewayAdvertisement.
     pub fn decode_cbor(bytes: &[u8]) -> NodeResult<Self> {
-        let value = snp_cbor::decode(bytes)
+        // N2.3 security gate: bound the CBOR decoder at the head before any
+        // Vec allocation. A GatewayAdvertisement arrives over the discovery
+        // link from a remote peer — attacker-controlled input.
+        let limits = snp_cbor::CborLimits {
+            // ~12 fields (nodeId, pubKey, circuit_x25519_pub, listenAddr,
+            // discoveryAddr, capabilities, egressPolicy, timestamp, expiry,
+            // nonce, signature, observedRtt?). 32 allows forward-compat.
+            max_map_entries: 32,
+            // capabilities array — small.
+            max_array_items: 32,
+            // signature=64 is the longest byte string.
+            max_byte_string_len: 128,
+            // addresses / policy strings.
+            max_text_string_len: 256,
+            // map → capabilities array → text; depth 2-3.
+            max_nesting_depth: 6,
+        };
+        let value = snp_cbor::decode_with_limits(bytes, &limits)
             .map_err(|e| NodeError::Other(format!("CBOR decode GatewayAdvertisement: {e}")))?;
         let entries = match value {
             CborValue::Map(entries) => entries,
