@@ -157,9 +157,9 @@ pub use route_discovery_protocol::{
     ForwardedQuery, ForwardingNode, InMemoryNextHopTransport, InMemoryRecursiveTransport,
     NextHopQuery, NextHopResolution, NextHopResolver, NextHopResponse, NextHopResult,
     NextHopTransport, PendingRouteQuery, QueryProvenance, QueryStep, RecursiveNextHopTransport,
-    RecursiveRouteResponse, RoutingAssertion, MAX_PENDING_ROUTE_QUERIES, MAX_RESPONSE_HOPS,
-    MAX_ROUTE_CLOCK_SKEW_SECS, MAX_ROUTE_QUERY_AGE_SECS, MAX_ROUTE_RESPONSE_AGE_SECS,
-    ROUTE_DISCOVERY_MSG_CONTEXT,
+    RecursiveRouteResponse, RoutingAssertion, SignedResponseStep, MAX_PENDING_ROUTE_QUERIES,
+    MAX_RESPONSE_HOPS, MAX_ROUTE_CLOCK_SKEW_SECS, MAX_ROUTE_QUERY_AGE_SECS,
+    MAX_ROUTE_RESPONSE_AGE_SECS, ROUTE_DISCOVERY_MSG_CONTEXT,
 };
 pub use route::RouteCommitment;
 pub use session::{

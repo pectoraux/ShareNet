@@ -1600,6 +1600,197 @@ impl ForwardedQuery {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2-response-auth — SignedResponseStep
+//
+// Each `ForwardingNode` that handles a `ForwardedQuery` creates and signs a
+// `SignedResponseStep` binding its contribution to the query it received and
+// (if forwarding) the child query it sent. The `RecursiveRouteResponse`
+// carries `response_steps: Vec<SignedResponseStep>` — one per forwarding hop,
+// ordered from the first forwarder to the last.
+//
+// This authenticates the response envelope itself (destination_reached,
+// not_found, remaining_hop_budget, query_chain, and the ordering of
+// accumulated entries). A transport cannot modify these fields without
+// detection — any tampering invalidates the responder's signature.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2-response-auth.** A signed response step from a single
+/// `ForwardingNode` in the recursive route-discovery chain.
+///
+/// Each `ForwardingNode` that handles a `ForwardedQuery` creates and signs a
+/// `SignedResponseStep` binding its contribution to the query it received
+/// and (if forwarding) the child query it sent. The signature covers the
+/// canonical CBOR preimage of every field EXCEPT `signature` itself, under
+/// `ROUTE_DISCOVERY_MSG_CONTEXT`.
+///
+/// ## Fields
+///
+/// - `responder_node_id` — the NodeId of the node that handled this step.
+/// - `responder_ed25519_public_key` — the responder's Ed25519 public key.
+///   The responder's NodeId MUST equal `derive_node_id(public_key)` (I4
+///   consistency) for `verify_signature()` to return true.
+/// - `received_query_id` — the `query_id` of the `ForwardedQuery` this
+///   responder received.
+/// - `received_query_hash` — `SHA-256(canonical_CBOR(received_query))` —
+///   binds the step to the ACTUAL query message the responder received.
+/// - `sent_query_hash` — `SHA-256(canonical_CBOR(sent_query))` — binds the
+///   step to the child query the responder forwarded. All-zeros (`[0u8; 32]`)
+///   for terminal steps (destination reached or not found).
+/// - `destination_reached` — whether this step reached the destination.
+/// - `next_hop_node_id` — the next hop NodeId this responder forwarded to.
+///   All-zeros (`[0u8; 32]`) for terminal steps.
+/// - `remaining_hop_budget` — the remaining hop budget AFTER this step.
+/// - `not_found` — whether the destination was not found at this step.
+/// - `signature` — Ed25519 signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖
+///   CBOR(preimage())`.
+///
+/// ## Chain coherence
+///
+/// For a chain A → B → C → G, the response carries three `SignedResponseStep`s:
+///
+/// ```text
+/// Step 0 (B): received_query_hash = H(Q_AB), sent_query_hash = H(Q_BC)
+/// Step 1 (C): received_query_hash = H(Q_BC), sent_query_hash = H(Q_CG)
+/// Step 2 (G): received_query_hash = H(Q_CG), sent_query_hash = [0; 32]   (terminal)
+/// ```
+///
+/// Each step's `sent_query_hash` MUST equal the next step's
+/// `received_query_hash`. The terminal step's `sent_query_hash` MUST be
+/// all-zeros. This chain coherence, combined with each step's signature,
+/// proves that the responders actually handled the queries they claim to
+/// have handled — a malicious transport cannot reorder, substitute, or
+/// fabricate steps without breaking the chain.
+#[derive(Debug, Clone)]
+pub struct SignedResponseStep {
+    /// The responder's NodeId (who handled this step).
+    pub responder_node_id: [u8; 32],
+    /// The responder's Ed25519 public key.
+    pub responder_ed25519_public_key: [u8; 32],
+    /// The `query_id` of the query this responder received.
+    pub received_query_id: [u8; 16],
+    /// The hash of the query this responder received (binds to actual message).
+    pub received_query_hash: [u8; 32],
+    /// The hash of the child query this responder sent (all-zeros if terminal).
+    pub sent_query_hash: [u8; 32],
+    /// Whether this step reached the destination.
+    pub destination_reached: bool,
+    /// The next hop NodeId (all-zeros if terminal/not found).
+    pub next_hop_node_id: [u8; 32],
+    /// Remaining hop budget after this step.
+    pub remaining_hop_budget: u8,
+    /// Whether the destination was not found at this step.
+    pub not_found: bool,
+    /// Ed25519 signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage())`.
+    pub signature: [u8; 64],
+}
+
+impl SignedResponseStep {
+    /// Compute the canonical CBOR preimage of the step (every field EXCEPT
+    /// `signature` itself).
+    ///
+    /// The signature covers `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage())`.
+    fn preimage(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
+            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.responder_ed25519_public_key.to_vec())),
+            (CborValue::TextString("receivedQueryId".into()), CborValue::ByteString(self.received_query_id.to_vec())),
+            (CborValue::TextString("receivedQueryHash".into()), CborValue::ByteString(self.received_query_hash.to_vec())),
+            (CborValue::TextString("sentQueryHash".into()), CborValue::ByteString(self.sent_query_hash.to_vec())),
+            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
+            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
+            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
+            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
+        ])
+    }
+
+    /// **N2.1.3.2-response-auth.** Create and sign a `SignedResponseStep`.
+    ///
+    /// The responder signs the preimage (every field EXCEPT `signature`)
+    /// under `ROUTE_DISCOVERY_MSG_CONTEXT`. The signature and the
+    /// responder's public key are stored in the step so any receiver can
+    /// independently verify the claim.
+    ///
+    /// # Parameters
+    /// - `secret_key`: The responder's Ed25519 secret key.
+    /// - `public_key`: The responder's Ed25519 public key. MUST correspond
+    ///   to `secret_key`. The responder's NodeId is derived from this key.
+    /// - `responder_node_id`: The responder's NodeId. MUST equal
+    ///   `derive_node_id(public_key)` for `verify_signature()` to succeed.
+    /// - `received_query_id`: The `query_id` of the `ForwardedQuery` the
+    ///   responder received.
+    /// - `received_query_hash`: `SHA-256(canonical_CBOR(received_query))`.
+    /// - `sent_query_hash`: `SHA-256(canonical_CBOR(sent_query))`, or
+    ///   `[0u8; 32]` for terminal steps.
+    /// - `destination_reached`: Whether this step reached the destination.
+    /// - `next_hop_node_id`: The next hop NodeId, or `[0u8; 32]` for
+    ///   terminal steps.
+    /// - `remaining_hop_budget`: The remaining hop budget after this step.
+    /// - `not_found`: Whether the destination was not found at this step.
+    #[must_use]
+    pub fn create_and_sign(
+        secret_key: &[u8; 32],
+        public_key: &[u8; 32],
+        responder_node_id: [u8; 32],
+        received_query_id: [u8; 16],
+        received_query_hash: [u8; 32],
+        sent_query_hash: [u8; 32],
+        destination_reached: bool,
+        next_hop_node_id: [u8; 32],
+        remaining_hop_budget: u8,
+        not_found: bool,
+    ) -> Self {
+        let mut step = Self {
+            responder_node_id,
+            responder_ed25519_public_key: *public_key,
+            received_query_id,
+            received_query_hash,
+            sent_query_hash,
+            destination_reached,
+            next_hop_node_id,
+            remaining_hop_budget,
+            not_found,
+            signature: [0u8; 64],
+        };
+        step.sign(secret_key);
+        step
+    }
+
+    /// Re-sign the step (after field mutation).
+    pub fn sign(&mut self, secret_key: &[u8; 32]) {
+        let preimage = self.preimage();
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        self.signature = ed25519_sign(secret_key, &msg);
+    }
+
+    /// **N2.1.3.2-response-auth.** Verify the step's signature and
+    /// responder identity consistency (I4).
+    ///
+    /// Returns `true` iff:
+    /// - The signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage)`
+    ///   verifies under `responder_ed25519_public_key`.
+    /// - `responder_node_id == derive_node_id(responder_ed25519_public_key)`
+    ///   (I4 consistency).
+    #[must_use]
+    pub fn verify_signature(&self) -> bool {
+        let preimage = self.preimage();
+        let Ok(bytes) = snp_cbor::encode(&preimage) else {
+            return false;
+        };
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        if !ed25519_verify(&self.responder_ed25519_public_key, &msg, &self.signature) {
+            return false;
+        }
+        let expected = snp_crypto::derive_node_id(&self.responder_ed25519_public_key);
+        self.responder_node_id == expected
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // N2.1.3.2-fix — RecursiveRouteResponse + RecursiveNextHopTransport
 //
 // `ForwardedQuery` is now the actual wire message. A sends ONE
@@ -1608,6 +1799,12 @@ impl ForwardedQuery {
 // and updated `visited_nodes`). Each hop augments the response with its
 // own assertion + record. A receives a single `RecursiveRouteResponse`
 // carrying the full accumulated chain A → B → C → G.
+//
+// **N2.1.3.2-response-auth:** The response also carries `response_steps` —
+// one `SignedResponseStep` per forwarding hop, ordered from the first
+// forwarder to the last. Each step is signed by its responder, binding
+// the responder's contribution to the query it received and (if forwarding)
+// the child query it sent.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// **N2.1.3.2-fix.** The response to a `ForwardedQuery`, carrying the FULL
@@ -1618,7 +1815,7 @@ impl ForwardedQuery {
 ///   forward), OR
 /// - Forwards a NEW `ForwardedQuery` to the next hop, receives a
 ///   `RecursiveRouteResponse`, and PREPENDS its own assertion + record +
-///   query step to the accumulated chain.
+///   query step + signed response step to the accumulated chain.
 ///
 /// When the response reaches the original source (A), it contains:
 /// - `accumulated_assertions`: one per forwarding hop (B, C, ...).
@@ -1628,6 +1825,10 @@ impl ForwardedQuery {
 /// - `query_chain`: one `QueryStep` per query (A→B, B→C, C→G, ...).
 /// - `destination_advertisement`: the destination's advert (if reached).
 /// - `remaining_hop_budget`: the budget at the destination.
+/// - `response_steps`: one `SignedResponseStep` per forwarding hop,
+///   ordered from the first forwarder to the last. Each step is signed by
+///   its responder and binds the responder's contribution to the actual
+///   query messages exchanged. **N2.1.3.2-response-auth.**
 #[derive(Debug, Clone)]
 pub struct RecursiveRouteResponse {
     /// The final destination's NodeId.
@@ -1652,6 +1853,12 @@ pub struct RecursiveRouteResponse {
     /// `true` if the destination wasn't reached (a forwarder returned
     /// NotFound, or the hop budget was exhausted mid-chain).
     pub not_found: bool,
+    /// **N2.1.3.2-response-auth.** Signed response steps from each
+    /// forwarding hop. One per `ForwardingNode` that handled a query.
+    /// Ordered from the first forwarder to the last. Each step is signed
+    /// by its responder, binding its contribution to the query it received
+    /// and (if forwarding) the child query it sent.
+    pub response_steps: Vec<SignedResponseStep>,
 }
 
 /// **N2.1.3.2-fix.** A transport abstraction for forwarding `ForwardedQuery`
@@ -1766,6 +1973,32 @@ pub enum DistributedRouteResolutionError {
         /// The index of the offending assertion.
         index: usize,
     },
+    /// **N2.1.3.2-response-auth.** A `SignedResponseStep`'s signature does
+    /// not verify, OR the responder's NodeId is inconsistent with the
+    /// embedded Ed25519 public key (I4 violation).
+    ///
+    /// Every step in `DistributedRouteResolution::response_steps` MUST be
+    /// individually signed by its claimed responder under
+    /// `ROUTE_DISCOVERY_MSG_CONTEXT`. This error indicates that step
+    /// `index`'s signature is missing, malformed, or does not verify under
+    /// the responder's public key.
+    #[error("response step at index {index} has an invalid signature")]
+    ResponseStepSignatureInvalid {
+        /// The index of the offending step.
+        index: usize,
+    },
+    /// **N2.1.3.2-response-auth.** The chain of `SignedResponseStep`s is
+    /// incoherent — a step's `sent_query_hash` does not match the next
+    /// step's `received_query_hash`, a step's fields do not match the
+    /// corresponding assertion, or a terminal step's fields are
+    /// inconsistent.
+    #[error("response step chain incoherent at index {index}: {reason}")]
+    ResponseStepChainIncoherent {
+        /// The index of the offending step.
+        index: usize,
+        /// A human-readable reason.
+        reason: String,
+    },
     /// The hop budget was exceeded.
     #[error("hop budget exceeded: {hops} hops with initial budget {budget}")]
     HopBudgetExceeded {
@@ -1870,6 +2103,13 @@ pub struct DistributedRouteResolution {
     pub remaining_hop_budget: u8,
     /// When this resolution expires (unix seconds).
     pub expiry: u64,
+    /// **N2.1.3.2-response-auth.** Signed response steps from each
+    /// forwarding hop. One per `ForwardingNode` that handled a query,
+    /// ordered from the first forwarder to the last. The last step is
+    /// always the terminal step (destination reached). Each step is
+    /// signed by its responder, binding its contribution to the query
+    /// it received and (if forwarding) the child query it sent.
+    pub response_steps: Vec<SignedResponseStep>,
 }
 
 impl DistributedRouteResolution {
@@ -1957,6 +2197,199 @@ impl DistributedRouteResolution {
                         expected_node_id
                     ),
                 });
+            }
+        }
+
+        // 7c. **N2.1.3.2-response-auth.** Verify the signed response step chain.
+        //
+        // For a chain A → B → C → G, the response carries three
+        // `SignedResponseStep`s:
+        //   Step 0 (B): received Q1, sent Q2.
+        //   Step 1 (C): received Q2, sent Q3.
+        //   Step 2 (G): received Q3, sent [0;32] (terminal).
+        //
+        // The expected count is `ordered_assertions.len() + 1` (one step
+        // per forwarder, plus one terminal step from the destination).
+        //
+        // For each step:
+        //   1. `verify_signature()` returns true (signature + I4).
+        //   2. The step's `responder_node_id` matches the corresponding
+        //      assertion's `responder_node_id` (for non-terminal steps) or
+        //      the destination (for the terminal step).
+        //   3. The step's `destination_reached` matches the assertion's
+        //      `is_destination` (for non-terminal steps) or is `true`
+        //      (for the terminal step).
+        //   4. The step's `next_hop_node_id` matches the assertion's
+        //      `next_hop_node_id` (for non-terminal steps) or is `[0u8; 32]`
+        //      (for the terminal step).
+        //   5. The step's `received_query_hash` is non-zero (the first step
+        //      is also non-zero — it binds to A's initial query).
+        //   6. The step's `received_query_id` matches the corresponding
+        //      `query_chain` step's `query_id` (the query the responder
+        //      received is the query the previous hop sent).
+        //   7. The chain of `sent_query_hash` → next step's
+        //      `received_query_hash` is coherent (each step's
+        //      `sent_query_hash` equals the next step's
+        //      `received_query_hash`, or is all-zeros for the terminal step).
+        let expected_steps = self.ordered_assertions.len().checked_add(1).expect("step count fits in usize");
+        if self.response_steps.len() != expected_steps {
+            return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                index: 0,
+                reason: format!(
+                    "expected {} response steps (assertions + 1 terminal), got {}",
+                    expected_steps,
+                    self.response_steps.len()
+                ),
+            });
+        }
+        for (i, step) in self.response_steps.iter().enumerate() {
+            // 7c-1. Verify the step's signature + I4 consistency.
+            if !step.verify_signature() {
+                return Err(DistributedRouteResolutionError::ResponseStepSignatureInvalid {
+                    index: i,
+                });
+            }
+
+            // 7c-5. received_query_hash must be non-zero (binds to a real query).
+            if step.received_query_hash == [0u8; 32] {
+                return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                    index: i,
+                    reason: "received_query_hash is all-zero (must bind to a real query)".to_string(),
+                });
+            }
+
+            // 7c-6. received_query_id matches the corresponding query_chain step.
+            // The i-th response step received the i-th query in the chain
+            // (query_chain[i] is "the query SENT at step i", which is the
+            // query the i-th responder received).
+            let expected_query_id = self.query_chain.get(i).map(|qs| qs.query_id);
+            if expected_query_id != Some(step.received_query_id) {
+                return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                    index: i,
+                    reason: format!(
+                        "step {} received_query_id {:?} != query_chain[{}].query_id {:?}",
+                        i,
+                        step.received_query_id,
+                        i,
+                        expected_query_id
+                    ),
+                });
+            }
+
+            // 7c-7. Chain coherence: step[i].sent_query_hash == step[i+1].received_query_hash
+            //       (or [0;32] for the terminal step).
+            if i + 1 < self.response_steps.len() {
+                let next_step = &self.response_steps[i + 1];
+                if step.sent_query_hash != next_step.received_query_hash {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "step {} sent_query_hash {:?} != step {} received_query_hash {:?}",
+                            i,
+                            step.sent_query_hash,
+                            i + 1,
+                            next_step.received_query_hash
+                        ),
+                    });
+                }
+                if step.sent_query_hash == [0u8; 32] {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "non-terminal step {} has all-zero sent_query_hash (must forward)",
+                            i
+                        ),
+                    });
+                }
+            } else {
+                // Terminal step (last in the chain) — sent_query_hash MUST be all-zero.
+                if step.sent_query_hash != [0u8; 32] {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: "terminal step's sent_query_hash must be all-zero".to_string(),
+                    });
+                }
+            }
+
+            // 7c-2/3/4. For non-terminal steps, the step's fields must match
+            //           the corresponding assertion. For the terminal step,
+            //           the step must have destination_reached=true,
+            //           next_hop_node_id=[0u8;32].
+            if i < self.ordered_assertions.len() {
+                let assertion = &self.ordered_assertions[i];
+                if step.responder_node_id != assertion.responder_node_id {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "step {} responder {:?} != assertion responder {:?}",
+                            i,
+                            step.responder_node_id,
+                            assertion.responder_node_id
+                        ),
+                    });
+                }
+                if step.destination_reached != assertion.is_destination {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "step {} destination_reached {} != assertion is_destination {}",
+                            i,
+                            step.destination_reached,
+                            assertion.is_destination
+                        ),
+                    });
+                }
+                if step.next_hop_node_id != assertion.next_hop_node_id {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "step {} next_hop {:?} != assertion next_hop {:?}",
+                            i,
+                            step.next_hop_node_id,
+                            assertion.next_hop_node_id
+                        ),
+                    });
+                }
+                if step.not_found {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "non-terminal step {} has not_found=true (must be false)",
+                            i
+                        ),
+                    });
+                }
+            } else {
+                // Terminal step (destination reached) — check specific terminal fields.
+                if !step.destination_reached {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: "terminal step must have destination_reached=true".to_string(),
+                    });
+                }
+                if step.next_hop_node_id != [0u8; 32] {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: "terminal step's next_hop_node_id must be all-zero".to_string(),
+                    });
+                }
+                if step.not_found {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: "terminal step has not_found=true (resolution succeeded)".to_string(),
+                    });
+                }
+                // The terminal step's responder is the destination.
+                if step.responder_node_id != self.destination {
+                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "terminal step responder {:?} != destination {:?}",
+                            step.responder_node_id,
+                            self.destination
+                        ),
+                    });
+                }
             }
         }
 
@@ -2274,6 +2707,25 @@ impl<'a> NextHopResolver<'a> {
             return None;
         }
 
+        // 3b. **N2.1.3.2-response-auth.** Verify the response_steps chain
+        //     starts with the correct query. The first step's
+        //     received_query_hash MUST equal `initial_query.compute_hash()`
+        //     — this proves the first responder (B) actually received A's
+        //     initial query, not a substituted query from a different chain.
+        //     This check is done at resolution time (not in verify()) because
+        //     the initial ForwardedQuery is not stored in
+        //     DistributedRouteResolution.
+        if response.response_steps.is_empty() {
+            return None;
+        }
+        let expected_initial_hash = initial_query.compute_hash();
+        if response.response_steps[0].received_query_hash != expected_initial_hash {
+            return None;
+        }
+        if response.response_steps[0].received_query_id != initial_query.query_id {
+            return None;
+        }
+
         // 4. Verify the destination's advertisement independently.
         //    The destination's advert comes from the response.
         let dest_advert = response.destination_advertisement.as_ref()?;
@@ -2358,6 +2810,7 @@ impl<'a> NextHopResolver<'a> {
             initial_hop_budget: initial_budget,
             remaining_hop_budget,
             expiry,
+            response_steps: response.response_steps,
         })
     }
 
@@ -2566,6 +3019,24 @@ impl ForwardingNode {
 
         // 4. If we ARE the destination, return a terminal response.
         if query.destination_node_id == self.node_id {
+            // **N2.1.3.2-response-auth:** Sign a terminal SignedResponseStep
+            // binding this step to the query we received. sent_query_hash is
+            // all-zeros (no child query was sent); next_hop_node_id is
+            // all-zeros (we are the destination, no forward); not_found is
+            // false; destination_reached is true.
+            let received_query_hash = query.compute_hash();
+            let terminal_step = SignedResponseStep::create_and_sign(
+                &self.ed25519_secret,
+                &self.ed25519_public,
+                self.node_id,                       // responder (us — the destination)
+                query.query_id,                     // received_query_id
+                received_query_hash,                // received_query_hash
+                [0u8; 32],                          // sent_query_hash (terminal — no child)
+                true,                               // destination_reached
+                [0u8; 32],                          // next_hop_node_id (terminal — no next hop)
+                query.max_hops.saturating_sub(1),   // remaining_hop_budget after this step
+                false,                              // not_found
+            );
             return Some(RecursiveRouteResponse {
                 destination_node_id: query.destination_node_id,
                 destination_reached: true,
@@ -2575,6 +3046,7 @@ impl ForwardingNode {
                 query_chain: Vec::new(),
                 remaining_hop_budget: query.max_hops.saturating_sub(1),
                 not_found: false,
+                response_steps: vec![terminal_step],
             });
         }
 
@@ -2582,6 +3054,25 @@ impl ForwardingNode {
         //    max_hops > 0, which means current max_hops must be > 1).
         if query.max_hops <= 1 {
             // Budget exhausted — can't forward. Return a not-found response.
+            //
+            // **N2.1.3.2-response-auth:** Sign a terminal SignedResponseStep
+            // with not_found=true binding this step to the query we received.
+            // sent_query_hash is all-zeros (no child query was sent);
+            // next_hop_node_id is all-zeros (no forward); destination_reached
+            // is false; not_found is true.
+            let received_query_hash = query.compute_hash();
+            let not_found_step = SignedResponseStep::create_and_sign(
+                &self.ed25519_secret,
+                &self.ed25519_public,
+                self.node_id,           // responder (us — we can't forward)
+                query.query_id,         // received_query_id
+                received_query_hash,    // received_query_hash
+                [0u8; 32],              // sent_query_hash (terminal — no child)
+                false,                  // destination_reached
+                [0u8; 32],              // next_hop_node_id (no forward)
+                0,                      // remaining_hop_budget
+                true,                   // not_found
+            );
             return Some(RecursiveRouteResponse {
                 destination_node_id: query.destination_node_id,
                 destination_reached: false,
@@ -2591,6 +3082,7 @@ impl ForwardingNode {
                 query_chain: Vec::new(),
                 remaining_hop_budget: 0,
                 not_found: true,
+                response_steps: vec![not_found_step],
             });
         }
 
@@ -2678,6 +3170,39 @@ impl ForwardingNode {
             query_id: new_query.query_id,
             remaining_hops: new_query.max_hops.saturating_sub(1),
         });
+
+        // 14. **N2.1.3.2-response-auth.** Prepend our SignedResponseStep.
+        //     Bind our step to:
+        //     - the query we RECEIVED (query.query_id, query.compute_hash())
+        //     - the child query we SENT (new_query.compute_hash())
+        //     - the destination state at THIS step (is_destination — same
+        //       value as our assertion's is_destination, so the verify check
+        //       `step.destination_reached == assertion.is_destination` holds)
+        //     - the remaining_hop_budget from the child response
+        //     - our next_hop (next_hop_id)
+        //     - not_found = false (we successfully forwarded)
+        //
+        //     The signature covers all of these fields, so any tampering with
+        //     destination_reached, next_hop_node_id, remaining_hop_budget, or
+        //     not_found invalidates the signature. The chain of
+        //     sent_query_hash → next step's received_query_hash proves the
+        //     responders actually handled the queries they claim to have
+        //     handled.
+        let received_query_hash = parent_query_hash; // hash of the query we received
+        let sent_query_hash = new_query.compute_hash(); // hash of the child query we sent
+        let our_step = SignedResponseStep::create_and_sign(
+            &self.ed25519_secret,
+            &self.ed25519_public,
+            self.node_id,                       // responder (us — the forwarder)
+            query.query_id,                     // received_query_id
+            received_query_hash,                // received_query_hash (query we received)
+            sent_query_hash,                    // sent_query_hash (child query we sent)
+            is_destination,                     // destination_reached (this step's claim — matches assertion)
+            next_hop_id,                        // next_hop_node_id (the node we forwarded to)
+            response.remaining_hop_budget,      // remaining_hop_budget (from child response)
+            false,                              // not_found (we successfully forwarded)
+        );
+        response.response_steps.insert(0, our_step);
 
         Some(response)
     }

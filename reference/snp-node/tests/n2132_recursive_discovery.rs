@@ -1305,14 +1305,22 @@ fn assertion_signature_verified() {
 /// cause `DistributedRouteResolution::verify()` to fail.
 ///
 /// Even though both assertions have valid signatures individually,
-/// swapping them breaks the hop-order coherence: assertion 0 now claims
-/// to be from C (not B), but `ordered_node_ids[1]` is B. The
-/// `HopOrderIncoherent` check catches this.
+/// swapping them breaks coherence: assertion 0 now claims to be from C
+/// (not B), but `ordered_node_ids[1]` is B, AND the corresponding
+/// `SignedResponseStep` (which is signed and bound to B's query) is from
+/// B — so the step-assertion correspondence check fails first.
+///
+/// **N2.1.3.2-response-auth:** With the new `response_steps` field, the
+/// swap is detected by the step-assertion correspondence check
+/// (`ResponseStepChainIncoherent`) BEFORE the existing
+/// `HopOrderIncoherent` check runs. Both errors indicate the swap was
+/// detected — the test accepts either.
 ///
 /// Scenario:
 /// - Resolve A→B→C→G successfully.
 /// - Swap ordered_assertions[0] (B's) and ordered_assertions[1] (C's).
-/// - `verify()` must fail with `HopOrderIncoherent` (responder mismatch).
+/// - `verify()` must fail (with `ResponseStepChainIncoherent` or
+///   `HopOrderIncoherent`).
 #[test]
 fn swapped_assertion_entries_rejected() {
     let mesh = TestMesh::new(b"swap-assert");
@@ -1354,18 +1362,453 @@ fn swapped_assertion_entries_rejected() {
         "swapped assertion 1 (B's) still has a valid signature"
     );
 
-    // But the resolution's verify() must fail because the hop order is
-    // incoherent: assertion 0 now claims to be from C, but
-    // ordered_node_ids[1] is B.
+    // The resolution's verify() must fail because either:
+    // - The step-assertion correspondence is broken (response_step[0] is
+    //   from B, but assertion[0] is now from C). This is caught by the
+    //   new ResponseStepChainIncoherent check (N2.1.3.2-response-auth).
+    // - The hop order is incoherent (assertion 0 is from C, but
+    //   ordered_node_ids[1] is B). This is caught by the existing
+    //   HopOrderIncoherent check.
+    // The new check runs first, so we expect ResponseStepChainIncoherent.
     let err = resolution.verify();
     assert!(
         matches!(
             err,
-            Err(DistributedRouteResolutionError::HopOrderIncoherent { index: 0, .. })
+            Err(DistributedRouteResolutionError::ResponseStepChainIncoherent { index: 0, .. })
+            | Err(DistributedRouteResolutionError::HopOrderIncoherent { index: 0, .. })
         ),
-        "swapped assertions must fail HopOrderIncoherent at index 0 (responder mismatch), got: {err:?}"
+        "swapped assertions must fail (ResponseStepChainIncoherent or HopOrderIncoherent at index 0), got: {err:?}"
     );
 
     eprintln!("[test 17] PASS: swapped assertion entries rejected (responder mismatch)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2-response-auth — Chained response authentication tests
+//
+// These tests verify the new `SignedResponseStep` chain that authenticates
+// the `RecursiveRouteResponse` envelope. Each `ForwardingNode` signs a
+// `SignedResponseStep` binding its contribution to the query it received
+// and (if forwarding) the child query it sent. The chain of
+// `sent_query_hash` → next step's `received_query_hash` proves the
+// responders actually handled the queries they claim to have handled.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── 18. forged_response_envelope_rejected ──────────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Tampering with the `destination_reached`
+/// field of a `SignedResponseStep` MUST cause `verify()` to fail with
+/// `ResponseStepSignatureInvalid`.
+///
+/// The `destination_reached` field is part of the signed preimage. Flipping
+/// it from `true` to `false` (or vice versa) without updating the
+/// signature invalidates the signature. This proves the response envelope
+/// itself is authenticated — a transport cannot modify
+/// `destination_reached` without detection.
+///
+/// Scenario:
+/// - Build the standard A→B→C→G mesh.
+/// - Resolve successfully (all response_steps have valid signatures).
+/// - Tamper with `response_steps[0].destination_reached` (flip false↔true).
+/// - The tampered step's `verify_signature()` must return false.
+/// - `verify()` must fail with `ResponseStepSignatureInvalid { index: 0 }`.
+#[test]
+fn forged_response_envelope_rejected() {
+    let mesh = TestMesh::new(b"forged-env");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let mut resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed before tampering");
+
+    // Sanity: the resolution verifies before tampering.
+    assert!(resolution.verify().is_ok(), "valid resolution must verify");
+
+    // Sanity: each response_step has a valid signature.
+    for (i, step) in resolution.response_steps.iter().enumerate() {
+        assert!(
+            step.verify_signature(),
+            "response step {i} must have a valid signature before tampering"
+        );
+    }
+
+    // For a chain A→B→C→G, response_steps[0] is B's step with
+    // destination_reached = false (B forwarded to C, not G).
+    // Flip it to true — this should invalidate B's signature.
+    let original = resolution.response_steps[0].destination_reached;
+    resolution.response_steps[0].destination_reached = !original;
+
+    // The tampered step's signature no longer verifies.
+    assert!(
+        !resolution.response_steps[0].verify_signature(),
+        "tampered response step must fail verify_signature"
+    );
+
+    // verify() must fail with ResponseStepSignatureInvalid at index 0.
+    let err = resolution.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::ResponseStepSignatureInvalid { index: 0 })
+        ),
+        "tampered destination_reached must fail ResponseStepSignatureInvalid at index 0, got: {err:?}"
+    );
+
+    eprintln!("[test 18] PASS: forged response envelope (destination_reached) rejected");
+}
+
+// ─── 19. response_chain_substitution_rejected ───────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Substituting `response_steps` from a
+/// different resolution MUST cause `verify()` to fail.
+///
+/// Even though the substituted steps are internally coherent (they form a
+/// valid chain from the other resolution's perspective), their
+/// `received_query_id` fields do not match this resolution's
+/// `query_chain` (different random nonces per resolution). The
+/// `received_query_id` check catches this.
+///
+/// Scenario:
+/// - Resolve resolution A (A→B→C→G1) — has response_steps_A.
+/// - Resolve resolution B (A→B→C→G2) — has response_steps_B.
+/// - Replace A's response_steps with B's response_steps.
+/// - verify() must fail because B's response_steps[i].received_query_id
+///   != A's query_chain[i].query_id (different random nonces).
+#[test]
+fn response_chain_substitution_rejected() {
+    // Build two meshes with different destinations so the response_steps
+    // are guaranteed to be from different resolutions. (Even with the
+    // same destination, the random query_ids would differ, but using
+    // different destinations makes the test more robust.)
+    let mesh_a = TestMesh::new(b"subst-a");
+    let mesh_b = TestMesh::new(b"subst-b");
+
+    // Resolution A: A→B→C→G_a.
+    let hint_a = make_hint(mesh_a.g_id, mesh_a.b_id);
+    let mut resolver_a = mesh_a.resolver();
+    let mut resolution_a = resolver_a
+        .resolve_route(&mesh_a.g_id, &hint_a)
+        .expect("resolution A must succeed");
+
+    // Resolution B: A→B→C→G_b.
+    let hint_b = make_hint(mesh_b.g_id, mesh_b.b_id);
+    let mut resolver_b = mesh_b.resolver();
+    let resolution_b = resolver_b
+        .resolve_route(&mesh_b.g_id, &hint_b)
+        .expect("resolution B must succeed");
+
+    // Sanity: both resolutions verify.
+    assert!(resolution_a.verify().is_ok(), "resolution A must verify");
+    assert!(resolution_b.verify().is_ok(), "resolution B must verify");
+
+    // Sanity: the response_steps have different received_query_ids (random
+    // nonces make each resolution's queries unique).
+    assert_ne!(
+        resolution_a.response_steps[0].received_query_id,
+        resolution_b.response_steps[0].received_query_id,
+        "resolutions A and B must have different first-step query_ids"
+    );
+
+    // SUBSTITUTE: replace A's response_steps with B's response_steps.
+    // B's steps are internally coherent and individually signed, but they
+    // don't match A's query_chain.
+    resolution_a.response_steps = resolution_b.response_steps.clone();
+
+    // verify() must fail because B's response_steps[i].received_query_id
+    // != A's query_chain[i].query_id.
+    let err = resolution_a.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::ResponseStepChainIncoherent { index: 0, .. })
+        ),
+        "substituted response_steps must fail ResponseStepChainIncoherent at index 0 (query_id mismatch), got: {err:?}"
+    );
+
+    eprintln!("[test 19] PASS: response chain substitution rejected (query_id mismatch)");
+}
+
+// ─── 20. query_chain_tampering_rejected ─────────────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Tampering with a `QueryStep`'s `query_id`
+/// in `query_chain` MUST cause `verify()` to fail.
+///
+/// Each `SignedResponseStep`'s `received_query_id` is signed and bound to
+/// the actual query the responder received. If we tamper with the
+/// `query_chain[i].query_id`, the signed `received_query_id` no longer
+/// matches, and the chain coherence check fails.
+///
+/// Scenario:
+/// - Resolve A→B→C→G successfully.
+/// - Tamper with `query_chain[1].query_id` (the query B sent to C).
+/// - verify() must fail because response_steps[1].received_query_id !=
+///   query_chain[1].query_id (the signed step still has the original).
+#[test]
+fn query_chain_tampering_rejected() {
+    let mesh = TestMesh::new(b"qchain-tamper");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let mut resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed");
+
+    // Sanity: the resolution verifies.
+    assert!(resolution.verify().is_ok(), "valid resolution must verify");
+
+    // Sanity: response_steps[1].received_query_id matches query_chain[1].query_id.
+    assert_eq!(
+        resolution.response_steps[1].received_query_id,
+        resolution.query_chain[1].query_id,
+        "response step 1's received_query_id must match query_chain[1].query_id"
+    );
+
+    // Tamper with query_chain[1].query_id (flip a byte).
+    resolution.query_chain[1].query_id[0] ^= 0xFF;
+
+    // The signed response_steps[1].received_query_id is unchanged — it
+    // still has the original query_id. Now they don't match.
+    assert_ne!(
+        resolution.response_steps[1].received_query_id,
+        resolution.query_chain[1].query_id,
+        "tampered query_chain[1].query_id must differ from signed received_query_id"
+    );
+
+    // verify() must fail because response_steps[1].received_query_id !=
+    // query_chain[1].query_id.
+    let err = resolution.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::ResponseStepChainIncoherent { index: 1, .. })
+        ),
+        "tampered query_chain must fail ResponseStepChainIncoherent at index 1 (query_id mismatch), got: {err:?}"
+    );
+
+    eprintln!("[test 20] PASS: query_chain tampering rejected (query_id mismatch)");
+}
+
+// ─── 21. destination_state_tampering_rejected ───────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Tampering with the `not_found` field of a
+/// `SignedResponseStep` MUST cause `verify()` to fail with
+/// `ResponseStepSignatureInvalid`.
+///
+/// The `not_found` field is part of the signed preimage. Flipping it from
+/// `false` to `true` (without updating the signature) invalidates the
+/// signature. This proves the response envelope's `not_found` state is
+/// authenticated.
+///
+/// Scenario:
+/// - Resolve A→B→C→G successfully.
+/// - Tamper with `response_steps[0].not_found` (false → true).
+/// - The tampered step's signature no longer verifies.
+/// - verify() must fail with `ResponseStepSignatureInvalid { index: 0 }`.
+#[test]
+fn destination_state_tampering_rejected() {
+    let mesh = TestMesh::new(b"dest-state-tamper");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let mut resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed");
+
+    // Sanity: the resolution verifies.
+    assert!(resolution.verify().is_ok(), "valid resolution must verify");
+
+    // Sanity: response_steps[0].not_found is false (B successfully forwarded).
+    assert!(
+        !resolution.response_steps[0].not_found,
+        "response step 0 (B's) must have not_found=false before tampering"
+    );
+
+    // Tamper: flip not_found from false to true.
+    resolution.response_steps[0].not_found = true;
+
+    // The tampered step's signature no longer verifies.
+    assert!(
+        !resolution.response_steps[0].verify_signature(),
+        "tampered response step (not_found flipped) must fail verify_signature"
+    );
+
+    // verify() must fail with ResponseStepSignatureInvalid at index 0.
+    let err = resolution.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::ResponseStepSignatureInvalid { index: 0 })
+        ),
+        "tampered not_found must fail ResponseStepSignatureInvalid at index 0, got: {err:?}"
+    );
+
+    eprintln!("[test 21] PASS: destination state tampering (not_found) rejected");
+}
+
+// ─── 22. cross_chain_response_replay_rejected ───────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Injecting a `SignedResponseStep` from
+/// resolution A into resolution B's `response_steps` MUST cause
+/// `verify()` to fail.
+///
+/// The injected step's `received_query_hash` does not match the previous
+/// step's `sent_query_hash` (because A's queries are different from B's).
+/// The chain coherence check catches this.
+///
+/// Scenario:
+/// - Resolve resolution A (A→B→C→G_a) — has response_steps_A.
+/// - Resolve resolution B (A→B→C→G_b) — has response_steps_B.
+/// - Inject response_steps_A[1] (C's step from A) into resolution B at
+///   index 1 (replacing B's C-step).
+/// - verify() must fail because either:
+///   - The injected step's received_query_id != query_chain[1].query_id.
+///   - The injected step's received_query_hash != response_steps[0].sent_query_hash
+///     (chain coherence from previous step).
+#[test]
+fn cross_chain_response_replay_rejected() {
+    let mesh_a = TestMesh::new(b"replay-a");
+    let mesh_b = TestMesh::new(b"replay-b");
+
+    // Resolution A: A→B→C→G_a.
+    let hint_a = make_hint(mesh_a.g_id, mesh_a.b_id);
+    let mut resolver_a = mesh_a.resolver();
+    let resolution_a = resolver_a
+        .resolve_route(&mesh_a.g_id, &hint_a)
+        .expect("resolution A must succeed");
+
+    // Resolution B: A→B→C→G_b.
+    let hint_b = make_hint(mesh_b.g_id, mesh_b.b_id);
+    let mut resolver_b = mesh_b.resolver();
+    let mut resolution_b = resolver_b
+        .resolve_route(&mesh_b.g_id, &hint_b)
+        .expect("resolution B must succeed");
+
+    // Sanity: both resolutions verify.
+    assert!(resolution_a.verify().is_ok(), "resolution A must verify");
+    assert!(resolution_b.verify().is_ok(), "resolution B must verify");
+
+    // Sanity: A's response_steps[1] (C's step from A) has a different
+    // received_query_hash than B's response_steps[1] (C's step from B),
+    // because A's B→C query (Q_BC_A) is different from B's B→C query
+    // (Q_BC_B) — they use different random nonces.
+    assert_ne!(
+        resolution_a.response_steps[1].received_query_hash,
+        resolution_b.response_steps[1].received_query_hash,
+        "A's step 1 received_query_hash must differ from B's (different queries)"
+    );
+
+    // Sanity: A's step 1 individually verifies (it's a real signature).
+    assert!(
+        resolution_a.response_steps[1].verify_signature(),
+        "A's response step 1 must have a valid signature"
+    );
+
+    // INJECT: replace B's response_steps[1] with A's response_steps[1].
+    // The injected step is signed by A's C and has valid signature, but
+    // its received_query_hash doesn't match B's response_steps[0].sent_query_hash
+    // (because A's B→C query is different from B's B→C query).
+    let injected_step = resolution_a.response_steps[1].clone();
+    resolution_b.response_steps[1] = injected_step;
+
+    // verify() must fail because either:
+    // - Chain coherence: response_steps[0].sent_query_hash !=
+    //   response_steps[1].received_query_hash.
+    // - Query ID mismatch: response_steps[1].received_query_id !=
+    //   query_chain[1].query_id.
+    let err = resolution_b.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::ResponseStepChainIncoherent { index: 0, .. })
+            | Err(DistributedRouteResolutionError::ResponseStepChainIncoherent { index: 1, .. })
+        ),
+        "injected cross-chain response step must fail ResponseStepChainIncoherent at index 0 or 1 (hash/query_id mismatch), got: {err:?}"
+    );
+
+    eprintln!("[test 22] PASS: cross-chain response replay rejected (hash mismatch)");
+}
+
+// ─── Bonus: response_steps_basic_properties ─────────────────────────────────
+
+/// **N2.1.3.2-response-auth.** Verify the basic properties of the
+/// `response_steps` chain in a successful resolution.
+///
+/// For a chain A→B→C→G:
+/// - response_steps has 3 entries (B, C, G).
+/// - Step 0 (B): received Q_AB, sent Q_BC, destination_reached=false, next_hop=C.
+/// - Step 1 (C): received Q_BC, sent Q_CG, destination_reached=true, next_hop=G.
+/// - Step 2 (G): received Q_CG, sent [0;32] (terminal), destination_reached=true,
+///   next_hop=[0;32].
+/// - Each step's signature verifies.
+/// - Chain coherence: step[i].sent_query_hash == step[i+1].received_query_hash.
+/// - Terminal step's sent_query_hash is [0;32].
+#[test]
+fn response_steps_basic_properties() {
+    let mesh = TestMesh::new(b"resp-step-props");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed");
+
+    // 3 response_steps (B, C, G).
+    assert_eq!(
+        resolution.response_steps.len(),
+        3,
+        "expected 3 response steps (B, C, G)"
+    );
+
+    // Step 0 (B): forwarder, destination_reached=false, next_hop=C.
+    let step_b = &resolution.response_steps[0];
+    assert_eq!(step_b.responder_node_id, mesh.b_id, "step 0 is from B");
+    assert!(!step_b.destination_reached, "step 0 destination_reached=false");
+    assert_eq!(step_b.next_hop_node_id, mesh.c_id, "step 0 next_hop=C");
+    assert!(!step_b.not_found, "step 0 not_found=false");
+    assert_ne!(step_b.received_query_hash, [0u8; 32], "step 0 received_query_hash non-zero");
+    assert_ne!(step_b.sent_query_hash, [0u8; 32], "step 0 sent_query_hash non-zero");
+    assert!(step_b.verify_signature(), "step 0 signature verifies");
+
+    // Step 1 (C): forwarder, destination_reached=true (C's next_hop IS G).
+    let step_c = &resolution.response_steps[1];
+    assert_eq!(step_c.responder_node_id, mesh.c_id, "step 1 is from C");
+    assert!(step_c.destination_reached, "step 1 destination_reached=true");
+    assert_eq!(step_c.next_hop_node_id, mesh.g_id, "step 1 next_hop=G");
+    assert!(!step_c.not_found, "step 1 not_found=false");
+    assert_ne!(step_c.received_query_hash, [0u8; 32], "step 1 received_query_hash non-zero");
+    assert_ne!(step_c.sent_query_hash, [0u8; 32], "step 1 sent_query_hash non-zero");
+    assert!(step_c.verify_signature(), "step 1 signature verifies");
+
+    // Step 2 (G): terminal, destination_reached=true, next_hop=[0;32],
+    // sent_query_hash=[0;32].
+    let step_g = &resolution.response_steps[2];
+    assert_eq!(step_g.responder_node_id, mesh.g_id, "step 2 is from G");
+    assert!(step_g.destination_reached, "step 2 destination_reached=true");
+    assert_eq!(step_g.next_hop_node_id, [0u8; 32], "step 2 next_hop=[0;32] (terminal)");
+    assert!(!step_g.not_found, "step 2 not_found=false");
+    assert_ne!(step_g.received_query_hash, [0u8; 32], "step 2 received_query_hash non-zero");
+    assert_eq!(step_g.sent_query_hash, [0u8; 32], "step 2 sent_query_hash=[0;32] (terminal)");
+    assert!(step_g.verify_signature(), "step 2 signature verifies");
+
+    // Chain coherence: step[i].sent_query_hash == step[i+1].received_query_hash.
+    assert_eq!(
+        step_b.sent_query_hash, step_c.received_query_hash,
+        "step 0 sent_query_hash == step 1 received_query_hash"
+    );
+    assert_eq!(
+        step_c.sent_query_hash, step_g.received_query_hash,
+        "step 1 sent_query_hash == step 2 received_query_hash"
+    );
+
+    // received_query_id matches query_chain.
+    assert_eq!(step_b.received_query_id, resolution.query_chain[0].query_id);
+    assert_eq!(step_c.received_query_id, resolution.query_chain[1].query_id);
+    assert_eq!(step_g.received_query_id, resolution.query_chain[2].query_id);
+
+    // The full verify() passes.
+    assert!(resolution.verify().is_ok(), "resolution must verify");
+
+    eprintln!("[test 23] PASS: response_steps basic properties verified");
 }
 
