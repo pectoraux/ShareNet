@@ -59,6 +59,33 @@ use crate::node::identity::Capability;
 use snp_cbor::CborValue;
 use snp_crypto::{ed25519_sign, ed25519_verify, derive_node_id, sha256};
 
+/// Errors from fallible serialization / signing operations.
+///
+/// ## P0 — Fail-closed principle (N2.1.2 review)
+///
+/// Canonical CBOR encoding and OS randomness are security-critical operations.
+/// If either fails, the protocol object (proposal, acceptance, attestation)
+/// MUST NOT be created. No `unwrap_or_default()`, no silent fallback to
+/// empty bytes or zero nonces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSerializationError {
+    /// Canonical CBOR encoding of the preimage failed.
+    CborEncodingFailed,
+    /// OS randomness generation failed (nonce could not be filled).
+    RandomnessFailure,
+}
+
+impl std::fmt::Display for RouteSerializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CborEncodingFailed => write!(f, "canonical CBOR encoding failed"),
+            Self::RandomnessFailure => write!(f, "OS randomness generation failed"),
+        }
+    }
+}
+
+impl std::error::Error for RouteSerializationError {}
+
 /// SIG_CONTEXT for route proposals, acceptances, and link attestations.
 pub const ROUTE_MSG_CONTEXT: &[u8] = b"SNP/0.1 route-msg\0";
 
@@ -196,7 +223,10 @@ pub struct LinkAttestation {
 
 impl LinkAttestation {
     /// Create and sign a `LinkAttestation`.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns `RouteSerializationError::CborEncodingFailed` if canonical
+    /// CBOR encoding of the preimage fails (P0 fail-closed).
     pub fn create_and_sign(
         attester_secret_key: &[u8; 32],
         attester_public_key: &[u8; 32],
@@ -204,7 +234,7 @@ impl LinkAttestation {
         remote_node_id: [u8; 32],
         link_state: String,
         expiry: u64,
-    ) -> Self {
+    ) -> Result<Self, RouteSerializationError> {
         let now = now_unix();
         let mut att = Self {
             attester_node_id,
@@ -215,8 +245,9 @@ impl LinkAttestation {
             expiry,
             signature: [0u8; 64],
         };
-        att.signature = ed25519_sign(attester_secret_key, &att.preimage_bytes());
-        att
+        let preimage = att.preimage_bytes()?;
+        att.signature = ed25519_sign(attester_secret_key, &preimage);
+        Ok(att)
     }
 
     fn preimage(&self) -> CborValue {
@@ -230,21 +261,26 @@ impl LinkAttestation {
         ])
     }
 
-    fn preimage_bytes(&self) -> Vec<u8> {
-        let cbor = snp_cbor::encode(&self.preimage()).unwrap_or_default();
+    fn preimage_bytes(&self) -> Result<Vec<u8>, RouteSerializationError> {
+        let cbor = snp_cbor::encode(&self.preimage())
+            .map_err(|_| RouteSerializationError::CborEncodingFailed)?;
         let mut msg = Vec::with_capacity(ROUTE_MSG_CONTEXT.len() + cbor.len());
         msg.extend_from_slice(ROUTE_MSG_CONTEXT);
         msg.extend_from_slice(&cbor);
-        msg
+        Ok(msg)
     }
 
     /// Verify the attestation's signature + NodeId↔pubkey binding + freshness.
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify(&self) -> bool {
         self.verify_at(now_unix())
     }
 
     /// Verify at a specific time (for testing).
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify_at(&self, now: u64) -> bool {
         let expected = derive_node_id(&self.attester_public_key);
@@ -263,7 +299,12 @@ impl LinkAttestation {
         if self.expiry.saturating_sub(self.timestamp) > ROUTE_MAX_LIFETIME_SECS {
             return false;
         }
-        ed25519_verify(&self.attester_public_key, &self.preimage_bytes(), &self.signature)
+        // P0: fail-closed if encoding fails.
+        let preimage = match self.preimage_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        ed25519_verify(&self.attester_public_key, &preimage, &self.signature)
     }
 }
 
@@ -782,17 +823,24 @@ pub struct RouteProposal {
 
 impl RouteProposal {
     /// Create and sign a `RouteProposal` from a `ValidatedPath`.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns `RouteSerializationError::RandomnessFailure` if OS randomness
+    /// generation fails (P0 — the nonce must NOT be left as all-zeros).
+    /// Returns `RouteSerializationError::CborEncodingFailed` if canonical
+    /// CBOR encoding of the preimage fails (P0 fail-closed).
     pub fn from_validated_path(
         path: &ValidatedPath,
         source_secret_key: &[u8; 32],
         source_public_key: &[u8; 32],
         service: ServiceAgreement,
         expiry: u64,
-    ) -> Self {
+    ) -> Result<Self, RouteSerializationError> {
         let now = now_unix();
         let mut nonce = [0u8; 16];
-        let _ = getrandom::getrandom(&mut nonce);
+        // P0: fail-closed on RNG failure. Do NOT discard the error with `let _ =`.
+        getrandom::getrandom(&mut nonce)
+            .map_err(|_| RouteSerializationError::RandomnessFailure)?;
         let source = path.source();
         let destination = path.destination();
         let hop_node_ids = path.node_ids();
@@ -808,8 +856,9 @@ impl RouteProposal {
             source_signature: [0u8; 64],
             source_public_key: *source_public_key,
         };
-        proposal.source_signature = ed25519_sign(source_secret_key, &proposal.preimage_bytes());
-        proposal
+        let preimage = proposal.preimage_bytes()?;
+        proposal.source_signature = ed25519_sign(source_secret_key, &preimage);
+        Ok(proposal)
     }
 
     fn preimage(&self) -> CborValue {
@@ -826,23 +875,33 @@ impl RouteProposal {
         ])
     }
 
-    fn preimage_bytes(&self) -> Vec<u8> {
-        let cbor = snp_cbor::encode(&self.preimage()).unwrap_or_default();
+    fn preimage_bytes(&self) -> Result<Vec<u8>, RouteSerializationError> {
+        let cbor = snp_cbor::encode(&self.preimage())
+            .map_err(|_| RouteSerializationError::CborEncodingFailed)?;
         let mut msg = Vec::with_capacity(ROUTE_MSG_CONTEXT.len() + cbor.len());
         msg.extend_from_slice(ROUTE_MSG_CONTEXT);
         msg.extend_from_slice(&cbor);
-        msg
+        Ok(msg)
     }
 
-    #[must_use]
-    pub fn proposal_hash(&self) -> [u8; 32] {
-        sha256(&self.preimage_bytes())
+    /// Compute the SHA-256 hash of this proposal (used as the acceptance key).
+    ///
+    /// # Errors
+    /// Returns `RouteSerializationError::CborEncodingFailed` if encoding fails.
+    pub fn proposal_hash(&self) -> Result<[u8; 32], RouteSerializationError> {
+        let preimage = self.preimage_bytes()?;
+        Ok(sha256(&preimage))
     }
 
     /// Verify signature + NodeId binding + source==first + freshness.
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify(&self) -> bool { self.verify_at(now_unix()) }
 
+    /// Verify at a specific time (for testing).
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify_at(&self, now: u64) -> bool {
         let expected = derive_node_id(&self.source_public_key);
@@ -852,7 +911,12 @@ impl RouteProposal {
         if self.expiry <= now { return false; }
         if self.expiry <= self.timestamp { return false; }
         if self.expiry.saturating_sub(self.timestamp) > ROUTE_MAX_LIFETIME_SECS { return false; }
-        ed25519_verify(&self.source_public_key, &self.preimage_bytes(), &self.source_signature)
+        // P0: fail-closed if encoding fails.
+        let preimage = match self.preimage_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        ed25519_verify(&self.source_public_key, &preimage, &self.source_signature)
     }
 
     #[must_use]
@@ -893,7 +957,11 @@ pub struct RouteAcceptance {
 }
 
 impl RouteAcceptance {
-    #[must_use]
+    /// Create and sign a `RouteAcceptance` with a typed role.
+    ///
+    /// # Errors
+    /// Returns `RouteSerializationError::CborEncodingFailed` if canonical
+    /// CBOR encoding of the preimage fails (P0 fail-closed).
     pub fn create_and_sign(
         participant_secret_key: &[u8; 32],
         participant_public_key: &[u8; 32],
@@ -902,14 +970,15 @@ impl RouteAcceptance {
         role: RouteRole,
         conditions: Vec<String>,
         expiry: u64,
-    ) -> Self {
+    ) -> Result<Self, RouteSerializationError> {
         let now = now_unix();
         let mut acceptance = Self {
             proposal_hash, participant_node_id, participant_public_key: *participant_public_key,
             role, conditions, timestamp: now, expiry, signature: [0u8; 64],
         };
-        acceptance.signature = ed25519_sign(participant_secret_key, &acceptance.preimage_bytes());
-        acceptance
+        let preimage = acceptance.preimage_bytes()?;
+        acceptance.signature = ed25519_sign(participant_secret_key, &preimage);
+        Ok(acceptance)
     }
 
     fn preimage(&self) -> CborValue {
@@ -925,17 +994,24 @@ impl RouteAcceptance {
         ])
     }
 
-    fn preimage_bytes(&self) -> Vec<u8> {
-        let cbor = snp_cbor::encode(&self.preimage()).unwrap_or_default();
+    fn preimage_bytes(&self) -> Result<Vec<u8>, RouteSerializationError> {
+        let cbor = snp_cbor::encode(&self.preimage())
+            .map_err(|_| RouteSerializationError::CborEncodingFailed)?;
         let mut msg = Vec::with_capacity(ROUTE_MSG_CONTEXT.len() + cbor.len());
         msg.extend_from_slice(ROUTE_MSG_CONTEXT);
         msg.extend_from_slice(&cbor);
-        msg
+        Ok(msg)
     }
 
+    /// Verify signature + NodeId binding + freshness.
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify(&self) -> bool { self.verify_at(now_unix()) }
 
+    /// Verify at a specific time (for testing).
+    ///
+    /// Returns `false` if CBOR encoding fails (fail-closed — P0).
     #[must_use]
     pub fn verify_at(&self, now: u64) -> bool {
         let expected = derive_node_id(&self.participant_public_key);
@@ -944,7 +1020,12 @@ impl RouteAcceptance {
         if self.expiry <= now { return false; }
         if self.expiry <= self.timestamp { return false; }
         if self.expiry.saturating_sub(self.timestamp) > ROUTE_MAX_LIFETIME_SECS { return false; }
-        ed25519_verify(&self.participant_public_key, &self.preimage_bytes(), &self.signature)
+        // P0: fail-closed if encoding fails.
+        let preimage = match self.preimage_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        ed25519_verify(&self.participant_public_key, &preimage, &self.signature)
     }
 }
 
@@ -1136,6 +1217,13 @@ pub fn commit_route(
         .map(|h| (h.node_id, h.role))
         .collect();
 
+    // 5b. P0: compute proposal_hash once (fallible). Used for acceptance
+    //     verification and commitment construction.
+    let prop_hash = match proposal.proposal_hash() {
+        Ok(h) => h,
+        Err(_) => return Err(CommitError::CommitmentEncodingFailed),
+    };
+
     // 6. Verify each acceptance.
     let mut accepted_by: std::collections::HashMap<[u8; 32], &RouteAcceptance> = std::collections::HashMap::new();
     for acc in &acceptances {
@@ -1145,7 +1233,7 @@ pub fn commit_route(
             }
             return Err(CommitError::AcceptanceSignatureInvalid { participant: acc.participant_node_id });
         }
-        if acc.proposal_hash != proposal.proposal_hash() {
+        if acc.proposal_hash != prop_hash {
             return Err(CommitError::AcceptanceProposalMismatch { participant: acc.participant_node_id });
         }
         let expected_role = required.iter()
@@ -1252,7 +1340,7 @@ pub fn commit_route(
 
         let commitment_preimage = CborValue::Map(vec![
             (CborValue::TextString("version".into()), CborValue::TextString("SNP/0.1 route-commitment v1".into())),
-            (CborValue::TextString("proposalHash".into()), CborValue::ByteString(proposal.proposal_hash().to_vec())),
+            (CborValue::TextString("proposalHash".into()), CborValue::ByteString(prop_hash.to_vec())),
             (CborValue::TextString("hops".into()), CborValue::Array(hops_cbor)),
             (CborValue::TextString("acceptances".into()), CborValue::Array(acceptances_cbor)),
         ]);

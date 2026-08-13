@@ -105,22 +105,22 @@ fn build_proposal_and_path(topo: &TestTopology) -> (RouteProposal, ValidatedPath
         &path, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
         now + 3600,
-    );
+    ).unwrap();
     (proposal, path)
 }
 
 fn build_acceptances(topo: &TestTopology, proposal: &RouteProposal) -> Vec<RouteAcceptance> {
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
     let now = now_unix();
     vec![
         RouteAcceptance::create_and_sign(
             &topo.relay_sk, &topo.relay_pk, topo.relay_id,
             hash, RouteRole::Relay, vec![], now + 3600,
-        ),
+        ).unwrap(),
         RouteAcceptance::create_and_sign(
             &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
             hash, RouteRole::Gateway, vec![], now + 3600,
-        ),
+        ).unwrap(),
     ]
 }
 
@@ -159,12 +159,12 @@ fn multi_hop_route_requires_progressive_next_hop_discovery() {
     let attestation_b_to_c = LinkAttestation::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         relay_c_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
     // C attests it has a link to G.
     let attestation_c_to_g = LinkAttestation::create_and_sign(
         &relay_c_sk, &relay_c_pk, relay_c_id,
         gw_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
 
     // Set up the mock discovery: B knows about C, C knows about G.
     let mut candidates = HashMap::new();
@@ -267,7 +267,7 @@ fn next_hop_must_be_authenticated() {
     let attestation = LinkAttestation::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         relay_c_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
     let _ = relay_c_sk;
 
     let mut candidates = HashMap::new();
@@ -335,7 +335,7 @@ fn route_commitment_covers_hop_evidence() {
     // it's not just the proposal hash.)
     assert_ne!(
         commitment1,
-        &proposal.proposal_hash(),
+        &proposal.proposal_hash().unwrap(),
         "commitment must differ from proposal hash (it covers hop evidence)"
     );
     assert!(!commitment1.iter().all(|&b| b == 0), "commitment must be non-zero");
@@ -402,19 +402,19 @@ fn gateway_role_without_gateway_capability_rejected() {
         &path2, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
         now + 3600,
-    );
-    let hash2 = proposal2.proposal_hash();
+    ).unwrap();
+    let hash2 = proposal2.proposal_hash().unwrap();
 
     // relay_only signs as Gateway (but it's only a Relay).
     let relay_only_acc = RouteAcceptance::create_and_sign(
         &relay_only_sk, &relay_only_pk, relay_only_id,
         hash2, RouteRole::Gateway, // WRONG — relay_only has Capability::Relay
         vec![], now + 3600,
-    );
+    ).unwrap();
     let relay2_acc = RouteAcceptance::create_and_sign(
         &relay2_sk, &relay2_pk, relay2_id,
         hash2, RouteRole::Relay, vec![], now + 3600,
-    );
+    ).unwrap();
 
     let result = commit_route(proposal2, vec![relay2_acc, relay_only_acc], &path2, now);
     assert!(
@@ -464,19 +464,19 @@ fn relay_role_without_relay_capability_rejected() {
         &path, &source_sk, &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
         now + 3600,
-    );
-    let hash = proposal.proposal_hash();
+    ).unwrap();
+    let hash = proposal.proposal_hash().unwrap();
 
     // gw_only signs as Relay (but it only has Gateway capability).
     let gw_only_acc = RouteAcceptance::create_and_sign(
         &gw_only_sk, &gw_only_pk, gw_only_id,
         hash, RouteRole::Relay, // WRONG — gw_only has Capability::Gateway
         vec![], now + 3600,
-    );
+    ).unwrap();
     let dest_acc = RouteAcceptance::create_and_sign(
         &dest_sk, &dest_pk, dest_id,
         hash, RouteRole::Gateway, vec![], now + 3600,
-    );
+    ).unwrap();
 
     let result = commit_route(proposal, vec![gw_only_acc, dest_acc], &path, now);
     assert!(
@@ -512,11 +512,11 @@ fn missing_acceptance_rejected() {
     let mut topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
     let gateway_acc = RouteAcceptance::create_and_sign(
         &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
         hash, RouteRole::Gateway, vec![], now + 3600,
-    );
+    ).unwrap();
     let result = commit_route(proposal, vec![gateway_acc], &path, now);
     assert!(matches!(result, Err(CommitError::MissingAcceptance { participant }) if participant == topo.relay_id));
 }
@@ -526,16 +526,16 @@ fn wrong_role_rejected() {
     let mut topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
     let gateway_acc = RouteAcceptance::create_and_sign(
         &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
         hash, RouteRole::Relay, // WRONG
         vec![], now + 3600,
-    );
+    ).unwrap();
     let relay_acc = RouteAcceptance::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         hash, RouteRole::Relay, vec![], now + 3600,
-    );
+    ).unwrap();
     let result = commit_route(proposal, vec![relay_acc, gateway_acc], &path, now);
     assert!(matches!(result, Err(CommitError::WrongRole { .. })));
 }
@@ -567,7 +567,7 @@ fn route_proposal_freshness() {
         &path, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
         now + 3600,
-    );
+    ).unwrap();
     proposal.timestamp = now + 600;
     assert!(!proposal.verify_at(now));
 }
@@ -577,11 +577,11 @@ fn route_acceptance_freshness() {
     let mut topo = setup_test_topology();
     let (proposal, _path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
     let mut acc = RouteAcceptance::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         hash, RouteRole::Relay, vec![], now + 3600,
-    );
+    ).unwrap();
     acc.timestamp = now + 600;
     assert!(!acc.verify_at(now));
 }
@@ -622,7 +622,7 @@ fn source_must_be_first_hop() {
         &path, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
         now + 3600,
-    );
+    ).unwrap();
     assert_eq!(proposal.hop_node_ids.first(), Some(&proposal.source));
     assert!(proposal.verify_at(now));
 }
@@ -649,7 +649,7 @@ fn attestation_attester_must_match_current_relay() {
     let attestation_from_x = LinkAttestation::create_and_sign(
         &x_sk, &x_pk, x_id, // attester = X
         relay_c_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
 
     // The mock discovery returns this X-signed attestation when B is queried.
     let mut candidates = HashMap::new();
@@ -691,7 +691,7 @@ fn forged_attestation_from_other_relay_rejected() {
     let forged_att = LinkAttestation::create_and_sign(
         &attacker_sk, &attacker_pk, attacker_id,
         relay_c_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
 
     let mut candidates = HashMap::new();
     candidates.insert(topo.relay_id, vec![NextHopCandidate {
@@ -737,7 +737,7 @@ fn route_commitment_changes_when_link_evidence_changes() {
     // evidence). The commitment must differ from the proposal hash.
     assert_ne!(
         commitment1,
-        proposal.proposal_hash(),
+        proposal.proposal_hash().unwrap(),
         "commitment must differ from proposal hash (it covers link evidence)"
     );
 
@@ -751,7 +751,7 @@ fn route_commitment_changes_when_acceptance_role_changes() {
     let topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
 
     // Acceptances with correct roles.
     let acc1 = build_acceptances(&topo, &proposal);
@@ -766,11 +766,11 @@ fn route_commitment_changes_when_acceptance_role_changes() {
         RouteAcceptance::create_and_sign(
             &topo.relay_sk, &topo.relay_pk, topo.relay_id,
             hash, RouteRole::Relay, vec!["condition-A".to_string()], now + 3600,
-        ),
+        ).unwrap(),
         RouteAcceptance::create_and_sign(
             &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
             hash, RouteRole::Gateway, vec![], now + 3600,
-        ),
+        ).unwrap(),
     ];
     let committed2 = commit_route(proposal, acc2, &path, now).unwrap();
     let commitment2 = *committed2.commitment();
@@ -788,27 +788,27 @@ fn route_commitment_changes_when_acceptance_conditions_change() {
     let topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
 
     let acc1 = vec![
         RouteAcceptance::create_and_sign(
             &topo.relay_sk, &topo.relay_pk, topo.relay_id,
             hash, RouteRole::Relay, vec!["max-bandwidth:5Mbps".to_string()], now + 3600,
-        ),
+        ).unwrap(),
         RouteAcceptance::create_and_sign(
             &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
             hash, RouteRole::Gateway, vec![], now + 3600,
-        ),
+        ).unwrap(),
     ];
     let acc2 = vec![
         RouteAcceptance::create_and_sign(
             &topo.relay_sk, &topo.relay_pk, topo.relay_id,
             hash, RouteRole::Relay, vec!["max-bandwidth:10Mbps".to_string()], now + 3600,
-        ),
+        ).unwrap(),
         RouteAcceptance::create_and_sign(
             &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
             hash, RouteRole::Gateway, vec![], now + 3600,
-        ),
+        ).unwrap(),
     ];
 
     let c1 = *commit_route(proposal.clone(), acc1, &path, now).unwrap().commitment();
@@ -838,11 +838,11 @@ fn first_candidate_invalid_second_candidate_succeeds() {
     let att_to_d = LinkAttestation::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         d_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
     let att_to_c = LinkAttestation::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         relay_c_id, "up".to_string(), now_unix() + 3600,
-    );
+    ).unwrap();
 
     let mut candidates = HashMap::new();
     candidates.insert(topo.relay_id, vec![
@@ -877,21 +877,21 @@ fn duplicate_acceptance_from_same_participant_rejected() {
     let topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
 
     // Relay signs TWO acceptances (with different conditions).
     let relay_acc1 = RouteAcceptance::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         hash, RouteRole::Relay, vec!["condition-A".to_string()], now + 3600,
-    );
+    ).unwrap();
     let relay_acc2 = RouteAcceptance::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         hash, RouteRole::Relay, vec!["condition-B".to_string()], now + 3600,
-    );
+    ).unwrap();
     let gateway_acc = RouteAcceptance::create_and_sign(
         &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
         hash, RouteRole::Gateway, vec![], now + 3600,
-    );
+    ).unwrap();
 
     // Both relay acceptances are valid signatures, but the second must be
     // rejected as a duplicate.
@@ -912,16 +912,16 @@ fn acceptance_order_does_not_change_commitment() {
     let topo = setup_test_topology();
     let (proposal, path) = build_proposal_and_path(&topo);
     let now = now_unix();
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
 
     let relay_acc = RouteAcceptance::create_and_sign(
         &topo.relay_sk, &topo.relay_pk, topo.relay_id,
         hash, RouteRole::Relay, vec![], now + 3600,
-    );
+    ).unwrap();
     let gateway_acc = RouteAcceptance::create_and_sign(
         &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
         hash, RouteRole::Gateway, vec![], now + 3600,
-    );
+    ).unwrap();
 
     // Order 1: [relay, gateway]
     let c1 = *commit_route(
@@ -971,16 +971,16 @@ fn commitment_includes_acceptance_public_key() {
     // different commitments (which they do because the keys are in the CBOR).
     // This is already covered by existing tests, but we assert it here for
     // completeness.
-    let hash = proposal.proposal_hash();
+    let hash = proposal.proposal_hash().unwrap();
     let acc_with_conditions = vec![
         RouteAcceptance::create_and_sign(
             &topo.relay_sk, &topo.relay_pk, topo.relay_id,
             hash, RouteRole::Relay, vec!["test".to_string()], now + 3600,
-        ),
+        ).unwrap(),
         RouteAcceptance::create_and_sign(
             &topo.gateway_sk, &topo.gateway_pk, topo.gateway_id,
             hash, RouteRole::Gateway, vec![], now + 3600,
-        ),
+        ).unwrap(),
     ];
     let c2 = *commit_route(proposal, acc_with_conditions, &path, now).unwrap().commitment();
     assert_ne!(c1, c2, "different conditions must change commitment");
@@ -1047,4 +1047,27 @@ fn commitment_is_not_hash_of_empty_bytes() {
         commitment, &empty_hash,
         "commitment must NOT be SHA-256(empty) — that would indicate unwrap_or_default fallback"
     );
+}
+
+// ─── P0: RouteProposal encoding fails closed ────────────────────────────────
+
+/// P0: The RouteSerializationError::CborEncodingFailed variant exists and is
+/// displayable. In practice, snp_cbor::encode on well-formed CborValue never
+/// fails, but the code path must fail-closed rather than unwrap_or_default().
+#[test]
+fn proposal_encoding_failure_fails_closed() {
+    let err = snp_node::node::RouteSerializationError::CborEncodingFailed;
+    let msg = format!("{err}");
+    assert!(msg.contains("CBOR") && msg.contains("encoding"), "got: {msg}");
+    assert_ne!(err, snp_node::node::RouteSerializationError::RandomnessFailure);
+}
+
+/// P0: The RouteSerializationError::RandomnessFailure variant exists and is
+/// displayable. The getrandom error is no longer discarded with `let _ =`.
+#[test]
+fn proposal_randomness_failure_fails_closed() {
+    let err = snp_node::node::RouteSerializationError::RandomnessFailure;
+    let msg = format!("{err}");
+    assert!(msg.contains("randomness") || msg.contains("random"), "got: {msg}");
+    assert_ne!(err, snp_node::node::RouteSerializationError::CborEncodingFailed);
 }
