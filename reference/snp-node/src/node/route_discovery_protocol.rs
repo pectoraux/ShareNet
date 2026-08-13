@@ -1810,6 +1810,36 @@ impl SignedResponseStep {
 /// **N2.1.3.2-fix.** The response to a `ForwardedQuery`, carrying the FULL
 /// accumulated discovery chain (not just one hop's advertisement).
 ///
+/// ## Trust model — N2.1.3.2-response-auth
+///
+/// `RecursiveRouteResponse` is an **unsigned transport envelope**. The
+/// fields on this struct are **derived/untrusted** — they are convenience
+/// data carried by the transport and MUST NOT independently establish
+/// security properties. The authority for the response chain comes from:
+///
+/// 1. **`SignedResponseStep` chain** — each step is individually signed by
+///    its responder, binding to the actual query hashes, destination state,
+///    hop budget, and next-hop identity. Chain coherence is verified
+///    (`step[i].sent_query_hash == step[i+1].received_query_hash`).
+/// 2. **Signed `RoutingAssertion`s** — each assertion is individually signed
+///    by its responder under `ROUTE_DISCOVERY_MSG_CONTEXT`.
+/// 3. **Authenticated `NodeAdvertisement`s** — each advertisement is
+///    independently verified via `verify_into_verified()`.
+/// 4. **Initial query binding** — the resolver verifies that
+///    `response_steps[0].received_query_hash` matches the actual
+///    `initial_query.compute_hash()`.
+///
+/// The unsigned envelope fields (`destination_node_id`,
+/// `destination_reached`, `not_found`, `remaining_hop_budget`,
+/// `query_chain`, ordering of `accumulated_assertions`/`accumulated_records`)
+/// are checked for consistency against the signed data in
+/// `DistributedRouteResolution::verify()`. If they disagree with the signed
+/// steps/assertions/advertisements, verification fails.
+///
+/// **Invariant:** No security decision should be made based on the unsigned
+/// envelope fields alone. Always go through `DistributedRouteResolution::verify()`
+/// (which checks the signed chain) before using the resolution result.
+///
 /// Each `ForwardingNode` that handles a `ForwardedQuery` either:
 /// - Returns a terminal response (it IS the destination, or it cannot
 ///   forward), OR
@@ -1831,33 +1861,44 @@ impl SignedResponseStep {
 ///   query messages exchanged. **N2.1.3.2-response-auth.**
 #[derive(Debug, Clone)]
 pub struct RecursiveRouteResponse {
-    /// The final destination's NodeId.
+    /// **Derived/untrusted.** The final destination's NodeId.
+    /// Verified against the signed response step chain + the initial query.
     pub destination_node_id: [u8; 32],
-    /// Whether the destination was reached.
+    /// **Derived/untrusted.** Whether the destination was reached.
+    /// Verified against the signed response step chain.
     pub destination_reached: bool,
-    /// The destination's advertisement (if reached). Verified independently
-    /// by the receiver before constructing `DistributedRouteResolution`.
+    /// **Authenticated (independently verified).** The destination's
+    /// advertisement (if reached). Verified independently by the receiver
+    /// via `verify_into_verified()` before constructing
+    /// `DistributedRouteResolution`.
     pub destination_advertisement: Option<NodeAdvertisement>,
-    /// Accumulated routing assertions from each forwarding hop.
-    /// Ordered from the first forwarder (B) to the last (the hop before G).
+    /// **Authenticated (individually signed).** Accumulated routing
+    /// assertions from each forwarding hop. Each assertion is signed by
+    /// its responder. Ordered from the first forwarder (B) to the last.
     pub accumulated_assertions: Vec<RoutingAssertion>,
-    /// Accumulated node records (next-hop advertisements from each hop).
-    /// Ordered from the first forwarder's next-hop to the destination.
-    /// Does NOT include A's direct neighbor — A adds that from its topology.
+    /// **Authenticated (individually verified).** Accumulated node records
+    /// (next-hop advertisements from each hop). Each record's advertisement
+    /// is verified via `verify_into_verified()`. Ordered from the first
+    /// forwarder's next-hop to the destination. Does NOT include A's direct
+    /// neighbor — A adds that from its topology.
     pub accumulated_records: Vec<AuthenticatedNodeRecord>,
-    /// The query chain (provenance). One `QueryStep` per query.
+    /// **Derived/untrusted.** The query chain (provenance). One `QueryStep`
+    /// per query. Verified against the signed response step chain
+    /// (`received_query_id` must match `query_chain[i].query_id`).
     pub query_chain: Vec<QueryStep>,
-    /// Remaining hop budget at the destination.
-    /// Equal to `initial_hop_budget - num_hops`.
+    /// **Derived/untrusted.** Remaining hop budget at the destination.
+    /// Verified against the signed response step chain + recomputed from
+    /// the resolution chain length.
     pub remaining_hop_budget: u8,
-    /// `true` if the destination wasn't reached (a forwarder returned
-    /// NotFound, or the hop budget was exhausted mid-chain).
+    /// **Derived/untrusted.** `true` if the destination wasn't reached.
+    /// Verified against the signed response step chain.
     pub not_found: bool,
-    /// **N2.1.3.2-response-auth.** Signed response steps from each
-    /// forwarding hop. One per `ForwardingNode` that handled a query.
-    /// Ordered from the first forwarder to the last. Each step is signed
-    /// by its responder, binding its contribution to the query it received
-    /// and (if forwarding) the child query it sent.
+    /// **Authenticated (individually signed + chain-coherent).** Signed
+    /// response steps from each forwarding hop. One per `ForwardingNode`
+    /// that handled a query. Ordered from the first forwarder to the last.
+    /// Each step is signed by its responder, binding its contribution to
+    /// the query it received and (if forwarding) the child query it sent.
+    /// **This is the authoritative response chain.**
     pub response_steps: Vec<SignedResponseStep>,
 }
 
