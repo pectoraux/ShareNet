@@ -120,6 +120,7 @@ pub mod peer_directory;
 pub mod topology;
 pub mod propagation_state;
 pub mod route_discovery;
+pub mod circuit_handshake;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -154,6 +155,10 @@ pub use route_discovery::{
     LinkAttestation, LinkEvidence, NextHopCandidate, NextHopDiscovery, RouteSerializationError,
     commit_route, discover_path, validate_path, assemble_progressive_path,
     ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS, ROUTE_MAX_LIFETIME_SECS,
+};
+pub use circuit_handshake::{
+    CircuitHandshake, ActiveCircuit, CircuitTeardown, CircuitError, HopForwardingState,
+    establish_circuit, CIRCUIT_MAX_LIFETIME_SECS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
