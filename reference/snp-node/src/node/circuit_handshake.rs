@@ -14,7 +14,7 @@
 //! ## CRITICAL: CommittedRoute ≠ Circuit
 //!
 //! A `CommittedRoute` is a **cryptographically consented route agreement**
-//! backed by validated evidence. It is NOT live forwarding state.
+//! backed by validated evidence. It is NOT source-side preparation.
 //!
 //! A `Circuit` is **live cryptographic execution state** — actual secure
 //! forwarding keys, per-hop state, and an active session bound to a specific
@@ -30,7 +30,7 @@
 //!         ↓
 //! Per-hop X25519 DH + HKDF key derivation
 //!         ↓
-//! CircuitState (live forwarding state)
+//! CircuitState (source-side preparation)
 //!         ↓
 //! Traffic (encrypted + authenticated per-hop)
 //!         ↓
@@ -75,7 +75,7 @@
 //!
 //! - Arbitrary TCP connection migration — spec §39 (N2.1.4+).
 //! - Route failure / recovery — spec §39 (N2.1.4).
-//! - Key rotation within a live circuit (N2.1.4+).
+//! - Key rotation within a circuit (N2.1.4+).
 //! - Actual traffic forwarding (the circuit provides the keys; the
 //!   transport layer uses them — that's N2.2+).
 
@@ -127,7 +127,7 @@ pub struct HopForwardingState {
 ///
 /// The handshake is the INITIATION message. It proves the source authorized
 /// this circuit and binds it to a specific committed route. The actual
-/// `CircuitState` (live forwarding state) is produced by `prepare_circuit_setup()`
+/// `CircuitState` (source-side preparation) is produced by `prepare_circuit_setup()`
 /// after verifying the handshake.
 ///
 /// ## Binding
@@ -276,11 +276,11 @@ impl CircuitHandshake {
     }
 }
 
-/// The live circuit state — actual secure forwarding state.
+/// Source-side cryptographic preparation artifact — NOT a live circuit.
 ///
 /// ## CRITICAL: CommittedRoute ≠ Circuit
 ///
-/// This is the LIVE execution state derived from a committed route. It
+/// This is the source-side cryptographic preparation derived from a committed route. It
 /// contains:
 /// - The circuit ID (replay prevention)
 /// - The binding to the committed route (commitment hash)
@@ -305,11 +305,12 @@ pub struct CircuitSetup {
     destination: [u8; 32],
     /// Per-hop forwarding state (ordered from source to destination).
     hops: Vec<HopForwardingState>,
-    /// When the circuit was established.
+    /// When the circuit setup was prepared.
     created_at: u64,
     /// When the circuit expires.
     expires_at: u64,
-    /// Whether the circuit is active (not torn down).
+    /// Whether the setup is valid (not torn down). LOCAL state only —
+    /// does NOT imply the circuit is active on any relay.
     active: bool,
 }
 
@@ -484,11 +485,11 @@ impl CircuitSetup {
     #[must_use] pub fn destination(&self) -> [u8; 32] { self.destination }
     /// Per-hop forwarding state.
     #[must_use] pub fn hops(&self) -> &[HopForwardingState] { &self.hops }
-    /// When the circuit was established.
+    /// When the circuit setup was prepared.
     #[must_use] pub fn created_at(&self) -> u64 { self.created_at }
     /// When the circuit expires.
     #[must_use] pub fn expires_at(&self) -> u64 { self.expires_at }
-    /// Is the circuit active?
+    /// Is the setup valid (not torn down)? LOCAL state only.
     #[must_use] pub fn is_active(&self) -> bool { self.active }
     /// Has the circuit expired?
     #[must_use] pub fn is_expired(&self, now: u64) -> bool { self.expires_at <= now }
@@ -499,7 +500,8 @@ impl CircuitSetup {
         self.hops.iter().find(|h| &h.node_id == node_id)
     }
 
-    /// Mark the circuit as torn down.
+    /// Mark the setup as torn down (local state only — does NOT tear down
+    /// any relay's forwarding state, since none is installed).
     pub fn teardown(&mut self) {
         self.active = false;
     }
