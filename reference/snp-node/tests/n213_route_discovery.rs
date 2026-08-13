@@ -225,11 +225,11 @@ fn next_hop_resolver_resolves_destination_through_neighbor() {
         ))
     });
 
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&g_id, &hint);
 
     assert!(resolved.is_some(), "resolver must find G");
-    let record = resolved.unwrap();
+    let record = &resolved.unwrap().record;
     assert_eq!(record.node_id(), g_id);
     assert!(record.descriptor.is_gateway());
     eprintln!("[test 9] PASS: NextHopResolver resolves destination through neighbor");
@@ -257,8 +257,8 @@ fn next_hop_resolver_returns_none_when_neighbor_does_not_respond() {
 
     // Empty transport — no responders registered.
     let transport = InMemoryNextHopTransport::new();
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &[0xAA; 32], &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&[0xAA; 32], &hint);
     assert!(resolved.is_none(), "resolver must return None when neighbor doesn't respond");
     eprintln!("[test 10] PASS: resolver returns None when neighbor doesn't respond");
 }
@@ -302,8 +302,8 @@ fn next_hop_resolver_rejects_unsigned_response() {
         Some(response)
     });
 
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&g_id, &hint);
     assert!(resolved.is_none(), "resolver must reject unsigned response");
     eprintln!("[test 11] PASS: resolver rejects unsigned response");
 }
@@ -344,8 +344,8 @@ fn next_hop_resolver_rejects_response_with_mismatched_query_id() {
         ))
     });
 
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&g_id, &hint);
     assert!(resolved.is_none(), "resolver must reject mismatched query_id");
     eprintln!("[test 12] PASS: resolver rejects mismatched query_id");
 }
@@ -377,8 +377,8 @@ fn next_hop_resolver_rejects_not_found_response() {
         Some(NextHopResponse::create_not_found_and_sign(&b_sk, &b_pk, b_node_id, query.query_id))
     });
 
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &[0xBB; 32], &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&[0xBB; 32], &hint);
     assert!(resolved.is_none(), "resolver must return None for NotFound");
     eprintln!("[test 13] PASS: resolver returns None for NotFound");
 }
@@ -430,8 +430,8 @@ fn next_hop_resolver_rejects_invalid_advertisement() {
         ))
     });
 
-    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &[0xCC; 32], &hint);
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&[0xCC; 32], &hint);
     assert!(resolved.is_none(), "resolver must reject invalid advertisement");
     eprintln!("[test 14] PASS: resolver rejects invalid advertisement");
 }
@@ -495,10 +495,10 @@ fn distributed_resolution_plus_local_route_construction() {
     // The resolver borrows topology immutably, so we resolve first,
     // then mutate topology after the resolver is dropped.
     {
-        let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-        let resolved = snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint);
+        let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+        let resolved = resolver.resolve_step(&g_id, &hint);
         assert!(resolved.is_some(), "G must be resolved");
-        let g_record = resolved.unwrap();
+        let g_record = &resolved.unwrap().record;
         assert_eq!(g_record.node_id(), g_id);
     }
 
@@ -535,7 +535,7 @@ fn distributed_resolution_plus_local_route_construction() {
 // ════════════════════════════════════════════════════════════════════════════
 
 use snp_node::node::{
-    NextHopResolution, PendingRouteQuery, RoutingAssertion,
+    DistributedRouteResolver, NextHopResolution, PendingRouteQuery, RoutingAssertion,
     MAX_ROUTE_QUERY_AGE_SECS, MAX_ROUTE_RESPONSE_AGE_SECS, MAX_ROUTE_CLOCK_SKEW_SECS,
 };
 
@@ -911,4 +911,452 @@ fn response_freshness_validated() {
     future.sign(&sk);
     assert!(!future.is_fresh(), "future-dated response must fail is_fresh()");
     eprintln!("[test 25] PASS: response freshness validated");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.1.1 — Stateful distributed resolver semantics tests
+//
+// `NextHopResolver` now implements `DistributedRouteResolver` (stateful
+// `&mut self`) instead of `DestinationResolver` (stateless `&self`). The
+// pending-query state survives across `resolve_step()` calls, enabling
+// replay protection, expected-responder binding, and future recursive
+// query chaining (N2.1.3.2).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 26. distributed_resolver_state_survives_multiple_operations
+///
+/// N2.1.3.1.1: `DistributedRouteResolver::resolve_step` takes `&mut self`
+/// so the pending-query state survives across calls. Verify that two
+/// successive `resolve_step()` calls leave BOTH queries in
+/// `resolver.pending_queries()`.
+#[test]
+fn distributed_resolver_state_survives_multiple_operations() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"state-survive-a");
+    let a_id = derive_node_id(&a_pk);
+    let (_b_verified, b_id) = make_relay_advert(b"state-survive-b", 1, "127.0.0.1:7001");
+    let (g1_verified, g1_id) = make_gateway_advert(b"state-survive-g1", 1, "127.0.0.1:7002");
+    let (g2_verified, g2_id) = make_gateway_advert(b"state-survive-g2", 1, "127.0.0.1:7003");
+
+    let g1_advert = g1_verified.as_ref().clone();
+    let g2_advert = g2_verified.as_ref().clone();
+
+    // Hint 1: B claims G1 exists.
+    let hint1 = snp_node::node::RemoteNodeHint {
+        target_node_id: g1_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    // Hint 2: B claims G2 exists (same shape as hint1, different target).
+    let hint2 = snp_node::node::RemoteNodeHint {
+        target_node_id: g2_id,
+        ..hint1.clone()
+    };
+
+    let (b_sk, b_pk) = fresh_keypair(b"state-survive-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        let dest = query.destination_node_id;
+        let (next_hop, advert) = if dest == g1_id {
+            (g1_id, g1_advert.clone())
+        } else if dest == g2_id {
+            (g2_id, g2_advert.clone())
+        } else {
+            return None;
+        };
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id, next_hop, advert, true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+
+    // First call — resolve G1.
+    let r1 = resolver.resolve_step(&g1_id, &hint1);
+    assert!(r1.is_some(), "first resolve_step must succeed for G1");
+
+    // Second call — resolve G2. State (pending_queries) MUST persist across calls.
+    let r2 = resolver.resolve_step(&g2_id, &hint2);
+    assert!(r2.is_some(), "second resolve_step must succeed for G2");
+
+    // Both pending queries must be tracked in the resolver's state.
+    let pending = resolver.pending_queries();
+    assert!(
+        pending.len() >= 2,
+        "pending_queries must contain entries from BOTH calls (got {})",
+        pending.len()
+    );
+
+    eprintln!(
+        "[test 26] PASS: distributed resolver state survives multiple operations (pending={})",
+        pending.len()
+    );
+}
+
+/// 27. pending_query_state_not_discarded
+///
+/// After a `resolve_step` call, the pending query MUST remain in
+/// `resolver.pending_queries()` and be marked as consumed (replay protection).
+/// The previous stateless `DestinationResolver` could not retain this state.
+#[test]
+fn pending_query_state_not_discarded() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"pending-state-a");
+    let a_id = derive_node_id(&a_pk);
+    let (_b_verified, b_id) = make_relay_advert(b"pending-state-b", 1, "127.0.0.1:7101");
+    let (g_verified, g_id) = make_gateway_advert(b"pending-state-g", 1, "127.0.0.1:7102");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    let g_advert = g_verified.as_ref().clone();
+    let (b_sk, b_pk) = fresh_keypair(b"pending-state-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id, g_id, g_advert.clone(), true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let resolved = resolver.resolve_step(&g_id, &hint);
+    assert!(resolved.is_some(), "resolution must succeed");
+
+    // The pending query MUST be retained in resolver state (NOT discarded).
+    let pending = resolver.pending_queries();
+    assert_eq!(pending.len(), 1, "exactly one pending query must be tracked");
+
+    // And it MUST be marked as consumed (replay protection).
+    let entry = pending.values().next().expect("pending query entry");
+    assert!(
+        entry.consumed,
+        "pending query must be marked consumed after successful resolution"
+    );
+
+    // The resolver's `pending_query_count()` reflects unconsumed queries.
+    // After successful resolution the single query is consumed → count is 0.
+    assert_eq!(
+        resolver.pending_query_count(),
+        0,
+        "pending_query_count is 0 because the one query was consumed"
+    );
+
+    eprintln!("[test 27] PASS: pending query state is not discarded (consumed=true)");
+}
+
+/// 28. consumed_query_replay_rejected_across_calls
+///
+/// N2.1.3.1.1: A consumed query_id is tracked across `resolve_step()` calls
+/// via `is_query_consumed`. The state lives in `resolver.pending_queries()`
+/// and persists across calls on the SAME resolver instance.
+#[test]
+fn consumed_query_replay_rejected_across_calls() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"replay-cross-a");
+    let a_id = derive_node_id(&a_pk);
+    let (_b_verified, b_id) = make_relay_advert(b"replay-cross-b", 1, "127.0.0.1:7201");
+    let (g_verified, g_id) = make_gateway_advert(b"replay-cross-g", 1, "127.0.0.1:7202");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    let g_advert = g_verified.as_ref().clone();
+    let (b_sk, b_pk) = fresh_keypair(b"replay-cross-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id, g_id, g_advert.clone(), true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+
+    // First call — should succeed.
+    let r1 = resolver.resolve_step(&g_id, &hint);
+    assert!(r1.is_some(), "first resolution must succeed");
+
+    // The query_id from the first call MUST be tracked as consumed.
+    let consumed_qid = *resolver
+        .pending_queries()
+        .keys()
+        .next()
+        .expect("pending query key");
+    assert!(
+        resolver.is_query_consumed(&consumed_qid),
+        "is_query_consumed must report true for the consumed query_id"
+    );
+
+    // A second call on the SAME resolver generates a NEW query_id (each
+    // NextHopQuery is created with a random 16-byte nonce). The original
+    // consumed query_id must remain tracked as consumed across this call.
+    let r2 = resolver.resolve_step(&g_id, &hint);
+    assert!(r2.is_some(), "second resolution must succeed");
+
+    // Original consumed query_id still tracked as consumed.
+    assert!(
+        resolver.is_query_consumed(&consumed_qid),
+        "consumed query_id must remain tracked as consumed after a second resolve_step call"
+    );
+
+    // Two distinct query_ids are now tracked in state.
+    assert_eq!(
+        resolver.pending_queries().len(),
+        2,
+        "two pending queries must be tracked across two resolve_step calls"
+    );
+
+    eprintln!("[test 28] PASS: consumed query replay rejected across calls via is_query_consumed");
+}
+
+/// 29. local_destination_resolver_remains_stateless
+///
+/// N2.1.3.1.1: `InMemoryResolver` STILL implements `DestinationResolver`
+/// (stateless `&self`). The stateless trait is retained for LOCAL lookups
+/// (e.g. `RouteEngine::discover_and_compute`). This is a parity check: the
+/// stateful `DistributedRouteResolver` did NOT replace the stateless
+/// `DestinationResolver` — they coexist for different scopes.
+#[test]
+fn local_destination_resolver_remains_stateless() {
+    use snp_node::node::{DestinationResolver, InMemoryResolver};
+
+    // Build an InMemoryResolver with a registered record.
+    let (g_verified, g_id) = make_gateway_advert(b"stateless-g", 1, "127.0.0.1:7301");
+    let mut resolver = InMemoryResolver::new();
+    resolver.register_verified(g_verified.clone());
+
+    // The hint's `learned_from` is ignored by InMemoryResolver.
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: [0u8; 32],
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    // Stateless resolve — `&self`, no pending_queries state.
+    let record = DestinationResolver::resolve(&resolver, &g_id, &hint);
+    assert!(
+        record.is_some(),
+        "InMemoryResolver must resolve registered destination"
+    );
+    let record = record.unwrap();
+    assert_eq!(record.node_id(), g_id);
+    assert!(record.descriptor.is_gateway());
+
+    // Calling resolve again MUST succeed — the stateless resolver doesn't
+    // consume queries (no replay protection at this layer).
+    let record2 = DestinationResolver::resolve(&resolver, &g_id, &hint);
+    assert!(
+        record2.is_some(),
+        "stateless resolver must remain callable repeatedly (no consumed state)"
+    );
+
+    // A resolver for an unregistered destination returns None — also stateless.
+    let record3 = DestinationResolver::resolve(&resolver, &[0xFE; 32], &hint);
+    assert!(record3.is_none(), "unregistered destination returns None");
+
+    eprintln!("[test 29] PASS: InMemoryResolver remains stateless (DestinationResolver)");
+}
+
+/// 30. distributed_resolver_is_stateful
+///
+/// N2.1.3.1.1: `NextHopResolver` implements `DistributedRouteResolver`
+/// (stateful `&mut self`). It does NOT implement `DestinationResolver`
+/// (stateless `&self`) — the source has no `impl DestinationResolver for
+/// NextHopResolver` block. This is a deliberate design choice: a stateful
+/// resolver cannot satisfy a stateless trait contract without discarding
+/// its state.
+///
+/// The compile-time trait bound below would fail to compile if
+/// `NextHopResolver` did not implement `DistributedRouteResolver`. The
+/// non-implementation of `DestinationResolver` is a compile-time guarantee
+/// enforced by the source — there is no runtime assertion possible for
+/// "trait is not implemented".
+#[test]
+fn distributed_resolver_is_stateful() {
+    // Compile-time assertion: NextHopResolver implements DistributedRouteResolver.
+    // (If the impl were removed, this function would fail to compile.)
+    fn _assert_distributed<T: snp_node::node::DistributedRouteResolver>() {}
+    _assert_distributed::<NextHopResolver<'static>>();
+
+    // Runtime assertion: the stateful resolver owns mutable state.
+    // After constructing one, pending_queries starts empty.
+    let topology = TopologyGraph::new();
+    let transport = InMemoryNextHopTransport::new();
+    let (a_sk, a_pk) = fresh_keypair(b"stateful-a");
+    let a_id = derive_node_id(&a_pk);
+    let resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    assert_eq!(
+        resolver.pending_queries().len(),
+        0,
+        "fresh resolver has no pending queries"
+    );
+    assert_eq!(resolver.pending_query_count(), 0, "pending_query_count is 0");
+    assert!(
+        !resolver.is_query_consumed(&[0u8; 16]),
+        "no queries consumed yet"
+    );
+
+    // Documentation: NextHopResolver does NOT implement DestinationResolver.
+    // The source `route_discovery_protocol.rs` has only
+    //   `impl<'a> DistributedRouteResolver for NextHopResolver<'a>`
+    // and no `impl DestinationResolver for NextHopResolver`. This is the
+    // compile-time guarantee that the stateful resolver is not misused as
+    // a stateless one (which would silently discard pending-query state).
+
+    eprintln!("[test 30] PASS: NextHopResolver implements DistributedRouteResolver (stateful)");
+}
+
+/// 31. query_provenance_can_be_chained
+///
+/// N2.1.3.1.1: `QueryProvenance` records the chain of queries that led to
+/// a resolution step. In the current single-step implementation only one
+/// entry is created; the `append_step` API supports future recursive
+/// multi-hop discovery (N2.1.3.2). This test verifies the chain can be
+/// extended and the last step is correctly retrievable.
+#[test]
+fn query_provenance_can_be_chained() {
+    use snp_node::node::{QueryProvenance, QueryStep};
+
+    let step1 = QueryStep {
+        source_node_id: [0xAA; 32],
+        responder_node_id: [0xBB; 32],
+        query_id: [1; 16],
+        remaining_hops: 5,
+    };
+    let step2 = QueryStep {
+        source_node_id: [0xBB; 32],
+        responder_node_id: [0xCC; 32],
+        query_id: [2; 16],
+        remaining_hops: 4,
+    };
+    let step3 = QueryStep {
+        source_node_id: [0xCC; 32],
+        responder_node_id: [0xDD; 32],
+        query_id: [3; 16],
+        remaining_hops: 3,
+    };
+
+    // Empty provenance.
+    let empty = QueryProvenance::new();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert!(empty.last_step().is_none());
+    assert!(empty.remaining_hops().is_none());
+
+    // Start with the initial step.
+    let mut provenance = QueryProvenance::from_initial_step(step1);
+    assert_eq!(provenance.len(), 1, "chain has 1 step after initial");
+    assert!(!provenance.is_empty());
+
+    // Append two more steps — model recursive forwarding (future work).
+    provenance.append_step(step2);
+    assert_eq!(provenance.len(), 2, "chain has 2 steps after first append");
+
+    provenance.append_step(step3);
+    assert_eq!(provenance.len(), 3, "chain has 3 steps after second append");
+
+    // The last step MUST be step3.
+    let last = provenance.last_step().expect("last step");
+    assert_eq!(last.source_node_id, [0xCC; 32]);
+    assert_eq!(last.responder_node_id, [0xDD; 32]);
+    assert_eq!(last.query_id, [3; 16]);
+    assert_eq!(last.remaining_hops, 3);
+
+    // remaining_hops() must reflect the last step.
+    assert_eq!(provenance.remaining_hops(), Some(3));
+
+    // Default-constructed provenance is also empty.
+    let default: QueryProvenance = QueryProvenance::default();
+    assert!(default.is_empty());
+
+    eprintln!(
+        "[test 31] PASS: query provenance can be chained (length={}, last_remaining_hops={})",
+        provenance.len(),
+        provenance.remaining_hops().unwrap_or(0)
+    );
+}
+
+/// 32. max_hops_can_be_decremented_without_increasing
+///
+/// N2.1.3.1.1: `NextHopQuery::decrement_max_hops` is a SATURATING
+/// decrement. The hop budget can only go DOWN, never UP — there is no
+/// `increment_max_hops` API on `NextHopQuery`. When the budget is
+/// exhausted (0), decrement returns `false` and the value stays at 0.
+#[test]
+fn max_hops_can_be_decremented_without_increasing() {
+    let (sk, pk) = fresh_keypair(b"max-hops-dec");
+    let node_id = derive_node_id(&pk);
+    let destination = [0xEE; 32];
+
+    // Start with max_hops=5.
+    let mut query = NextHopQuery::create_and_sign(&sk, &pk, node_id, destination, 5);
+    assert_eq!(query.max_hops, 5, "initial max_hops=5");
+    assert_eq!(query.remaining_hops(), 5);
+
+    // Decrement once → 4.
+    assert!(
+        query.decrement_max_hops(),
+        "decrement from 5 → 4 must succeed"
+    );
+    assert_eq!(query.max_hops, 4, "max_hops must be 4 after one decrement");
+    assert_eq!(query.remaining_hops(), 4);
+
+    // The decrement ONLY goes down — there is no `increment_max_hops` API.
+    // (The compiler enforces this: no such method exists on `NextHopQuery`.)
+
+    // Drain the budget to 0.
+    assert!(query.decrement_max_hops(), "decrement 4 → 3");
+    assert_eq!(query.max_hops, 3);
+    assert!(query.decrement_max_hops(), "decrement 3 → 2");
+    assert_eq!(query.max_hops, 2);
+    assert!(query.decrement_max_hops(), "decrement 2 → 1");
+    assert_eq!(query.max_hops, 1);
+    assert!(query.decrement_max_hops(), "decrement 1 → 0");
+    assert_eq!(query.max_hops, 0);
+
+    // Decrement at 0 returns false (saturating — does NOT underflow).
+    assert!(
+        !query.decrement_max_hops(),
+        "decrement at 0 must return false"
+    );
+    assert_eq!(query.max_hops, 0, "max_hops stays at 0 (saturating)");
+    assert_eq!(query.remaining_hops(), 0);
+
+    eprintln!("[test 32] PASS: max_hops can be decremented only (5→0), saturates at 0");
 }

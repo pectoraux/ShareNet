@@ -1,4 +1,4 @@
-//! N2.1.3 / N2.1.3.1 — Distributed Route Discovery Protocol Foundation.
+//! N2.1.3 / N2.1.3.1 / N2.1.3.1.1 — Distributed Route Discovery Protocol Foundation.
 //!
 //! **This module implements a SINGLE-STEP distributed next-hop
 //! query/response protocol foundation.** It does NOT yet implement
@@ -12,11 +12,23 @@
 //! - Expected-responder binding (response must come from the queried neighbor).
 //! - Replay protection (each query can only be consumed once).
 //! - Freshness validation (MAX_ROUTE_QUERY_AGE, MAX_ROUTE_RESPONSE_AGE).
-//! - `max_hops` validation (>0, reject invalid).
-//!- `RoutingAssertion` type — distinguishes "B claims C is next hop" from
+//! - `max_hops` validation (>0, reject invalid) + decrement semantics.
+//! - `RoutingAssertion` type — distinguishes "B claims C is next hop" from
 //!   "C is C" (identity proof).
-//! - `NextHopResolver` implementing `DestinationResolver` for single-step
-//!   resolution.
+//! - `DistributedRouteResolver` trait — stateful interface for distributed
+//!   protocol resolution (separate from the stateless `DestinationResolver`).
+//! - `QueryProvenance` — data structure for future recursive query chaining.
+//! - `NextHopResolver` implementing `DistributedRouteResolver` for
+//!   single-step resolution with persistent state.
+//!
+//! ## N2.1.3.1.1: Stateful composition
+//!
+//! The `DestinationResolver` trait is **stateless** (`&self`) and remains
+//! for LOCAL/pure lookup. The `DistributedRouteResolver` trait is
+//! **stateful** (`&mut self`) and owns `PendingRouteQuery` state across
+//! query/response exchanges. The `NextHopResolver` no longer implements
+//! `DestinationResolver` — callers must use `DistributedRouteResolver`
+//! for distributed resolution.
 //!
 //! ## What is NOT implemented
 //!
@@ -218,6 +230,134 @@ impl NextHopQuery {
             return false; // Too old.
         }
         true
+    }
+
+    /// **N2.1.3.1.1.** Get the remaining hop budget.
+    #[must_use]
+    pub fn remaining_hops(&self) -> u8 {
+        self.max_hops
+    }
+
+    /// **N2.1.3.1.1.** Decrement `max_hops` for forwarding.
+    ///
+    /// Returns `false` if the hop budget is exhausted (max_hops was 0).
+    /// The decrement is saturating — it cannot underflow.
+    ///
+    /// **This method does NOT re-sign the query.** The caller MUST call
+    /// `sign()` after mutation if the query will be re-transmitted.
+    /// (Future: for recursive forwarding, the forwarding node creates a
+    /// NEW query with a decremented max_hops and its own signature.)
+    ///
+    /// # Returns
+    /// - `true` if the hop budget was successfully decremented.
+    /// - `false` if the hop budget is exhausted.
+    pub fn decrement_max_hops(&mut self) -> bool {
+        if self.max_hops == 0 {
+            return false;
+        }
+        self.max_hops = self.max_hops.saturating_sub(1);
+        true
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// QueryProvenance (N2.1.3.1.1) — for future recursive query chaining
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.1.1.** Provenance for a route-discovery query — tracks the
+/// chain of queries that led to the current resolution step.
+///
+/// ## Purpose
+///
+/// In the current single-step implementation, `QueryProvenance` has a
+/// single entry (the initial query). In the future recursive
+/// implementation (N2.1.3.2), each forwarding step will append a new
+/// entry, creating a chain:
+///
+/// ```text
+/// QueryProvenance {
+///     chain: [
+///         QueryStep { source: A, responder: B, query_id: Q1 },
+///         QueryStep { source: B, responder: C, query_id: Q2 },
+///         QueryStep { source: C, responder: G, query_id: Q3 },
+///     ]
+/// }
+/// ```
+///
+/// Each step is bound to the preceding query context, preventing
+/// assertion injection attacks where a malicious node provides a
+/// response for a different query chain.
+///
+/// ## N2.1.3.1.1
+///
+/// This data structure exists to make the next milestone (recursive
+/// discovery) composable without redesigning the protocol state model.
+/// Recursive forwarding is NOT yet implemented.
+#[derive(Debug, Clone)]
+pub struct QueryProvenance {
+    /// The ordered chain of query steps.
+    pub chain: Vec<QueryStep>,
+}
+
+/// A single step in a query provenance chain.
+#[derive(Debug, Clone)]
+pub struct QueryStep {
+    /// The NodeId of the node that sent the query.
+    pub source_node_id: [u8; 32],
+    /// The NodeId of the node that was queried (expected responder).
+    pub responder_node_id: [u8; 32],
+    /// The query_id for this step.
+    pub query_id: [u8; 16],
+    /// The remaining max_hops at this step.
+    pub remaining_hops: u8,
+}
+
+impl QueryProvenance {
+    /// Create a new empty provenance chain.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { chain: Vec::new() }
+    }
+
+    /// Create a provenance with a single initial step.
+    #[must_use]
+    pub fn from_initial_step(step: QueryStep) -> Self {
+        Self { chain: vec![step] }
+    }
+
+    /// Append a new step to the provenance chain.
+    pub fn append_step(&mut self, step: QueryStep) {
+        self.chain.push(step);
+    }
+
+    /// Get the number of steps in the chain.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chain.len()
+    }
+
+    /// Check if the chain is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chain.is_empty()
+    }
+
+    /// Get the last step in the chain (the most recent query).
+    #[must_use]
+    pub fn last_step(&self) -> Option<&QueryStep> {
+        self.chain.last()
+    }
+
+    /// Get the remaining hop budget from the last step.
+    #[must_use]
+    pub fn remaining_hops(&self) -> Option<u8> {
+        self.chain.last().map(|s| s.remaining_hops)
+    }
+}
+
+impl Default for QueryProvenance {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -600,16 +740,83 @@ impl RoutingAssertion {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// DistributedRouteResolver trait (N2.1.3.1.1) — stateful distributed resolution
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.1.1.** A stateful trait for distributed route resolution.
+///
+/// Unlike `DestinationResolver` (which is stateless and used for LOCAL
+/// lookup), `DistributedRouteResolver` owns `PendingRouteQuery` state
+/// across query/response exchanges. This is essential for:
+///
+/// - **Replay protection:** Each query can only be consumed once.
+/// - **Expected-responder binding:** The response must come from the
+///   queried neighbor.
+/// - **Freshness:** Queries have bounded lifetimes.
+/// - **Future recursive chaining:** Query provenance must survive across
+///   multiple resolution steps.
+///
+/// ## Why not `DestinationResolver`?
+///
+/// `DestinationResolver` takes `&self` and returns
+/// `Option<AuthenticatedNodeRecord>`. It cannot own mutable state.
+/// The previous implementation worked around this by creating a temporary
+/// resolver per call — but that **discarded the pending-query state**,
+/// defeating the replay protection and responder binding.
+///
+/// `DistributedRouteResolver` takes `&mut self` and returns
+/// `Option<NextHopResolution>` (which includes the `RoutingAssertion`).
+/// The state survives across calls.
+///
+/// ## Composition
+///
+/// - **LOCAL ROUTE COMPUTATION** uses `DestinationResolver` (stateless).
+/// - **DISTRIBUTED ROUTE DISCOVERY** uses `DistributedRouteResolver` (stateful).
+///
+/// The two may be composed by a higher-level route-discovery orchestrator
+/// in a future milestone.
+pub trait DistributedRouteResolver {
+    /// Resolve a destination by querying a single next-hop peer.
+    ///
+    /// This is SINGLE-STEP resolution. Recursive multi-hop discovery
+    /// is a future milestone (N2.1.3.2).
+    ///
+    /// # Parameters
+    /// - `destination`: The NodeId to resolve.
+    /// - `hint`: The `RemoteNodeHint` that triggered the resolution.
+    ///
+    /// # Returns
+    /// - `Some(NextHopResolution)` if a valid response was received and
+    ///   the advertisement verified.
+    /// - `None` if resolution failed.
+    fn resolve_step(
+        &mut self,
+        destination: &[u8; 32],
+        hint: &RemoteNodeHint,
+    ) -> Option<NextHopResolution>;
+
+    /// Get the number of pending (unconsumed) queries.
+    fn pending_query_count(&self) -> usize;
+
+    /// Check if a specific query_id has been consumed.
+    fn is_query_consumed(&self, query_id: &[u8; 16]) -> bool;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // NextHopResolver — single-step distributed destination resolution
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A `DestinationResolver` that resolves remote destinations by querying
+/// A `DistributedRouteResolver` that resolves remote destinations by querying
 /// a single authenticated next-hop peer using the `NextHopQuery`/
 /// `NextHopResponse` protocol.
 ///
 /// **N2.1.3.1:** This resolver performs SINGLE-STEP resolution only.
 /// It does NOT recursively query the next hop. Recursive multi-hop
 /// discovery is a future milestone (N2.1.3.2).
+///
+/// **N2.1.3.1.1:** This resolver implements `DistributedRouteResolver`
+/// (NOT `DestinationResolver`). The state (`pending_queries`) survives
+/// across `resolve_step()` calls. Callers must use `&mut self`.
 ///
 /// ## How it works (single-step)
 ///
@@ -626,7 +833,7 @@ impl RoutingAssertion {
 ///    - Pending query not expired, not consumed.
 /// 7. It marks the pending query as consumed (replay protection).
 /// 8. It verifies the advertisement via `verify_into_verified()`.
-/// 9. It returns the `AuthenticatedNodeRecord` + `RoutingAssertion`.
+/// 9. It returns the `NextHopResolution` (assertion + record).
 ///
 /// ## Security
 ///
@@ -635,6 +842,7 @@ impl RoutingAssertion {
 /// - Freshness: query and response have bounded age.
 /// - max_hops validation: must be > 0.
 /// - Advertisement verified independently.
+/// - **State persists across calls** (N2.1.3.1.1).
 pub struct NextHopResolver<'a> {
     /// The local topology (for finding authenticated neighbors to query).
     topology: &'a TopologyGraph,
@@ -647,6 +855,7 @@ pub struct NextHopResolver<'a> {
     /// The local node's NodeId.
     local_node_id: [u8; 32],
     /// Pending queries (query_id → PendingRouteQuery). Provides replay protection.
+    /// **N2.1.3.1.1:** This state PERSISTS across resolve_step() calls.
     pending_queries: HashMap<[u8; 16], PendingRouteQuery>,
 }
 
@@ -691,23 +900,15 @@ impl<'a> NextHopResolver<'a> {
         }
     }
 
-    /// Resolve a destination by querying a single next-hop peer.
-    ///
-    /// **N2.1.3.1:** This is SINGLE-STEP resolution. It does NOT recursively
-    /// query the next hop. If the responder returns an intermediate next hop
-    /// (not the destination), the resolution returns that next hop's record,
-    /// but does NOT continue querying it. Recursive multi-hop discovery is
-    /// a future milestone (N2.1.3.2).
-    ///
-    /// # Parameters
-    /// - `destination`: The NodeId to resolve.
-    /// - `hint`: The `RemoteNodeHint` that triggered the resolution.
-    ///
-    /// # Returns
-    /// - `Some(NextHopResolution)` if a valid response was received and
-    ///   the advertisement verified.
-    /// - `None` if resolution failed.
-    pub fn resolve_step(
+    /// Get a reference to the pending queries map.
+    #[must_use]
+    pub fn pending_queries(&self) -> &HashMap<[u8; 16], PendingRouteQuery> {
+        &self.pending_queries
+    }
+}
+
+impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
+    fn resolve_step(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
@@ -725,6 +926,7 @@ impl<'a> NextHopResolver<'a> {
         );
 
         // Step 3: Create pending query state (replay protection + responder binding).
+        // N2.1.3.1.1: This state PERSISTS in self.pending_queries across calls.
         let pending = PendingRouteQuery::new(&query, expected_responder);
         self.pending_queries.insert(query.query_id, pending);
 
@@ -776,26 +978,13 @@ impl<'a> NextHopResolver<'a> {
             NextHopResult::NotFound => None,
         }
     }
-}
 
-impl<'a> DestinationResolver for NextHopResolver<'a> {
-    fn resolve(
-        &self,
-        destination: &[u8; 32],
-        hint: &RemoteNodeHint,
-    ) -> Option<AuthenticatedNodeRecord> {
-        // The DestinationResolver trait requires &self, but our stateful
-        // resolver needs &mut self for pending_queries. We create a
-        // temporary clone of the resolver's state for this call.
-        // (In production, the caller should use resolve_step() directly.)
-        let mut resolver = NextHopResolver::new(
-            self.topology,
-            self.transport,
-            self.local_ed25519_secret,
-            self.local_ed25519_public,
-            self.local_node_id,
-        );
-        resolver.resolve_step(destination, hint).map(|r| r.record)
+    fn pending_query_count(&self) -> usize {
+        self.pending_queries.values().filter(|p| !p.consumed).count()
+    }
+
+    fn is_query_consumed(&self, query_id: &[u8; 16]) -> bool {
+        self.pending_queries.get(query_id).map_or(false, |p| p.consumed)
     }
 }
 

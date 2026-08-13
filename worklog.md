@@ -4706,3 +4706,177 @@ Stage Summary:
   > identity/location confusion where a handshake over endpoint A is
   > claimed to authorize a link over endpoint B."
 - Ready for the next task.
+
+---
+Task ID: 7 (test update for N2.1.3.1.1 — stateful composition)
+Agent: Z.ai (sub-agent — test update for stateful DistributedRouteResolver)
+
+Task: Update the n213_route_discovery.rs integration tests for the
+N2.1.3.1.1 stateful composition milestone. `NextHopResolver` no longer
+implements `DestinationResolver` (stateless `&self`); it implements
+`DistributedRouteResolver` (stateful `&mut self`). The old call pattern
+`snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint)`
+must become `resolver.resolve_step(&g_id, &hint)`. The result type
+changed from `Option<AuthenticatedNodeRecord>` to
+`Option<NextHopResolution>`; the record is accessed via
+`resolution.record`.
+
+Work Log:
+
+- **Constraint respected:** Do NOT modify any source files in `src/`.
+  Only the test file `tests/n213_route_discovery.rs` was modified. No
+  Cargo.toml changes were needed.
+
+- **Import added:** Added `DistributedRouteResolver` to the existing
+  `use snp_node::node::{...}` block at line 537-540. This trait must be
+  in scope for ALL calls to `resolver.resolve_step(...)` because
+  `resolve_step` is a trait method (not an inherent method on
+  `NextHopResolver`). Without this import, 12 calls across tests 9-22
+  fail to compile with `method not found`.
+
+- **Tests 9-14 (existing, all 6 migrated to stateful API):**
+  * Changed `let resolver = NextHopResolver::new(...)` →
+    `let mut resolver = NextHopResolver::new(...)` (required because
+    `resolve_step` takes `&mut self`).
+  * Changed
+    `snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint)`
+    → `resolver.resolve_step(&g_id, &hint)` (calls the method directly
+    rather than via the removed `DestinationResolver` trait).
+  * Tests 10, 11, 12, 13, 14 only check `resolved.is_none()` — no
+    further change needed.
+  * Test 9 accesses the returned record: changed
+    `let record = resolved.unwrap();` →
+    `let record = &resolved.unwrap().record;` (since `resolve_step`
+    returns `NextHopResolution`, not `AuthenticatedNodeRecord`). The
+    subsequent `record.node_id()` and `record.descriptor.is_gateway()`
+    calls work because `record` is now a `&AuthenticatedNodeRecord`
+    borrowed from the `NextHopResolution`.
+
+- **Test 15 (integration test, scope block):**
+  * Changed `let resolver = ...` → `let mut resolver = ...` inside the
+    scope block.
+  * Changed
+    `snp_node::node::DestinationResolver::resolve(&resolver, &g_id, &hint)`
+    → `resolver.resolve_step(&g_id, &hint)`.
+  * Changed `let g_record = resolved.unwrap();` →
+    `let g_record = &resolved.unwrap().record;` (same record-access
+    pattern as test 9).
+  * The subsequent `assert_eq!(g_record.node_id(), g_id);` works
+    unchanged because `&AuthenticatedNodeRecord` still exposes
+    `node_id()`.
+
+- **Tests 16-22 (pre-existing N2.1.3.1 tests):** UNCHANGED in their
+  bodies — they already used `resolver.resolve_step(...)` directly.
+  However, they would not have compiled without my new
+  `DistributedRouteResolver` import. The single import addition
+  retroactively fixes all 12 `resolve_step` call sites (tests 9-22).
+
+- **7 NEW tests appended at the end of the file (numbered 26-32):**
+  * 26. `distributed_resolver_state_survives_multiple_operations` — Two
+    successive `resolve_step()` calls (resolving G1 and G2) on the SAME
+    resolver instance. The transport responder dispatches on
+    `query.destination_node_id`. After both calls,
+    `resolver.pending_queries().len() >= 2` — proving the state survives
+    across calls (the old stateless `DestinationResolver` could not have
+    retained this).
+  * 27. `pending_query_state_not_discarded` — One `resolve_step()` call,
+    then verifies: (a) `pending_queries().len() == 1` (entry retained),
+    (b) `entry.consumed == true` (replay protection engaged), (c)
+    `pending_query_count() == 0` (because the single query was
+    consumed). The `pending_query_count()` method returns the count of
+    UNCONSUMED pending queries.
+  * 28. `consumed_query_replay_rejected_across_calls` — First call
+    resolves G and consumes query_id `q1`. Verifies
+    `is_query_consumed(&q1) == true`. Second call on the SAME resolver
+    generates a new query_id `q2` (because `NextHopQuery::create_and_sign`
+    uses `getrandom` for the 16-byte nonce). Verifies `q1` is STILL
+    tracked as consumed after the second call, and that
+    `pending_queries().len() == 2` (both q1 and q2 retained in state).
+    This proves cross-call replay protection on a single resolver.
+  * 29. `local_destination_resolver_remains_stateless` — Imports
+    `InMemoryResolver` and `DestinationResolver` locally. Creates an
+    `InMemoryResolver`, registers a verified gateway advertisement.
+    Calls `DestinationResolver::resolve(&resolver, &g_id, &hint)` — the
+    stateless path still works. Verifies the returned record has the
+    correct `node_id()` and `descriptor.is_gateway()`. Calls resolve
+    AGAIN — succeeds (no consumed state, no replay protection at this
+    layer). A third call for an unregistered destination returns `None`.
+    This is the parity check: the stateful
+    `DistributedRouteResolver` did NOT replace the stateless
+    `DestinationResolver`; they coexist for different scopes.
+  * 30. `distributed_resolver_is_stateful` — Compile-time trait-bound
+    assertion: declares
+    `fn _assert_distributed<T: snp_node::node::DistributedRouteResolver>() {}`
+    and calls `_assert_distributed::<NextHopResolver<'static>>()` —
+    this compiles only because `NextHopResolver` implements
+    `DistributedRouteResolver` (impl exists for any `'a`, including
+    `'static`). Runtime portion: constructs a fresh resolver and verifies
+    `pending_queries().len() == 0`, `pending_query_count() == 0`, and
+    `is_query_consumed(&[0u8;16]) == false`. The non-implementation of
+    `DestinationResolver` for `NextHopResolver` is documented as a
+    compile-time guarantee enforced by the source (no runtime assertion
+    possible for "trait not implemented").
+  * 31. `query_provenance_can_be_chained` — Imports `QueryProvenance`
+    and `QueryStep`. Builds 3 `QueryStep` values modelling an A→B→C→G
+    recursive chain. Starts with `QueryProvenance::from_initial_step`
+    (length 1), appends 2 more steps via `append_step` (length 3).
+    Verifies `last_step()` returns step3 with the correct
+    `source_node_id`, `responder_node_id`, `query_id`, and
+    `remaining_hops`. Verifies `remaining_hops() == Some(3)` (reflects
+    the last step). Verifies `QueryProvenance::new()` and
+    `QueryProvenance::default()` both produce empty chains
+    (`is_empty()`, `len() == 0`, `last_step() == None`,
+    `remaining_hops() == None`). Models the future recursive multi-hop
+    discovery (N2.1.3.2) data shape.
+  * 32. `max_hops_can_be_decremented_without_increasing` — Creates a
+    `NextHopQuery` with `max_hops=5`. Calls `decrement_max_hops()` once,
+    verifies `max_hops == 4`. Documents that there is no
+    `increment_max_hops` API (compile-time guarantee — the compiler
+    enforces that no such method exists on `NextHopQuery`). Drains the
+    budget from 5→0 via successive `decrement_max_hops()` calls (each
+    returns `true`). At 0, `decrement_max_hops()` returns `false` and
+    `max_hops` stays at 0 (saturating — does NOT underflow). Verifies
+    `remaining_hops() == 0` at exhaustion.
+
+- **Production build check:** `cargo build -p snp-node` (without
+  `test-support`) still compiles cleanly. No `src/` files were modified.
+
+Test results:
+- `cargo test -p snp-node --test n213_route_discovery`:
+  - 32 passed, 0 failed, 0 ignored (was 25; +7 new)
+- `cargo test -p snp-node` (full suite):
+  - 286 passed across 22 test binaries, 0 failed, 3 ignored
+- Production build (`cargo build -p snp-node`, no `test-support`):
+  compiles cleanly (only pre-existing warnings).
+
+Stage Summary:
+- The n213 test file now uses the stateful `DistributedRouteResolver`
+  API exclusively for distributed resolution. All 7 occurrences of
+  `snp_node::node::DestinationResolver::resolve(&resolver, ...)` have
+  been replaced with `resolver.resolve_step(...)` (tests 9-15) or were
+  already using `resolve_step` (tests 16-22).
+- The 5 occurrences of `let resolver = NextHopResolver::new(...)` in
+  tests 9-15 were made `let mut resolver = ...` to satisfy
+  `&mut self`.
+- The 2 occurrences that accessed the returned record directly (tests 9
+  and 15) were changed to access `&resolved.unwrap().record` (since
+  `resolve_step` returns `NextHopResolution`, not
+  `AuthenticatedNodeRecord`).
+- The 7 new tests cover:
+  * State persistence across `resolve_step()` calls (test 26).
+  * Pending-query retention + consumed-state marking (test 27).
+  * Cross-call replay tracking via `is_query_consumed` (test 28).
+  * Statelessness parity: `InMemoryResolver` still implements
+    `DestinationResolver` (test 29).
+  * Compile-time trait-bound assertion: `NextHopResolver` implements
+    `DistributedRouteResolver` (test 30).
+  * `QueryProvenance` chain construction with `append_step` (test 31).
+  * Saturating `decrement_max_hops` semantics with no inverse API
+    (test 32).
+- The security invariant holds:
+  > "Distributed route resolution is now stateful — pending queries are
+  > retained across `resolve_step()` calls, enabling replay protection,
+  > expected-responder binding, and a foundation for future recursive
+  > query chaining (N2.1.3.2). The stateless `DestinationResolver`
+  > remains for LOCAL/pure lookups and is unchanged."
+- Ready for the next task.
