@@ -514,6 +514,11 @@ pub enum DistributedCircuitError {
     /// authorization_root. This means the relay received an authorization
     /// that is not part of the source-committed authorization set.
     AuthorizationNotInRoot { relay_node_id: [u8; 32] },
+    /// P1: the authorization hash set has the wrong cardinality (does not
+    /// match the number of non-source hops in the committed route).
+    AuthorizationSetCardinalityMismatch { expected: usize, actual: usize },
+    /// P1: the authorization hash set contains duplicate entries.
+    DuplicateAuthorizationHash { hash: [u8; 32] },
 }
 
 impl std::fmt::Display for DistributedCircuitError {
@@ -531,6 +536,8 @@ impl std::fmt::Display for DistributedCircuitError {
             Self::InconsistentInputs => write!(f, "inconsistent inputs: setup, handshake, and route do not describe the same circuit"),
             Self::AuthorizationHashMismatch { relay_node_id } => write!(f, "relay {} authorization hash mismatch — relay processed a different authorization than the source sent", hex_short(relay_node_id)),
             Self::AuthorizationNotInRoot { relay_node_id } => write!(f, "relay {} authorization not in handshake's authorization_root — split-view attack or wrong authorization", hex_short(relay_node_id)),
+            Self::AuthorizationSetCardinalityMismatch { expected, actual } => write!(f, "authorization hash set cardinality mismatch: expected {expected}, got {actual}"),
+            Self::DuplicateAuthorizationHash { hash } => write!(f, "duplicate authorization hash: {}", hex_short(hash)),
         }
     }
 }
@@ -654,11 +661,28 @@ pub fn establish_distributed_circuit(
     // P0: compute all authorization hashes for the membership proof.
     // Each relay receives the full set so it can verify its authorization
     // is in the set committed by handshake.authorization_root.
-    let all_auth_hashes: Vec<[u8; 32]> = authorizations.iter().map(|a| {
+    // P0: fail-closed on CBOR encoding failure — NO expect(), NO panic.
+    let mut all_auth_hashes: Vec<[u8; 32]> = Vec::with_capacity(authorizations.len());
+    for a in &authorizations {
         let preimage = a.canonical_preimage_bytes()
-            .expect("CBOR encoding must not fail for well-formed authorizations");
-        sha256(&preimage)
-    }).collect();
+            .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
+        all_auth_hashes.push(sha256(&preimage));
+    }
+
+    // P1: validate authorization hash set cardinality + uniqueness.
+    let expected_count = route.validated_hops().len().saturating_sub(1); // non-source hops
+    if all_auth_hashes.len() != expected_count {
+        return Err(DistributedCircuitError::AuthorizationSetCardinalityMismatch {
+            expected: expected_count,
+            actual: all_auth_hashes.len(),
+        });
+    }
+    let mut seen_hashes = std::collections::HashSet::new();
+    for h in &all_auth_hashes {
+        if !seen_hashes.insert(*h) {
+            return Err(DistributedCircuitError::DuplicateAuthorizationHash { hash: *h });
+        }
+    }
 
     for auth in &authorizations {
         // Construct the request — send the ACTUAL CircuitHandshake + the
@@ -999,12 +1023,22 @@ pub fn accept_relay_handshake(
     //     The relay verifies:
     //     1. SHA-256(authorization.canonical_preimage_bytes()) is in the set.
     //     2. SHA-256(concat(all hashes)) == handshake.authorization_root.
+    //     3. P1: No duplicate hashes in the set.
     //     This prevents split-view attacks where an intermediary substitutes
     //     a different validly-signed authorization for the same relay/circuit.
     //     The relay rejects BEFORE installing forwarding state.
     let auth_preimage = auth.canonical_preimage_bytes()
         .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
     let auth_hash = sha256(&auth_preimage);
+
+    // P1: check for duplicate authorization hashes.
+    let mut seen_hashes = std::collections::HashSet::new();
+    for h in &request.authorization_hashes {
+        if !seen_hashes.insert(*h) {
+            return Err(DistributedCircuitError::DuplicateAuthorizationHash { hash: *h });
+        }
+    }
+
     let in_set = request.authorization_hashes.iter().any(|h| h == &auth_hash);
     if !in_set {
         return Err(DistributedCircuitError::AuthorizationNotInRoot {

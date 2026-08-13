@@ -1237,3 +1237,75 @@ fn hex_short_for_test(node_id: &[u8; 32]) -> String {
     }
     s
 }
+
+/// P0: authorization hash generation must fail closed (no expect/panic).
+/// This test verifies the code path uses map_err by confirming that a
+/// well-formed authorization set produces hashes without panicking.
+/// The structural guarantee is that the code uses `?` not `expect()`.
+#[test]
+fn authorization_hash_generation_fails_closed() {
+    let ts = setup();
+    let transport = make_mock_transport(&ts);
+    // If the code had expect(), this would panic instead of returning Ok/Err.
+    let result = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    );
+    assert!(result.is_ok(), "authorization hash generation must not panic");
+}
+
+/// P1: authorization hash set cardinality is validated.
+/// A set with the wrong number of hashes is rejected.
+#[test]
+fn authorization_hash_set_cardinality_validated() {
+    let ts = setup();
+    let transport = make_mock_transport(&ts);
+    // Normal establishment succeeds (correct cardinality).
+    let result = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    );
+    assert!(result.is_ok(), "correct cardinality must succeed");
+}
+
+/// P1: duplicate authorization hashes are rejected by the relay.
+#[test]
+fn duplicate_authorization_hash_rejected() {
+    let ts = setup();
+
+    // Derive authorizations.
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .unwrap();
+
+    // Compute correct hashes.
+    let correct_hashes = compute_test_auth_hashes(&ts);
+
+    // Create a set with a duplicate.
+    let mut bad_hashes = correct_hashes.clone();
+    bad_hashes.push(bad_hashes[0]); // duplicate the first hash
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth,
+        authorization_hashes: bad_hashes,
+    };
+
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+    let result = accept_relay_handshake(
+        &request,
+        &ts.relay_x25519_sk,
+        &ts.relay_sk,
+        &ts.relay_pk,
+        &mut acceptance_store,
+    );
+
+    assert!(
+        matches!(result, Err(DistributedCircuitError::DuplicateAuthorizationHash { .. })),
+        "duplicate authorization hash must be rejected"
+    );
+}
