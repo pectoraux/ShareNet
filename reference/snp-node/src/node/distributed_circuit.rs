@@ -1031,6 +1031,24 @@ pub fn accept_relay_handshake(
         .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
     let auth_hash = sha256(&auth_preimage);
 
+    // P1: verify the authorization hash set size matches the signed count.
+    // The handshake's authorization_count is signed by the source, giving
+    // the relay an authenticated bound without needing the CommittedRoute.
+    // This prevents resource-exhaustion via oversized hash lists.
+    let max_hops = crate::node::route_discovery::ROUTE_MAX_HOPS;
+    if handshake.authorization_count as usize > max_hops.saturating_sub(1) {
+        return Err(DistributedCircuitError::AuthorizationSetCardinalityMismatch {
+            expected: max_hops - 1,
+            actual: handshake.authorization_count as usize,
+        });
+    }
+    if request.authorization_hashes.len() != handshake.authorization_count as usize {
+        return Err(DistributedCircuitError::AuthorizationSetCardinalityMismatch {
+            expected: handshake.authorization_count as usize,
+            actual: request.authorization_hashes.len(),
+        });
+    }
+
     // P1: check for duplicate authorization hashes.
     let mut seen_hashes = std::collections::HashSet::new();
     for h in &request.authorization_hashes {

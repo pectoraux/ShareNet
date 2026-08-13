@@ -137,6 +137,10 @@ fn handshake_preimage_bytes(h: &CircuitHandshake) -> Vec<u8> {
             CborValue::ByteString(h.authorization_root.to_vec()),
         ),
         (
+            CborValue::TextString("authorizationCount".into()),
+            CborValue::UnsignedInt(u64::from(h.authorization_count)),
+        ),
+        (
             CborValue::TextString("timestamp".into()),
             CborValue::UnsignedInt(h.timestamp),
         ),
@@ -315,6 +319,7 @@ fn fresh_handshake(ts: &TestSetup) -> (snp_crypto::X25519Secret, CircuitHandshak
         &ts.source_pk,
         &eph_sk,
         [0u8; 32],
+        0,
     )
     .expect("handshake");
     (eph_sk, handshake)
@@ -587,7 +592,7 @@ fn stale_route_rejected() {
     // expiry is clamped to route.expiry, so it is ALSO stale.
     let (eph_sk, handshake) = {
         let (e, _p) = x25519_ephemeral_keypair();
-        let h = CircuitHandshake::create_and_sign(&short_route, &ts.source_sk, &ts.source_pk, &e, [0u8; 32])
+        let h = CircuitHandshake::create_and_sign(&short_route, &ts.source_sk, &ts.source_pk, &e, [0u8; 32], 0)
             .expect("handshake");
         (e, h)
     };
@@ -812,7 +817,7 @@ fn intermediate_relay_missing_circuit_key_rejected() {
     // check passes (we want to reach the HopMissingCircuitKey check).
     let (eph_sk, _eph_pk) = x25519_ephemeral_keypair();
     let handshake =
-        CircuitHandshake::create_and_sign(&committed, &source_sk, &source_pk, &eph_sk, [0u8; 32])
+        CircuitHandshake::create_and_sign(&committed, &source_sk, &source_pk, &eph_sk, [0u8; 32], 0)
             .expect("handshake");
 
     let err = prepare_circuit_setup(&committed, &handshake, &eph_sk)
@@ -1010,7 +1015,7 @@ fn relay_derives_same_forwarding_key() {
     // for both create_and_sign and prepare_circuit_setup.
     let (eph_sk, _eph_pk) = x25519_ephemeral_keypair();
     let handshake =
-        CircuitHandshake::create_and_sign(&committed, &source_sk, &source_pk, &eph_sk, [0u8; 32])
+        CircuitHandshake::create_and_sign(&committed, &source_sk, &source_pk, &eph_sk, [0u8; 32], 0)
             .expect("handshake");
     let circuit = prepare_circuit_setup(&committed, &handshake, &eph_sk).expect("circuit");
 

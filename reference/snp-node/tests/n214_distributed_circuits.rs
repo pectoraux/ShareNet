@@ -204,54 +204,23 @@ fn setup() -> TestSetup {
     let committed_route = commit_route(proposal, vec![relay_acc, gateway_acc], &validated_path, now).unwrap();
 
     let (ephemeral_secret, _) = x25519_ephemeral_keypair();
-    // Compute the authorization_root from the committed route + a temporary
-    // circuit_id. The root commits to the EXACT authorization objects.
-    // We generate the circuit_id first, compute the root, then create the
-    // handshake with the same circuit_id + root.
-    let mut temp_circuit_id = [0u8; 32];
-    getrandom::getrandom(&mut temp_circuit_id).unwrap();
-    let (authorization_root, _) = snp_node::node::compute_authorization_root(
-        &committed_route,
-        temp_circuit_id,
-        *committed_route.commitment(),
-        &source_sk,
-    ).unwrap();
+    // Create the handshake first (with a dummy root), then compute the
+    // actual root using the handshake's circuit_id, and re-sign.
+    let auth_count = (committed_route.validated_hops().len() - 1) as u8;
     let circuit_handshake = CircuitHandshake::create_and_sign(
         &committed_route, &source_sk, &source_pk, &ephemeral_secret,
-        authorization_root,
+        [0u8; 32], auth_count,
     ).unwrap();
-    // Override circuit_id to match what we used for the root computation.
-    // This is necessary because create_and_sign generates its own random circuit_id.
-    // In production, a wrapper function would handle this coordination.
-    // For tests, we just re-derive with the actual circuit_id.
-    let (authorization_root2, _) = snp_node::node::compute_authorization_root(
-        &committed_route,
-        circuit_handshake.circuit_id,
-        *committed_route.commitment(),
-        &source_sk,
-    ).unwrap();
-    // Re-create the handshake with the correct root.
-    let circuit_handshake = CircuitHandshake::create_and_sign(
-        &committed_route, &source_sk, &source_pk, &ephemeral_secret,
-        authorization_root2,
-    ).unwrap();
-    // But now the circuit_id changed again... We need a different approach.
-    // The cleanest fix: make CircuitHandshake::create_and_sign take the
-    // circuit_id as a parameter, OR compute the root AFTER create_and_sign
-    // and then re-sign.
-    //
-    // Actually the simplest approach for the test: just compute the root
-    // using the handshake's actual circuit_id AFTER creation.
+    // Compute the actual root using the handshake's circuit_id.
     let (final_root, _) = snp_node::node::compute_authorization_root(
         &committed_route,
         circuit_handshake.circuit_id,
         circuit_handshake.commitment_hash,
         &source_sk,
     ).unwrap();
-    // Create a handshake with the correct root.
+    // Update the root and re-sign.
     let mut circuit_handshake = circuit_handshake;
     circuit_handshake.authorization_root = final_root;
-    // Re-sign since we changed a field.
     let preimage = circuit_handshake.preimage_bytes().unwrap();
     circuit_handshake.source_signature = snp_crypto::ed25519_sign(&source_sk, &preimage);
     let circuit_setup = prepare_circuit_setup(&committed_route, &circuit_handshake, &ephemeral_secret).unwrap();
@@ -1285,9 +1254,11 @@ fn duplicate_authorization_hash_rejected() {
     // Compute correct hashes.
     let correct_hashes = compute_test_auth_hashes(&ts);
 
-    // Create a set with a duplicate.
+    // Create a set with a duplicate (replace second entry with first —
+    // keeps the same count so the cardinality check passes, but the
+    // duplicate check fires).
     let mut bad_hashes = correct_hashes.clone();
-    bad_hashes.push(bad_hashes[0]); // duplicate the first hash
+    bad_hashes[1] = bad_hashes[0]; // duplicate the first hash
 
     let request = RelayHandshakeRequest {
         handshake: ts.circuit_handshake.clone(),

@@ -163,6 +163,13 @@ pub struct CircuitHandshake {
     /// preventing split-view attacks where different relays receive different
     /// (individually signed) authorizations for the same circuit.
     pub authorization_root: [u8; 32],
+    /// P1: The number of relay authorizations in the authorization set.
+    /// Bounded by ROUTE_MAX_HOPS - 1 (max 15 non-source hops).
+    /// The relay verifies: authorization_hashes.len() == authorization_count
+    /// and authorization_count <= ROUTE_MAX_HOPS - 1 before processing.
+    /// This gives the relay an authenticated bound without needing the
+    /// CommittedRoute, preventing resource-exhaustion via oversized hash lists.
+    pub authorization_count: u8,
     /// When the handshake was created (unix seconds).
     pub timestamp: u64,
     /// When the circuit expires (unix seconds).
@@ -194,6 +201,7 @@ impl CircuitHandshake {
         source_public_key: &[u8; 32],
         ephemeral_x25519_secret: &X25519Secret,
         authorization_root: [u8; 32],
+        authorization_count: u8,
     ) -> Result<Self, RouteSerializationError> {
         let now = now_unix();
 
@@ -221,6 +229,7 @@ impl CircuitHandshake {
             source_public_key: *source_public_key,
             ephemeral_x25519_public: ephemeral_pub_bytes,
             authorization_root,
+            authorization_count,
             timestamp: now,
             expiry,
             nonce,
@@ -240,6 +249,7 @@ impl CircuitHandshake {
             (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_public_key.to_vec())),
             (CborValue::TextString("ephemeralX25519Public".into()), CborValue::ByteString(self.ephemeral_x25519_public.to_vec())),
             (CborValue::TextString("authorizationRoot".into()), CborValue::ByteString(self.authorization_root.to_vec())),
+            (CborValue::TextString("authorizationCount".into()), CborValue::UnsignedInt(u64::from(self.authorization_count))),
             (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
             (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
             (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
