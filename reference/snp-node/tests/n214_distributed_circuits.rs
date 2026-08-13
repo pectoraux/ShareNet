@@ -204,8 +204,15 @@ fn setup() -> TestSetup {
     let committed_route = commit_route(proposal, vec![relay_acc, gateway_acc], &validated_path, now).unwrap();
 
     let (ephemeral_secret, _) = x25519_ephemeral_keypair();
+    // Compute the authorization_root from the committed route BEFORE creating
+    // the handshake. The handshake signs this root, committing the source to
+    // the exact set of relay positions.
+    let authorization_root = snp_node::node::compute_authorization_root_from_route(
+        &committed_route,
+    ).unwrap();
     let circuit_handshake = CircuitHandshake::create_and_sign(
         &committed_route, &source_sk, &source_pk, &ephemeral_secret,
+        authorization_root,
     ).unwrap();
     let circuit_setup = prepare_circuit_setup(&committed_route, &circuit_handshake, &ephemeral_secret).unwrap();
 
