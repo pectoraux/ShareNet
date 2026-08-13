@@ -84,7 +84,7 @@
 
 use super::*;
 use snp_cbor::CborValue;
-use snp_crypto::{ed25519_sign, ed25519_verify, sig_contexts};
+use snp_crypto::{ed25519_sign, ed25519_verify, sha256, sig_contexts};
 
 /// The SIG_CONTEXT for route-discovery messages.
 pub const ROUTE_DISCOVERY_MSG_CONTEXT: &[u8] = b"SNP/0.1 route-discovery\0";
@@ -686,10 +686,26 @@ impl PendingRouteQuery {
 ///
 /// ## Construction
 ///
-/// A `RoutingAssertion` is constructed from a verified `NextHopResponse`
-/// (signature verified, responder matches expected neighbor, query matches
-/// pending state, freshness validated). The advertisement in the response
-/// must be independently verified via `verify_into_verified()`.
+/// A `RoutingAssertion` is constructed via either:
+/// - **`create_and_sign()`** — used in the recursive multi-hop path
+///   (N2.1.3.2). The forwarding node signs the assertion preimage
+///   (responder_node_id, destination_node_id, next_hop_node_id,
+///   is_destination, query_id, timestamp) under
+///   `ROUTE_DISCOVERY_MSG_CONTEXT`. The signature and public key are
+///   carried in the assertion so that the ultimate receiver (A) can
+///   verify the claim was authored by the claimed responder.
+/// - **`from_verified_response()`** — used in the SINGLE-STEP path
+///   (N2.1.3.1). The assertion is derived from a verified
+///   `NextHopResponse` whose signature already proves the responder's
+///   authorship. In this path, the assertion's `ed25519_public_key` and
+///   `signature` fields are all-zero — they are NOT used because the
+///   enclosing `NextHopResponse` signature already binds the claim.
+///   `verify_signature()` therefore returns `true` for assertions
+///   constructed via `from_verified_response()` only because the caller
+///   has already verified the parent `NextHopResponse` signature. The
+///   `DistributedRouteResolution::verify()` check for assertion
+///   signatures is enforced on the recursive path; the single-step path
+///   does not invoke `DistributedRouteResolution::verify()`.
 #[derive(Debug, Clone)]
 pub struct RoutingAssertion {
     /// The responder's NodeId (the node that made the claim).
@@ -704,6 +720,22 @@ pub struct RoutingAssertion {
     pub query_id: [u8; 16],
     /// When the assertion was made (from the response timestamp).
     pub timestamp: u64,
+    /// **N2.1.3.2-security.** The responder's Ed25519 public key. The
+    /// responder's NodeId MUST equal `derive_node_id(ed25519_public_key)`
+    /// (I4 consistency) for `verify_signature()` to return true.
+    ///
+    /// In the single-step path (`from_verified_response`), this is
+    /// all-zero — the assertion is bound by the enclosing
+    /// `NextHopResponse` signature instead.
+    pub ed25519_public_key: [u8; 32],
+    /// **N2.1.3.2-security.** Ed25519 signature over
+    /// `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage())`. `preimage()`
+    /// covers every assertion field EXCEPT `signature` itself.
+    ///
+    /// In the single-step path (`from_verified_response`), this is
+    /// all-zero — the assertion is bound by the enclosing
+    /// `NextHopResponse` signature instead.
+    pub signature: [u8; 64],
 }
 
 impl RoutingAssertion {
@@ -714,6 +746,14 @@ impl RoutingAssertion {
     /// - Responder matches expected neighbor.
     /// - Query matches pending state.
     /// - Response freshness.
+    ///
+    /// ## Single-step path
+    ///
+    /// In this path, the assertion's `ed25519_public_key` and `signature`
+    /// fields are all-zero. The enclosing `NextHopResponse` signature
+    /// already proves the responder's authorship. This assertion type is
+    /// used by the single-step `NextHopResolver::resolve_step()` method
+    /// and is NOT subject to `DistributedRouteResolution::verify()`.
     #[must_use]
     pub fn from_verified_response(
         response: &NextHopResponse,
@@ -727,9 +767,125 @@ impl RoutingAssertion {
                 is_destination: *is_destination,
                 query_id: response.query_id,
                 timestamp: response.timestamp,
+                // Single-step path: signature fields are all-zero. The
+                // enclosing NextHopResponse signature binds the claim.
+                ed25519_public_key: [0u8; 32],
+                signature: [0u8; 64],
             }),
             NextHopResult::NotFound => None,
         }
+    }
+
+    /// **N2.1.3.2-security.** Create and sign a `RoutingAssertion`.
+    ///
+    /// The forwarding node (responder) signs the assertion preimage
+    /// (responder_node_id, destination_node_id, next_hop_node_id,
+    /// is_destination, query_id, timestamp) under
+    /// `ROUTE_DISCOVERY_MSG_CONTEXT`. The signature and the responder's
+    /// public key are stored in the assertion so that any receiver can
+    /// independently verify the claim.
+    ///
+    /// # Parameters
+    /// - `secret_key`: The responder's Ed25519 secret key.
+    /// - `public_key`: The responder's Ed25519 public key. MUST correspond
+    ///   to `secret_key`. The responder's NodeId is derived from this key.
+    /// - `responder_node_id`: The responder's NodeId. MUST equal
+    ///   `derive_node_id(public_key)` for `verify_signature()` to succeed.
+    /// - `destination_node_id`: The destination being resolved.
+    /// - `next_hop_node_id`: The next hop the responder claims is toward
+    ///   the destination.
+    /// - `is_destination`: Whether `next_hop_node_id == destination_node_id`.
+    /// - `query_id`: The query_id of the `ForwardedQuery` that triggered
+    ///   this assertion.
+    #[must_use]
+    pub fn create_and_sign(
+        secret_key: &[u8; 32],
+        public_key: &[u8; 32],
+        responder_node_id: [u8; 32],
+        destination_node_id: [u8; 32],
+        next_hop_node_id: [u8; 32],
+        is_destination: bool,
+        query_id: [u8; 16],
+    ) -> Self {
+        let timestamp = now_unix();
+        let mut assertion = Self {
+            responder_node_id,
+            destination_node_id,
+            next_hop_node_id,
+            is_destination,
+            query_id,
+            timestamp,
+            ed25519_public_key: *public_key,
+            signature: [0u8; 64],
+        };
+        assertion.sign(secret_key);
+        assertion
+    }
+
+    /// Compute the canonical CBOR preimage of the assertion (every field
+    /// EXCEPT the signature itself).
+    ///
+    /// The signature covers `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage)`.
+    fn preimage(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
+            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
+            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
+            (CborValue::TextString("isDestination".into()), CborValue::Bool(self.is_destination)),
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
+        ])
+    }
+
+    /// Re-sign the assertion (after field mutation).
+    pub fn sign(&mut self, secret_key: &[u8; 32]) {
+        let preimage = self.preimage();
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        self.signature = ed25519_sign(secret_key, &msg);
+    }
+
+    /// **N2.1.3.2-security.** Verify the assertion's signature and
+    /// responder identity consistency (I4).
+    ///
+    /// Returns `true` iff:
+    /// - `ed25519_public_key` is non-zero (i.e., this assertion was
+    ///   created via `create_and_sign`, not `from_verified_response`).
+    /// - The signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage)`
+    ///   verifies under `ed25519_public_key`.
+    /// - `responder_node_id == derive_node_id(ed25519_public_key)` (I4).
+    ///
+    /// ## Single-step path
+    ///
+    /// For assertions created via `from_verified_response()`, both
+    /// `ed25519_public_key` and `signature` are all-zero. This method
+    /// returns `false` for such assertions. The single-step path does
+    /// NOT call `DistributedRouteResolution::verify()` (which invokes
+    /// this method) — single-step assertions are validated by the
+    /// enclosing `NextHopResponse::verify_signature()` instead.
+    #[must_use]
+    pub fn verify_signature(&self) -> bool {
+        // Single-step assertions have all-zero public key + signature.
+        // They are NOT verifiable via this method — they are validated
+        // by the enclosing NextHopResponse signature instead.
+        if self.ed25519_public_key == [0u8; 32] && self.signature == [0u8; 64] {
+            return false;
+        }
+        let preimage = self.preimage();
+        let Ok(bytes) = snp_cbor::encode(&preimage) else {
+            return false;
+        };
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        if !ed25519_verify(&self.ed25519_public_key, &msg, &self.signature) {
+            return false;
+        }
+        let expected = snp_crypto::derive_node_id(&self.ed25519_public_key);
+        self.responder_node_id == expected
     }
 
     /// Check if this assertion claims the next hop is the destination.
@@ -1208,10 +1364,20 @@ pub struct ForwardedQuery {
     /// Nodes already visited in this resolution chain (loop prevention).
     /// Always includes the source.
     pub visited_nodes: Vec<[u8; 32]>,
+    /// **N2.1.3.2-security.** `SHA-256(canonical_CBOR(parent_query))` — a
+    /// hash of the COMPLETE parent `ForwardedQuery` (all fields, including
+    /// both signatures). This cryptographically binds the forwarded query
+    /// to the actual parent message that was received, preventing a
+    /// malicious forwarder from inventing a `parent_query_id` for a query
+    /// that was never sent.
+    ///
+    /// All-zero (`[0u8; 32]`) for the initial query (no parent).
+    pub parent_query_hash: [u8; 32],
     /// The source's signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖
     /// CBOR(parent_binding_preimage)`. Covers `parent_query_id`,
-    /// `parent_responder_node_id`, `visited_nodes`, and `query_id` (to bind
-    /// the parent relationship to this specific query).
+    /// `parent_responder_node_id`, `parent_query_hash`, `visited_nodes`,
+    /// and `query_id` (to bind the parent relationship to this specific
+    /// query).
     pub parent_signature: [u8; 64],
 }
 
@@ -1220,7 +1386,13 @@ impl ForwardedQuery {
     ///
     /// The `signature` field is the standard `NextHopQuery` signature (over
     /// the NextHopQuery preimage only). The `parent_signature` field covers
-    /// the parent binding fields.
+    /// the parent binding fields, INCLUDING the `parent_query_hash` — a
+    /// SHA-256 of the COMPLETE parent `ForwardedQuery`.
+    ///
+    /// # Parameters
+    /// - `parent_query_hash`: `SHA-256(canonical_CBOR(parent_query))` for
+    ///   forwarded queries. MUST be `[0u8; 32]` for the initial query
+    ///   (no parent).
     ///
     /// # Panics
     /// Panics if `max_hops` is 0.
@@ -1233,6 +1405,7 @@ impl ForwardedQuery {
         max_hops: u8,
         parent_query_id: [u8; 16],
         parent_responder_node_id: [u8; 32],
+        parent_query_hash: [u8; 32],
         visited_nodes: Vec<[u8; 32]>,
     ) -> Self {
         assert!(max_hops > 0, "max_hops must be > 0");
@@ -1249,6 +1422,7 @@ impl ForwardedQuery {
             signature: [0u8; 64],
             parent_query_id,
             parent_responder_node_id,
+            parent_query_hash,
             visited_nodes,
             parent_signature: [0u8; 64],
         };
@@ -1272,14 +1446,62 @@ impl ForwardedQuery {
     }
 
     /// Compute the parent binding preimage.
+    ///
+    /// **N2.1.3.2-security:** The preimage now includes `parent_query_hash`
+    /// (SHA-256 of the complete parent query). This binds the parent
+    /// binding signature to the actual parent message, preventing a
+    /// malicious forwarder from inventing a `parent_query_id` for a query
+    /// that was never sent.
     fn parent_binding_preimage(&self) -> CborValue {
         CborValue::Map(vec![
             (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
             (CborValue::TextString("parentQueryId".into()), CborValue::ByteString(self.parent_query_id.to_vec())),
             (CborValue::TextString("parentResponderNodeId".into()), CborValue::ByteString(self.parent_responder_node_id.to_vec())),
+            (CborValue::TextString("parentQueryHash".into()), CborValue::ByteString(self.parent_query_hash.to_vec())),
             (CborValue::TextString("visitedNodes".into()), CborValue::Array(
                 self.visited_nodes.iter().map(|n| CborValue::ByteString(n.to_vec())).collect()
             )),
+        ])
+    }
+
+    /// **N2.1.3.2-security.** Compute `SHA-256(canonical_CBOR(self))` — a
+    /// hash of the COMPLETE `ForwardedQuery` (all fields, including both
+    /// signatures).
+    ///
+    /// This hash is used as the `parent_query_hash` of the NEXT forwarded
+    /// query in the chain. It cryptographically binds the next query to
+    /// the actual parent message that was received and signed.
+    ///
+    /// The hash covers EVERY field of `ForwardedQuery`:
+    /// - `source_node_id`, `source_ed25519_public_key`, `destination_node_id`,
+    ///   `query_id`, `timestamp`, `max_hops`, `signature` (NextHopQuery sig),
+    /// - `parent_query_id`, `parent_responder_node_id`, `parent_query_hash`,
+    ///   `visited_nodes`, `parent_signature`.
+    #[must_use]
+    pub fn compute_hash(&self) -> [u8; 32] {
+        let preimage = self.canonical_cbor();
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
+        sha256(&bytes)
+    }
+
+    /// Canonical CBOR encoding of the COMPLETE `ForwardedQuery` (all fields,
+    /// including both signatures). Used by `compute_hash`.
+    fn canonical_cbor(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
+            (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
+            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (CborValue::TextString("maxHops".into()), CborValue::UnsignedInt(u64::from(self.max_hops))),
+            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+            (CborValue::TextString("parentQueryId".into()), CborValue::ByteString(self.parent_query_id.to_vec())),
+            (CborValue::TextString("parentResponderNodeId".into()), CborValue::ByteString(self.parent_responder_node_id.to_vec())),
+            (CborValue::TextString("parentQueryHash".into()), CborValue::ByteString(self.parent_query_hash.to_vec())),
+            (CborValue::TextString("visitedNodes".into()), CborValue::Array(
+                self.visited_nodes.iter().map(|n| CborValue::ByteString(n.to_vec())).collect()
+            )),
+            (CborValue::TextString("parentSignature".into()), CborValue::ByteString(self.parent_signature.to_vec())),
         ])
     }
 
@@ -1365,7 +1587,9 @@ impl ForwardedQuery {
     /// Check if this is the initial query in a chain (no parent).
     #[must_use]
     pub fn is_initial(&self) -> bool {
-        self.parent_query_id == [0u8; 16] && self.parent_responder_node_id == [0u8; 32]
+        self.parent_query_id == [0u8; 16]
+            && self.parent_responder_node_id == [0u8; 32]
+            && self.parent_query_hash == [0u8; 32]
     }
 
     /// Check if a node has already been visited (loop prevention).
@@ -1528,6 +1752,19 @@ pub enum DistributedRouteResolutionError {
         index: usize,
         /// A human-readable reason.
         reason: String,
+    },
+    /// **N2.1.3.2-security.** A routing assertion's signature does not
+    /// verify, OR the responder's NodeId is inconsistent with the
+    /// embedded Ed25519 public key (I4 violation).
+    ///
+    /// Every assertion in `DistributedRouteResolution::ordered_assertions`
+    /// MUST be individually signed by its claimed responder. This error
+    /// indicates that assertion `index`'s signature is missing, malformed,
+    /// or does not verify under the responder's public key.
+    #[error("assertion at index {index} has an invalid signature")]
+    AssertionSignatureInvalid {
+        /// The index of the offending assertion.
+        index: usize,
     },
     /// The hop budget was exceeded.
     #[error("hop budget exceeded: {hops} hops with initial budget {budget}")]
@@ -1731,7 +1968,22 @@ impl DistributedRouteResolution {
         //   - destination_node_id == self.destination
         //   - the LAST assertion should have is_destination=true and
         //     next_hop_node_id == destination.
+        //
+        // **N2.1.3.2-security:** Every assertion MUST also have a valid
+        // signature from its claimed responder. The signature covers the
+        // assertion preimage (responder_node_id, destination_node_id,
+        // next_hop_node_id, is_destination, query_id, timestamp,
+        // responder_public_key) under ROUTE_DISCOVERY_MSG_CONTEXT. This
+        // proves the responder actually authored the claim — A cannot
+        // forge a claim from B, and a malicious transport cannot tamper
+        // with the assertion fields.
         for (i, assertion) in self.ordered_assertions.iter().enumerate() {
+            // 8a. Verify the assertion's signature + I4 consistency.
+            if !assertion.verify_signature() {
+                return Err(DistributedRouteResolutionError::AssertionSignatureInvalid {
+                    index: i,
+                });
+            }
             let expected_responder = self
                 .ordered_node_ids
                 .get(i + 1)
@@ -1998,7 +2250,8 @@ impl<'a> NextHopResolver<'a> {
         // 1. Construct the initial ForwardedQuery.
         //    - budget = initial_budget
         //    - visited_nodes = [A]
-        //    - parent = none (all-zero parent_query_id and parent_responder_node_id)
+        //    - parent = none (all-zero parent_query_id, parent_responder_node_id,
+        //      AND parent_query_hash — the initial query has no parent).
         let initial_query = ForwardedQuery::create_and_sign(
             &self.local_ed25519_secret,
             &self.local_ed25519_public,
@@ -2007,6 +2260,7 @@ impl<'a> NextHopResolver<'a> {
             initial_budget,
             [0u8; 16],           // parent_query_id (none)
             [0u8; 32],           // parent_responder_node_id (none)
+            [0u8; 32],           // parent_query_hash (none — initial query)
             vec![self.local_node_id], // visited_nodes = [A]
         );
 
@@ -2357,17 +2611,27 @@ impl ForwardingNode {
         // 9. Construct a NEW ForwardedQuery with:
         //    - Decremented hop budget (query.max_hops - 1)
         //    - Updated visited_nodes (add self)
-        //    - Parent binding to the current query
+        //    - Parent binding to the current query (parent_query_id =
+        //      current query_id, parent_responder_node_id = self,
+        //      parent_query_hash = SHA-256 of the COMPLETE current query).
+        //
+        //    **N2.1.3.2-security:** The parent_query_hash binds the new
+        //    query to the ACTUAL parent message that was received and
+        //    verified. A malicious forwarder cannot invent a parent_query_id
+        //    for a query that was never sent — the hash would not match
+        //    any real parent message.
         let mut new_visited = query.visited_nodes.clone();
         new_visited.push(self.node_id);
+        let parent_query_hash = query.compute_hash();
         let new_query = ForwardedQuery::create_and_sign(
             &self.ed25519_secret,
             &self.ed25519_public,
             self.node_id,
             query.destination_node_id,
             query.max_hops - 1,
-            query.query_id,   // parent_query_id (the query we received)
-            self.node_id,     // parent_responder_node_id (us — we're forwarding)
+            query.query_id,        // parent_query_id (the query we received)
+            self.node_id,          // parent_responder_node_id (us — we're forwarding)
+            parent_query_hash,     // SHA-256 of the complete parent query
             new_visited,
         );
 
@@ -2387,15 +2651,23 @@ impl ForwardingNode {
         //     `is_destination` is true iff the next_hop IS the destination.
         //     B forwards to C (C != G) → is_destination=false.
         //     C forwards to G (G == G) → is_destination=true.
+        //
+        //     **N2.1.3.2-security:** The assertion is SIGNED by us (the
+        //     responder). The signature covers the assertion preimage
+        //     (responder_node_id, destination_node_id, next_hop_node_id,
+        //     is_destination, query_id, timestamp, responder_public_key)
+        //     under ROUTE_DISCOVERY_MSG_CONTEXT. A cannot forge our claim
+        //     — any tampering with the assertion invalidates the signature.
         let is_destination = next_hop_id == query.destination_node_id;
-        let our_assertion = RoutingAssertion {
-            responder_node_id: self.node_id,
-            destination_node_id: query.destination_node_id,
-            next_hop_node_id: next_hop_id,
+        let our_assertion = RoutingAssertion::create_and_sign(
+            &self.ed25519_secret,
+            &self.ed25519_public,
+            self.node_id,                 // responder_node_id (us)
+            query.destination_node_id,
+            next_hop_id,
             is_destination,
-            query_id: new_query.query_id,
-            timestamp: now_unix(),
-        };
+            new_query.query_id,
+        );
 
         // 13. Prepend our assertion + record + query_step to the response.
         response.accumulated_assertions.insert(0, our_assertion);

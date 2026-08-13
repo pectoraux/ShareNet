@@ -520,7 +520,7 @@ fn wrong_recursive_responder_rejected() {
     // Construct a valid ForwardedQuery.
     let mut query = ForwardedQuery::create_and_sign(
         &a_sk, &a_pk, a_id, [0xCC; 32], 16,
-        [0u8; 16], [0u8; 32], vec![a_id],
+        [0u8; 16], [0u8; 32], [0u8; 32], vec![a_id],
     );
     // Verify it WAS valid.
     assert!(query.verify_all(), "query must be valid before tampering");
@@ -580,6 +580,7 @@ fn replayed_recursive_response_rejected() {
         &a_sk, &a_pk, a_id, [0xDD; 32], 16,
         [1u8; 16],    // parent_query_id (non-zero — has a parent)
         [0xEE; 32],   // parent_responder_node_id
+        [0xAB; 32],   // parent_query_hash (non-zero — has a parent)
         vec![a_id, [0xFF; 32]], // visited_nodes
     );
     // Verify it WAS valid.
@@ -1029,7 +1030,7 @@ fn forwarded_query_signs_and_verifies() {
 
     let fwd = ForwardedQuery::create_and_sign(
         &sk, &pk, node_id, destination, 10,
-        [1u8; 16], [0xBB; 32], visited.clone(),
+        [1u8; 16], [0xBB; 32], [0xCD; 32], visited.clone(),
     );
 
     // Both signatures verify.
@@ -1047,7 +1048,7 @@ fn forwarded_query_signs_and_verifies() {
     // Initial query (no parent).
     let initial = ForwardedQuery::create_and_sign(
         &sk, &pk, node_id, destination, 5,
-        [0u8; 16], [0u8; 32], vec![node_id],
+        [0u8; 16], [0u8; 32], [0u8; 32], vec![node_id],
     );
     assert!(initial.is_initial(), "query with zero parent is initial");
     assert!(!fwd.is_initial(), "query with non-zero parent is NOT initial");
@@ -1059,7 +1060,7 @@ fn forwarded_query_signs_and_verifies() {
     tampered.parent_query_id = [2u8; 16];
     assert!(
         !tampered.verify_parent_signature(),
-        "tampered parent binding must fail verify_parent_signature"
+        "tampered parent binding (parent_query_id) must fail verify_parent_signature"
     );
     // But the NextHopQuery signature is unchanged.
     assert!(
@@ -1067,5 +1068,304 @@ fn forwarded_query_signs_and_verifies() {
         "NextHopQuery signature must still verify (covers different preimage)"
     );
 
+    // Tamper with parent_query_hash — parent signature must fail.
+    let mut tampered_hash = fwd.clone();
+    tampered_hash.parent_query_hash = [0x99; 32];
+    assert!(
+        !tampered_hash.verify_parent_signature(),
+        "tampered parent_query_hash must fail verify_parent_signature"
+    );
+    assert!(
+        tampered_hash.verify_signature(),
+        "NextHopQuery signature must still verify (covers different preimage)"
+    );
+
     eprintln!("[test 13] PASS: ForwardedQuery signs and verifies (parent binding covered)");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2-security — Cryptographic authentication tests
+//
+// These tests verify the three security fixes:
+//  1. Every RoutingAssertion is individually signed by its responder.
+//  2. ForwardedQuery.parent_query_hash binds the forwarded query to the
+//     ACTUAL parent message (preventing invented parent_query_id).
+//  3. DistributedRouteResolution::verify() checks every assertion's signature.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── 14. tampered_assertion_rejected ───────────────────────────────────────
+
+/// **N2.1.3.2-security.** Tampering with one byte of an assertion's
+/// signature MUST cause `DistributedRouteResolution::verify()` to fail
+/// with `AssertionSignatureInvalid`.
+///
+/// Scenario:
+/// - Build the standard A→B→C→G mesh.
+/// - Resolve successfully (both assertions are signed by their responders).
+/// - Tamper with the FIRST assertion's signature (flip one byte).
+/// - `verify()` must fail with `AssertionSignatureInvalid { index: 0 }`.
+#[test]
+fn tampered_assertion_rejected() {
+    let mesh = TestMesh::new(b"tamper-assert");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let mut resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed before tampering");
+
+    // Sanity: the resolution verifies before tampering.
+    assert!(resolution.verify().is_ok(), "valid resolution must verify");
+
+    // Each assertion has a valid signature (positive baseline).
+    for (i, assertion) in resolution.ordered_assertions.iter().enumerate() {
+        assert!(
+            assertion.verify_signature(),
+            "assertion {i} must have a valid signature before tampering"
+        );
+    }
+
+    // Tamper with the FIRST assertion's signature (flip one byte).
+    resolution.ordered_assertions[0].signature[0] ^= 0xFF;
+
+    // The tampered assertion's signature no longer verifies.
+    assert!(
+        !resolution.ordered_assertions[0].verify_signature(),
+        "tampered assertion signature must fail verify_signature"
+    );
+
+    // The resolution's verify() must fail with AssertionSignatureInvalid { index: 0 }.
+    let err = resolution.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::AssertionSignatureInvalid { index: 0 })
+        ),
+        "tampered assertion must fail AssertionSignatureInvalid at index 0, got: {err:?}"
+    );
+
+    eprintln!("[test 14] PASS: tampered assertion signature rejected by verify()");
+}
+
+// ─── 15. tampered_parent_hash_rejected ─────────────────────────────────────
+
+/// **N2.1.3.2-security.** Tampering with a `ForwardedQuery`'s
+/// `parent_query_hash` MUST cause `verify_parent_signature()` to fail.
+///
+/// The `parent_query_hash` is `SHA-256(canonical_CBOR(parent_query))`.
+/// It binds the forwarded query to the ACTUAL parent message. A malicious
+/// forwarder cannot invent a `parent_query_id` for a query that was never
+/// sent — the parent_signature covers `parent_query_hash`, so any tampering
+/// invalidates the signature.
+#[test]
+fn tampered_parent_hash_rejected() {
+    let (sk, pk) = fresh_keypair(b"tamper-hash-a");
+    let node_id = derive_node_id(&pk);
+    let destination = [0xAA; 32];
+
+    // Construct a valid ForwardedQuery with a parent_query_hash.
+    let parent_hash = [0x42u8; 32];
+    let fwd = ForwardedQuery::create_and_sign(
+        &sk, &pk, node_id, destination, 10,
+        [1u8; 16], [0xBB; 32], parent_hash, vec![node_id, [0xCC; 32]],
+    );
+
+    // Both signatures verify before tampering.
+    assert!(fwd.verify_signature(), "NextHopQuery signature must verify");
+    assert!(fwd.verify_parent_signature(), "parent binding signature must verify");
+    assert!(fwd.verify_all(), "both signatures must verify");
+
+    // Tamper with parent_query_hash (flip one byte).
+    let mut tampered = fwd.clone();
+    tampered.parent_query_hash[0] ^= 0xFF;
+
+    // The NextHopQuery signature still verifies (covers a different preimage).
+    assert!(
+        tampered.verify_signature(),
+        "NextHopQuery signature must still verify (covers different preimage)"
+    );
+
+    // But the parent binding signature MUST fail.
+    assert!(
+        !tampered.verify_parent_signature(),
+        "tampered parent_query_hash must fail verify_parent_signature"
+    );
+    assert!(!tampered.verify_all(), "tampered query must fail verify_all");
+
+    // The ForwardingNode must also reject the tampered query — its
+    // `handle_query` calls `verify_all()`, which combines both signature
+    // checks. Since `verify_parent_signature` fails, the query is rejected
+    // before any forwarding logic runs.
+    let transport = Arc::new(InMemoryRecursiveTransport::new());
+    let (b_sk, b_pk) = fresh_keypair(b"tamper-hash-b");
+    let b_node = ForwardingNode::new(
+        b_sk, b_pk,
+        vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:2901")],
+        None,
+        transport.clone(),
+    );
+    let b_node_arc = Arc::new(b_node);
+    let result = b_node_arc.handle_query(&tampered);
+    assert!(
+        result.is_none(),
+        "ForwardingNode must reject a query with a tampered parent_query_hash"
+    );
+
+    // The ORIGINAL (untampered) query passes `verify_all()` — proving the
+    // rejection was due to the parent binding signature failure, not some
+    // other issue. (We do NOT call handle_query on the original because B
+    // has no neighbors and `handle_query` would return `None` for the
+    // unrelated reason that `find_next_hop` finds no neighbor — the
+    // verify_all() check is the relevant positive control here.)
+    assert!(
+        fwd.verify_all(),
+        "original (untampered) query must pass verify_all — proving the \
+         tampered query was rejected specifically due to parent binding \
+         signature failure"
+    );
+
+    eprintln!("[test 15] PASS: tampered parent_query_hash rejected by verify_parent_signature");
+}
+
+// ─── 16. assertion_signature_verified ──────────────────────────────────────
+
+/// **N2.1.3.2-security.** Verify that every `RoutingAssertion` in a
+/// successfully resolved `DistributedRouteResolution` has a valid
+/// signature from its claimed responder.
+///
+/// This is a positive test — it confirms that the security fix is in
+/// place and that legitimate assertions pass the signature check.
+#[test]
+fn assertion_signature_verified() {
+    let mesh = TestMesh::new(b"assert-sig-verify");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed");
+
+    // Verify there are 2 assertions (B's and C's).
+    assert_eq!(resolution.ordered_assertions.len(), 2, "2 assertions expected");
+
+    // Each assertion must have a valid signature from its responder.
+    let b_assertion = &resolution.ordered_assertions[0];
+    assert_eq!(b_assertion.responder_node_id, mesh.b_id, "assertion 0 is from B");
+    assert!(
+        b_assertion.verify_signature(),
+        "B's assertion must have a valid signature"
+    );
+    // The assertion's public key must derive to B's NodeId (I4 consistency).
+    assert_eq!(
+        b_assertion.ed25519_public_key,
+        b_assertion.ed25519_public_key, // self-consistency (placeholder)
+    );
+    let expected_b_id = snp_crypto::derive_node_id(&b_assertion.ed25519_public_key);
+    assert_eq!(
+        expected_b_id, mesh.b_id,
+        "B's assertion public key must derive to B's NodeId (I4)"
+    );
+
+    let c_assertion = &resolution.ordered_assertions[1];
+    assert_eq!(c_assertion.responder_node_id, mesh.c_id, "assertion 1 is from C");
+    assert!(
+        c_assertion.verify_signature(),
+        "C's assertion must have a valid signature"
+    );
+    let expected_c_id = snp_crypto::derive_node_id(&c_assertion.ed25519_public_key);
+    assert_eq!(
+        expected_c_id, mesh.c_id,
+        "C's assertion public key must derive to C's NodeId (I4)"
+    );
+
+    // The full verify() must pass (it now checks every assertion signature).
+    assert!(
+        resolution.verify().is_ok(),
+        "resolution must verify — all assertion signatures are valid"
+    );
+
+    // Tampering with ANY assertion's signature must fail verify().
+    let mut tampered = resolution.clone();
+    tampered.ordered_assertions[1].signature[31] ^= 0x01;
+    assert!(
+        matches!(
+            tampered.verify(),
+            Err(DistributedRouteResolutionError::AssertionSignatureInvalid { index: 1 })
+        ),
+        "tampering with assertion 1's signature must fail AssertionSignatureInvalid at index 1"
+    );
+
+    eprintln!("[test 16] PASS: every assertion has a valid signature from its responder");
+}
+
+// ─── 17. swapped_assertion_entries_rejected ────────────────────────────────
+
+/// **N2.1.3.2-security.** Swapping two assertions in the chain MUST
+/// cause `DistributedRouteResolution::verify()` to fail.
+///
+/// Even though both assertions have valid signatures individually,
+/// swapping them breaks the hop-order coherence: assertion 0 now claims
+/// to be from C (not B), but `ordered_node_ids[1]` is B. The
+/// `HopOrderIncoherent` check catches this.
+///
+/// Scenario:
+/// - Resolve A→B→C→G successfully.
+/// - Swap ordered_assertions[0] (B's) and ordered_assertions[1] (C's).
+/// - `verify()` must fail with `HopOrderIncoherent` (responder mismatch).
+#[test]
+fn swapped_assertion_entries_rejected() {
+    let mesh = TestMesh::new(b"swap-assert");
+    let hint = make_hint(mesh.g_id, mesh.b_id);
+
+    let mut resolver = mesh.resolver();
+    let mut resolution = resolver
+        .resolve_route(&mesh.g_id, &hint)
+        .expect("resolution must succeed");
+
+    // Sanity: the resolution verifies before tampering.
+    assert!(resolution.verify().is_ok(), "valid resolution must verify");
+
+    // Capture the assertions.
+    let b_assertion = resolution.ordered_assertions[0].clone();
+    let c_assertion = resolution.ordered_assertions[1].clone();
+
+    // Sanity: B's assertion is from B, C's is from C.
+    assert_eq!(b_assertion.responder_node_id, mesh.b_id);
+    assert_eq!(c_assertion.responder_node_id, mesh.c_id);
+
+    // Both assertions individually have valid signatures (they're REAL
+    // signatures from B and C respectively).
+    assert!(b_assertion.verify_signature(), "B's assertion has a valid signature");
+    assert!(c_assertion.verify_signature(), "C's assertion has a valid signature");
+
+    // SWAP the assertions: [B's, C's] → [C's, B's].
+    resolution.ordered_assertions[0] = c_assertion;
+    resolution.ordered_assertions[1] = b_assertion;
+
+    // The signatures are STILL individually valid (they're real signatures
+    // from real responders).
+    assert!(
+        resolution.ordered_assertions[0].verify_signature(),
+        "swapped assertion 0 (C's) still has a valid signature"
+    );
+    assert!(
+        resolution.ordered_assertions[1].verify_signature(),
+        "swapped assertion 1 (B's) still has a valid signature"
+    );
+
+    // But the resolution's verify() must fail because the hop order is
+    // incoherent: assertion 0 now claims to be from C, but
+    // ordered_node_ids[1] is B.
+    let err = resolution.verify();
+    assert!(
+        matches!(
+            err,
+            Err(DistributedRouteResolutionError::HopOrderIncoherent { index: 0, .. })
+        ),
+        "swapped assertions must fail HopOrderIncoherent at index 0 (responder mismatch), got: {err:?}"
+    );
+
+    eprintln!("[test 17] PASS: swapped assertion entries rejected (responder mismatch)");
+}
+
