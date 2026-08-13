@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# N2.1.2.4: Expose test-only constructors for VerifiedHandshake that bypass
+# the actual SNP-IK handshake. This feature MUST NOT be enabled in production.
+test-support = []
+
 [dependencies]
 snp-cbor.workspace = true
 snp-crypto.workspace = true
@@ -19,3 +25,6 @@ tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "macros"
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
+# N2.1.2.4: Enable test-only VerifiedHandshake factory for snp-link's own
+# unit tests.
+snp-link = { path = ".", features = ["test-support"] }

@@ -346,6 +346,139 @@ pub struct HandshakeResult {
     pub session_id: [u8; 32],
 }
 
+// ─── VerifiedHandshake (N2.1.2.4) ───────────────────────────────────────────
+
+/// **N2.1.2.4.** An **unforgeable** proof that a successful SNP-IK/0.1
+/// handshake was completed with a specific peer.
+///
+/// ## Why this exists
+///
+/// `HandshakeResult` (above) has public fields and can be constructed by
+/// anyone. It is useful as a data container but is NOT sufficient as a
+/// security proof — a caller could synthesize a `HandshakeResult` with
+/// matching fields and claim a handshake occurred.
+///
+/// `VerifiedHandshake` solves this by having **private fields and a private
+/// constructor**. The ONLY way to create a `VerifiedHandshake` is through
+/// [`perform_snp_ik_handshake`] (or the async variant), which performs the
+/// actual SNP-IK/0.1 protocol over a real transport. The proof is minted
+/// inside the handshake implementation and cannot be manufactured by
+/// external code.
+///
+/// ## Usage
+///
+/// `snp-node`'s `AuthenticatedLink::from_verified_handshake()` consumes a
+/// `&VerifiedHandshake` to create an `AuthenticatedLink`. This makes the
+/// security boundary real:
+///
+/// ```text
+/// No actual successful handshake
+///     → No VerifiedHandshake
+///     → No AuthenticatedLink
+///     → No route hop
+/// ```
+///
+/// ## Read-only access
+///
+/// The fields are private. Read-only accessors are provided for the
+/// information `snp-node` needs to verify bindings against a
+/// `VerifiedNodeAdvertisement`.
+#[derive(Debug, Clone)]
+pub struct VerifiedHandshake {
+    /// The session ID from the completed handshake.
+    session_id: [u8; 32],
+    /// The authenticated peer NodeId.
+    peer_node_id: [u8; 32],
+    /// The authenticated peer Ed25519 public key.
+    peer_public_key: [u8; 32],
+    /// The authenticated peer static X25519 public key.
+    peer_x25519_public: [u8; 32],
+    /// The peer's ephemeral X25519 public key for THIS session.
+    peer_ephemeral_public: [u8; 32],
+    /// Directional AEAD link keys.
+    link_keys: LinkKeys,
+}
+
+impl VerifiedHandshake {
+    /// **Private constructor.** Only callable from within the `snp-link` crate
+    /// (including the `test_support` submodule). External code CANNOT create
+    /// a `VerifiedHandshake`.
+    #[must_use]
+    pub(crate) fn new(
+        session_id: [u8; 32],
+        peer_node_id: [u8; 32],
+        peer_public_key: [u8; 32],
+        peer_x25519_public: [u8; 32],
+        peer_ephemeral_public: [u8; 32],
+        link_keys: LinkKeys,
+    ) -> Self {
+        Self {
+            session_id,
+            peer_node_id,
+            peer_public_key,
+            peer_x25519_public,
+            peer_ephemeral_public,
+            link_keys,
+        }
+    }
+
+    /// Get the session ID.
+    #[must_use]
+    pub fn session_id(&self) -> [u8; 32] {
+        self.session_id
+    }
+
+    /// Get the authenticated peer NodeId.
+    #[must_use]
+    pub fn peer_node_id(&self) -> [u8; 32] {
+        self.peer_node_id
+    }
+
+    /// Get the authenticated peer Ed25519 public key.
+    #[must_use]
+    pub fn peer_public_key(&self) -> [u8; 32] {
+        self.peer_public_key
+    }
+
+    /// Get the authenticated peer static X25519 public key.
+    #[must_use]
+    pub fn peer_x25519_public(&self) -> [u8; 32] {
+        self.peer_x25519_public
+    }
+
+    /// Get the peer's ephemeral X25519 public key for this session.
+    #[must_use]
+    pub fn peer_ephemeral_public(&self) -> [u8; 32] {
+        self.peer_ephemeral_public
+    }
+
+    /// Get the directional AEAD link keys.
+    ///
+    /// These keys are the output of the handshake and are used for
+    /// encrypted frame transport. The caller takes ownership.
+    #[must_use]
+    pub fn link_keys(&self) -> LinkKeys {
+        self.link_keys.clone()
+    }
+
+    /// Convert from a `HandshakeResult` (internal only).
+    ///
+    /// This is private — only callable from within `snp-link`. It is used
+    /// by `perform_snp_ik_handshake` to convert its internal `HandshakeResult`
+    /// into the unforgeable `VerifiedHandshake` proof.
+    #[must_use]
+    fn from_handshake_result(result: &HandshakeResult) -> Self {
+        Self::new(
+            result.session_id,
+            result.peer_node_id,
+            result.peer_public_key,
+            result.peer_x25519_public,
+            result.peer_ephemeral_public,
+            result.link_keys.clone(),
+        )
+    }
+}
+
 /// Derive directional AEAD link keys from the three SNP-IK/0.1 DH outputs.
 ///
 /// Per ADR-0006 step 6: `HKDF-SHA256(dh1 || dh2 || dh3, salt=empty,
@@ -750,6 +883,45 @@ pub fn perform_snp_ik_handshake(
         peer_ephemeral_public: peer_eph_pub,
         session_id,
     })
+}
+
+/// **N2.1.2.4.** Perform the SNP-IK/0.1 handshake and return an **unforgeable**
+/// `VerifiedHandshake` proof.
+///
+/// This is the same as [`perform_snp_ik_handshake`], but returns a
+/// `VerifiedHandshake` instead of a `HandshakeResult`. The
+/// `VerifiedHandshake` has private fields and a private constructor — it
+/// can ONLY be created by this function (or the async variant). External
+/// code cannot manufacture a `VerifiedHandshake`.
+///
+/// Use this function when you need to create an `AuthenticatedLink` in
+/// `snp-node`. The `VerifiedHandshake` is the security proof that the
+/// handshake actually occurred.
+///
+/// # Errors
+/// Returns `LinkError` if the handshake fails (I/O error, signature
+/// verification failure, NodeId mismatch, etc.).
+pub fn perform_snp_ik_handshake_verified(
+    stream: &mut TcpStream,
+    is_initiator: bool,
+    my_ed25519_secret: &[u8; 32],
+    my_ed25519_public: &[u8; 32],
+    my_x25519_secret: &X25519Secret,
+    my_x25519_public: &X25519PubKey,
+    expected_peer_node_id: Option<&[u8; 32]>,
+) -> LinkResult<VerifiedHandshake> {
+    let result = perform_snp_ik_handshake(
+        stream,
+        is_initiator,
+        my_ed25519_secret,
+        my_ed25519_public,
+        my_x25519_secret,
+        my_x25519_public,
+        expected_peer_node_id,
+    )?;
+    // Mint the unforgeable proof from the internal HandshakeResult.
+    // This conversion is private — external code cannot call it.
+    Ok(VerifiedHandshake::from_handshake_result(&result))
 }
 
 // ─── Circuit keys (N1.9 — end-to-end client↔gateway) ────────────────────────
@@ -1524,5 +1696,61 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 0xff;
         assert!(decrypt_circuit_payload(&gateway.recv_key, &sealed).is_none());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.2.4: Test-only VerifiedHandshake factory
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.2.4 test-support module.**
+///
+/// ONLY compiled when the `test-support` Cargo feature is enabled.
+/// Provides a test-only factory for creating `VerifiedHandshake` proofs
+/// WITHOUT performing an actual SNP-IK handshake over a real transport.
+///
+/// ## Security
+///
+/// This module is gated behind `feature = "test-support"` and is NOT
+/// compiled in production builds. It allows deterministic testing of
+/// `snp-node`'s `AuthenticatedLink` without network I/O.
+///
+/// The factory creates a genuine `VerifiedHandshake` (using the private
+/// constructor) — the proof is real, it just bypasses the transport layer.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+
+    /// **TEST-ONLY.** Create a `VerifiedHandshake` from explicit fields.
+    ///
+    /// This bypasses the actual SNP-IK handshake but produces a genuine
+    /// `VerifiedHandshake` using the private constructor. The proof is
+    /// real — it just doesn't come from a real transport handshake.
+    ///
+    /// # Parameters
+    /// - `peer_node_id`: The authenticated peer NodeId.
+    /// - `peer_public_key`: The authenticated peer Ed25519 public key.
+    /// - `peer_x25519_public`: The authenticated peer static X25519 public key.
+    /// - `session_id`: The session ID (must be non-zero).
+    ///
+    /// **Production code MUST NOT use this.**
+    #[must_use]
+    pub fn verified_handshake_from_fields(
+        peer_node_id: [u8; 32],
+        peer_public_key: [u8; 32],
+        peer_x25519_public: [u8; 32],
+        session_id: [u8; 32],
+    ) -> VerifiedHandshake {
+        VerifiedHandshake::new(
+            session_id,
+            peer_node_id,
+            peer_public_key,
+            peer_x25519_public,
+            [0u8; 32], // ephemeral — not used by snp-node link verification
+            LinkKeys {
+                send_key: [0u8; 32],
+                recv_key: [0u8; 32],
+            },
+        )
     }
 }

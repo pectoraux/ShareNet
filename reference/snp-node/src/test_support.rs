@@ -1,4 +1,4 @@
-//! **N2.1.2.3 test-support module.**
+//! **N2.1.2.4 test-support module.**
 //!
 //! This module is ONLY compiled when the `test-support` Cargo feature is
 //! enabled. It provides test helpers for constructing `AuthenticatedLink`
@@ -6,15 +6,14 @@
 //!
 //! ## Security
 //!
-//! These helpers construct a real `snp_link::HandshakeResult` whose fields
-//! match a `VerifiedNodeAdvertisement`. The resulting `AuthenticatedLink`
-//! is genuine — it passes all the same verification checks as a production
-//! link. The only shortcut is that the `HandshakeResult` is synthesized
-//! rather than produced by an actual SNP-IK handshake over a real transport.
+//! These helpers use `snp_link::test_support::verified_handshake_from_fields()`
+//! to create a genuine `snp_link::VerifiedHandshake` proof. The proof is
+//! real — it's minted using the private constructor inside `snp-link`.
+//! The only shortcut is that no actual SNP-IK handshake over a real
+//! transport is performed.
 //!
-//! This is acceptable for deterministic route-engine testing. The test
-//! helpers do NOT weaken the `AuthenticatedLink` verification — they
-//! simply provide a `HandshakeResult` that matches the advertisement.
+//! The resulting `AuthenticatedLink` passes all the same verification checks
+//! as a production link (identity, Ed25519, X25519, endpoint authorization).
 //!
 //! **Production code MUST NOT use this module.** It is gated behind
 //! `feature = "test-support"` and is not compiled in production builds.
@@ -26,9 +25,10 @@ use crate::node::{
 /// Construct an `AuthenticatedLink` from a `VerifiedNodeAdvertisement`
 /// for testing purposes.
 ///
-/// This synthesizes a `snp_link::HandshakeResult` whose `peer_node_id` and
-/// `peer_public_key` match the advertisement. The `session_id` is derived
-/// from the advertisement's NodeId (deterministic for testing).
+/// This uses `snp_link::test_support::verified_handshake_from_fields()` to
+/// create an unforgeable `VerifiedHandshake` proof whose fields match the
+/// advertisement. The `session_id` is derived from the advertisement's
+/// NodeId (deterministic for testing).
 ///
 /// The `LinkKey.endpoint` must appear in the advertisement's endpoints
 /// (endpoint authorization is still enforced).
@@ -40,20 +40,16 @@ pub fn test_authenticated_link(
     key: LinkKey,
     advert: &VerifiedNodeAdvertisement,
 ) -> Result<AuthenticatedLink, AuthenticatedLinkError> {
-    // Synthesize a HandshakeResult that matches the advertisement.
-    let handshake = snp_link::HandshakeResult {
-        link_keys: snp_link::LinkKeys {
-            send_key: [0u8; 32],
-            recv_key: [0u8; 32],
-        },
-        peer_node_id: advert.node_id(),
-        peer_public_key: *advert.ed25519_public_key(),
-        peer_x25519_public: advert.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
-        peer_ephemeral_public: [0u8; 32],
-        // Derive a non-zero session_id from the NodeId (deterministic).
-        session_id: derive_test_session_id(&advert.node_id()),
-    };
-    AuthenticatedLink::from_handshake(key, advert, &handshake)
+    // Use snp-link's test-only factory to create an unforgeable VerifiedHandshake.
+    // This proof is real — it's minted using the private constructor inside snp-link.
+    // The only shortcut is no actual network transport.
+    let proof = snp_link::test_support::verified_handshake_from_fields(
+        advert.node_id(),
+        *advert.ed25519_public_key(),
+        advert.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
+        derive_test_session_id(&advert.node_id()),
+    );
+    AuthenticatedLink::from_verified_handshake(key, advert, &proof)
 }
 
 /// Derive a non-zero session ID from a NodeId for testing.

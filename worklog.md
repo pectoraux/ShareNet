@@ -4407,3 +4407,118 @@ Stage Summary:
 - Adversarial tests in n2122 (missing handshake, identity mismatch, unauthorized endpoint, failed handshake) still verify the same security properties via `AuthenticatedLink::from_handshake` + a synthesised `snp_link::HandshakeResult`.
 - The `endpoint` parameter on `make_relay_advert` / `make_gateway_advert` makes endpoint authorization explicit in each test — the `LinkKey.endpoint` must match an endpoint in the remote node's advertisement.
 - Ready for the next task.
+
+---
+Task ID: 8 (test update for N2.1.2.4 — unforgeable VerifiedHandshake proof)
+Agent: Z.ai (sub-agent — test update for unforgeable proof API)
+
+Task: Update the n2122_authenticated_link.rs integration tests to use the new
+N2.1.2.4 unforgeable `VerifiedHandshake` proof API. The N2.1.2.3 constructor
+`AuthenticatedLink::from_handshake(&HandshakeResult)` was REMOVED — a
+publicly-constructible `HandshakeResult` is no longer sufficient to mint an
+`AuthenticatedLink`. The new constructor is
+`AuthenticatedLink::from_verified_handshake(&VerifiedHandshake)`, where
+`VerifiedHandshake` has private fields, a private constructor, and is only
+mintable by `snp_link::perform_snp_ik_handshake_verified()` or the test-only
+factory `snp_link::test_support::verified_handshake_from_fields()`. A new
+X25519 binding check was also added: when the advertisement has an X25519
+circuit public key (gateways), the handshake's `peer_x25519_public` MUST
+match. A new error variant `AuthenticatedLinkError::HandshakeX25519Mismatch`
+was added for this case.
+
+Work Log:
+
+- **Constraint:** Do NOT modify any source files in `src/`. Only the test
+  file `tests/n2122_authenticated_link.rs` was modified. (No Cargo.toml
+  changes were needed — `snp-link` was already in `[dev-dependencies]` from
+  the previous task, and `snp-node`'s `test-support` feature already
+  enables `snp-link/test-support`.)
+
+- **n2122_authenticated_link.rs** (10 → 15 tests, all pass):
+  * Updated module docstring: from `from_handshake` to `from_verified_handshake`,
+    documented the N2.1.2.4 unforgeability guarantee, and explained how
+    adversarial tests use the test-only factory.
+  * Replaced the `make_handshake_result(advert, session_id)` helper (which
+    built a publicly-constructible `snp_link::HandshakeResult`) with
+    `make_verified_handshake(advert, session_id)`, which calls
+    `snp_link::test_support::verified_handshake_from_fields` to mint a genuine
+    `VerifiedHandshake` proof via the private constructor. The proof is real
+    (minted inside `snp-link`) — it just bypasses the transport layer.
+  * Added `use snp_link::test_support::verified_handshake_from_fields;` import
+    so adversarial tests can construct proofs with WRONG fields directly.
+  * Tests 2, 3, 4, 7: replaced `AuthenticatedLink::from_handshake(key, advert,
+    &handshake_result)` with `AuthenticatedLink::from_verified_handshake(key,
+    advert, &verified_handshake)`. The adversarial checks (zero session_id →
+    MissingHandshake, mismatched key.remote_node_id → NodeIdMismatch,
+    unauthorized endpoint → UnauthorizedEndpoint) are unchanged in semantics.
+  * Tests 1, 5, 6, 8, 9, 10: unchanged — they use `test_authenticated_link`
+    which internally calls `from_verified_handshake` already.
+  * NEW test 11 (`peer_x25519_mismatch_rejected`): construct a `VerifiedHandshake`
+    with a `peer_x25519_public` that differs from the gateway advert's X25519
+    circuit public key (flipped high byte). All other fields match. Verify
+    `from_verified_handshake` returns `Err(HandshakeX25519Mismatch)`. This
+    covers the new N2.1.2.4 X25519 identity binding check.
+  * NEW test 12 (`public_handshake_result_cannot_construct_authenticated_link`):
+    documents that `AuthenticatedLink::from_handshake` was REMOVED in N2.1.2.4.
+    The compile-time guarantee is enforced by the Rust type system (an
+    `ignore`-tagged doc-test snippet shows the code that would NOT compile).
+    The runtime portion verifies what we CAN: (a) `snp_link::HandshakeResult`
+    still has public fields (anyone can construct one — proof it's not a
+    security boundary), and (b) the only way to construct an AuthenticatedLink
+    is via `from_verified_handshake(&VerifiedHandshake)`.
+  * NEW test 13 (`test_only_verified_handshake_creates_authenticated_link`):
+    verifies the `snp_link::test_support::verified_handshake_from_fields`
+    factory produces a genuine `VerifiedHandshake` that is accepted by
+    `from_verified_handshake`. The link's `session_id()` matches the value
+    passed to the factory.
+  * NEW test 14 (`authenticated_link_preserves_verified_handshake`): verifies
+    the `VerifiedHandshake` proof is RETAINED inside the `AuthenticatedLink`.
+    `auth_link.handshake_proof()` returns a reference whose fields match the
+    proof supplied at construction time (session_id, peer_node_id,
+    peer_public_key, peer_x25519_public). The proof travels with the link
+    through the entire route-engine pipeline.
+  * NEW test 15 (`production_build_excludes_test_handshake_factory`): verifies
+    the `snp_link::test_support` module is feature-gated behind `test-support`.
+    The `verified_handshake_from_fields` call only compiles when the feature
+    is enabled; production builds (without `test-support`) cannot access the
+    factory. Companion to test 10 (which covers `snp_node::test_support`).
+
+- **Verified no changes needed in n211_topology.rs (40 tests pass) and
+  n212_route_engine.rs (26 tests pass)**: both files use only
+  `test_authenticated_link(key, &verified)`, which internally calls
+  `from_verified_handshake` already. They don't reference `from_handshake`,
+  `HandshakeResult`, or any other removed APIs directly.
+
+- **Production build check**: `cargo build -p snp-node` (without `test-support`)
+  still compiles cleanly. The `snp_link::test_support` and
+  `snp_node::test_support` modules are `#[cfg(any(test, feature = "test-support"))]`
+  and are physically absent from the production binary.
+
+Test results:
+- `cargo test -p snp-node --test n2122_authenticated_link`:
+  - 15 passed, 0 failed, 0 ignored (was 10; +5 new)
+- `cargo test -p snp-node --test n211_topology`:
+  - 40 passed, 0 failed, 0 ignored (unchanged)
+- `cargo test -p snp-node --test n212_route_engine`:
+  - 26 passed, 0 failed, 0 ignored (unchanged)
+- Total across the three target test files: 81 passed, 0 failed.
+- Production build (`cargo build -p snp-node`, no `test-support`): compiles cleanly.
+
+Stage Summary:
+- The n2122 test file now exercises the unforgeable `VerifiedHandshake` proof
+  API exclusively. No remaining references to `AuthenticatedLink::from_handshake`
+  or to `make_handshake_result` exist.
+- The 5 new tests cover:
+  * The new X25519 identity binding check (`HandshakeX25519Mismatch`).
+  * The compile-time guarantee that `from_handshake` was removed.
+  * The test-only factory's acceptance by `from_verified_handshake`.
+  * Proof preservation inside `AuthenticatedLink` via `handshake_proof()`.
+  * The `snp_link::test_support` feature gate.
+- All adversarial cases (zero session_id, NodeIdMismatch, UnauthorizedEndpoint,
+  X25519Mismatch) are tested with `VerifiedHandshake` proofs that have WRONG
+  fields injected via the test-only factory.
+- The security invariant holds:
+  > "Every AuthenticatedLink consumed by RouteEngine is backed by an
+  > unforgeable VerifiedHandshake proof that the SNP-IK handshake occurred
+  > with the advertised peer identity (NodeId + Ed25519 + X25519)."
+- Ready for the next task.

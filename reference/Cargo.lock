@@ -871,6 +871,7 @@ dependencies = [
  "snp-crypto",
  "snp-frames",
  "snp-identity",
+ "snp-link",
  "thiserror",
  "tokio",
 ]

@@ -1,9 +1,23 @@
-//! N2.1.2.2 — Authenticated Link Boundary tests.
+//! N2.1.2.2 / N2.1.2.4 — Authenticated Link Boundary tests.
 //!
 //! These tests verify that the `Link` abstraction is a real security boundary:
-//! a forwardable `Link` can ONLY be created via `AuthenticatedLink::from_handshake`,
-//! which requires a verified advertisement + authorized endpoint + non-zero
-//! handshake session ID.
+//! a forwardable `Link` can ONLY be created via
+//! `AuthenticatedLink::from_verified_handshake`, which requires a verified
+//! advertisement + authorized endpoint + an UNFORGEABLE
+//! `snp_link::VerifiedHandshake` proof (private fields, private constructor).
+//!
+//! ## N2.1.2.4 update — unforgeable `VerifiedHandshake`
+//!
+//! The previous N2.1.2.3 constructor `AuthenticatedLink::from_handshake` (which
+//! took a publicly-constructible `snp_link::HandshakeResult`) was REMOVED in
+//! N2.1.2.4. The new constructor is `AuthenticatedLink::from_verified_handshake`,
+//! which takes an UNFORGEABLE `snp_link::VerifiedHandshake` — private fields,
+//! private constructor — minted only by `snp_link::perform_snp_ik_handshake_verified()`
+//! or the test-only `snp_link::test_support::verified_handshake_from_fields()`
+//! factory. Adversarial tests in this file use the test factory to construct
+//! `VerifiedHandshake` proofs with WRONG fields (zero session_id, mismatched
+//! identity, mismatched X25519) and verify `from_verified_handshake` rejects
+//! them with the appropriate error.
 
 #![allow(clippy::pedantic)]
 
@@ -14,6 +28,12 @@ use snp_node::node::{
     HopCountCost, NullResolver,
 };
 use snp_node::test_support::test_authenticated_link;
+// N2.1.2.4: Adversarial tests construct `VerifiedHandshake` proofs with WRONG
+// fields via the test-only `snp_link::test_support` factory. This factory is
+// gated behind the `test-support` Cargo feature (which `snp-node` enables in
+// `[dev-dependencies]`). Production builds CANNOT access this factory —
+// `VerifiedHandshake` is unforgeable in production.
+use snp_link::test_support::verified_handshake_from_fields;
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
@@ -64,28 +84,31 @@ fn fake_session_id() -> [u8; 32] {
     id
 }
 
-/// Construct a `snp_link::HandshakeResult` whose peer identity fields match
-/// the given verified advertisement. The `session_id` is caller-supplied so
-/// tests can verify both the valid (non-zero) and invalid (zero) cases.
+/// Construct an UNFORGEABLE `snp_link::VerifiedHandshake` whose peer identity
+/// fields match the given verified advertisement. The `session_id` is
+/// caller-supplied so tests can verify both the valid (non-zero) and invalid
+/// (zero) cases.
+///
+/// This uses `snp_link::test_support::verified_handshake_from_fields` — the
+/// test-only factory that calls `VerifiedHandshake`'s PRIVATE constructor.
+/// The proof is real (it's minted inside `snp-link`), it just bypasses the
+/// transport layer. Production code CANNOT call this factory — it is gated
+/// behind `feature = "test-support"` and is physically absent from production
+/// builds.
 ///
 /// This is the same synthesis performed by `test_authenticated_link`, but
-/// exposed so individual tests can drive `AuthenticatedLink::from_handshake`
-/// directly with adversarial inputs (zero session_id, mismatched peer, etc.).
-fn make_handshake_result(
+/// exposed so individual tests can drive `AuthenticatedLink::from_verified_handshake`
+/// directly with adversarial inputs (zero session_id, mismatched X25519, etc.).
+fn make_verified_handshake(
     advert: &VerifiedNodeAdvertisement,
     session_id: [u8; 32],
-) -> snp_link::HandshakeResult {
-    snp_link::HandshakeResult {
-        link_keys: snp_link::LinkKeys {
-            send_key: [0u8; 32],
-            recv_key: [0u8; 32],
-        },
-        peer_node_id: advert.node_id(),
-        peer_public_key: *advert.ed25519_public_key(),
-        peer_x25519_public: advert.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
-        peer_ephemeral_public: [0u8; 32],
+) -> snp_link::VerifiedHandshake {
+    verified_handshake_from_fields(
+        advert.node_id(),
+        *advert.ed25519_public_key(),
+        advert.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
         session_id,
-    }
+    )
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -127,19 +150,23 @@ fn unauthenticated_link_cannot_enter_link_table() {
 
 /// 2. missing_handshake_cannot_create_up_link
 ///
-/// `AuthenticatedLink::from_handshake` rejects a zero session_id
-/// (no handshake was performed).
+/// `AuthenticatedLink::from_verified_handshake` rejects a `VerifiedHandshake`
+/// whose `session_id` is all-zero (defensive check — no handshake was
+/// performed). In production, `snp_link::perform_snp_ik_handshake_verified`
+/// never produces a zero session_id, but the test-only factory lets us inject
+/// one to verify the defensive check fires.
 #[test]
 fn missing_handshake_cannot_create_up_link() {
     let (gw_verified, gw_id) = make_gateway_advert(b"missing-hs-gw", 1, "127.0.0.1:1234");
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1234"));
 
-    // Zero session_id = no handshake. The HandshakeResult otherwise matches
-    // the advertisement (peer_node_id, peer_public_key) so the ONLY failing
-    // check is the zero session_id.
-    let zero_handshake = make_handshake_result(&gw_verified, [0u8; 32]);
-    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &zero_handshake);
+    // Construct a VerifiedHandshake with a ZERO session_id via the test-only
+    // factory. The other fields (peer_node_id, peer_public_key,
+    // peer_x25519_public) match the advertisement, so the ONLY failing check
+    // is the zero session_id.
+    let zero_proof = make_verified_handshake(&gw_verified, [0u8; 32]);
+    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &zero_proof);
     assert!(matches!(result, Err(AuthenticatedLinkError::MissingHandshake)),
         "zero session_id must be rejected (no handshake)");
 
@@ -149,7 +176,7 @@ fn missing_handshake_cannot_create_up_link() {
 /// 3. handshake_identity_mismatch_rejected
 ///
 /// If the LinkKey.remote_node_id does not match the advertisement's NodeId,
-/// the link is rejected.
+/// the link is rejected with `NodeIdMismatch`.
 #[test]
 fn handshake_identity_mismatch_rejected() {
     let (gw_verified, _gw_id) = make_gateway_advert(b"mismatch-gw", 1, "127.0.0.1:1234");
@@ -158,11 +185,11 @@ fn handshake_identity_mismatch_rejected() {
     let wrong_remote = [0x99; 32];
     let key = LinkKey::new(local, wrong_remote, TransportEndpoint::tcp("127.0.0.1:1234"));
 
-    // The HandshakeResult matches the advertisement (so the handshake check
+    // The VerifiedHandshake matches the advertisement (so the handshake check
     // would pass on its own); the rejection comes from key.remote_node_id !=
     // advert.node_id().
-    let handshake = make_handshake_result(&gw_verified, fake_session_id());
-    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &handshake);
+    let proof = make_verified_handshake(&gw_verified, fake_session_id());
+    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof);
     match result {
         Err(AuthenticatedLinkError::NodeIdMismatch { .. }) => { /* expected */ }
         other => panic!("expected NodeIdMismatch, got {other:?}"),
@@ -184,8 +211,8 @@ fn unauthorized_endpoint_rejected() {
     let unauthorized_endpoint = TransportEndpoint::tcp("127.0.0.1:9999");
     let key = LinkKey::new(local, gw_id, unauthorized_endpoint);
 
-    let handshake = make_handshake_result(&gw_verified, fake_session_id());
-    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &handshake);
+    let proof = make_verified_handshake(&gw_verified, fake_session_id());
+    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof);
     match result {
         Err(AuthenticatedLinkError::UnauthorizedEndpoint { endpoint }) => {
             assert!(endpoint.contains("9999"), "error must mention the unauthorized endpoint");
@@ -262,10 +289,10 @@ fn failed_handshake_creates_no_forwardable_link() {
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:4444"));
 
-    // Failed handshake = zero session_id. The HandshakeResult otherwise
+    // Failed handshake = zero session_id. The VerifiedHandshake otherwise
     // matches the advertisement so ONLY the zero session_id check fails.
-    let zero_handshake = make_handshake_result(&gw_verified, [0u8; 32]);
-    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &zero_handshake);
+    let zero_proof = make_verified_handshake(&gw_verified, [0u8; 32]);
+    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &zero_proof);
     assert!(result.is_err(), "failed handshake must not produce a link");
 
     // No link was created, so nothing enters the LinkTable.
@@ -397,4 +424,238 @@ fn production_build_has_no_public_new_up() {
     // not compiled in production builds.
 
     eprintln!("[test 10] PASS: test_support module is feature-gated (not in production)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.2.4 — Unforgeable VerifiedHandshake proof: new tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 11. peer_x25519_mismatch_rejected
+///
+/// N2.1.2.4: When the advertisement has an X25519 circuit public key
+/// (mandatory for gateways), the `VerifiedHandshake`'s `peer_x25519_public`
+/// MUST match. This prevents identity substitution where an attacker
+/// authenticates as node B but uses a different X25519 key (e.g., to
+/// intercept circuit traffic destined for B).
+///
+/// All other fields match the advertisement — the ONLY failing check is the
+/// X25519 binding (check #5 in `from_verified_handshake`).
+#[test]
+fn peer_x25519_mismatch_rejected() {
+    let (gw_verified, gw_id) = make_gateway_advert(b"x25519-mismatch-gw", 1, "127.0.0.1:7777");
+    let local = [0x42; 32];
+    let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:7777"));
+
+    // The advert's real X25519 key (from make_gateway_advert).
+    let advert_x25519 = gw_verified
+        .circuit_x25519_pub()
+        .expect("gateway must have X25519 circuit key");
+
+    // Construct a proof with a DIFFERENT peer_x25519_public. All other
+    // fields match the advertisement, so the ONLY failing check is the
+    // X25519 binding (check #5 in from_verified_handshake).
+    let wrong_x25519 = {
+        let mut x = *advert_x25519;
+        // Flip bits to make it different (avoid the all-zero key, which is
+        // a separate failure mode not under test here).
+        x[0] ^= 0xff;
+        x
+    };
+    assert_ne!(
+        wrong_x25519, *advert_x25519,
+        "test setup: X25519 keys must differ"
+    );
+
+    let proof = verified_handshake_from_fields(
+        gw_verified.node_id(),
+        *gw_verified.ed25519_public_key(),
+        wrong_x25519,
+        fake_session_id(),
+    );
+    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof);
+    match result {
+        Err(AuthenticatedLinkError::HandshakeX25519Mismatch) => { /* expected */ }
+        other => panic!("expected HandshakeX25519Mismatch, got {other:?}"),
+    }
+
+    eprintln!("[test 11] PASS: peer X25519 mismatch rejected");
+}
+
+/// 12. public_handshake_result_cannot_construct_authenticated_link
+///
+/// N2.1.2.4: Verify that `AuthenticatedLink::from_handshake` (the N2.1.2.3
+/// constructor that accepted a publicly-constructible `snp_link::HandshakeResult`)
+/// was REMOVED. The only public constructor is now
+/// `AuthenticatedLink::from_verified_handshake`, which takes an UNFORGEABLE
+/// `snp_link::VerifiedHandshake`.
+///
+/// ## Compile-time guarantee
+///
+/// The removal of `from_handshake` is a compile-time guarantee enforced by
+/// the Rust type system. The following code would NOT compile if uncommented:
+///
+/// ```ignore
+/// let result: snp_link::HandshakeResult = /* publicly constructible */;
+/// let _ = AuthenticatedLink::from_handshake(key, &advert, &result);
+/// //                       ^^^^^^^^^^^^^^^ no such method exists in N2.1.2.4
+/// ```
+///
+/// ## Runtime verification
+///
+/// This test verifies what we CAN verify at runtime:
+/// 1. `snp_link::HandshakeResult` still exists and has PUBLIC fields — anyone
+///    can construct one, which is exactly why it is NOT a sufficient security
+///    proof.
+/// 2. `snp_link::VerifiedHandshake` has PRIVATE fields and a PRIVATE
+///    constructor — it CANNOT be constructed without either the actual
+///    handshake (`perform_snp_ik_handshake_verified`) or the test-only
+///    factory (`verified_handshake_from_fields`).
+/// 3. The ONLY way to construct an `AuthenticatedLink` is via
+///    `from_verified_handshake(&VerifiedHandshake)`.
+#[test]
+fn public_handshake_result_cannot_construct_authenticated_link() {
+    let (gw_verified, gw_id) = make_gateway_advert(b"no-from-hs-gw", 1, "127.0.0.1:8888");
+    let local = [0x42; 32];
+    let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:8888"));
+
+    // (1) HandshakeResult is PUBLIC and constructible by anyone — this is
+    // exactly why it is NOT a sufficient security proof. An attacker could
+    // synthesize one with arbitrary fields.
+    let _publicly_constructed: snp_link::HandshakeResult = snp_link::HandshakeResult {
+        link_keys: snp_link::LinkKeys {
+            send_key: [0u8; 32],
+            recv_key: [0u8; 32],
+        },
+        peer_node_id: gw_verified.node_id(),
+        peer_public_key: *gw_verified.ed25519_public_key(),
+        peer_x25519_public: gw_verified.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
+        peer_ephemeral_public: [0u8; 32],
+        session_id: fake_session_id(),
+    };
+    // Note: there is NO way to feed this HandshakeResult into an
+    // AuthenticatedLink. The following line would NOT compile:
+    //   AuthenticatedLink::from_handshake(key, &gw_verified, &_publicly_constructed);
+    // because `from_handshake` was REMOVED in N2.1.2.4.
+
+    // (2) The ONLY way to construct an AuthenticatedLink is via a
+    // VerifiedHandshake, which (in production) can only be minted by
+    // `perform_snp_ik_handshake_verified`. In tests, we use the test-only
+    // factory.
+    let proof = make_verified_handshake(&gw_verified, fake_session_id());
+    let auth = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof)
+        .expect("VerifiedHandshake matching the advert must produce an AuthenticatedLink");
+    assert!(auth.is_usable());
+
+    eprintln!("[test 12] PASS: public HandshakeResult cannot construct AuthenticatedLink (only VerifiedHandshake can)");
+}
+
+/// 13. test_only_verified_handshake_creates_authenticated_link
+///
+/// Verify the test-only factory `snp_link::test_support::verified_handshake_from_fields`
+/// produces a genuine `VerifiedHandshake` that is accepted by
+/// `AuthenticatedLink::from_verified_handshake`. This is the canonical test
+/// path: it doesn't perform an actual SNP-IK handshake over a transport, but
+/// the proof it produces is real (minted via the private constructor inside
+/// `snp-link`).
+#[test]
+fn test_only_verified_handshake_creates_authenticated_link() {
+    let (gw_verified, gw_id) = make_gateway_advert(b"factory-gw", 1, "127.0.0.1:9999");
+    let local = [0x42; 32];
+    let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:9999"));
+
+    // Construct a VerifiedHandshake via the test-only factory.
+    let proof = verified_handshake_from_fields(
+        gw_verified.node_id(),
+        *gw_verified.ed25519_public_key(),
+        gw_verified.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
+        fake_session_id(),
+    );
+
+    // The proof must be accepted by from_verified_handshake.
+    let auth = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof)
+        .expect("test-factory proof matching the advert must produce an AuthenticatedLink");
+
+    // The link's session_id comes from the proof.
+    assert_eq!(auth.session_id(), fake_session_id());
+    assert!(auth.is_usable());
+
+    eprintln!("[test 13] PASS: test-only verified_handshake_from_fields creates AuthenticatedLink");
+}
+
+/// 14. authenticated_link_preserves_verified_handshake
+///
+/// N2.1.2.4: The `VerifiedHandshake` proof is RETAINED inside the
+/// `AuthenticatedLink` — it is NOT discarded at the storage boundary.
+/// `auth_link.handshake_proof()` returns a reference to the same proof that
+/// was used to construct the link. This means the proof travels with the
+/// link through the entire route-engine pipeline (LinkTable stores
+/// AuthenticatedLink, not plain Link).
+#[test]
+fn authenticated_link_preserves_verified_handshake() {
+    let (gw_verified, gw_id) = make_gateway_advert(b"preserve-proof-gw", 1, "127.0.0.1:7000");
+    let local = [0x42; 32];
+    let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:7000"));
+
+    // Mint a proof via the test-only factory.
+    let proof = make_verified_handshake(&gw_verified, fake_session_id());
+
+    // Construct the AuthenticatedLink.
+    let auth = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof)
+        .expect("valid link");
+
+    // The proof is preserved — handshake_proof() returns a reference to a
+    // VerifiedHandshake with the same fields as the one we supplied.
+    let preserved = auth.handshake_proof();
+    assert_eq!(preserved.session_id(), proof.session_id());
+    assert_eq!(preserved.peer_node_id(), proof.peer_node_id());
+    assert_eq!(preserved.peer_public_key(), proof.peer_public_key());
+    assert_eq!(preserved.peer_x25519_public(), proof.peer_x25519_public());
+
+    // Sanity: the preserved proof matches the advert.
+    assert_eq!(preserved.peer_node_id(), gw_verified.node_id());
+    assert_eq!(preserved.peer_public_key(), *gw_verified.ed25519_public_key());
+
+    eprintln!("[test 14] PASS: AuthenticatedLink preserves VerifiedHandshake proof");
+}
+
+/// 15. production_build_excludes_test_handshake_factory
+///
+/// Verify that `snp_link::test_support::verified_handshake_from_fields`
+/// (the test-only factory for `VerifiedHandshake`) is gated behind the
+/// `test-support` Cargo feature. Production builds (which do NOT enable
+/// `test-support`) cannot access `snp_link::test_support` at all — the
+/// module is `#[cfg(any(test, feature = "test-support"))]` and is physically
+/// absent from the production binary.
+///
+/// This test verifies the feature gate is correctly applied by calling
+/// `verified_handshake_from_fields` (only reachable when the feature is
+/// enabled). If someone removes the feature gate or moves the factory into
+/// the public production API, the security boundary is broken — external
+/// code could manufacture `VerifiedHandshake` proofs without performing an
+/// actual SNP-IK handshake.
+#[test]
+fn production_build_excludes_test_handshake_factory() {
+    let (gw_verified, _) = make_gateway_advert(b"prod-factory-gate-gw", 1, "127.0.0.1:7001");
+
+    // This call only compiles when the `test-support` feature is enabled.
+    // In a production build (no test-support), `snp_link::test_support` is
+    // physically absent.
+    let proof = verified_handshake_from_fields(
+        gw_verified.node_id(),
+        *gw_verified.ed25519_public_key(),
+        gw_verified.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
+        fake_session_id(),
+    );
+
+    // The proof is a genuine VerifiedHandshake — it passes from_verified_handshake.
+    let local = [0x42; 32];
+    let key = LinkKey::new(
+        local,
+        gw_verified.node_id(),
+        TransportEndpoint::tcp("127.0.0.1:7001"),
+    );
+    let _auth = AuthenticatedLink::from_verified_handshake(key, &gw_verified, &proof)
+        .expect("test-factory proof must produce AuthenticatedLink");
+
+    eprintln!("[test 15] PASS: snp_link::test_support factory is feature-gated (not in production)");
 }

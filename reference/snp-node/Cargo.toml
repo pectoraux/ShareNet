@@ -21,11 +21,12 @@ legacy-demo = []
 # does NOT enable this feature — the old APIs are physically absent from
 # the production binary.
 legacy-circuit-keys = []
-# N2.1.2.2: Expose test-only constructors for Link/LinkTable that bypass
-# authentication. This feature MUST NOT be enabled in production builds.
-# It exists ONLY for deterministic route-engine/topology testing where
-# performing actual SNP-IK handshakes is impractical.
-test-support = []
+# N2.1.2.2/N2.1.2.4: Expose test-only constructors for AuthenticatedLink
+# that bypass the actual SNP-IK handshake. This feature MUST NOT be enabled
+# in production builds. It exists ONLY for deterministic route-engine/topology
+# testing where performing actual SNP-IK handshakes is impractical.
+# Enabling this feature also enables snp-link's test-support feature.
+test-support = ["snp-link/test-support"]
 
 [[bin]]
 name = "snp-node"
