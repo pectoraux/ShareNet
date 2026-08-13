@@ -1103,3 +1103,941 @@ impl NextHopTransport for InMemoryNextHopTransport {
         self.responders.get(neighbor_node_id)?(query)
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2 — Recursive multi-hop distributed route discovery
+//
+// Extends the single-step `resolve_step` protocol with recursive forwarding.
+// A queries B, B returns "next hop is C", A queries C, C returns "next hop
+// is G (destination)". The full chain A → B → C → G is accumulated into a
+// `DistributedRouteResolution` with provenance, hop budget tracking, and
+// loop prevention.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2.** A `NextHopQuery` bound to its parent query for recursive
+/// forwarding.
+///
+/// A `ForwardedQuery` extends `NextHopQuery` with three pieces of parent
+/// binding metadata:
+///
+/// - `parent_query_id` — the `query_id` of the previous step's query
+///   (the query whose response triggered this forward). All-zero for the
+///   initial query (no parent).
+/// - `parent_responder_node_id` — the NodeId of the node that responded to
+///   the parent query (the "forwarder"). All-zero for the initial query.
+/// - `visited_nodes` — the set of nodes already visited in this resolution
+///   chain, including the source. Used for loop prevention.
+///
+/// ## Signature model
+///
+/// The `signature` field is the standard `NextHopQuery` signature (signed by
+/// the source over the `NextHopQuery` preimage). The `parent_signature`
+/// field is an ADDITIONAL signature from the source over the parent binding
+/// fields. This binds the parent relationship to the source's identity,
+/// preventing assertion injection attacks where a malicious node provides a
+/// response for a different query chain.
+///
+/// ## Why two signatures?
+///
+/// The `signature` must remain compatible with `NextHopQuery::verify_signature`
+/// so that the existing `NextHopTransport` infrastructure (which takes a
+/// `&NextHopQuery`) can be reused without modification. The `parent_signature`
+/// covers the additional parent binding fields that `NextHopQuery` does not
+/// include, providing end-to-end provenance for the recursive chain.
+///
+/// ## Construction
+///
+/// A `ForwardedQuery` is constructed via `ForwardedQuery::create_and_sign`.
+/// The initial query in a chain has `parent_query_id = [0u8; 16]` and
+/// `parent_responder_node_id = [0u8; 32]` (no parent). Each subsequent
+/// forwarded query carries the previous step's `query_id` and responder.
+#[derive(Debug, Clone)]
+pub struct ForwardedQuery {
+    // === NextHopQuery fields (preserved for transport compatibility) ===
+    /// The querying node's NodeId.
+    pub source_node_id: [u8; 32],
+    /// The querying node's Ed25519 public key.
+    pub source_ed25519_public_key: [u8; 32],
+    /// The destination NodeId the source wants to reach.
+    pub destination_node_id: [u8; 32],
+    /// A unique 16-byte nonce for this query (correlation ID).
+    pub query_id: [u8; 16],
+    /// When this query was created (unix seconds).
+    pub timestamp: u64,
+    /// The maximum remaining hops the source will accept.
+    pub max_hops: u8,
+    /// Ed25519 signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(NextHopQuery preimage)`.
+    pub signature: [u8; 64],
+
+    // === Parent binding fields (N2.1.3.2) ===
+    /// The query_id of the parent query (the previous step in the chain).
+    /// All-zero for the initial query (no parent).
+    pub parent_query_id: [u8; 16],
+    /// The NodeId of the node that responded to the parent query (the
+    /// forwarder). All-zero for the initial query.
+    pub parent_responder_node_id: [u8; 32],
+    /// Nodes already visited in this resolution chain (loop prevention).
+    /// Always includes the source.
+    pub visited_nodes: Vec<[u8; 32]>,
+    /// The source's signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖
+    /// CBOR(parent_binding_preimage)`. Covers `parent_query_id`,
+    /// `parent_responder_node_id`, `visited_nodes`, and `query_id` (to bind
+    /// the parent relationship to this specific query).
+    pub parent_signature: [u8; 64],
+}
+
+impl ForwardedQuery {
+    /// Create and sign a `ForwardedQuery`.
+    ///
+    /// The `signature` field is the standard `NextHopQuery` signature (over
+    /// the NextHopQuery preimage only). The `parent_signature` field covers
+    /// the parent binding fields.
+    ///
+    /// # Panics
+    /// Panics if `max_hops` is 0.
+    #[must_use]
+    pub fn create_and_sign(
+        source_ed25519_secret_key: &[u8; 32],
+        source_ed25519_public_key: &[u8; 32],
+        source_node_id: [u8; 32],
+        destination_node_id: [u8; 32],
+        max_hops: u8,
+        parent_query_id: [u8; 16],
+        parent_responder_node_id: [u8; 32],
+        visited_nodes: Vec<[u8; 32]>,
+    ) -> Self {
+        assert!(max_hops > 0, "max_hops must be > 0");
+        let now = now_unix();
+        let mut query_id = [0u8; 16];
+        let _ = getrandom::getrandom(&mut query_id);
+        let mut msg = Self {
+            source_node_id,
+            source_ed25519_public_key: *source_ed25519_public_key,
+            destination_node_id,
+            query_id,
+            timestamp: now,
+            max_hops,
+            signature: [0u8; 64],
+            parent_query_id,
+            parent_responder_node_id,
+            visited_nodes,
+            parent_signature: [0u8; 64],
+        };
+        // Sign the NextHopQuery preimage (compatible with NextHopQuery::verify_signature).
+        msg.sign_next_hop_query(source_ed25519_secret_key);
+        // Sign the parent binding preimage.
+        msg.sign_parent_binding(source_ed25519_secret_key);
+        msg
+    }
+
+    /// Compute the NextHopQuery preimage (same as NextHopQuery::preimage).
+    fn next_hop_preimage(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
+            (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
+            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (CborValue::TextString("maxHops".into()), CborValue::UnsignedInt(u64::from(self.max_hops))),
+        ])
+    }
+
+    /// Compute the parent binding preimage.
+    fn parent_binding_preimage(&self) -> CborValue {
+        CborValue::Map(vec![
+            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
+            (CborValue::TextString("parentQueryId".into()), CborValue::ByteString(self.parent_query_id.to_vec())),
+            (CborValue::TextString("parentResponderNodeId".into()), CborValue::ByteString(self.parent_responder_node_id.to_vec())),
+            (CborValue::TextString("visitedNodes".into()), CborValue::Array(
+                self.visited_nodes.iter().map(|n| CborValue::ByteString(n.to_vec())).collect()
+            )),
+        ])
+    }
+
+    /// Sign the NextHopQuery preimage (compatible with NextHopQuery::sign).
+    pub fn sign_next_hop_query(&mut self, ed25519_secret_key: &[u8; 32]) {
+        let preimage = self.next_hop_preimage();
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        self.signature = ed25519_sign(ed25519_secret_key, &msg);
+    }
+
+    /// Sign the parent binding preimage.
+    pub fn sign_parent_binding(&mut self, ed25519_secret_key: &[u8; 32]) {
+        let preimage = self.parent_binding_preimage();
+        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails");
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        self.parent_signature = ed25519_sign(ed25519_secret_key, &msg);
+    }
+
+    /// Verify the NextHopQuery signature and source identity consistency (I4).
+    ///
+    /// This is equivalent to `NextHopQuery::verify_signature` on the
+    /// projected `NextHopQuery`.
+    #[must_use]
+    pub fn verify_signature(&self) -> bool {
+        let preimage = self.next_hop_preimage();
+        let Ok(bytes) = snp_cbor::encode(&preimage) else {
+            return false;
+        };
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        if !ed25519_verify(&self.source_ed25519_public_key, &msg, &self.signature) {
+            return false;
+        }
+        let expected = snp_crypto::derive_node_id(&self.source_ed25519_public_key);
+        self.source_node_id == expected
+    }
+
+    /// Verify the parent binding signature.
+    ///
+    /// This proves the source authored the parent binding fields, binding
+    /// the forwarded query to its parent query.
+    #[must_use]
+    pub fn verify_parent_signature(&self) -> bool {
+        let preimage = self.parent_binding_preimage();
+        let Ok(bytes) = snp_cbor::encode(&preimage) else {
+            return false;
+        };
+        let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
+        msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
+        msg.extend_from_slice(&bytes);
+        ed25519_verify(&self.source_ed25519_public_key, &msg, &self.parent_signature)
+    }
+
+    /// Verify both signatures (NextHopQuery + parent binding).
+    #[must_use]
+    pub fn verify_all(&self) -> bool {
+        self.verify_signature() && self.verify_parent_signature()
+    }
+
+    /// Project to a `NextHopQuery` (drops parent binding fields).
+    ///
+    /// The resulting `NextHopQuery` has the same `signature` (which is the
+    /// NextHopQuery signature, compatible with `NextHopQuery::verify_signature`).
+    #[must_use]
+    pub fn as_next_hop_query(&self) -> NextHopQuery {
+        NextHopQuery {
+            source_node_id: self.source_node_id,
+            source_ed25519_public_key: self.source_ed25519_public_key,
+            destination_node_id: self.destination_node_id,
+            query_id: self.query_id,
+            timestamp: self.timestamp,
+            max_hops: self.max_hops,
+            signature: self.signature,
+        }
+    }
+
+    /// Check if this is the initial query in a chain (no parent).
+    #[must_use]
+    pub fn is_initial(&self) -> bool {
+        self.parent_query_id == [0u8; 16] && self.parent_responder_node_id == [0u8; 32]
+    }
+
+    /// Check if a node has already been visited (loop prevention).
+    #[must_use]
+    pub fn has_visited(&self, node_id: &[u8; 32]) -> bool {
+        self.visited_nodes.contains(node_id)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DistributedRouteResolutionError
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2.** Errors that can occur when verifying a
+/// `DistributedRouteResolution` or converting it to a `Route`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DistributedRouteResolutionError {
+    /// The resolution chain is empty (no nodes).
+    #[error("distributed resolution is empty")]
+    Empty,
+    /// The source NodeId does not match the first node in the chain.
+    #[error("source mismatch: expected {expected:?}, got {actual:?}")]
+    SourceMismatch {
+        /// The expected source NodeId.
+        expected: [u8; 32],
+        /// The actual first node in the chain.
+        actual: [u8; 32],
+    },
+    /// The destination NodeId does not match the last node in the chain.
+    #[error("destination mismatch: expected {expected:?}, got {actual:?}")]
+    DestinationMismatch {
+        /// The expected destination NodeId.
+        expected: [u8; 32],
+        /// The actual last node in the chain.
+        actual: [u8; 32],
+    },
+    /// The number of records does not match the number of hops.
+    #[error("record count mismatch: expected {expected} records, got {actual}")]
+    RecordCountMismatch {
+        /// The expected number of records.
+        expected: usize,
+        /// The actual number of records.
+        actual: usize,
+    },
+    /// The number of assertions does not match the number of queries.
+    #[error("assertion count mismatch: expected {expected} assertions, got {actual}")]
+    AssertionCountMismatch {
+        /// The expected number of assertions.
+        expected: usize,
+        /// The actual number of assertions.
+        actual: usize,
+    },
+    /// The hop order is incoherent: an assertion's responder or next_hop
+    /// does not match the ordered_node_ids chain.
+    #[error("hop order incoherent at index {index}: {reason}")]
+    HopOrderIncoherent {
+        /// The index of the incoherent assertion.
+        index: usize,
+        /// A human-readable reason.
+        reason: String,
+    },
+    /// The chain contains a duplicate node (loop).
+    #[error("duplicate node in chain at index {index}: {node_id:?}")]
+    DuplicateNode {
+        /// The index of the duplicate.
+        index: usize,
+        /// The duplicated NodeId.
+        node_id: [u8; 32],
+    },
+    /// A node record's NodeId is inconsistent with its Ed25519 public key (I4).
+    #[error("node record at index {index} has inconsistent NodeId (I4 violation)")]
+    NodeRecordInconsistent {
+        /// The index of the inconsistent record.
+        index: usize,
+    },
+    /// A routing assertion is invalid (next_hop doesn't match the record).
+    #[error("routing assertion at index {index} is invalid: {reason}")]
+    InvalidAssertion {
+        /// The index of the invalid assertion.
+        index: usize,
+        /// A human-readable reason.
+        reason: String,
+    },
+    /// The hop budget was exceeded.
+    #[error("hop budget exceeded: {hops} hops with initial budget {budget}")]
+    HopBudgetExceeded {
+        /// The number of hops in the chain.
+        hops: usize,
+        /// The initial hop budget.
+        budget: u8,
+    },
+    /// The destination does not have the Gateway capability.
+    #[error("destination is not a gateway")]
+    DestinationNotGateway,
+    /// The gateway does not have an X25519 circuit public key.
+    #[error("gateway missing X25519 circuit key")]
+    GatewayMissingCircuitKey,
+    /// A relay hop incorrectly advertises an X25519 circuit key.
+    #[error("relay hop at index {index} incorrectly advertises an X25519 circuit key")]
+    RelayHasCircuitKey {
+        /// The index of the offending relay hop.
+        index: usize,
+    },
+    /// The resolution has expired.
+    #[error("resolution has expired (expires_at={expires_at}, now={now})")]
+    Expired {
+        /// When the resolution expires.
+        expires_at: u64,
+        /// The current time.
+        now: u64,
+    },
+    /// Route validation failed during `into_route` conversion.
+    #[error("route validation failed: {0}")]
+    RouteValidationFailed(#[from] RouteError),
+    /// A hop is missing an endpoint.
+    #[error("hop at index {index} has no endpoints")]
+    HopMissingEndpoint {
+        /// The index of the offending hop.
+        index: usize,
+    },
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DistributedRouteResolution
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2.** The result of recursive multi-hop distributed route
+/// discovery.
+///
+/// A `DistributedRouteResolution` captures the full chain of queries and
+/// responses that led to a destination being reached, along with the
+/// authenticated records and routing assertions accumulated along the way.
+///
+/// ## Structure
+///
+/// For a chain A → B → C → G (3 hops):
+///
+/// - `ordered_node_ids = [A, B, C, G]` (length 4, including source).
+/// - `ordered_records = [B's record, C's record, G's record]` (length 3,
+///   one per hop, excluding source A).
+/// - `ordered_assertions = [B's assertion, C's assertion]` (length 2,
+///   one per query/response — A queried B and C, but not G).
+/// - `query_chain` has one entry per query (length 2).
+///
+/// ## Verification
+///
+/// `verify()` checks:
+/// 1. Source is correct (first node in chain).
+/// 2. Destination is correct (last node in chain).
+/// 3. Hop order is coherent (each assertion's responder is the next hop,
+///    each assertion's next_hop matches the following record).
+/// 4. No duplicate/looped nodes.
+/// 5. Every NodeAdvertisement is authenticated (NodeId ↔ Ed25519 consistency).
+/// 6. Every RoutingAssertion is valid (next_hop matches the corresponding record).
+/// 7. Hop budget was never exceeded.
+/// 8. Destination has required capability (Gateway).
+/// 9. Gateway has X25519 circuit identity.
+///
+/// ## Conversion to Route
+///
+/// `into_route()` calls `verify()`, constructs `RouteHop` entries from the
+/// verified descriptors + endpoints, calls `Route::new_with_hop_details()`
+/// and `Route::validate()`, and returns the validated `Route`.
+#[derive(Debug, Clone)]
+pub struct DistributedRouteResolution {
+    /// The source NodeId (the local node that initiated the resolution).
+    pub source: [u8; 32],
+    /// The destination NodeId that was resolved.
+    pub destination: [u8; 32],
+    /// The ordered list of NodeIds in the chain, including the source.
+    /// For A → B → C → G, this is `[A, B, C, G]`.
+    pub ordered_node_ids: Vec<[u8; 32]>,
+    /// The authenticated records for each hop (excluding the source).
+    /// For A → B → C → G, this is `[B's record, C's record, G's record]`.
+    pub ordered_records: Vec<AuthenticatedNodeRecord>,
+    /// The routing assertions from each responder (one per query).
+    /// For A → B → C → G, this is `[B's assertion, C's assertion]`.
+    pub ordered_assertions: Vec<RoutingAssertion>,
+    /// The provenance chain of query steps.
+    pub query_chain: Vec<QueryStep>,
+    /// The initial hop budget at the start of resolution.
+    pub initial_hop_budget: u8,
+    /// The remaining hop budget after resolution.
+    /// Equal to `initial_hop_budget - (ordered_node_ids.len() - 1)`.
+    pub remaining_hop_budget: u8,
+    /// When this resolution expires (unix seconds).
+    pub expiry: u64,
+}
+
+impl DistributedRouteResolution {
+    /// Verify the resolution's structural invariants.
+    ///
+    /// See the type-level documentation for the full list of checks.
+    ///
+    /// # Errors
+    /// Returns a `DistributedRouteResolutionError` describing the first
+    /// violation encountered.
+    pub fn verify(&self) -> Result<(), DistributedRouteResolutionError> {
+        // 1. Non-empty chain.
+        if self.ordered_node_ids.is_empty() {
+            return Err(DistributedRouteResolutionError::Empty);
+        }
+
+        // 2. Source is correct (first node in chain).
+        let first = self.ordered_node_ids[0];
+        if first != self.source {
+            return Err(DistributedRouteResolutionError::SourceMismatch {
+                expected: self.source,
+                actual: first,
+            });
+        }
+
+        // 3. Destination is correct (last node in chain).
+        let last = *self.ordered_node_ids.last().expect("non-empty");
+        if last != self.destination {
+            return Err(DistributedRouteResolutionError::DestinationMismatch {
+                expected: self.destination,
+                actual: last,
+            });
+        }
+
+        // 4. Record count matches hop count (ordered_node_ids.len() - 1).
+        let expected_records = self.ordered_node_ids.len().saturating_sub(1);
+        if self.ordered_records.len() != expected_records {
+            return Err(DistributedRouteResolutionError::RecordCountMismatch {
+                expected: expected_records,
+                actual: self.ordered_records.len(),
+            });
+        }
+
+        // 5. Assertion count matches query count (ordered_node_ids.len() - 2).
+        // For a chain of length N+1 (N hops), there are N-1 assertions.
+        // Special case: a 1-hop chain (A → B, where B is the destination) has
+        // 0 queries/assertions (A already has B's record).
+        // For our recursive resolution, every hop except the destination
+        // is queried, so assertions.len() = hops - 1 = (N+1-1) - 1 = N - 1.
+        let expected_assertions = self.ordered_node_ids.len().saturating_sub(2);
+        if self.ordered_assertions.len() != expected_assertions {
+            return Err(DistributedRouteResolutionError::AssertionCountMismatch {
+                expected: expected_assertions,
+                actual: self.ordered_assertions.len(),
+            });
+        }
+
+        // 6. No duplicate/looped nodes.
+        let mut seen = HashSet::new();
+        for (i, node_id) in self.ordered_node_ids.iter().enumerate() {
+            if !seen.insert(*node_id) {
+                return Err(DistributedRouteResolutionError::DuplicateNode {
+                    index: i,
+                    node_id: *node_id,
+                });
+            }
+        }
+
+        // 7. Every NodeAdvertisement is authenticated (NodeId ↔ Ed25519).
+        for (i, record) in self.ordered_records.iter().enumerate() {
+            if !record.descriptor.verify_node_id_consistency() {
+                return Err(DistributedRouteResolutionError::NodeRecordInconsistent {
+                    index: i,
+                });
+            }
+            // 7b. Record's NodeId matches the corresponding node in the chain.
+            let expected_node_id = self.ordered_node_ids.get(i + 1).copied();
+            if expected_node_id != Some(record.node_id()) {
+                return Err(DistributedRouteResolutionError::HopOrderIncoherent {
+                    index: i,
+                    reason: format!(
+                        "record {} has node_id {:?} but chain expects {:?}",
+                        i,
+                        record.node_id(),
+                        expected_node_id
+                    ),
+                });
+            }
+        }
+
+        // 8. Every RoutingAssertion is valid + hop order is coherent.
+        // For assertion i:
+        //   - responder_node_id == ordered_node_ids[i+1]
+        //   - next_hop_node_id == ordered_node_ids[i+2]
+        //   - next_hop_node_id == ordered_records[i+1].node_id()
+        //   - destination_node_id == self.destination
+        //   - the LAST assertion should have is_destination=true and
+        //     next_hop_node_id == destination.
+        for (i, assertion) in self.ordered_assertions.iter().enumerate() {
+            let expected_responder = self
+                .ordered_node_ids
+                .get(i + 1)
+                .copied();
+            if expected_responder != Some(assertion.responder_node_id) {
+                return Err(DistributedRouteResolutionError::HopOrderIncoherent {
+                    index: i,
+                    reason: format!(
+                        "assertion {} responder {:?} != chain[{}] {:?}",
+                        i, assertion.responder_node_id, i + 1, expected_responder
+                    ),
+                });
+            }
+            let expected_next_hop = self
+                .ordered_node_ids
+                .get(i + 2)
+                .copied();
+            if expected_next_hop != Some(assertion.next_hop_node_id) {
+                return Err(DistributedRouteResolutionError::HopOrderIncoherent {
+                    index: i,
+                    reason: format!(
+                        "assertion {} next_hop {:?} != chain[{}] {:?}",
+                        i, assertion.next_hop_node_id, i + 2, expected_next_hop
+                    ),
+                });
+            }
+            // The next_hop's record must exist and match.
+            if let Some(next_record) = self.ordered_records.get(i + 1) {
+                if next_record.node_id() != assertion.next_hop_node_id {
+                    return Err(DistributedRouteResolutionError::InvalidAssertion {
+                        index: i,
+                        reason: format!(
+                            "assertion {} next_hop {:?} != record[{}].node_id() {:?}",
+                            i, assertion.next_hop_node_id, i + 1, next_record.node_id()
+                        ),
+                    });
+                }
+            }
+            if assertion.destination_node_id != self.destination {
+                return Err(DistributedRouteResolutionError::InvalidAssertion {
+                    index: i,
+                    reason: format!(
+                        "assertion {} destination {:?} != resolution destination {:?}",
+                        i, assertion.destination_node_id, self.destination
+                    ),
+                });
+            }
+            // The last assertion should claim destination reached.
+            if i == self.ordered_assertions.len() - 1 {
+                if !assertion.is_destination {
+                    return Err(DistributedRouteResolutionError::InvalidAssertion {
+                        index: i,
+                        reason: "last assertion should have is_destination=true".to_string(),
+                    });
+                }
+                if assertion.next_hop_node_id != self.destination {
+                    return Err(DistributedRouteResolutionError::InvalidAssertion {
+                        index: i,
+                        reason: "last assertion's next_hop should equal destination".to_string(),
+                    });
+                }
+            } else {
+                // Non-last assertions should NOT claim destination reached.
+                if assertion.is_destination {
+                    return Err(DistributedRouteResolutionError::InvalidAssertion {
+                        index: i,
+                        reason: "non-last assertion has is_destination=true".to_string(),
+                    });
+                }
+            }
+        }
+
+        // 9. Hop budget was never exceeded.
+        // The number of hops (links) is ordered_node_ids.len() - 1.
+        // This must be ≤ initial_hop_budget.
+        let num_hops = self.ordered_node_ids.len() - 1;
+        if u8::try_from(num_hops).unwrap_or(u8::MAX) > self.initial_hop_budget {
+            return Err(DistributedRouteResolutionError::HopBudgetExceeded {
+                hops: num_hops,
+                budget: self.initial_hop_budget,
+            });
+        }
+        // remaining_hop_budget should equal initial - num_hops.
+        let expected_remaining = self
+            .initial_hop_budget
+            .saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
+        if self.remaining_hop_budget != expected_remaining {
+            return Err(DistributedRouteResolutionError::HopBudgetExceeded {
+                hops: num_hops,
+                budget: self.initial_hop_budget,
+            });
+        }
+
+        // 10. Destination has required capability (Gateway).
+        let dest_record = self
+            .ordered_records
+            .last()
+            .ok_or(DistributedRouteResolutionError::Empty)?;
+        if !dest_record.descriptor.is_gateway() {
+            return Err(DistributedRouteResolutionError::DestinationNotGateway);
+        }
+
+        // 11. Gateway has X25519 circuit identity.
+        if dest_record.descriptor.circuit_x25519_pub().is_none() {
+            return Err(DistributedRouteResolutionError::GatewayMissingCircuitKey);
+        }
+
+        // 12. Relay hops must NOT have X25519 circuit keys.
+        for (i, record) in self.ordered_records.iter().enumerate() {
+            // Skip the last record (it's the destination/gateway).
+            if i == self.ordered_records.len() - 1 {
+                continue;
+            }
+            if record.descriptor.circuit_x25519_pub().is_some() {
+                return Err(DistributedRouteResolutionError::RelayHasCircuitKey {
+                    index: i,
+                });
+            }
+        }
+
+        // 13. Each hop has at least one endpoint.
+        for (i, record) in self.ordered_records.iter().enumerate() {
+            if record.endpoints.is_empty() {
+                return Err(DistributedRouteResolutionError::HopMissingEndpoint {
+                    index: i,
+                });
+            }
+        }
+
+        // 14. Not expired.
+        let now = now_unix();
+        if self.expiry <= now {
+            return Err(DistributedRouteResolutionError::Expired {
+                expires_at: self.expiry,
+                now,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Convert the resolution into a validated `Route`.
+    ///
+    /// This method:
+    /// 1. Calls `verify()` to check all invariants.
+    /// 2. Constructs `RouteHop` for each hop using the verified descriptor
+    ///    and the record's endpoints.
+    /// 3. Calls `Route::new_with_hop_details()`.
+    /// 4. Calls `route.validate()`.
+    /// 5. Returns the validated `Route`.
+    ///
+    /// # Errors
+    /// Returns a `DistributedRouteResolutionError` if verification fails
+    /// or if route validation fails.
+    pub fn into_route(self) -> Result<Route, DistributedRouteResolutionError> {
+        // 1. Verify all invariants.
+        self.verify()?;
+
+        // 2. Construct RouteHop entries.
+        let mut hop_details = Vec::with_capacity(self.ordered_records.len());
+        for record in &self.ordered_records {
+            let hop = RouteHop::with_endpoints(
+                record.descriptor.clone(),
+                record.endpoints.clone(),
+            );
+            hop_details.push(hop);
+        }
+
+        // 3. Construct the Route.
+        let route = Route::new_with_hop_details(self.source, self.destination, hop_details);
+
+        // 4. Validate the route.
+        route.validate()?;
+
+        // 5. Return the validated Route.
+        Ok(route)
+    }
+
+    /// Get the number of hops (links) in the chain.
+    #[must_use]
+    pub fn hop_count(&self) -> usize {
+        self.ordered_node_ids.len().saturating_sub(1)
+    }
+
+    /// Check if the resolution has expired.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        now_unix() >= self.expiry
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NextHopResolver::resolve_route — recursive multi-hop distributed discovery
+// ════════════════════════════════════════════════════════════════════════════
+
+impl<'a> NextHopResolver<'a> {
+    /// **N2.1.3.2.** Recursively resolve a destination through multiple hops.
+    ///
+    /// This method performs recursive multi-hop distributed route discovery:
+    ///
+    /// 1. A queries B (using `resolve_step`).
+    /// 2. If B returns a next hop C (not the destination), A queries C.
+    /// 3. If C returns a next hop G (destination), resolution is complete.
+    ///
+    /// At each step:
+    /// - Decrement the hop budget.
+    /// - Add the current responder to `visited_nodes` (loop prevention).
+    /// - Verify the response (via `resolve_step`).
+    /// - Accumulate the routing assertion + node record.
+    ///
+    /// # Loop prevention
+    ///
+    /// Before forwarding a query to a node, the resolver checks if that node
+    /// is already in `visited_nodes`. If so, the resolution is rejected
+    /// (loop detected).
+    ///
+    /// # Hop budget
+    ///
+    /// The hop budget starts at `MAX_RESPONSE_HOPS` (16). Each forward
+    /// decrements it by 1. If the budget reaches 0 before the destination is
+    /// reached, the resolution is rejected (budget exhausted). There is NO
+    /// way to increase the budget.
+    ///
+    /// # Returns
+    /// - `Some(DistributedRouteResolution)` if the destination was reached.
+    /// - `None` if resolution failed (budget exhausted, loop detected,
+    ///   responder returned NotFound, advertisement verification failed,
+    ///   etc.).
+    #[must_use]
+    pub fn resolve_route(
+        &mut self,
+        destination: &[u8; 32],
+        hint: &RemoteNodeHint,
+    ) -> Option<DistributedRouteResolution> {
+        self.resolve_route_with_budget(destination, hint, MAX_RESPONSE_HOPS)
+    }
+
+    /// **N2.1.3.2.** Recursively resolve a destination with a custom initial
+    /// hop budget.
+    ///
+    /// This is the same as `resolve_route` but allows the caller to specify
+    /// the initial hop budget. Useful for testing budget exhaustion.
+    ///
+    /// # Panics
+    /// Panics if `initial_budget` is 0.
+    #[must_use]
+    pub fn resolve_route_with_budget(
+        &mut self,
+        destination: &[u8; 32],
+        hint: &RemoteNodeHint,
+        initial_budget: u8,
+    ) -> Option<DistributedRouteResolution> {
+        assert!(initial_budget > 0, "initial_budget must be > 0");
+
+        // Track resolution state.
+        let mut remaining_budget = initial_budget;
+        let mut visited_nodes: Vec<[u8; 32]> = vec![self.local_node_id];
+        let mut ordered_node_ids: Vec<[u8; 32]> = vec![self.local_node_id];
+        let mut ordered_records: Vec<AuthenticatedNodeRecord> = Vec::new();
+        let mut ordered_assertions: Vec<RoutingAssertion> = Vec::new();
+        let mut query_chain: Vec<QueryStep> = Vec::new();
+        let mut parent_query_id: [u8; 16] = [0u8; 16];
+        let mut parent_responder_node_id: [u8; 32] = [0u8; 32];
+
+        // The current hint tells us which neighbor to query.
+        let mut current_hint = hint.clone();
+
+        loop {
+            // 1. Hop budget check — if exhausted, reject.
+            if remaining_budget == 0 {
+                return None;
+            }
+            // Decrement the budget for this forward step.
+            remaining_budget -= 1;
+
+            // 2. Loop prevention — check if the responder is already visited.
+            let next_responder = current_hint.learned_from;
+            if visited_nodes.contains(&next_responder) {
+                // Loop detected — reject.
+                return None;
+            }
+
+            // 3. Construct a ForwardedQuery to track parent binding (internal
+            //    metadata; the actual transport uses a NextHopQuery via
+            //    resolve_step).
+            let _forwarded = ForwardedQuery::create_and_sign(
+                &self.local_ed25519_secret,
+                &self.local_ed25519_public,
+                self.local_node_id,
+                *destination,
+                MAX_RESPONSE_HOPS,
+                parent_query_id,
+                parent_responder_node_id,
+                visited_nodes.clone(),
+            );
+            // The forwarded query's query_id will be DIFFERENT from the one
+            // resolve_step generates (since both use getrandom). The
+            // forwarded query is metadata only — it is NOT sent over the
+            // transport. The parent binding is tracked via the assertion's
+            // query_id (set below).
+
+            // 4. Call resolve_step to do the actual query/response.
+            let resolution = self.resolve_step(destination, &current_hint)?;
+            let assertion = resolution.assertion.clone();
+            let record = resolution.record.clone();
+
+            // 5. Track the query step (using the assertion's query_id, which
+            //    is the actual query_id used by resolve_step).
+            query_chain.push(QueryStep {
+                source_node_id: self.local_node_id,
+                responder_node_id: next_responder,
+                query_id: assertion.query_id,
+                remaining_hops: remaining_budget,
+            });
+
+            // 6. Update parent binding for the next iteration.
+            parent_query_id = assertion.query_id;
+            parent_responder_node_id = next_responder;
+
+            // 7. Add the responder to visited_nodes (loop prevention).
+            visited_nodes.push(next_responder);
+
+            // 8. Add the responder's record to ordered_records.
+            //    The responder's record comes from the topology (if available)
+            //    or is implicit (we queried them, so they must be authenticated).
+            //    For the FIRST iteration, the responder is the hint's
+            //    learned_from — A's neighbor, whose record should be in the
+            //    topology. For subsequent iterations, the responder is the
+            //    previous step's next_hop — whose record was returned in the
+            //    previous step's response.
+            let responder_record: Option<AuthenticatedNodeRecord> = if ordered_node_ids.len() == 1 {
+                // First iteration: responder = hint.learned_from (A's neighbor).
+                // Look up the responder's record in the topology.
+                self.topology.get_record(&next_responder).cloned()
+            } else {
+                // Subsequent iteration: responder = previous step's next_hop.
+                // Their record was the previous step's returned record.
+                ordered_records.last().cloned()
+            };
+
+            // The record returned by resolve_step is the NEXT hop's record
+            // (what the responder claims is the next hop). Add it to
+            // ordered_records.
+            //
+            // But first, we need to add the responder's record (if not already
+            // present). The responder's record is added BEFORE the next hop's
+            // record to maintain the chain order.
+            if let Some(r) = responder_record {
+                // Add the responder's record if it's not already the last
+                // record (which would happen if the responder was the
+                // previous step's next_hop).
+                let already_last = ordered_records
+                    .last()
+                    .map_or(false, |last| last.node_id() == r.node_id());
+                if !already_last {
+                    ordered_records.push(r);
+                    ordered_node_ids.push(next_responder);
+                }
+            } else {
+                // We don't have the responder's record (e.g., it's not in
+                // the topology). This happens when the responder was the
+                // previous step's next_hop. In that case, the responder's
+                // record WAS the previous step's returned record, which is
+                // already in ordered_records.
+                //
+                // Make sure the responder is in ordered_node_ids.
+                if !ordered_node_ids.contains(&next_responder) {
+                    ordered_node_ids.push(next_responder);
+                }
+            }
+
+            // 9. Add the assertion + next hop's record.
+            ordered_assertions.push(assertion.clone());
+            ordered_node_ids.push(record.node_id());
+            ordered_records.push(record.clone());
+
+            // 10. Check if destination reached.
+            if assertion.claims_destination_reached() {
+                // Destination reached — construct the resolution.
+                let num_hops = ordered_node_ids.len() - 1;
+                let final_remaining = initial_budget
+                    .saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
+                let expiry = now_unix().saturating_add(MAX_ROUTE_RESPONSE_AGE_SECS);
+                return Some(DistributedRouteResolution {
+                    source: self.local_node_id,
+                    destination: *destination,
+                    ordered_node_ids,
+                    ordered_records,
+                    ordered_assertions,
+                    query_chain,
+                    initial_hop_budget: initial_budget,
+                    remaining_hop_budget: final_remaining,
+                    expiry,
+                });
+            }
+
+            // 11. Set up the next iteration.
+            // The next responder is the current step's next_hop.
+            current_hint = RemoteNodeHint {
+                target_node_id: *destination,
+                learned_from: assertion.next_hop_node_id,
+                claimed_sequence: 0,
+                claimed_capabilities: Vec::new(),
+                claimed_visibility: String::new(),
+                claimed_last_seen: 0,
+                distance_hint: 0,
+                received_at: 0,
+                source_propagation_sequence: 0,
+            };
+        }
+    }
+
+    /// **N2.1.3.2.** Get the local node's NodeId.
+    #[must_use]
+    pub fn local_node_id(&self) -> [u8; 32] {
+        self.local_node_id
+    }
+}

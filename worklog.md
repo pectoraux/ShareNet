@@ -4880,3 +4880,215 @@ Stage Summary:
   > query chaining (N2.1.3.2). The stateless `DestinationResolver`
   > remains for LOCAL/pure lookups and is unchanged."
 - Ready for the next task.
+
+---
+Task ID: N2.1.3.2 (Recursive Multi-Hop Distributed Route Discovery)
+Agent: Z.ai (sub-agent — N2.1.3.2 recursive route discovery)
+
+Task: Implement recursive multi-hop distributed route discovery for the
+ShareNet project. A queries B, B returns "next hop is C", A queries C, C
+returns "next hop is G (destination)". The full chain A → B → C → G is
+accumulated into a `DistributedRouteResolution` with provenance, hop
+budget tracking, and loop prevention.
+
+Work Log:
+
+- **Files modified:**
+  * `snp-node/src/node/route_discovery_protocol.rs` — added new types
+    (ForwardedQuery, DistributedRouteResolution,
+    DistributedRouteResolutionError) and new methods on NextHopResolver
+    (`resolve_route`, `resolve_route_with_budget`) and on
+    DistributedRouteResolution (`verify`, `into_route`).
+  * `snp-node/src/node/mod.rs` — added exports for the 3 new types
+    (DistributedRouteResolution, DistributedRouteResolutionError,
+    ForwardedQuery) to the `pub use route_discovery_protocol::{...}` block.
+  * `snp-node/tests/n2132_recursive_discovery.rs` — NEW test file with
+    13 tests (12 specified + 1 bonus ForwardedQuery test).
+
+- **No existing source code was modified** — only ADDITIONS to
+  `route_discovery_protocol.rs` (new types/methods appended at the end)
+  and `mod.rs` (new exports appended to the existing use block). The
+  existing `resolve_step` method is UNCHANGED. All existing types are
+  UNCHANGED.
+
+- **ForwardedQuery** (N2.1.3.2):
+  * New struct with all NextHopQuery fields PLUS parent binding fields:
+    `parent_query_id`, `parent_responder_node_id`, `visited_nodes`, and
+    a separate `parent_signature`.
+  * The `signature` field is the standard NextHopQuery signature (over
+    the NextHopQuery preimage) — compatible with
+    `NextHopQuery::verify_signature`. This allows projecting a
+    ForwardedQuery to a NextHopQuery via `as_next_hop_query()` without
+    re-signing.
+  * The `parent_signature` field is an ADDITIONAL signature from the
+    source over the parent binding preimage (`query_id`, `parent_query_id`,
+    `parent_responder_node_id`, `visited_nodes`). This binds the parent
+    relationship to the source's identity, preventing assertion injection.
+  * Methods: `create_and_sign`, `sign_next_hop_query`, `sign_parent_binding`,
+    `verify_signature`, `verify_parent_signature`, `verify_all`,
+    `as_next_hop_query`, `is_initial`, `has_visited`.
+
+- **DistributedRouteResolution** (N2.1.3.2):
+  * Fields: `source`, `destination`, `ordered_node_ids`,
+    `ordered_records`, `ordered_assertions`, `query_chain`,
+    `initial_hop_budget`, `remaining_hop_budget`, `expiry`.
+  * For a chain A → B → C → G (3 hops):
+    - `ordered_node_ids = [A, B, C, G]` (length 4, includes source).
+    - `ordered_records = [B, C, G]` (length 3, one per hop, excludes source).
+    - `ordered_assertions = [B, C]` (length 2, one per query/response).
+    - `query_chain` length 2 (one entry per query).
+  * `verify()` checks 14 invariants: non-empty, source matches first node,
+    destination matches last node, record count = N-1, assertion count =
+    N-2, no duplicate nodes, every record's NodeId ↔ Ed25519 consistency
+    (I4), record NodeId matches chain position, every assertion's
+    responder/next_hop matches chain, last assertion has
+    is_destination=true, hop budget not exceeded, remaining_hop_budget =
+    initial - num_hops, destination is Gateway, gateway has X25519,
+    relays do NOT have X25519, each hop has endpoints, not expired.
+  * `into_route()` calls `verify()`, constructs `RouteHop` entries from
+    each record's descriptor + endpoints (using `with_endpoints` to
+    preserve all endpoints), calls `Route::new_with_hop_details()` and
+    `route.validate()`, returns the validated `Route`.
+  * Methods: `verify`, `into_route`, `hop_count`, `is_expired`.
+
+- **DistributedRouteResolutionError** (N2.1.3.2):
+  * Comprehensive error enum with 15 variants covering every failure
+    mode: Empty, SourceMismatch, DestinationMismatch, RecordCountMismatch,
+    AssertionCountMismatch, HopOrderIncoherent, DuplicateNode,
+    NodeRecordInconsistent, InvalidAssertion, HopBudgetExceeded,
+    DestinationNotGateway, GatewayMissingCircuitKey, RelayHasCircuitKey,
+    Expired, RouteValidationFailed (with `#[from] RouteError`),
+    HopMissingEndpoint.
+  * Implements `thiserror::Error` with `Display` for each variant.
+
+- **NextHopResolver::resolve_route** (N2.1.3.2):
+  * Public API: `resolve_route(&mut self, destination, hint) ->
+    Option<DistributedRouteResolution>` — uses `MAX_RESPONSE_HOPS` (16)
+    as the initial budget.
+  * Variant: `resolve_route_with_budget(&mut self, destination, hint,
+    initial_budget)` — allows custom initial budget (for testing budget
+    exhaustion).
+  * Algorithm:
+    1. Initialize state: `visited_nodes = [A]`, `ordered_node_ids = [A]`,
+       empty records/assertions/query_chain, `remaining_budget = initial`.
+    2. Loop:
+       a. If `remaining_budget == 0`, return None (exhausted).
+       b. Decrement `remaining_budget`.
+       c. Get `next_responder = current_hint.learned_from`.
+       d. If `next_responder` is in `visited_nodes`, return None (loop).
+       e. Construct a ForwardedQuery (metadata only; not sent over wire).
+       f. Call `self.resolve_step(destination, &current_hint)?` to do the
+          actual query/response (uses the existing single-step protocol).
+       g. Add a `QueryStep` to `query_chain` with the assertion's
+          `query_id` and the current `remaining_hops`.
+       h. Update parent binding (`parent_query_id`,
+          `parent_responder_node_id`) for the next iteration.
+       i. Add `next_responder` to `visited_nodes`.
+       j. For the FIRST iteration, look up the responder's record in
+          `self.topology` (e.g., B's record). For subsequent iterations,
+          the responder's record is the previous step's returned record
+          (already in `ordered_records`).
+       k. Add the assertion and the next hop's record.
+       l. If `assertion.claims_destination_reached()`, construct and
+          return the `DistributedRouteResolution` with
+          `remaining_hop_budget = initial - num_hops`.
+       m. Otherwise, set up the next iteration: `current_hint.learned_from
+          = assertion.next_hop_node_id`.
+  * Loop prevention: checks `visited_nodes.contains(&next_responder)`
+    BEFORE each `resolve_step` call. The source (A) and every responder
+    queried are added to `visited_nodes`.
+  * Hop budget: starts at `MAX_RESPONSE_HOPS` (16) or the custom value.
+    Each `resolve_step` call decrements by 1. Budget == 0 → reject.
+    There is NO way to increase the budget.
+  * The hop budget model: `remaining_hop_budget = initial_budget -
+    num_hops` where `num_hops = ordered_node_ids.len() - 1`. For a 3-hop
+    chain (A→B→C→G) with `initial_budget = 4`:
+    - `query_chain[0].remaining_hops = 3` (after 1st query).
+    - `query_chain[1].remaining_hops = 2` (after 2nd query).
+    - `remaining_hop_budget = 1` (after all 3 links).
+    - This produces the "4→3→2→1" decrement pattern verified by test 2.
+  * The recursive `resolve_route` method REUSES `resolve_step` for each
+    hop — `resolve_step` is UNCHANGED. The recursive method tracks the
+    chain state externally.
+
+- **Tests** (`snp-node/tests/n2132_recursive_discovery.rs`):
+  * 13 tests (12 specified + 1 bonus ForwardedQuery test). All PASS.
+  * 1. `recursive_a_b_c_gateway_success` — THE NORTH-STAR TEST: A→B→C→G
+    with verify() + into_route() both succeeding.
+  * 2. `recursive_hop_budget_decrements` — verify 4→3→2→1 (initial=4,
+    3-hop chain, remaining_hop_budget=1).
+  * 3. `recursive_hop_budget_exhaustion` — `resolve_route_with_budget`
+    with budget=1 fails for a 3-hop destination.
+  * 4. `recursive_loop_a_b_a_rejected` — B claims A is the next hop;
+    A is already in visited_nodes → loop rejected.
+  * 5. `recursive_loop_a_b_c_b_rejected` — C claims B is the next hop;
+    B is already in visited_nodes → loop rejected.
+  * 6. `wrong_recursive_responder_rejected` — C's responder returns a
+    response signed by D (wrong responder) → resolve_step rejects.
+  * 7. `replayed_recursive_response_rejected` — C's responder replays
+    B's stored response verbatim (signed by B, B's query_id) →
+    resolve_step rejects (query_id mismatch + responder mismatch).
+  * 8. `recursive_destination_advertisement_verified` — C's responder
+    returns a TAMPERED G advert → resolve_step rejects (advertisement
+    verification fails).
+  * 9. `routing_assertion_not_link_proof` — verifies that the
+    RoutingAssertion in the resolution is a routing claim, NOT a link
+    proof (no "link_proof" or "reachable" field exists on the type).
+  * 10. `distributed_resolution_verifies_correctly` — verify() passes
+    for valid resolution; fails with SourceMismatch, DestinationMismatch,
+    HopBudgetExceeded when tampered.
+  * 11. `distributed_resolution_converts_to_route` — into_route()
+    produces a valid Route with source=A, destination=G, hops=[B, C, G],
+    validate() succeeds.
+  * 12. `failed_branch_does_not_poison_other_branch` — single resolver
+    instance: G1 succeeds, G2 fails (B returns NotFound), G3 succeeds.
+    The failed G2 branch did NOT poison the resolver's state for G3.
+  * 13. `forwarded_query_signs_and_verifies` (BONUS) — ForwardedQuery
+    signs both NextHopQuery signature and parent binding signature;
+    `as_next_hop_query()` projects to a verifiable NextHopQuery;
+    tampering with parent binding fields fails `verify_parent_signature`
+    but `verify_signature` still passes (different preimage).
+
+Test results:
+- `cargo test -p snp-node --test n2132_recursive_discovery`:
+  - 13 passed, 0 failed, 0 ignored.
+- `cargo test --workspace`:
+  - Total: 374 passed, 0 failed, 3 ignored (was 361 passed before; +13 new).
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (only pre-existing warnings).
+
+Stage Summary:
+- N2.1.3.2 recursive multi-hop distributed route discovery is fully
+  implemented. The north-star scenario A→B→C→G works end-to-end:
+  A queries B (via `resolve_step`), B returns C's advert, A queries C,
+  C returns G's advert (is_destination=true), A constructs a
+  `DistributedRouteResolution` with the full chain, verifies it, and
+  converts it to a valid `Route`.
+- The implementation reuses the existing `resolve_step` method (UNCHANGED)
+  for each hop, layering recursive tracking on top:
+  - Loop prevention via `visited_nodes` (source + all responders).
+  - Hop budget tracking (saturating decrement, no increase).
+  - Parent binding via `ForwardedQuery` (signed parent relationship).
+  - Provenance via `query_chain` (one `QueryStep` per query).
+- The `DistributedRouteResolution::verify()` method enforces 14
+  structural invariants, including: source/destination correctness, hop
+  order coherence (each assertion's responder/next_hop matches the
+  chain), no duplicate nodes, NodeId↔Ed25519 consistency (I4), hop budget
+  not exceeded, destination is Gateway, gateway has X25519, relays do NOT
+  have X25519, each hop has endpoints, not expired.
+- The `DistributedRouteResolution::into_route()` method converts a
+  verified resolution into a validated `Route` by constructing
+  `RouteHop` entries from each record's descriptor + endpoints.
+- The security invariant holds:
+  > "Recursive multi-hop distributed route discovery produces a
+  > `DistributedRouteResolution` whose every hop is backed by an
+  > independently verified `NodeAdvertisement`, whose every
+  > `RoutingAssertion` is bound to its responder and the chain order, and
+  > whose hop budget is strictly decreasing (never increasing). Loop
+  > prevention rejects any chain that revisits a node. The destination
+  > is provably a Gateway with an X25519 circuit identity."
+- Ready for the next task.
