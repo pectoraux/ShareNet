@@ -1,25 +1,107 @@
-//! N2.1.3 / N2.1.3.1 / N2.1.3.1.1 — Distributed Route Discovery Protocol Foundation.
-//!
-//! **This module implements a SINGLE-STEP distributed next-hop
-//! query/response protocol foundation.** It does NOT yet implement
-//! recursive multi-hop discovery (A → B → C → G). That is a future
-//! milestone (N2.1.3.2).
+//! N2.1.3 — Distributed Route Discovery Protocol (single-step + recursive).
 //!
 //! ## What is implemented
+//!
+//! ### Single-step protocol (N2.1.3 / N2.1.3.1)
 //!
 //! - Signed `NextHopQuery` / `NextHopResponse` messages.
 //! - `PendingRouteQuery` state for stateful response acceptance.
 //! - Expected-responder binding (response must come from the queried neighbor).
 //! - Replay protection (each query can only be consumed once).
 //! - Freshness validation (MAX_ROUTE_QUERY_AGE, MAX_ROUTE_RESPONSE_AGE).
+//! - Transactional query consumption (failed validation does NOT consume).
 //! - `max_hops` validation (>0, reject invalid) + decrement semantics.
-//! - `RoutingAssertion` type — distinguishes "B claims C is next hop" from
-//!   "C is C" (identity proof).
+//! - `RoutingAssertion` type — individually signed by the responder.
 //! - `DistributedRouteResolver` trait — stateful interface for distributed
 //!   protocol resolution (separate from the stateless `DestinationResolver`).
-//! - `QueryProvenance` — data structure for future recursive query chaining.
+//! - `QueryProvenance` — data structure for recursive query chaining.
 //! - `NextHopResolver` implementing `DistributedRouteResolver` for
 //!   single-step resolution with persistent state.
+//!
+//! ### Recursive protocol (N2.1.3.2)
+//!
+//! - `ForwardedQuery` — the canonical recursive protocol message, carrying
+//!   parent binding (parent_query_id, parent_responder_node_id,
+//!   parent_query_hash), visited_nodes (loop prevention), and hop budget.
+//! - `ForwardingNode` — test-only protocol participant that verifies
+//!   incoming queries, creates new ForwardedQuery instances with decremented
+//!   budget + updated visited_nodes + parent binding, and forwards via
+//!   `RecursiveNextHopTransport`.
+//! - `SignedResponseStep` — per-hop signed response step binding the
+//!   responder's contribution to the actual query hashes, destination
+//!   state, hop budget, and next-hop identity.
+//! - `RecursiveRouteResponse` — unsigned transport envelope carrying the
+//!   accumulated chain. Envelope fields are derived/untrusted; authority
+//!   comes from the signed `SignedResponseStep` chain, signed
+//!   `RoutingAssertion`s, and authenticated `NodeAdvertisement`s.
+//! - `DistributedRouteResolution` — the result of recursive discovery,
+//!   verified via `verify()` (checks assertion signatures, response step
+//!   signatures, chain coherence, hop budget, loop prevention, destination
+//!   capabilities) before conversion to `Route` via `into_route()`.
+//!
+//! ## Protocol overview (recursive)
+//!
+//! ```text
+//! A (wants route to G)
+//!     │
+//!     │ 1. Creates ForwardedQuery(budget=16, visited=[A], parent=none)
+//!     │ 2. Sends to B via RecursiveNextHopTransport
+//!     ▼
+//! B (A's authenticated neighbor)
+//!     │
+//!     │ 3. Verifies ForwardedQuery (signature, parent binding, I4)
+//!     │ 4. Checks visited_nodes (loop prevention)
+//!     │ 5. Checks hop budget (> 0)
+//!     │ 6. If B IS destination → terminal response
+//!     │ 7. Otherwise → creates NEW ForwardedQuery:
+//!     │    - Decremented budget (15)
+//!     │    - Updated visited_nodes ([A, B])
+//!     │    - Parent binding (parent_query_hash = SHA-256 of received query)
+//!     │ 8. Forwards to C via transport
+//!     ▼
+//! C
+//!     │
+//!     │ 9. Same verification + forwarding to G
+//!     ▼
+//! G (destination)
+//!     │
+//!     │ 10. Returns RecursiveRouteResponse with destination_reached=true
+//!     ▼
+//! C → B → A
+//!     │
+//!     │ 11. Each forwarder prepends its SignedResponseStep +
+//!     │     RoutingAssertion + record to the response
+//!     ▼
+//! A
+//!     │
+//!     │ 12. Constructs DistributedRouteResolution from response
+//!     │ 13. verify() checks all signatures + chain coherence
+//!     │ 14. into_route() → validated Route with RouteCommitment
+//! ```
+//!
+//! ## Security model
+//!
+//! - Every `NextHopQuery`, `NextHopResponse`, `ForwardedQuery`,
+//!   `RoutingAssertion`, and `SignedResponseStep` is **signed** by the
+//!   sender under `ROUTE_DISCOVERY_MSG_CONTEXT`.
+//! - The sender's NodeId is bound to the Ed25519 public key (I4 consistency).
+//! - `parent_query_hash` binds each forwarded query to the ACTUAL parent
+//!   message (SHA-256 of the complete parent ForwardedQuery).
+//! - `SignedResponseStep` chain coherence: `step[i].sent_query_hash ==
+//!   step[i+1].received_query_hash`.
+//! - Initial query binding: `response_steps[0].received_query_hash` must
+//!   match `initial_query.compute_hash()`.
+//! - `RecursiveRouteResponse` envelope fields are derived/untrusted —
+//!   authority comes from the signed chain, not the envelope.
+//!
+//! ## What is NOT implemented
+//!
+//! - Real network transport (only `InMemoryRecursiveTransport`).
+//!   N2.2.1 will implement `TcpRecursiveTransport`.
+//! - Wire serialization/deserialization.
+//!   N2.2.1 will add canonical CBOR encode/decode for protocol messages.
+//! - Proof that the responder has a usable link to the next hop
+//!   (the response is a routing assertion, not a link proof).
 //!
 //! ## N2.1.3.1.1: Stateful composition
 //!
@@ -29,58 +111,6 @@
 //! query/response exchanges. The `NextHopResolver` no longer implements
 //! `DestinationResolver` — callers must use `DistributedRouteResolver`
 //! for distributed resolution.
-//!
-//! ## What is NOT implemented
-//!
-//! - Recursive multi-hop forwarding (A → B → C → G).
-//! - Real network transport (only `InMemoryNextHopTransport`).
-//! - Proof that the responder has a usable link to the next hop
-//!   (the response is a routing assertion, not a link proof).
-//!
-//! ## Protocol overview (single-step)
-//!
-//! ```text
-//! Client A (wants route to G)
-//!     │
-//!     │ 1. Creates PendingRouteQuery { destination: G, expected_responder: B }
-//!     │ 2. Sends NextHopQuery { destination: G, query_id } to B
-//!     ▼
-//! Relay B (A's authenticated neighbor)
-//!     │
-//!     │ 3. B checks its local topology + hints.
-//!     │    If B knows G → respond with G's advertisement.
-//!     │    If B knows a next hop C → respond with C's advertisement.
-//!     │    If B doesn't know → respond with NotFound.
-//!     │
-//!     │ 4. NextHopResponse { query_id, responder: B, result }
-//!     ▼
-//! Client A
-//!     │
-//!     │ 5. A verifies:
-//!     │    - Response signature (B signed it).
-//!     │    - responder_node_id == expected_responder (B).
-//!     │    - query_id matches pending query.
-//!     │    - Query not expired, not already consumed.
-//!     │    - Response not expired, not future-dated.
-//!     │    - Advertisement verifies independently.
-//!     │ 6. A accepts the RoutingAssertion (B claims C/G is next hop).
-//!     │ 7. A does NOT yet recursively query C. (Future: N2.1.3.2)
-//! ```
-//!
-//! ## Security model
-//!
-//! - Every `NextHopQuery` and `NextHopResponse` is **signed** by the sender.
-//! - The sender's NodeId is bound to the Ed25519 public key (I4 consistency).
-//! - The `query_id` correlates query and response, but is NOT by itself a
-//!   replay cache — `PendingRouteQuery` state is required.
-//! - The response's `responder_node_id` MUST match the neighbor that was
-//!   queried. A valid signature from a different node is rejected.
-//! - The advertisement in a `NextHopResponse` is a full `NodeAdvertisement`
-//!   that the receiver MUST verify independently via
-//!   `verify_into_verified()`.
-//! - A `RoutingAssertion` is a signed claim by the responder. It proves
-//!   "B claims C is the next hop." It does NOT prove "B has a usable link
-//!   to C" or "A can reach C."
 
 use super::*;
 use snp_cbor::CborValue;
