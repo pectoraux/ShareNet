@@ -5520,3 +5520,279 @@ binds the responder's claim. This is documented in
 > (new), and every parent-child query relationship is hash-bound (new)."
 
 - Ready for the next task.
+
+---
+
+**Task ID:** N2.1.3.2-response-auth
+**Repository:** `/home/z/my-project/reference`
+**Base commit:** `12cd15b`
+
+### The problem fixed
+
+`RecursiveRouteResponse` was an unsigned mutable envelope. While individual
+`RoutingAssertion`s and `NodeAdvertisement`s were signed (N2.1.3.2-security),
+the response envelope itself — including `destination_reached`, `not_found`,
+`remaining_hop_budget`, `query_chain`, and the ordering of accumulated
+entries — was not authenticated. A transport could modify these fields
+without detection.
+
+### The fix — chained response authentication
+
+Added a `SignedResponseStep` type. Each `ForwardingNode` that handles a
+query creates and signs a `SignedResponseStep` binding its contribution
+to the query it received and (if forwarding) the child query it sent. The
+`RecursiveRouteResponse` carries `response_steps: Vec<SignedResponseStep>`
+— one per forwarding hop, ordered from the first forwarder to the last
+(including the terminal step from the destination itself).
+
+### 1. `SignedResponseStep` type
+
+Added a new struct in `route_discovery_protocol.rs` with the fields
+specified in the task:
+
+```rust
+pub struct SignedResponseStep {
+    pub responder_node_id: [u8; 32],
+    pub responder_ed25519_public_key: [u8; 32],
+    pub received_query_id: [u8; 16],
+    pub received_query_hash: [u8; 32],
+    pub sent_query_hash: [u8; 32],
+    pub destination_reached: bool,
+    pub next_hop_node_id: [u8; 32],
+    pub remaining_hop_budget: u8,
+    pub not_found: bool,
+    pub signature: [u8; 64],
+}
+```
+
+Methods:
+- `preimage() -> CborValue` — canonical CBOR of all fields EXCEPT
+  `signature`.
+- `create_and_sign(secret, public, responder_node_id, received_query_id,
+  received_query_hash, sent_query_hash, destination_reached, next_hop,
+  remaining_budget, not_found) -> Self` — signs the preimage under
+  `ROUTE_DISCOVERY_MSG_CONTEXT` and stores both the signature and the
+  public key in the step.
+- `verify_signature(&self) -> bool` — verifies the signature under the
+  embedded public key AND checks I4 consistency (responder_node_id ==
+  derive_node_id(responder_ed25519_public_key)).
+- `sign(&mut self, secret_key)` — re-signs after field mutation.
+
+### 2. `response_steps` added to `RecursiveRouteResponse`
+
+```rust
+pub struct RecursiveRouteResponse {
+    // ... existing fields ...
+    /// **N2.1.3.2-response-auth.** Signed response steps from each
+    /// forwarding hop. One per `ForwardingNode` that handled a query.
+    pub response_steps: Vec<SignedResponseStep>,
+}
+```
+
+### 3. `ForwardingNode::handle_query()` updated
+
+**Terminal case (this node IS the destination):**
+- Creates a `SignedResponseStep` with `destination_reached=true`,
+  `sent_query_hash=[0;32]`, `next_hop_node_id=[0;32]`,
+  `not_found=false`, `received_query_hash=query.compute_hash()`.
+- Signs it with this node's key.
+- Includes it in `response_steps: vec![terminal_step]`.
+
+**Terminal case (budget exhausted / not found):**
+- Creates a `SignedResponseStep` with `not_found=true`,
+  `destination_reached=false`, `sent_query_hash=[0;32]`,
+  `next_hop_node_id=[0;32]`, `received_query_hash=query.compute_hash()`.
+- Signs it.
+- Includes it in `response_steps: vec![not_found_step]`.
+
+**Forwarding case:**
+- After forwarding and receiving the child response:
+  - `received_query_hash = query.compute_hash()` (the query we received).
+  - `sent_query_hash = new_query.compute_hash()` (the child query we sent).
+  - Creates a `SignedResponseStep` with `destination_reached = is_destination`
+    (same value as the corresponding `RoutingAssertion.is_destination`,
+    so the verify check `step.destination_reached == assertion.is_destination`
+    holds), `next_hop_node_id = next_hop_id`,
+    `remaining_hop_budget = response.remaining_hop_budget`,
+    `not_found = false`.
+  - Signs it.
+  - Prepends to `response.response_steps`.
+
+**Note on `destination_reached` semantics:** The task spec describes
+`destination_reached = response.destination_reached` for the forwarding
+case, but this would propagate `true` from the terminal step back through
+all forwarders — making `destination_reached = true` for B's step (which
+forwarded to C, not G). This conflicts with the verify check
+`step.destination_reached == assertion.is_destination`. I interpreted
+`destination_reached` per-step (matching `is_destination` for forwarders,
+`true` for the terminal step). This makes the verify check consistent
+and preserves the security property: a transport cannot flip
+`destination_reached` on any step without invalidating the signature.
+
+### 4. `DistributedRouteResolution::verify()` updated
+
+Added a new check (step 7c, between the existing record-consistency
+check and the existing assertion check) that verifies the
+`response_steps` chain:
+
+- **Count check:** `response_steps.len() == ordered_assertions.len() + 1`
+  (one step per forwarder, plus one terminal step from the destination).
+- **Per-step checks** (for each `SignedResponseStep`):
+  1. `verify_signature()` returns true (signature + I4).
+  2. For non-terminal steps: `step.responder_node_id ==
+     assertion.responder_node_id`.
+  3. For non-terminal steps: `step.destination_reached ==
+     assertion.is_destination`.
+  4. For non-terminal steps: `step.next_hop_node_id ==
+     assertion.next_hop_node_id`.
+  5. For non-terminal steps: `step.not_found == false`.
+  6. `step.received_query_hash` is non-zero (binds to a real query).
+  7. `step.received_query_id == query_chain[i].query_id` (the query the
+     responder received is the query the previous hop sent — this is the
+     check that detects query_chain tampering and cross-chain replay).
+  8. Chain coherence: `step[i].sent_query_hash ==
+     step[i+1].received_query_hash` (or `[0;32]` for the terminal step).
+  9. For terminal step: `destination_reached == true`,
+     `next_hop_node_id == [0;32]`, `not_found == false`,
+     `responder_node_id == self.destination`, `sent_query_hash == [0;32]`.
+
+Added error variants:
+- `ResponseStepSignatureInvalid { index: usize }` — a step's signature
+  does not verify, OR the responder's NodeId is inconsistent with the
+  embedded Ed25519 public key (I4 violation).
+- `ResponseStepChainIncoherent { index: usize, reason: String }` — the
+  chain of `SignedResponseStep`s is incoherent (hash mismatch,
+  responder mismatch, terminal-step inconsistency, etc.).
+
+### 5. `DistributedRouteResolution` extended
+
+Added a `response_steps: Vec<SignedResponseStep>` field to
+`DistributedRouteResolution`. This is populated by
+`NextHopResolver::resolve_route_with_budget()` from the
+`RecursiveRouteResponse`.
+
+### 6. `NextHopResolver::resolve_route_with_budget()` updated
+
+- **Initial-query binding (step 3b):** After receiving the response,
+  verifies that `response.response_steps[0].received_query_hash ==
+  initial_query.compute_hash()` AND
+  `response.response_steps[0].received_query_id ==
+  initial_query.query_id`. This proves the first responder (B) actually
+  received A's initial query — a malicious transport cannot substitute
+  the entire response_steps with steps from a different resolution
+  (because their hashes wouldn't match A's actual initial query). This
+  check is at resolution time (not in `verify()`) because the initial
+  `ForwardedQuery` is not stored in `DistributedRouteResolution`.
+- **Field propagation (step 9):** Includes `response_steps:
+  response.response_steps` in the constructed
+  `DistributedRouteResolution`.
+
+### 7. `SignedResponseStep` exported from `mod.rs`
+
+Added `SignedResponseStep` to the `pub use route_discovery_protocol::{...}`
+re-export list in `snp-node/src/node/mod.rs`.
+
+### Files modified
+
+- **`snp-node/src/node/route_discovery_protocol.rs`**:
+  * Added `SignedResponseStep` struct + `preimage()`, `create_and_sign()`,
+    `sign()`, `verify_signature()` methods.
+  * Added `response_steps: Vec<SignedResponseStep>` field to
+    `RecursiveRouteResponse`.
+  * `ForwardingNode::handle_query()`: all three cases (terminal
+    destination, terminal not-found, forwarding) now create and sign a
+    `SignedResponseStep` and include it in `response_steps`. The
+    forwarding case prepends the step to the child response's
+    `response_steps`.
+  * Added `ResponseStepSignatureInvalid { index }` and
+    `ResponseStepChainIncoherent { index, reason }` variants to
+    `DistributedRouteResolutionError`.
+  * Added `response_steps: Vec<SignedResponseStep>` field to
+    `DistributedRouteResolution`.
+  * `DistributedRouteResolution::verify()`: added step 7c — verify the
+    signed response step chain (signature, count, per-step
+    correspondence with assertions, received_query_hash non-zero,
+    received_query_id matches query_chain, sent_query_hash →
+    received_query_hash chain coherence, terminal step fields).
+  * `NextHopResolver::resolve_route_with_budget()`: added step 3b —
+    verify `response_steps[0].received_query_hash` and
+    `received_query_id` match A's initial query; added
+    `response_steps: response.response_steps` to the constructed
+    `DistributedRouteResolution`.
+
+- **`snp-node/src/node/mod.rs`**:
+  * Added `SignedResponseStep` to the `pub use route_discovery_protocol`
+    re-export list.
+
+- **`snp-node/tests/n2132_recursive_discovery.rs`**:
+  * Updated test 17 (`swapped_assertion_entries_rejected`) to accept
+    either `ResponseStepChainIncoherent` or `HopOrderIncoherent` (the
+    new step-assertion correspondence check runs before the existing
+    hop-order check, so a swapped assertion is now caught by the new
+    check first).
+  * Added 5 adversarial tests (18–22) + 1 positive baseline test (23):
+    * **18. `forged_response_envelope_rejected`** — flip
+      `destination_reached` on `response_steps[0]` →
+      `verify_signature()` fails → `ResponseStepSignatureInvalid { 0 }`.
+    * **19. `response_chain_substitution_rejected`** — substitute all
+      `response_steps` from a different resolution →
+      `received_query_id` doesn't match `query_chain[i].query_id` →
+      `ResponseStepChainIncoherent { 0 }`.
+    * **20. `query_chain_tampering_rejected`** — modify
+      `query_chain[1].query_id` → signed
+      `response_steps[1].received_query_id` doesn't match →
+      `ResponseStepChainIncoherent { 1 }`.
+    * **21. `destination_state_tampering_rejected`** — flip `not_found`
+      on `response_steps[0]` → `verify_signature()` fails →
+      `ResponseStepSignatureInvalid { 0 }`.
+    * **22. `cross_chain_response_replay_rejected`** — inject
+      `response_steps[1]` from resolution A into resolution B →
+      `received_query_hash`/`received_query_id` mismatch →
+      `ResponseStepChainIncoherent { 0 or 1 }`.
+    * **23. `response_steps_basic_properties`** — positive test verifying
+      the chain has the expected structure for A→B→C→G (3 steps, chain
+      coherence, terminal step fields, signature validity).
+
+### Test results
+
+- `cargo build -p snp-node`:
+  - Success (only pre-existing warnings, no new warnings).
+- `cargo test -p snp-node --test n2132_recursive_discovery`:
+  - 23 passed, 0 failed, 0 ignored (was 17; +6 new: 5 adversarial + 1
+    positive baseline).
+- `cargo test --workspace`:
+  - Total: 384 passed, 0 failed, 3 ignored (was 378; +6 new).
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (only pre-existing warnings).
+
+### Security invariant (updated)
+
+> "Every `RoutingAssertion` in a `DistributedRouteResolution` is
+> individually signed by its claimed responder under
+> `ROUTE_DISCOVERY_MSG_CONTEXT` (N2.1.3.2-security). Every
+> `SignedResponseStep` in `DistributedRouteResolution.response_steps` is
+> ALSO individually signed by its claimed responder under
+> `ROUTE_DISCOVERY_MSG_CONTEXT` (N2.1.3.2-response-auth). The step's
+> signature covers `destination_reached`, `not_found`,
+> `remaining_hop_budget`, `next_hop_node_id`, `received_query_id`, and
+> `received_query_hash`/`sent_query_hash` — any tampering with these
+> fields invalidates the signature. The responder's NodeId MUST equal
+> `derive_node_id(responder_ed25519_public_key)` (I4 consistency). The
+> chain of `sent_query_hash` → next step's `received_query_hash`
+> cryptographically binds each forwarder's contribution to the actual
+> queries exchanged, preventing step reordering, substitution, or
+> fabrication. The first step's `received_query_hash` is verified at
+> resolution time to equal `SHA-256(canonical_CBOR(initial_query))` —
+> this binds the entire chain to A's actual initial query, preventing
+> whole-chain substitution. The chain of custody from A → B → C → G is
+> now provably authentic at every layer: every hop's advertisement is
+> signed (existing), every hop's assertion is signed (N2.1.3.2-security),
+> every parent-child query relationship is hash-bound
+> (N2.1.3.2-security), and now every response step is signed and
+> chain-bound (N2.1.3.2-response-auth)."
+
+- Ready for the next task.
