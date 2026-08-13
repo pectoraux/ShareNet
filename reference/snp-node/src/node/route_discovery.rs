@@ -1010,6 +1010,11 @@ pub enum CommitError {
     /// P0/P1 #1: a participant supplied more than one acceptance. There must
     /// be exactly ONE acceptance per required participant.
     DuplicateAcceptance { participant: [u8; 32] },
+    /// P0: canonical CBOR encoding of the commitment preimage failed. The
+    /// commitment MUST NOT be computed from default/empty bytes —
+    /// `commit_route()` fails closed and returns this error. No `CommittedRoute`
+    /// is produced.
+    CommitmentEncodingFailed,
 }
 
 impl std::fmt::Display for CommitError {
@@ -1032,6 +1037,7 @@ impl std::fmt::Display for CommitError {
             Self::PathProposalMismatch => write!(f, "proposal hop_node_ids do not match validated path"),
             Self::EmptyPath => write!(f, "validated path is empty"),
             Self::DuplicateAcceptance { participant } => write!(f, "duplicate acceptance from {}", hex_short(participant)),
+            Self::CommitmentEncodingFailed => write!(f, "canonical CBOR encoding of commitment preimage failed"),
         }
     }
 }
@@ -1251,15 +1257,27 @@ pub fn commit_route(
             (CborValue::TextString("acceptances".into()), CborValue::Array(acceptances_cbor)),
         ]);
 
-        let encoded = snp_cbor::encode(&commitment_preimage).unwrap_or_default();
+        // P0: FAIL CLOSED. If canonical CBOR encoding fails, we MUST NOT
+        // hash empty/default bytes and produce a seemingly valid commitment.
+        // Return CommitmentEncodingFailed — no CommittedRoute is produced.
+        let encoded = snp_cbor::encode(&commitment_preimage)
+            .map_err(|_| CommitError::CommitmentEncodingFailed)?;
         sha256(&encoded)
     };
+
+    // P1 cleanup: store acceptances in canonical (participant_node_id sorted)
+    // order, matching the commitment representation. This ensures:
+    //   commitment order == stored representation order
+    // and prevents two logically identical CommittedRoutes from having
+    // different internal acceptance ordering.
+    let mut canonical_acceptances = acceptances;
+    canonical_acceptances.sort_by_key(|acc| acc.participant_node_id);
 
     Ok(CommittedRoute {
         proposal,
         validated_hops: validated_path.hops().to_vec(),
         commitment,
-        acceptances,
+        acceptances: canonical_acceptances,
         committed_at: now,
     })
 }

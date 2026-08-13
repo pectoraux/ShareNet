@@ -985,3 +985,66 @@ fn commitment_includes_acceptance_public_key() {
     let c2 = *commit_route(proposal, acc_with_conditions, &path, now).unwrap().commitment();
     assert_ne!(c1, c2, "different conditions must change commitment");
 }
+
+// ─── P0: Commitment encoding fails closed ──────────────────────────────────
+
+/// P0: commit_route() MUST NOT produce a CommittedRoute with a commitment
+/// derived from default/empty bytes if canonical CBOR encoding fails.
+///
+/// The `CommitError::CommitmentEncodingFailed` variant exists for this
+/// purpose. In practice, `snp_cbor::encode` on a well-formed `CborValue`
+/// constructed from the route's fields never fails — the CBOR encoder can
+/// always serialize maps, arrays, byte strings, text strings, and unsigned
+/// integers. But the code path must still FAIL CLOSED rather than
+/// `unwrap_or_default()`.
+///
+/// This test verifies:
+/// 1. The `CommitmentEncodingFailed` variant exists (compiles).
+/// 2. A normal commit succeeds (encoding works, no fallback).
+/// 3. The error variant is displayable (for logging/diagnostics).
+#[test]
+fn commitment_encoding_failure_fails_closed() {
+    let topo = setup_test_topology();
+    let (proposal, path) = build_proposal_and_path(&topo);
+    let acceptances = build_acceptances(&topo, &proposal);
+    let now = now_unix();
+
+    // Normal commit succeeds — encoding works.
+    let result = commit_route(proposal, acceptances, &path, now);
+    assert!(result.is_ok(), "normal commit must succeed");
+
+    // The CommitmentEncodingFailed variant exists and is displayable.
+    // (This is a compile-time + runtime check that the variant is present.)
+    let err = CommitError::CommitmentEncodingFailed;
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("CBOR") && msg.contains("encoding"),
+        "CommitmentEncodingFailed must have a descriptive message: got '{msg}'"
+    );
+
+    // The variant must be != other variants (so it's a distinct error).
+    assert_ne!(err, CommitError::EmptyRoute);
+    assert_ne!(err, CommitError::EmptyPath);
+}
+
+/// P0: Verify that the commitment is NOT the SHA-256 of empty bytes.
+/// If `unwrap_or_default()` were still used, a failed encoding would produce
+/// SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+/// This test verifies the actual commitment is different from that.
+#[test]
+fn commitment_is_not_hash_of_empty_bytes() {
+    let topo = setup_test_topology();
+    let (proposal, path) = build_proposal_and_path(&topo);
+    let acceptances = build_acceptances(&topo, &proposal);
+    let now = now_unix();
+
+    let committed = commit_route(proposal, acceptances, &path, now).unwrap();
+    let commitment = committed.commitment();
+
+    // SHA-256 of empty input.
+    let empty_hash = snp_crypto::sha256(&[]);
+    assert_ne!(
+        commitment, &empty_hash,
+        "commitment must NOT be SHA-256(empty) — that would indicate unwrap_or_default fallback"
+    );
+}
