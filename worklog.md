@@ -5092,3 +5092,227 @@ Stage Summary:
   > prevention rejects any chain that revisits a node. The destination
   > is provably a Gateway with an X25519 circuit identity."
 - Ready for the next task.
+
+---
+
+## N2.1.3.2-fix — ForwardedQuery as wire message
+
+**Task ID:** N2.1.3.2-fix
+**Repository:** `/home/z/my-project/reference`
+**Base commit:** `960055e`
+
+### The architectural flaw
+
+The previous N2.1.3.2 implementation had a critical architectural flaw:
+`resolve_route_with_budget()` constructed a `ForwardedQuery` but DISCARDED
+it (`let _forwarded = ...`). The actual transport call used `resolve_step()`
+which created a plain `NextHopQuery` with `MAX_RESPONSE_HOPS`. The hop
+budget, visited_nodes, and parent binding never traveled in the signed
+wire message.
+
+The old (broken) architecture:
+```
+A constructs ForwardedQuery → DISCARDED
+A sends plain NextHopQuery to B → B responds
+A sends plain NextHopQuery to C → C responds
+A assembles DistributedRouteResolution locally
+```
+
+### The fix
+
+`ForwardedQuery` is now the actual wire message. A sends ONE
+`ForwardedQuery` to its first hop (B), which recursively forwards it
+(creating NEW `ForwardedQuery` instances with decremented hop budget and
+updated `visited_nodes`). Each hop augments the response with its own
+assertion + record. A receives a single `RecursiveRouteResponse` carrying
+the full accumulated chain A → B → C → G.
+
+The new architecture:
+```
+A constructs ForwardedQuery(budget=16, visited=[A], parent=none)
+A sends ForwardedQuery to B via RecursiveNextHopTransport
+B verifies ForwardedQuery (signature + parent binding)
+B constructs ForwardedQuery(budget=15, visited=[A,B], parent=A's query)
+B sends ForwardedQuery to C
+C verifies ForwardedQuery
+C constructs ForwardedQuery(budget=14, visited=[A,B,C], parent=B's query)
+C sends ForwardedQuery to G
+G verifies ForwardedQuery
+G responds (destination_reached=true)
+C augments response (adds C's assertion + G's record)
+B augments response (adds B's assertion + C's record)
+A receives RecursiveRouteResponse with full chain
+A constructs DistributedRouteResolution
+```
+
+### Files modified
+
+- **`snp-node/src/node/route_discovery_protocol.rs`**:
+  * **Added `RecursiveRouteResponse`** — a response that carries the FULL
+    accumulated discovery chain (not just one hop's advertisement). Fields:
+    `destination_node_id`, `destination_reached`,
+    `destination_advertisement: Option<NodeAdvertisement>`,
+    `accumulated_assertions: Vec<RoutingAssertion>`,
+    `accumulated_records: Vec<AuthenticatedNodeRecord>`,
+    `query_chain: Vec<QueryStep>`, `remaining_hop_budget: u8`,
+    `not_found: bool`.
+  * **Added `RecursiveNextHopTransport` trait** — the recursive
+    counterpart to `NextHopTransport`. Single method:
+    `forward_query(&self, neighbor_node_id, query: &ForwardedQuery)
+    -> Option<RecursiveRouteResponse>`.
+  * **Added `InMemoryRecursiveTransport`** — a shared in-memory
+    transport that routes `ForwardedQuery` messages to registered
+    `ForwardingNode` participants. Holds
+    `Arc<Mutex<HashMap<[u8; 32], Arc<ForwardingNode>>>>`.
+    Implements `RecursiveNextHopTransport` by looking up the target node
+    and calling its `handle_query`.
+  * **Added `ForwardingNode`** — a test-only struct that simulates a
+    REAL protocol participant (B, C, or G). Has its own NodeId, Ed25519
+    keypair, self-advertisement, and neighbor map. The `handle_query`
+    method implements the full forwarding algorithm:
+    1. Verifies the query signature + parent binding (`verify_all()`).
+    2. Loop prevention: if self is in `visited_nodes`, return `None`.
+    3. Hop budget check: if `max_hops == 0`, return `None`.
+    4. If self IS the destination → return terminal `RecursiveRouteResponse`
+       with `destination_reached=true` and own advertisement.
+    5. If `max_hops <= 1` (can't forward) → return `not_found=true`.
+    6. Find next hop via `find_next_hop()` (prefers destination if direct
+       neighbor; otherwise any unvisited neighbor).
+    7. Loop prevention: if next hop is in `visited_nodes`, return `None`.
+    8. Construct a NEW `ForwardedQuery` with:
+       - Decremented hop budget (`query.max_hops - 1`).
+       - Updated `visited_nodes` (add self).
+       - Parent binding to the current query (`parent_query_id` =
+         current `query_id`, `parent_responder_node_id` = self).
+    9. Forward via `transport.forward_query(next_hop, new_query)`.
+    10. Verify the next hop's advertisement (`verify_into_verified`).
+    11. Construct own `RoutingAssertion` (`is_destination` = true iff
+        next_hop == destination).
+    12. Prepend own assertion + record + `QueryStep` to the response.
+  * **Modified `NextHopResolver`** — added an optional
+    `recursive_transport: Option<&'a dyn RecursiveNextHopTransport>`
+    field. `new()` initializes it to `None` (backward compat with
+    single-step tests). Added `with_recursive_transport()` builder
+    method.
+  * **Rewrote `resolve_route_with_budget()`** — the new version:
+    1. Requires `recursive_transport` (returns `None` if not set).
+    2. Constructs ONE `ForwardedQuery` with
+       `budget=initial, visited=[A], parent=none`.
+    3. Sends it to the first hop via
+       `RecursiveNextHopTransport::forward_query`.
+    4. Receives `RecursiveRouteResponse` with the full accumulated chain.
+    5. Verifies the destination's advertisement independently.
+    6. Looks up the first hop's record in A's topology (the only record
+       not in `accumulated_records`).
+    7. Prepends A's own `QueryStep` (A→B) to the response's query_chain.
+    8. Constructs `DistributedRouteResolution` from the response.
+    The method does NOT call `resolve_step` in a loop — the forwarding
+    happens inside the transport's `ForwardingNode` participants.
+  * The existing `resolve_step` method is UNCHANGED.
+  * The existing `NextHopTransport` trait and `InMemoryNextHopTransport`
+    are UNCHANGED (backward compat with single-step tests).
+
+- **`snp-node/src/node/mod.rs`** — added exports for the 4 new types
+  (`ForwardingNode`, `InMemoryRecursiveTransport`,
+  `RecursiveNextHopTransport`, `RecursiveRouteResponse`) to the
+  `pub use route_discovery_protocol::{...}` block.
+
+- **`snp-node/tests/n2132_recursive_discovery.rs`** — COMPLETELY REWRITTEN.
+  All 13 tests now use `ForwardingNode` participants instead of
+  pre-baked closures. A `TestMesh` helper struct assembles the standard
+  A → B → C → G mesh (creates G, C, B `ForwardingNode`s, registers them
+  with a shared `InMemoryRecursiveTransport`, sets up A's topology with
+  an authenticated link to B).
+  * Test 1 (`recursive_a_b_c_gateway_success`): THE NORTH-STAR TEST.
+    Verifies A sends ONE ForwardedQuery to B, B forwards to C, C
+    forwards to G. The response contains the full chain A→B→C→G with
+    4 nodes, 3 records, 2 assertions, 3 query_steps. `verify()` and
+    `into_route()` both succeed.
+  * Test 2 (`recursive_hop_budget_decrements`): Verifies the
+    16→15→14→13 decrement pattern (initial=16, 3 hops,
+    remaining_hop_budget=13). `query_chain` has 3 steps (A→B, B→C, C→G).
+  * Test 3 (`recursive_hop_budget_exhaustion`): `initial_budget=1`
+    fails for a 3-hop destination (B can't forward — would need
+    `max_hops=0`).
+  * Test 4 (`recursive_loop_a_b_a_rejected`): B's only neighbor is A
+    (in visited_nodes). B's `find_next_hop` returns `None`.
+  * Test 5 (`recursive_loop_a_b_c_b_rejected`): C's only neighbor is B
+    (in visited_nodes). C's `find_next_hop` returns `None`.
+  * Test 6 (`wrong_recursive_responder_rejected`): A `ForwardedQuery`
+    with a tampered signature is rejected by `handle_query`
+    (`verify_all()` fails).
+  * Test 7 (`replayed_recursive_response_rejected`): A `ForwardedQuery`
+    with a tampered `parent_query_id` is rejected (parent binding
+    signature fails `verify_parent_signature`).
+  * Test 8 (`recursive_destination_advertisement_verified`): Verifies
+    that a valid destination advert passes `verify_into_verified()`,
+    and a tampered advert fails.
+  * Test 9 (`routing_assertion_not_link_proof`): Inspects the assertion
+    fields — they are routing claims, not link proofs.
+  * Test 10 (`distributed_resolution_verifies_correctly`): `verify()`
+    passes for valid, fails with `SourceMismatch`,
+    `DestinationMismatch`, `HopBudgetExceeded` when tampered.
+  * Test 11 (`distributed_resolution_converts_to_route`):
+    `into_route()` produces a valid `Route` with source=A,
+    destination=G, hops=[B, C, G].
+  * Test 12 (`failed_branch_does_not_poison_other_branch`): G1 succeeds,
+    G2 fails (not registered), G3 succeeds — failed branch doesn't
+    poison the resolver.
+  * Test 13 (`forwarded_query_signs_and_verifies`): Bonus test —
+    `ForwardedQuery` signs both NextHopQuery signature and parent
+    binding signature; tampering with parent binding fails
+    `verify_parent_signature` but `verify_signature` still passes.
+
+### Test results
+
+- `cargo build -p snp-node`: Success (only pre-existing warnings).
+- `cargo test -p snp-node --test n2132_recursive_discovery`:
+  - 13 passed, 0 failed, 0 ignored.
+- `cargo test --workspace`:
+  - Total: 374 passed, 0 failed, 3 ignored.
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (only pre-existing warnings).
+
+### Key architectural improvements
+
+1. **`ForwardedQuery` is now the wire message.** The hop budget,
+   `visited_nodes`, and parent binding travel in the signed wire
+   message — they are no longer internal metadata tracked by A.
+2. **A sends ONE query, not multiple.** A sends ONE `ForwardedQuery`
+   to B. B and C handle the rest of the forwarding. A does NOT query
+   C or G directly.
+3. **Each `ForwardingNode` signs its own `ForwardedQuery`.** A
+   "wrong responder" attack (query signed by someone other than the
+   claimed source) is rejected by `verify_all()` at each hop.
+4. **Loop prevention is enforced at each hop.** Each `ForwardingNode`
+   checks `visited_nodes` before forwarding — both for itself (loop
+   back) and for the next hop (would create a loop).
+5. **Hop budget strictly decreasing.** Each `ForwardedQuery` has
+   `max_hops = previous.max_hops - 1`. The budget can never increase.
+6. **Parent binding cryptographically enforced.** Each
+   `ForwardedQuery`'s `parent_signature` covers `parent_query_id`,
+   `parent_responder_node_id`, and `visited_nodes`. Tampering with
+   these fields invalidates the signature.
+7. **Backward compatibility maintained.** `NextHopResolver::new()`
+   signature is unchanged — single-step tests (n213) still work without
+   modification. The `recursive_transport` is optional, set via the
+   `with_recursive_transport()` builder.
+
+### Security invariant (updated)
+
+> "Recursive multi-hop distributed route discovery sends ONE signed
+> `ForwardedQuery` to the first hop. Each `ForwardingNode` verifies the
+> query's signature + parent binding, checks `visited_nodes` for loop
+> prevention, decrements the hop budget, and constructs a NEW signed
+> `ForwardedQuery` for the next hop. The hop budget, visited_nodes,
+> and parent binding all travel in the signed wire message — they
+> cannot be tampered with in transit. The response accumulates the
+> full chain of assertions + records, which A assembles into a
+> `DistributedRouteResolution` whose every hop is backed by an
+> independently verified `NodeAdvertisement`."
+
+- Ready for the next task.
