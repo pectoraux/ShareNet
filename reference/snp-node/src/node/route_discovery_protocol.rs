@@ -821,27 +821,32 @@ pub trait DistributedRouteResolver {
 /// ## How it works (single-step)
 ///
 /// 1. The resolver receives a `RemoteNodeHint` for destination D.
-/// 2. It selects the hint's `learned_from` as the neighbor to query.
-/// 3. It creates a `PendingRouteQuery` (stateful tracking).
-/// 4. It sends a `NextHopQuery` to that neighbor.
-/// 5. It receives a `NextHopResponse`.
-/// 6. It verifies ALL of:
-///    - Response signature + I4.
-///    - Response freshness (not too old, not future-dated).
-///    - Responder == expected neighbor (queried neighbor).
-///    - query_id matches pending query.
-///    - Pending query not expired, not consumed.
-/// 7. It marks the pending query as consumed (replay protection).
-/// 8. It verifies the advertisement via `verify_into_verified()`.
-/// 9. It returns the `NextHopResolution` (assertion + record).
+/// 2. It purges expired pending queries (resource management).
+/// 3. It checks capacity (total live entries ≤ `MAX_PENDING_ROUTE_QUERIES`).
+/// 4. It selects the hint's `learned_from` as the neighbor to query.
+/// 5. It creates a `PendingRouteQuery` (stateful tracking).
+/// 6. It sends a `NextHopQuery` to that neighbor.
+/// 7. It receives a `NextHopResponse`.
+/// 8. It verifies the response signature + I4.
+/// 9. It verifies response freshness (not too old, not future-dated).
+/// 10. It verifies the responder matches the expected neighbor and the
+///     pending query is not expired/consumed.
+/// 11. It verifies the embedded `NodeAdvertisement` via `verify_into_verified()`.
+/// 12. It constructs the `RoutingAssertion` and `NextHopResolution`.
+/// 13. **ONLY THEN** it marks the pending query as consumed (replay protection).
+///     This is the transactional commit point — a failed validation at any
+///     earlier step does NOT consume the query (N2.1.3.1.2).
+/// 14. It returns the `NextHopResolution` (assertion + record).
 ///
 /// ## Security
 ///
 /// - Expected-responder binding: response must come from the queried neighbor.
 /// - Replay protection: each query can only be consumed once.
+/// - Transactional consumption: failed validation does NOT consume the query.
 /// - Freshness: query and response have bounded age.
 /// - max_hops validation: must be > 0.
 /// - Advertisement verified independently.
+/// - Capacity bounded: total live entries ≤ `MAX_PENDING_ROUTE_QUERIES` (N2.1.3.1.3).
 /// - **State persists across calls** (N2.1.3.1.1).
 pub struct NextHopResolver<'a> {
     /// The local topology (for finding authenticated neighbors to query).
@@ -907,8 +912,14 @@ impl<'a> NextHopResolver<'a> {
     }
 }
 
-/// **N2.1.3.1.2.** Maximum number of pending (unconsumed) route queries.
+/// **N2.1.3.1.2 / N2.1.3.1.3.** Maximum number of live, non-expired
+/// pending/replay-protection entries (both consumed and unconsumed).
 /// Prevents unbounded memory growth from route-discovery requests.
+///
+/// **N2.1.3.1.3:** This limit applies to the **total** number of entries
+/// in `pending_queries`, not just unconsumed entries. Consumed queries
+/// are retained for replay detection until they expire, and they consume
+/// memory just like unconsumed queries.
 pub const MAX_PENDING_ROUTE_QUERIES: usize = 256;
 
 impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
@@ -920,8 +931,11 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
         // Step 0: Purge expired pending queries (resource management).
         self.purge_expired_pending_queries();
 
-        // Step 0b: Check capacity — reject if too many pending queries.
-        if self.pending_queries.values().filter(|p| !p.consumed).count() >= MAX_PENDING_ROUTE_QUERIES {
+        // Step 0b: Check capacity — reject if too many total live entries.
+        // N2.1.3.1.3: This counts ALL entries (consumed + unconsumed),
+        // because consumed entries are retained for replay detection and
+        // consume memory just like unconsumed entries.
+        if self.pending_queries.len() >= MAX_PENDING_ROUTE_QUERIES {
             return None;
         }
 
