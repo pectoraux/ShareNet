@@ -11,6 +11,13 @@ use snp_node::node::{
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
     let sk = sha256(label);
     let pk = derive_public_key(&sk);
@@ -135,7 +142,7 @@ fn next_hop_response_matches_query() {
     let r_id = derive_node_id(&r_pk);
     let response = NextHopResponse::create_not_found_and_sign(&r_sk, &r_pk, r_id, query.query_id);
 
-    assert!(response.matches_query(&query), "response must match query");
+    assert!(response.matches_query_id(&query.query_id), "response must match query");
     eprintln!("[test 6] PASS: response matches query");
 }
 
@@ -151,8 +158,8 @@ fn next_hop_response_does_not_match_different_query() {
     let r_id = derive_node_id(&r_pk);
     let response = NextHopResponse::create_not_found_and_sign(&r_sk, &r_pk, r_id, query1.query_id);
 
-    assert!(response.matches_query(&query1), "response matches query1");
-    assert!(!response.matches_query(&query2), "response does NOT match query2");
+    assert!(response.matches_query_id(&query1.query_id), "response matches query1");
+    assert!(!response.matches_query_id(&query2.query_id), "response does NOT match query2");
     eprintln!("[test 7] PASS: response does not match different query");
 }
 
@@ -521,4 +528,387 @@ fn distributed_resolution_plus_local_route_construction() {
     assert_eq!(route.destination(), g_id);
     assert!(route.validate().is_ok());
     eprintln!("[test 15] PASS: distributed resolution + local route construction");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.1 — Secure distributed route-discovery semantics tests
+// ════════════════════════════════════════════════════════════════════════════
+
+use snp_node::node::{
+    NextHopResolution, PendingRouteQuery, RoutingAssertion,
+    MAX_ROUTE_QUERY_AGE_SECS, MAX_ROUTE_RESPONSE_AGE_SECS, MAX_ROUTE_CLOCK_SKEW_SECS,
+};
+
+/// 16. unexpected_responder_rejected
+///
+/// A response from a node OTHER than the queried neighbor must be rejected,
+/// even if the signature is valid.
+#[test]
+fn unexpected_responder_rejected() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"unexpected-a");
+    let a_id = derive_node_id(&a_pk);
+    let (_b_verified, b_id) = make_relay_advert(b"unexpected-b", 1, "127.0.0.1:4001");
+    let (g_verified, g_id) = make_gateway_advert(b"unexpected-g", 1, "127.0.0.1:4002");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id, // A expects B to respond
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    // Register a responder for B, but have it return a response signed by C.
+    let g_advert = g_verified.as_ref().clone();
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        // C signs the response, not B.
+        let (c_sk, c_pk) = fresh_keypair(b"unexpected-c");
+        let c_id = derive_node_id(&c_pk);
+        Some(NextHopResponse::create_found_and_sign(
+            &c_sk, &c_pk, c_id, // responder = C (WRONG — should be B)
+            query.query_id,
+            g_id,
+            g_advert.clone(),
+            true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let result = resolver.resolve_step(&g_id, &hint);
+    assert!(result.is_none(), "response from unexpected responder must be rejected");
+    eprintln!("[test 16] PASS: unexpected responder rejected");
+}
+
+/// 17. expected_responder_accepted
+#[test]
+fn expected_responder_accepted() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"expected-a");
+    let a_id = derive_node_id(&a_pk);
+    let (b_verified, b_id) = make_relay_advert(b"expected-b", 1, "127.0.0.1:4003");
+    let (g_verified, g_id) = make_gateway_advert(b"expected-g", 1, "127.0.0.1:4004");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    let g_advert = g_verified.as_ref().clone();
+    let (b_sk, b_pk) = fresh_keypair(b"expected-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id, // responder = B (CORRECT)
+            query.query_id,
+            g_id,
+            g_advert.clone(),
+            true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let result = resolver.resolve_step(&g_id, &hint);
+    assert!(result.is_some(), "response from expected responder must be accepted");
+    eprintln!("[test 17] PASS: expected responder accepted");
+}
+
+/// 18. replayed_response_rejected
+///
+/// A response for an already-consumed query must be rejected.
+/// This test verifies the PendingRouteQuery consumed-state mechanism.
+#[test]
+fn replayed_response_rejected() {
+    // Test the PendingRouteQuery state directly.
+    let (sk, pk) = fresh_keypair(b"replay-a");
+    let a_id = derive_node_id(&pk);
+    let query = NextHopQuery::create_and_sign(&sk, &pk, a_id, [0xBB; 32], 10);
+    let (b_sk, b_pk) = fresh_keypair(b"replay-b");
+    let b_id = derive_node_id(&b_pk);
+
+    let mut pending = PendingRouteQuery::new(&query, b_id);
+
+    // Create a valid response from B.
+    let response = NextHopResponse::create_not_found_and_sign(
+        &b_sk, &b_pk, b_id, query.query_id,
+    );
+
+    // First time: pending query matches response (not consumed).
+    assert!(pending.matches_response(&response), "first response must match");
+
+    // Consume the query.
+    pending.consume();
+
+    // Second time: same response is rejected (query consumed).
+    assert!(!pending.matches_response(&response), "replayed response must be rejected (consumed)");
+    eprintln!("[test 18] PASS: replayed response rejected (consumed state)");
+}
+
+/// 19. future_dated_response_rejected
+#[test]
+fn future_dated_response_rejected() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"future-a");
+    let a_id = derive_node_id(&a_pk);
+    let (b_verified, b_id) = make_relay_advert(b"future-b", 1, "127.0.0.1:4007");
+    let (g_verified, g_id) = make_gateway_advert(b"future-g", 1, "127.0.0.1:4008");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    let g_advert = g_verified.as_ref().clone();
+    let (b_sk, b_pk) = fresh_keypair(b"future-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        let mut response = NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id,
+            g_id,
+            g_advert.clone(),
+            true,
+        );
+        // Set timestamp far in the future.
+        response.timestamp = now_unix() + MAX_ROUTE_CLOCK_SKEW_SECS + 100;
+        response.sign(&b_sk); // re-sign with mutated timestamp.
+        Some(response)
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let result = resolver.resolve_step(&g_id, &hint);
+    assert!(result.is_none(), "future-dated response must be rejected");
+    eprintln!("[test 19] PASS: future-dated response rejected");
+}
+
+/// 20. max_hops_zero_rejected
+#[test]
+fn max_hops_zero_rejected() {
+    let (sk, pk) = fresh_keypair(b"maxhops-zero");
+    let node_id = derive_node_id(&pk);
+    let destination = [0xAA; 32];
+
+    // create_and_sign panics if max_hops == 0.
+    let result = std::panic::catch_unwind(|| {
+        NextHopQuery::create_and_sign(&sk, &pk, node_id, destination, 0);
+    });
+    assert!(result.is_err(), "max_hops=0 must panic");
+
+    // Also test is_fresh() rejects max_hops=0 if constructed manually.
+    let mut query = NextHopQuery::create_and_sign(&sk, &pk, node_id, destination, 5);
+    query.max_hops = 0;
+    query.sign(&sk);
+    assert!(!query.is_fresh(), "max_hops=0 must fail is_fresh()");
+    eprintln!("[test 20] PASS: max_hops=0 rejected");
+}
+
+/// 21. routing_assertion_is_not_link_proof
+///
+/// A RoutingAssertion proves "B claims C is next hop" — NOT "B has a link to C".
+#[test]
+fn routing_assertion_is_not_link_proof() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"assertion-a");
+    let a_id = derive_node_id(&a_pk);
+    let (b_verified, b_id) = make_relay_advert(b"assertion-b", 1, "127.0.0.1:4009");
+    let (g_verified, g_id) = make_gateway_advert(b"assertion-g", 1, "127.0.0.1:4010");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    let g_advert = g_verified.as_ref().clone();
+    let (b_sk, b_pk) = fresh_keypair(b"assertion-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id,
+            g_id,
+            g_advert.clone(),
+            true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let result = resolver.resolve_step(&g_id, &hint);
+    assert!(result.is_some());
+
+    let resolution = result.unwrap();
+    let assertion = &resolution.assertion;
+
+    // The assertion proves B CLAIMS G is the next hop.
+    assert_eq!(assertion.responder_node_id, b_id);
+    assert_eq!(assertion.next_hop_node_id, g_id);
+    assert!(assertion.claims_destination_reached());
+
+    // But the assertion does NOT prove B has a usable link to G.
+    // It's a routing claim, not a link proof.
+    // The RoutingAssertion type makes this distinction explicit — there
+    // is no "link_proof" field or method.
+    eprintln!("[test 21] PASS: routing assertion is not link proof");
+}
+
+/// 22. destination_advertisement_verified_independently
+///
+/// The advertisement in the response is verified independently via
+/// verify_into_verified(). A tampered advertisement must be rejected.
+#[test]
+fn destination_advertisement_verified_independently() {
+    let topology = TopologyGraph::new();
+    let (a_sk, a_pk) = fresh_keypair(b"indep-verify-a");
+    let a_id = derive_node_id(&a_pk);
+    let (b_verified, b_id) = make_relay_advert(b"indep-verify-b", 1, "127.0.0.1:4011");
+    let (g_verified, g_id) = make_gateway_advert(b"indep-verify-g", 1, "127.0.0.1:4012");
+
+    let hint = snp_node::node::RemoteNodeHint {
+        target_node_id: g_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: 0,
+        distance_hint: 1,
+        learned_from: b_id,
+        received_at: 0,
+        source_propagation_sequence: 1,
+    };
+
+    // Create a TAMPERED advertisement (bad signature).
+    let mut bad_advert = g_verified.as_ref().clone();
+    bad_advert.signature[0] ^= 0xFF;
+
+    let (b_sk, b_pk) = fresh_keypair(b"indep-verify-b");
+    let b_node_id = derive_node_id(&b_pk);
+    let mut transport = InMemoryNextHopTransport::new();
+    transport.register_responder(b_id, move |query| {
+        Some(NextHopResponse::create_found_and_sign(
+            &b_sk, &b_pk, b_node_id,
+            query.query_id,
+            g_id,
+            bad_advert.clone(),
+            true,
+        ))
+    });
+
+    let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
+    let result = resolver.resolve_step(&g_id, &hint);
+    assert!(result.is_none(), "tampered advertisement must be rejected");
+    eprintln!("[test 22] PASS: destination advertisement verified independently");
+}
+
+/// 23. pending_route_query_tracks_consumed_state
+#[test]
+fn pending_route_query_tracks_consumed_state() {
+    let (sk, pk) = fresh_keypair(b"pending-a");
+    let a_id = derive_node_id(&pk);
+    let query = NextHopQuery::create_and_sign(&sk, &pk, a_id, [0xBB; 32], 10);
+    let expected_responder = [0xCC; 32];
+
+    let mut pending = PendingRouteQuery::new(&query, expected_responder);
+    assert!(!pending.consumed, "new query must not be consumed");
+
+    // Create a matching response.
+    let (r_sk, r_pk) = fresh_keypair(b"pending-r");
+    let r_id = derive_node_id(&r_pk);
+    let response = NextHopResponse::create_not_found_and_sign(&r_sk, &r_pk, r_id, query.query_id);
+
+    // The response should match (responder == expected_responder? NO — r_id != expected_responder)
+    // So matches_response should return false.
+    assert!(!pending.matches_response(&response), "wrong responder must not match");
+
+    // Create a response from the expected responder.
+    let (er_sk, er_pk) = fresh_keypair(b"pending-er");
+    let er_id = derive_node_id(&er_pk);
+    // Override: we need er_id == expected_responder.
+    // Since we can't control derive_node_id, let's use a different approach:
+    // create a PendingRouteQuery with expected_responder = er_id.
+    let pending2 = PendingRouteQuery::new(&query, er_id);
+    let response2 = NextHopResponse::create_not_found_and_sign(&er_sk, &er_pk, er_id, query.query_id);
+    assert!(pending2.matches_response(&response2), "correct responder must match");
+
+    // Consume the query.
+    let mut pending3 = PendingRouteQuery::new(&query, er_id);
+    assert!(!pending3.consumed);
+    pending3.consume();
+    assert!(pending3.consumed);
+    assert!(!pending3.matches_response(&response2), "consumed query must not match");
+    eprintln!("[test 23] PASS: pending route query tracks consumed state");
+}
+
+/// 24. query_freshness_validated
+#[test]
+fn query_freshness_validated() {
+    let (sk, pk) = fresh_keypair(b"freshness-a");
+    let a_id = derive_node_id(&pk);
+
+    // Fresh query.
+    let query = NextHopQuery::create_and_sign(&sk, &pk, a_id, [0xCC; 32], 10);
+    assert!(query.is_fresh(), "fresh query must pass is_fresh()");
+
+    // Stale query.
+    let mut stale = query.clone();
+    stale.timestamp = now_unix().saturating_sub(MAX_ROUTE_QUERY_AGE_SECS + 100);
+    stale.sign(&sk);
+    assert!(!stale.is_fresh(), "stale query must fail is_fresh()");
+
+    // Future-dated query.
+    let mut future = query.clone();
+    future.timestamp = now_unix() + MAX_ROUTE_CLOCK_SKEW_SECS + 100;
+    future.sign(&sk);
+    assert!(!future.is_fresh(), "future-dated query must fail is_fresh()");
+    eprintln!("[test 24] PASS: query freshness validated");
+}
+
+/// 25. response_freshness_validated
+#[test]
+fn response_freshness_validated() {
+    let (sk, pk) = fresh_keypair(b"resp-freshness");
+    let node_id = derive_node_id(&pk);
+
+    // Fresh response.
+    let response = NextHopResponse::create_not_found_and_sign(&sk, &pk, node_id, [0u8; 16]);
+    assert!(response.is_fresh(), "fresh response must pass is_fresh()");
+
+    // Stale response.
+    let mut stale = response.clone();
+    stale.timestamp = now_unix().saturating_sub(MAX_ROUTE_RESPONSE_AGE_SECS + 100);
+    stale.sign(&sk);
+    assert!(!stale.is_fresh(), "stale response must fail is_fresh()");
+
+    // Future-dated response.
+    let mut future = response.clone();
+    future.timestamp = now_unix() + MAX_ROUTE_CLOCK_SKEW_SECS + 100;
+    future.sign(&sk);
+    assert!(!future.is_fresh(), "future-dated response must fail is_fresh()");
+    eprintln!("[test 25] PASS: response freshness validated");
 }

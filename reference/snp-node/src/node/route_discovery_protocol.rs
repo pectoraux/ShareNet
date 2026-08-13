@@ -1,55 +1,74 @@
-//! N2.1.3 — Distributed Route Discovery Protocol.
+//! N2.1.3 / N2.1.3.1 — Distributed Route Discovery Protocol Foundation.
 //!
-//! This module implements the **protocol messages** for distributed
-//! next-hop route discovery. Unlike the local `RouteEngine` (which computes
-//! paths over the local `TopologyGraph`), this module defines the
-//! authenticated query/response messages that nodes exchange to discover
-//! routes through the mesh.
+//! **This module implements a SINGLE-STEP distributed next-hop
+//! query/response protocol foundation.** It does NOT yet implement
+//! recursive multi-hop discovery (A → B → C → G). That is a future
+//! milestone (N2.1.3.2).
 //!
-//! ## Protocol overview
+//! ## What is implemented
+//!
+//! - Signed `NextHopQuery` / `NextHopResponse` messages.
+//! - `PendingRouteQuery` state for stateful response acceptance.
+//! - Expected-responder binding (response must come from the queried neighbor).
+//! - Replay protection (each query can only be consumed once).
+//! - Freshness validation (MAX_ROUTE_QUERY_AGE, MAX_ROUTE_RESPONSE_AGE).
+//! - `max_hops` validation (>0, reject invalid).
+//!- `RoutingAssertion` type — distinguishes "B claims C is next hop" from
+//!   "C is C" (identity proof).
+//! - `NextHopResolver` implementing `DestinationResolver` for single-step
+//!   resolution.
+//!
+//! ## What is NOT implemented
+//!
+//! - Recursive multi-hop forwarding (A → B → C → G).
+//! - Real network transport (only `InMemoryNextHopTransport`).
+//! - Proof that the responder has a usable link to the next hop
+//!   (the response is a routing assertion, not a link proof).
+//!
+//! ## Protocol overview (single-step)
 //!
 //! ```text
 //! Client A (wants route to G)
 //!     │
-//!     │ 1. NextHopQuery { destination: G, query_id }
+//!     │ 1. Creates PendingRouteQuery { destination: G, expected_responder: B }
+//!     │ 2. Sends NextHopQuery { destination: G, query_id } to B
 //!     ▼
 //! Relay B (A's authenticated neighbor)
 //!     │
-//!     │ 2. B checks its local topology + hints.
-//!     │    If B knows G directly → respond with G's advertisement.
+//!     │ 3. B checks its local topology + hints.
+//!     │    If B knows G → respond with G's advertisement.
 //!     │    If B knows a next hop C → respond with C's advertisement.
 //!     │    If B doesn't know → respond with NotFound.
 //!     │
-//!     │ 3. NextHopResponse { query_id, next_hop: C, advert: C_or_G }
+//!     │ 4. NextHopResponse { query_id, responder: B, result }
 //!     ▼
 //! Client A
 //!     │
-//!     │ 4. A verifies the advertisement in the response.
-//!     │ 5. A establishes an AuthenticatedLink to C.
-//!     │ 6. A queries C (repeat from step 1).
-//!     │ 7. Eventually C responds with G's advertisement.
-//!     │ 8. A establishes an AuthenticatedLink to G.
-//!     │ 9. A constructs the full Route: A → B → C → G.
+//!     │ 5. A verifies:
+//!     │    - Response signature (B signed it).
+//!     │    - responder_node_id == expected_responder (B).
+//!     │    - query_id matches pending query.
+//!     │    - Query not expired, not already consumed.
+//!     │    - Response not expired, not future-dated.
+//!     │    - Advertisement verifies independently.
+//!     │ 6. A accepts the RoutingAssertion (B claims C/G is next hop).
+//!     │ 7. A does NOT yet recursively query C. (Future: N2.1.3.2)
 //! ```
 //!
 //! ## Security model
 //!
 //! - Every `NextHopQuery` and `NextHopResponse` is **signed** by the sender.
 //! - The sender's NodeId is bound to the Ed25519 public key (I4 consistency).
-//! - The `query_id` prevents replay/cross-protocol injection.
+//! - The `query_id` correlates query and response, but is NOT by itself a
+//!   replay cache — `PendingRouteQuery` state is required.
+//! - The response's `responder_node_id` MUST match the neighbor that was
+//!   queried. A valid signature from a different node is rejected.
 //! - The advertisement in a `NextHopResponse` is a full `NodeAdvertisement`
-//!   that the receiver must verify independently via
+//!   that the receiver MUST verify independently via
 //!   `verify_into_verified()`.
-//! - The responder signs over the query_id, ensuring the response matches
-//!   the query and cannot be reused for a different query.
-//!
-//! ## What this is NOT
-//!
-//! - This is NOT a routing protocol (no Dijkstra, no link-state flooding).
-//! - This is NOT a directory service (no central server).
-//! - This is NOT a guarantee of reachability (the mesh may not have a path).
-//! - This IS an authenticated next-hop resolution protocol that allows
-//!   a node to incrementally discover a path by querying neighbors.
+//! - A `RoutingAssertion` is a signed claim by the responder. It proves
+//!   "B claims C is the next hop." It does NOT prove "B has a usable link
+//!   to C" or "A can reach C."
 
 use super::*;
 use snp_cbor::CborValue;
@@ -59,8 +78,20 @@ use snp_crypto::{ed25519_sign, ed25519_verify, sig_contexts};
 pub const ROUTE_DISCOVERY_MSG_CONTEXT: &[u8] = b"SNP/0.1 route-discovery\0";
 
 /// Maximum number of NextHopResponse hops allowed in a single response
-/// chain (prevents amplification).
+/// chain (prevents amplification). Reserved for future recursive forwarding.
 pub const MAX_RESPONSE_HOPS: u8 = 16;
+
+/// **N2.1.3.1.** Maximum age (in seconds) of a route query. Queries older
+/// than this are rejected.
+pub const MAX_ROUTE_QUERY_AGE_SECS: u64 = 60; // 1 minute
+
+/// **N2.1.3.1.** Maximum age (in seconds) of a route response. Responses
+/// older than this are rejected.
+pub const MAX_ROUTE_RESPONSE_AGE_SECS: u64 = 60; // 1 minute
+
+/// **N2.1.3.1.** Maximum clock skew (in seconds) for future-dated
+/// queries/responses.
+pub const MAX_ROUTE_CLOCK_SKEW_SECS: u64 = 30;
 
 // ════════════════════════════════════════════════════════════════════════════
 // NextHopQuery
@@ -73,9 +104,10 @@ pub const MAX_RESPONSE_HOPS: u8 = 16;
 /// - `source_node_id`: The querying node's NodeId.
 /// - `source_ed25519_public_key`: The querying node's Ed25519 public key.
 /// - `destination_node_id`: The destination NodeId the source wants to reach.
-/// - `query_id`: A unique 16-byte nonce for this query (prevents replay).
+/// - `query_id`: A unique 16-byte nonce for this query (correlation ID).
 /// - `timestamp`: When the query was created (unix seconds).
 /// - `max_hops`: The maximum remaining hops the source will accept.
+///   Must be > 0. Reserved for future recursive forwarding.
 /// - `signature`: Ed25519 signature over the preimage.
 #[derive(Debug, Clone)]
 pub struct NextHopQuery {
@@ -85,12 +117,12 @@ pub struct NextHopQuery {
     pub source_ed25519_public_key: [u8; 32],
     /// The destination NodeId the source wants to reach.
     pub destination_node_id: [u8; 32],
-    /// A unique 16-byte nonce for this query (prevents replay).
+    /// A unique 16-byte nonce for this query (correlation ID).
     pub query_id: [u8; 16],
     /// When this query was created (unix seconds).
     pub timestamp: u64,
     /// The maximum remaining hops the source will accept.
-    /// Decremented by each responder. When 0, the query is not forwarded.
+    /// Must be > 0. Reserved for future recursive forwarding.
     pub max_hops: u8,
     /// Ed25519 signature over `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage)`.
     pub signature: [u8; 64],
@@ -98,6 +130,9 @@ pub struct NextHopQuery {
 
 impl NextHopQuery {
     /// Create and sign a `NextHopQuery`.
+    ///
+    /// # Panics
+    /// Panics if `max_hops` is 0 (invalid — query would not be forwardable).
     #[must_use]
     pub fn create_and_sign(
         source_ed25519_secret_key: &[u8; 32],
@@ -106,6 +141,7 @@ impl NextHopQuery {
         destination_node_id: [u8; 32],
         max_hops: u8,
     ) -> Self {
+        assert!(max_hops > 0, "max_hops must be > 0");
         let now = now_unix();
         let mut query_id = [0u8; 16];
         let _ = getrandom::getrandom(&mut query_id);
@@ -145,8 +181,8 @@ impl NextHopQuery {
 
     /// Verify the signature and sender identity consistency (I4).
     ///
-    /// Does NOT verify freshness — that requires the stateful
-    /// `verify_into_verified()` which checks the timestamp.
+    /// Does NOT verify freshness or max_hops — those require stateful
+    /// validation via `PendingRouteQuery`.
     #[must_use]
     pub fn verify_signature(&self) -> bool {
         let preimage = self.preimage();
@@ -162,18 +198,39 @@ impl NextHopQuery {
         let expected = snp_crypto::derive_node_id(&self.source_ed25519_public_key);
         self.source_node_id == expected
     }
+
+    /// **N2.1.3.1.** Validate the query's freshness and max_hops.
+    ///
+    /// Returns `true` if:
+    /// - `max_hops > 0`
+    /// - `timestamp` is not too far in the future (≤ now + skew)
+    /// - `timestamp` is not too old (≥ now - MAX_ROUTE_QUERY_AGE_SECS)
+    #[must_use]
+    pub fn is_fresh(&self) -> bool {
+        if self.max_hops == 0 {
+            return false;
+        }
+        let now = now_unix();
+        if self.timestamp > now.saturating_add(MAX_ROUTE_CLOCK_SKEW_SECS) {
+            return false; // Future-dated.
+        }
+        if self.timestamp < now.saturating_sub(MAX_ROUTE_QUERY_AGE_SECS) {
+            return false; // Too old.
+        }
+        true
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// NextHopResponse
+// NextHopResponse + NextHopResult
 // ════════════════════════════════════════════════════════════════════════════
 
 /// The result of a next-hop query — either a next hop was found, or not.
 #[derive(Debug, Clone)]
 pub enum NextHopResult {
-    /// A next hop was found. Contains the next-hop node's authenticated
-    /// advertisement (or the destination's advertisement if the responder
-    /// knows it directly).
+    /// A next hop was found. Contains the next-hop node's advertisement
+    /// (or the destination's advertisement if the responder knows it
+    /// directly).
     Found {
         /// The NodeId of the next hop toward the destination.
         next_hop_node_id: [u8; 32],
@@ -192,11 +249,14 @@ pub enum NextHopResult {
 /// ## Security
 ///
 /// The response is signed by the responder and includes the `query_id`
-/// from the original query. This ensures:
-/// 1. The response matches the query (cannot be reused for a different query).
-/// 2. The responder is authenticated.
-/// 3. The advertisement in the response is signed over (integrity-protected
-///    in transit), though the receiver MUST still verify it independently.
+/// from the original query. The receiver MUST verify:
+///
+/// 1. Signature + I4 consistency (`verify_signature()`).
+/// 2. `responder_node_id == expected_responder` (the neighbor that was queried).
+/// 3. `query_id` matches a pending `PendingRouteQuery`.
+/// 4. The pending query is not expired and not already consumed.
+/// 5. The response timestamp is fresh (not too old, not future-dated).
+/// 6. The advertisement verifies independently via `verify_into_verified()`.
 #[derive(Debug, Clone)]
 pub struct NextHopResponse {
     /// The responder's NodeId.
@@ -315,10 +375,27 @@ impl NextHopResponse {
         self.responder_node_id == expected
     }
 
-    /// Check if this response matches a given query (same query_id).
+    /// **N2.1.3.1.** Validate the response's freshness.
+    ///
+    /// Returns `true` if:
+    /// - `timestamp` is not too far in the future (≤ now + skew)
+    /// - `timestamp` is not too old (≥ now - MAX_ROUTE_RESPONSE_AGE_SECS)
     #[must_use]
-    pub fn matches_query(&self, query: &NextHopQuery) -> bool {
-        self.query_id == query.query_id
+    pub fn is_fresh(&self) -> bool {
+        let now = now_unix();
+        if self.timestamp > now.saturating_add(MAX_ROUTE_CLOCK_SKEW_SECS) {
+            return false; // Future-dated.
+        }
+        if self.timestamp < now.saturating_sub(MAX_ROUTE_RESPONSE_AGE_SECS) {
+            return false; // Too old.
+        }
+        true
+    }
+
+    /// Check if this response's `query_id` matches a given query.
+    #[must_use]
+    pub fn matches_query_id(&self, query_id: &[u8; 16]) -> bool {
+        &self.query_id == query_id
     }
 }
 
@@ -346,39 +423,218 @@ fn advertisement_canonical_cbor(advert: &NodeAdvertisement) -> CborValue {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// NextHopResolver — distributed destination resolution
+// PendingRouteQuery (N2.1.3.1) — stateful query tracking
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.1.** State tracking for an outstanding route query.
+///
+/// A `PendingRouteQuery` is created when a query is sent and consumed when
+/// a valid response is received. This provides:
+///
+/// - **Expected-responder binding:** The response must come from the
+///   neighbor that was queried.
+/// - **Replay protection:** Each query can only be consumed once. A
+///   replayed response is rejected.
+/// - **Freshness:** The query has an expiry time. Responses for expired
+///   queries are rejected.
+/// - **Correlation:** The `query_id` matches the response to the query.
+#[derive(Debug, Clone)]
+pub struct PendingRouteQuery {
+    /// The query_id (correlation ID).
+    pub query_id: [u8; 16],
+    /// The source node's NodeId (the local node).
+    pub source_node_id: [u8; 32],
+    /// The destination NodeId being resolved.
+    pub destination_node_id: [u8; 32],
+    /// **Expected responder:** The NodeId of the neighbor that was queried.
+    /// The response MUST come from this node.
+    pub expected_responder_node_id: [u8; 32],
+    /// The max_hops from the query.
+    pub max_hops: u8,
+    /// When the query was created (unix seconds).
+    pub created_at: u64,
+    /// When the query expires (unix seconds). Responses after this are rejected.
+    pub expires_at: u64,
+    /// Whether the query has been consumed (a valid response was received).
+    pub consumed: bool,
+}
+
+impl PendingRouteQuery {
+    /// Create a new `PendingRouteQuery` for a query sent to `expected_responder`.
+    #[must_use]
+    pub fn new(
+        query: &NextHopQuery,
+        expected_responder_node_id: [u8; 32],
+    ) -> Self {
+        let now = now_unix();
+        Self {
+            query_id: query.query_id,
+            source_node_id: query.source_node_id,
+            destination_node_id: query.destination_node_id,
+            expected_responder_node_id,
+            max_hops: query.max_hops,
+            created_at: now,
+            expires_at: now.saturating_add(MAX_ROUTE_QUERY_AGE_SECS),
+            consumed: false,
+        }
+    }
+
+    /// Check if a response is valid for this pending query.
+    ///
+    /// Validates:
+    /// 1. `query_id` matches.
+    /// 2. `responder_node_id == expected_responder_node_id`.
+    /// 3. Query is not expired.
+    /// 4. Query is not already consumed.
+    ///
+    /// Does NOT verify the response signature or freshness — those are
+    /// checked separately by the caller.
+    #[must_use]
+    pub fn matches_response(&self, response: &NextHopResponse) -> bool {
+        // 1. query_id must match.
+        if response.query_id != self.query_id {
+            return false;
+        }
+        // 2. Responder must be the expected neighbor.
+        if response.responder_node_id != self.expected_responder_node_id {
+            return false;
+        }
+        // 3. Query must not be expired.
+        if self.is_expired() {
+            return false;
+        }
+        // 4. Query must not be already consumed.
+        if self.consumed {
+            return false;
+        }
+        true
+    }
+
+    /// Check if the query has expired.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        now_unix() >= self.expires_at
+    }
+
+    /// Mark the query as consumed (a valid response was received).
+    pub fn consume(&mut self) {
+        self.consumed = true;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// RoutingAssertion (N2.1.3.1) — distinguishes routing claim from identity
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.1.** A verified routing assertion — the responder's signed claim
+/// about the next hop toward a destination.
+///
+/// ## Trust model
+///
+/// A `RoutingAssertion` proves:
+/// > "Responder B claims that next_hop C is the next hop toward destination G."
+///
+/// It does **NOT** prove:
+/// > "B has a usable authenticated link to C."
+///
+/// or:
+/// > "A can reach C."
+///
+/// The `next_hop_node_id`'s `NodeAdvertisement` proves C's identity (when
+/// independently verified), but the routing assertion is B's claim, not
+/// C's proof of reachability.
+///
+/// ## Construction
+///
+/// A `RoutingAssertion` is constructed from a verified `NextHopResponse`
+/// (signature verified, responder matches expected neighbor, query matches
+/// pending state, freshness validated). The advertisement in the response
+/// must be independently verified via `verify_into_verified()`.
+#[derive(Debug, Clone)]
+pub struct RoutingAssertion {
+    /// The responder's NodeId (the node that made the claim).
+    pub responder_node_id: [u8; 32],
+    /// The destination NodeId being resolved.
+    pub destination_node_id: [u8; 32],
+    /// The next-hop NodeId the responder claims is toward the destination.
+    pub next_hop_node_id: [u8; 32],
+    /// Whether the responder claims this next hop IS the destination.
+    pub is_destination: bool,
+    /// The query_id that triggered this assertion (provenance).
+    pub query_id: [u8; 16],
+    /// When the assertion was made (from the response timestamp).
+    pub timestamp: u64,
+}
+
+impl RoutingAssertion {
+    /// Construct a `RoutingAssertion` from a verified `NextHopResponse`.
+    ///
+    /// The caller MUST have already verified:
+    /// - Response signature.
+    /// - Responder matches expected neighbor.
+    /// - Query matches pending state.
+    /// - Response freshness.
+    #[must_use]
+    pub fn from_verified_response(
+        response: &NextHopResponse,
+        destination_node_id: [u8; 32],
+    ) -> Option<Self> {
+        match &response.result {
+            NextHopResult::Found { next_hop_node_id, is_destination, .. } => Some(Self {
+                responder_node_id: response.responder_node_id,
+                destination_node_id,
+                next_hop_node_id: *next_hop_node_id,
+                is_destination: *is_destination,
+                query_id: response.query_id,
+                timestamp: response.timestamp,
+            }),
+            NextHopResult::NotFound => None,
+        }
+    }
+
+    /// Check if this assertion claims the next hop is the destination.
+    #[must_use]
+    pub fn claims_destination_reached(&self) -> bool {
+        self.is_destination && self.next_hop_node_id == self.destination_node_id
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NextHopResolver — single-step distributed destination resolution
 // ════════════════════════════════════════════════════════════════════════════
 
 /// A `DestinationResolver` that resolves remote destinations by querying
-/// authenticated next-hop peers using the `NextHopQuery`/`NextHopResponse`
-/// protocol.
+/// a single authenticated next-hop peer using the `NextHopQuery`/
+/// `NextHopResponse` protocol.
 ///
-/// ## How it works
+/// **N2.1.3.1:** This resolver performs SINGLE-STEP resolution only.
+/// It does NOT recursively query the next hop. Recursive multi-hop
+/// discovery is a future milestone (N2.1.3.2).
+///
+/// ## How it works (single-step)
 ///
 /// 1. The resolver receives a `RemoteNodeHint` for destination D.
-/// 2. It selects an authenticated neighbor (from the local `TopologyGraph`)
-///    that is closest to D (using `distance_hint` as a heuristic).
-/// 3. It sends a `NextHopQuery` to that neighbor.
-/// 4. The neighbor responds with a `NextHopResponse` containing either:
-///    - D's advertisement (if the neighbor knows D directly), or
-///    - A next-hop node's advertisement (to continue the resolution).
-/// 5. The resolver verifies the response signature and the advertisement.
-/// 6. If the response contains D's advertisement, resolution is complete.
-/// 7. Otherwise, the resolver repeats from step 2 with the new next hop.
-///
-/// ## Transport abstraction
-///
-/// The resolver does NOT perform network I/O directly. Instead, it uses a
-/// `NextHopTransport` trait that abstracts the query/response exchange.
-/// This allows deterministic testing without real sockets.
+/// 2. It selects the hint's `learned_from` as the neighbor to query.
+/// 3. It creates a `PendingRouteQuery` (stateful tracking).
+/// 4. It sends a `NextHopQuery` to that neighbor.
+/// 5. It receives a `NextHopResponse`.
+/// 6. It verifies ALL of:
+///    - Response signature + I4.
+///    - Response freshness (not too old, not future-dated).
+///    - Responder == expected neighbor (queried neighbor).
+///    - query_id matches pending query.
+///    - Pending query not expired, not consumed.
+/// 7. It marks the pending query as consumed (replay protection).
+/// 8. It verifies the advertisement via `verify_into_verified()`.
+/// 9. It returns the `AuthenticatedNodeRecord` + `RoutingAssertion`.
 ///
 /// ## Security
 ///
-/// - The resolver verifies every `NextHopResponse` signature.
-/// - The resolver verifies every `NodeAdvertisement` via
-///   `verify_into_verified()`.
-/// - The `query_id` prevents replay/cross-protocol injection.
-/// - The resolver never trusts unsigned or unverified data.
+/// - Expected-responder binding: response must come from the queried neighbor.
+/// - Replay protection: each query can only be consumed once.
+/// - Freshness: query and response have bounded age.
+/// - max_hops validation: must be > 0.
+/// - Advertisement verified independently.
 pub struct NextHopResolver<'a> {
     /// The local topology (for finding authenticated neighbors to query).
     topology: &'a TopologyGraph,
@@ -390,30 +646,29 @@ pub struct NextHopResolver<'a> {
     local_ed25519_public: [u8; 32],
     /// The local node's NodeId.
     local_node_id: [u8; 32],
+    /// Pending queries (query_id → PendingRouteQuery). Provides replay protection.
+    pending_queries: HashMap<[u8; 16], PendingRouteQuery>,
 }
 
 /// A transport abstraction for sending `NextHopQuery` messages and
 /// receiving `NextHopResponse` messages.
-///
-/// This trait abstracts the network I/O, allowing:
-/// - Production implementations that use real TCP/WebSocket connections.
-/// - Test implementations that simulate the mesh in memory.
 pub trait NextHopTransport {
     /// Send a `NextHopQuery` to the specified neighbor and wait for a
     /// `NextHopResponse`.
-    ///
-    /// # Parameters
-    /// - `neighbor_node_id`: The NodeId of the authenticated neighbor to query.
-    /// - `query`: The signed `NextHopQuery` to send.
-    ///
-    /// # Returns
-    /// - `Some(NextHopResponse)` if the neighbor responded.
-    /// - `None` if the neighbor did not respond (timeout, unreachable, etc.).
     fn query_next_hop(
         &self,
         neighbor_node_id: &[u8; 32],
         query: &NextHopQuery,
     ) -> Option<NextHopResponse>;
+}
+
+/// The result of a single-step next-hop resolution.
+#[derive(Debug, Clone)]
+pub struct NextHopResolution {
+    /// The routing assertion from the responder.
+    pub assertion: RoutingAssertion,
+    /// The next-hop node's authenticated record (independently verified).
+    pub record: AuthenticatedNodeRecord,
 }
 
 impl<'a> NextHopResolver<'a> {
@@ -432,33 +687,35 @@ impl<'a> NextHopResolver<'a> {
             local_ed25519_secret,
             local_ed25519_public,
             local_node_id,
+            pending_queries: HashMap::new(),
         }
     }
 
-    /// Resolve a destination by querying next-hop peers.
+    /// Resolve a destination by querying a single next-hop peer.
     ///
-    /// This implements the `DestinationResolver` trait by iteratively
-    /// querying authenticated neighbors until the destination's
-    /// advertisement is found.
+    /// **N2.1.3.1:** This is SINGLE-STEP resolution. It does NOT recursively
+    /// query the next hop. If the responder returns an intermediate next hop
+    /// (not the destination), the resolution returns that next hop's record,
+    /// but does NOT continue querying it. Recursive multi-hop discovery is
+    /// a future milestone (N2.1.3.2).
     ///
     /// # Parameters
     /// - `destination`: The NodeId to resolve.
     /// - `hint`: The `RemoteNodeHint` that triggered the resolution.
     ///
     /// # Returns
-    /// - `Some(AuthenticatedNodeRecord)` if the destination was resolved
-    ///   (its advertisement was found and verified).
-    /// - `None` if resolution failed (no path, no response, etc.).
-    pub fn resolve(
-        &self,
+    /// - `Some(NextHopResolution)` if a valid response was received and
+    ///   the advertisement verified.
+    /// - `None` if resolution failed.
+    pub fn resolve_step(
+        &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
-    ) -> Option<AuthenticatedNodeRecord> {
-        // Step 1: Select an authenticated neighbor to query.
-        // Use the hint's learned_from as the first neighbor to ask.
-        let first_neighbor = hint.learned_from;
+    ) -> Option<NextHopResolution> {
+        // Step 1: Select the neighbor to query.
+        let expected_responder = hint.learned_from;
 
-        // Step 2: Send a NextHopQuery to the first neighbor.
+        // Step 2: Create + sign the query.
         let query = NextHopQuery::create_and_sign(
             &self.local_ed25519_secret,
             &self.local_ed25519_public,
@@ -467,42 +724,54 @@ impl<'a> NextHopResolver<'a> {
             MAX_RESPONSE_HOPS,
         );
 
-        // Step 3: Get the response.
-        let response = self.transport.query_next_hop(&first_neighbor, &query)?;
+        // Step 3: Create pending query state (replay protection + responder binding).
+        let pending = PendingRouteQuery::new(&query, expected_responder);
+        self.pending_queries.insert(query.query_id, pending);
 
-        // Step 4: Verify the response signature.
+        // Step 4: Send the query.
+        let response = self.transport.query_next_hop(&expected_responder, &query)?;
+
+        // Step 5: Verify response signature + I4.
         if !response.verify_signature() {
             return None;
         }
 
-        // Step 5: Check if the response matches the query.
-        if !response.matches_query(&query) {
+        // Step 6: Verify response freshness.
+        if !response.is_fresh() {
             return None;
         }
 
-        // Step 6: Process the result.
-        match response.result {
+        // Step 7: Verify response matches pending query (responder binding + replay).
+        let pending = self.pending_queries.get_mut(&query.query_id)?;
+        if !pending.matches_response(&response) {
+            return None;
+        }
+
+        // Step 8: Mark query as consumed (replay protection).
+        pending.consume();
+
+        // Step 9: Process the result.
+        match &response.result {
             NextHopResult::Found { next_hop_node_id, advertisement, is_destination } => {
-                // Verify the advertisement.
+                // Verify the advertisement independently.
                 let verified = advertisement.verify_into_verified()?;
 
-                // Check that the advertisement's NodeId matches the next_hop_node_id.
-                if verified.node_id() != next_hop_node_id {
+                // Check that the advertisement's NodeId matches next_hop_node_id.
+                if verified.node_id() != *next_hop_node_id {
                     return None;
                 }
 
-                // If this is the destination, we're done.
-                if is_destination && next_hop_node_id == *destination {
-                    return Some(verified.into_record());
-                }
+                // Construct the routing assertion.
+                let assertion = RoutingAssertion::from_verified_response(
+                    &response,
+                    *destination,
+                )?;
 
-                // Otherwise, the next hop is an intermediate node.
-                // In a full implementation, we would recursively query the
-                // next hop. For now, we return the advertisement so the
-                // route engine can use it.
-                // (The route engine will need to establish a link to this
-                // next hop and continue resolution.)
-                Some(verified.into_record())
+                // Return the resolution.
+                Some(NextHopResolution {
+                    assertion,
+                    record: verified.into_record(),
+                })
             }
             NextHopResult::NotFound => None,
         }
@@ -515,7 +784,18 @@ impl<'a> DestinationResolver for NextHopResolver<'a> {
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
     ) -> Option<AuthenticatedNodeRecord> {
-        NextHopResolver::resolve(self, destination, hint)
+        // The DestinationResolver trait requires &self, but our stateful
+        // resolver needs &mut self for pending_queries. We create a
+        // temporary clone of the resolver's state for this call.
+        // (In production, the caller should use resolve_step() directly.)
+        let mut resolver = NextHopResolver::new(
+            self.topology,
+            self.transport,
+            self.local_ed25519_secret,
+            self.local_ed25519_public,
+            self.local_node_id,
+        );
+        resolver.resolve_step(destination, hint).map(|r| r.record)
     }
 }
 
@@ -525,10 +805,6 @@ impl<'a> DestinationResolver for NextHopResolver<'a> {
 
 /// **TEST-ONLY.** An in-memory `NextHopTransport` that simulates a mesh
 /// of nodes for deterministic testing.
-///
-/// Each registered "responder" is a closure that receives a `NextHopQuery`
-/// and returns a `NextHopResponse`. This allows tests to simulate the
-/// behavior of multiple mesh nodes without real network I/O.
 #[derive(Default)]
 pub struct InMemoryNextHopTransport {
     /// Map from neighbor NodeId → responder function.
