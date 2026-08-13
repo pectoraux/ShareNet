@@ -853,6 +853,12 @@ pub struct NextHopResolver<'a> {
     topology: &'a TopologyGraph,
     /// The transport for sending queries and receiving responses.
     transport: &'a dyn NextHopTransport,
+    /// **N2.1.3.2-fix.** Optional recursive transport for forwarding
+    /// `ForwardedQuery` messages through real protocol participants. When
+    /// set, `resolve_route_with_budget` uses this transport (sending ONE
+    /// `ForwardedQuery` to the first hop, which recursively forwards).
+    /// When `None`, `resolve_route_with_budget` returns `None`.
+    recursive_transport: Option<&'a dyn RecursiveNextHopTransport>,
     /// The local node's keypair (for signing queries).
     local_ed25519_secret: [u8; 32],
     /// The local node's public key.
@@ -887,6 +893,10 @@ pub struct NextHopResolution {
 
 impl<'a> NextHopResolver<'a> {
     /// Create a new `NextHopResolver`.
+    ///
+    /// The resolver starts without a recursive transport. To use
+    /// `resolve_route` / `resolve_route_with_budget`, call
+    /// `with_recursive_transport` to attach a `RecursiveNextHopTransport`.
     #[must_use]
     pub fn new(
         topology: &'a TopologyGraph,
@@ -898,11 +908,30 @@ impl<'a> NextHopResolver<'a> {
         Self {
             topology,
             transport,
+            recursive_transport: None,
             local_ed25519_secret,
             local_ed25519_public,
             local_node_id,
             pending_queries: HashMap::new(),
         }
+    }
+
+    /// **N2.1.3.2-fix.** Attach a `RecursiveNextHopTransport` to this
+    /// resolver, enabling `resolve_route` / `resolve_route_with_budget`.
+    ///
+    /// When set, `resolve_route_with_budget` sends ONE `ForwardedQuery` to
+    /// the first hop via `RecursiveNextHopTransport::forward_query`. The
+    /// first hop (and subsequent hops) handle recursive forwarding through
+    /// their own `ForwardingNode::handle_query` logic. A receives the full
+    /// accumulated `RecursiveRouteResponse` and constructs the
+    /// `DistributedRouteResolution` from it.
+    #[must_use]
+    pub fn with_recursive_transport(
+        mut self,
+        recursive_transport: &'a dyn RecursiveNextHopTransport,
+    ) -> Self {
+        self.recursive_transport = Some(recursive_transport);
+        self
     }
 
     /// Get a reference to the pending queries map.
@@ -1344,6 +1373,86 @@ impl ForwardedQuery {
     pub fn has_visited(&self, node_id: &[u8; 32]) -> bool {
         self.visited_nodes.contains(node_id)
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2-fix — RecursiveRouteResponse + RecursiveNextHopTransport
+//
+// `ForwardedQuery` is now the actual wire message. A sends ONE
+// `ForwardedQuery` to its first hop (B), which recursively forwards it
+// (creating NEW `ForwardedQuery` instances with decremented hop budget
+// and updated `visited_nodes`). Each hop augments the response with its
+// own assertion + record. A receives a single `RecursiveRouteResponse`
+// carrying the full accumulated chain A → B → C → G.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2-fix.** The response to a `ForwardedQuery`, carrying the FULL
+/// accumulated discovery chain (not just one hop's advertisement).
+///
+/// Each `ForwardingNode` that handles a `ForwardedQuery` either:
+/// - Returns a terminal response (it IS the destination, or it cannot
+///   forward), OR
+/// - Forwards a NEW `ForwardedQuery` to the next hop, receives a
+///   `RecursiveRouteResponse`, and PREPENDS its own assertion + record +
+///   query step to the accumulated chain.
+///
+/// When the response reaches the original source (A), it contains:
+/// - `accumulated_assertions`: one per forwarding hop (B, C, ...).
+/// - `accumulated_records`: one per forwarding hop (the next-hop's record
+///   at each step). Does NOT include the source A's direct neighbor (B) —
+///   A adds B's record from its own topology.
+/// - `query_chain`: one `QueryStep` per query (A→B, B→C, C→G, ...).
+/// - `destination_advertisement`: the destination's advert (if reached).
+/// - `remaining_hop_budget`: the budget at the destination.
+#[derive(Debug, Clone)]
+pub struct RecursiveRouteResponse {
+    /// The final destination's NodeId.
+    pub destination_node_id: [u8; 32],
+    /// Whether the destination was reached.
+    pub destination_reached: bool,
+    /// The destination's advertisement (if reached). Verified independently
+    /// by the receiver before constructing `DistributedRouteResolution`.
+    pub destination_advertisement: Option<NodeAdvertisement>,
+    /// Accumulated routing assertions from each forwarding hop.
+    /// Ordered from the first forwarder (B) to the last (the hop before G).
+    pub accumulated_assertions: Vec<RoutingAssertion>,
+    /// Accumulated node records (next-hop advertisements from each hop).
+    /// Ordered from the first forwarder's next-hop to the destination.
+    /// Does NOT include A's direct neighbor — A adds that from its topology.
+    pub accumulated_records: Vec<AuthenticatedNodeRecord>,
+    /// The query chain (provenance). One `QueryStep` per query.
+    pub query_chain: Vec<QueryStep>,
+    /// Remaining hop budget at the destination.
+    /// Equal to `initial_hop_budget - num_hops`.
+    pub remaining_hop_budget: u8,
+    /// `true` if the destination wasn't reached (a forwarder returned
+    /// NotFound, or the hop budget was exhausted mid-chain).
+    pub not_found: bool,
+}
+
+/// **N2.1.3.2-fix.** A transport abstraction for forwarding `ForwardedQuery`
+/// messages to neighbors and receiving `RecursiveRouteResponse` messages.
+///
+/// This is the recursive counterpart to `NextHopTransport`. The key
+/// difference: `forward_query` sends a `ForwardedQuery` (which carries the
+/// hop budget, visited_nodes, and parent binding), and receives a
+/// `RecursiveRouteResponse` (which carries the full accumulated chain).
+///
+/// The transport routes the query to the registered `ForwardingNode` for
+/// the target NodeId, which then handles the recursive forwarding logic.
+pub trait RecursiveNextHopTransport {
+    /// Forward a `ForwardedQuery` to the specified neighbor and wait for a
+    /// `RecursiveRouteResponse`.
+    ///
+    /// Returns `None` if:
+    /// - The neighbor is not registered with this transport.
+    /// - The neighbor's `handle_query` returned `None` (e.g., bad signature,
+    ///   loop detected, hop budget exhausted, no path to destination).
+    fn forward_query(
+        &self,
+        neighbor_node_id: &[u8; 32],
+        query: &ForwardedQuery,
+    ) -> Option<RecursiveRouteResponse>;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1816,41 +1925,43 @@ impl DistributedRouteResolution {
 
 // ════════════════════════════════════════════════════════════════════════════
 // NextHopResolver::resolve_route — recursive multi-hop distributed discovery
+//
+// **N2.1.3.2-fix:** `ForwardedQuery` is now the actual wire message. A
+// sends ONE `ForwardedQuery` to its first hop (B) via
+// `RecursiveNextHopTransport::forward_query`. B (a `ForwardingNode`)
+// recursively forwards a NEW `ForwardedQuery` to C, and so on, until the
+// destination is reached. The response propagates back with the full
+// accumulated chain. A constructs the `DistributedRouteResolution` from
+// the response — it does NOT loop over `resolve_step`.
 // ════════════════════════════════════════════════════════════════════════════
 
 impl<'a> NextHopResolver<'a> {
     /// **N2.1.3.2.** Recursively resolve a destination through multiple hops.
     ///
-    /// This method performs recursive multi-hop distributed route discovery:
+    /// This method performs recursive multi-hop distributed route discovery
+    /// by sending ONE `ForwardedQuery` to the first hop and letting the
+    /// `ForwardingNode` participants handle recursive forwarding:
     ///
-    /// 1. A queries B (using `resolve_step`).
-    /// 2. If B returns a next hop C (not the destination), A queries C.
-    /// 3. If C returns a next hop G (destination), resolution is complete.
+    /// 1. A constructs `ForwardedQuery(budget=MAX_RESPONSE_HOPS,
+    ///    visited=[A], parent=none)`.
+    /// 2. A sends it to B via `RecursiveNextHopTransport::forward_query`.
+    /// 3. B verifies the query, constructs a NEW `ForwardedQuery` with
+    ///    decremented budget and updated `visited_nodes`, and forwards to C.
+    /// 4. C repeats the process, forwarding to G (or responding if G is a
+    ///    direct neighbor).
+    /// 5. G (the destination) responds with `destination_reached=true`.
+    /// 6. Each forwarder prepends its assertion + record to the response.
+    /// 7. A receives the full `RecursiveRouteResponse` and constructs a
+    ///    `DistributedRouteResolution`.
     ///
-    /// At each step:
-    /// - Decrement the hop budget.
-    /// - Add the current responder to `visited_nodes` (loop prevention).
-    /// - Verify the response (via `resolve_step`).
-    /// - Accumulate the routing assertion + node record.
-    ///
-    /// # Loop prevention
-    ///
-    /// Before forwarding a query to a node, the resolver checks if that node
-    /// is already in `visited_nodes`. If so, the resolution is rejected
-    /// (loop detected).
-    ///
-    /// # Hop budget
-    ///
-    /// The hop budget starts at `MAX_RESPONSE_HOPS` (16). Each forward
-    /// decrements it by 1. If the budget reaches 0 before the destination is
-    /// reached, the resolution is rejected (budget exhausted). There is NO
-    /// way to increase the budget.
+    /// A does NOT query C or G directly — the forwarding happens inside the
+    /// transport's `ForwardingNode` participants.
     ///
     /// # Returns
     /// - `Some(DistributedRouteResolution)` if the destination was reached.
-    /// - `None` if resolution failed (budget exhausted, loop detected,
-    ///   responder returned NotFound, advertisement verification failed,
-    ///   etc.).
+    /// - `None` if resolution failed (no recursive transport, budget
+    ///   exhausted, loop detected, destination not reached, advertisement
+    ///   verification failed, etc.).
     #[must_use]
     pub fn resolve_route(
         &mut self,
@@ -1877,167 +1988,449 @@ impl<'a> NextHopResolver<'a> {
     ) -> Option<DistributedRouteResolution> {
         assert!(initial_budget > 0, "initial_budget must be > 0");
 
-        // Track resolution state.
-        let mut remaining_budget = initial_budget;
-        let mut visited_nodes: Vec<[u8; 32]> = vec![self.local_node_id];
-        let mut ordered_node_ids: Vec<[u8; 32]> = vec![self.local_node_id];
-        let mut ordered_records: Vec<AuthenticatedNodeRecord> = Vec::new();
-        let mut ordered_assertions: Vec<RoutingAssertion> = Vec::new();
-        let mut query_chain: Vec<QueryStep> = Vec::new();
-        let mut parent_query_id: [u8; 16] = [0u8; 16];
-        let mut parent_responder_node_id: [u8; 32] = [0u8; 32];
+        // The recursive transport is REQUIRED for the new architecture.
+        // Without it, A cannot send a ForwardedQuery to anyone.
+        let recursive_transport = self.recursive_transport?;
 
-        // The current hint tells us which neighbor to query.
-        let mut current_hint = hint.clone();
+        // The first hop is the hint's learned_from (A's direct neighbor).
+        let first_hop = hint.learned_from;
 
-        loop {
-            // 1. Hop budget check — if exhausted, reject.
-            if remaining_budget == 0 {
-                return None;
-            }
-            // Decrement the budget for this forward step.
-            remaining_budget -= 1;
+        // 1. Construct the initial ForwardedQuery.
+        //    - budget = initial_budget
+        //    - visited_nodes = [A]
+        //    - parent = none (all-zero parent_query_id and parent_responder_node_id)
+        let initial_query = ForwardedQuery::create_and_sign(
+            &self.local_ed25519_secret,
+            &self.local_ed25519_public,
+            self.local_node_id,
+            *destination,
+            initial_budget,
+            [0u8; 16],           // parent_query_id (none)
+            [0u8; 32],           // parent_responder_node_id (none)
+            vec![self.local_node_id], // visited_nodes = [A]
+        );
 
-            // 2. Loop prevention — check if the responder is already visited.
-            let next_responder = current_hint.learned_from;
-            if visited_nodes.contains(&next_responder) {
-                // Loop detected — reject.
-                return None;
-            }
+        // 2. Send the ForwardedQuery to the first hop via the recursive transport.
+        //    The first hop (a ForwardingNode) handles recursive forwarding.
+        //    A receives the full accumulated RecursiveRouteResponse.
+        let response = recursive_transport.forward_query(&first_hop, &initial_query)?;
 
-            // 3. Construct a ForwardedQuery to track parent binding (internal
-            //    metadata; the actual transport uses a NextHopQuery via
-            //    resolve_step).
-            let _forwarded = ForwardedQuery::create_and_sign(
-                &self.local_ed25519_secret,
-                &self.local_ed25519_public,
-                self.local_node_id,
-                *destination,
-                MAX_RESPONSE_HOPS,
-                parent_query_id,
-                parent_responder_node_id,
-                visited_nodes.clone(),
-            );
-            // The forwarded query's query_id will be DIFFERENT from the one
-            // resolve_step generates (since both use getrandom). The
-            // forwarded query is metadata only — it is NOT sent over the
-            // transport. The parent binding is tracked via the assertion's
-            // query_id (set below).
-
-            // 4. Call resolve_step to do the actual query/response.
-            let resolution = self.resolve_step(destination, &current_hint)?;
-            let assertion = resolution.assertion.clone();
-            let record = resolution.record.clone();
-
-            // 5. Track the query step (using the assertion's query_id, which
-            //    is the actual query_id used by resolve_step).
-            query_chain.push(QueryStep {
-                source_node_id: self.local_node_id,
-                responder_node_id: next_responder,
-                query_id: assertion.query_id,
-                remaining_hops: remaining_budget,
-            });
-
-            // 6. Update parent binding for the next iteration.
-            parent_query_id = assertion.query_id;
-            parent_responder_node_id = next_responder;
-
-            // 7. Add the responder to visited_nodes (loop prevention).
-            visited_nodes.push(next_responder);
-
-            // 8. Add the responder's record to ordered_records.
-            //    The responder's record comes from the topology (if available)
-            //    or is implicit (we queried them, so they must be authenticated).
-            //    For the FIRST iteration, the responder is the hint's
-            //    learned_from — A's neighbor, whose record should be in the
-            //    topology. For subsequent iterations, the responder is the
-            //    previous step's next_hop — whose record was returned in the
-            //    previous step's response.
-            let responder_record: Option<AuthenticatedNodeRecord> = if ordered_node_ids.len() == 1 {
-                // First iteration: responder = hint.learned_from (A's neighbor).
-                // Look up the responder's record in the topology.
-                self.topology.get_record(&next_responder).cloned()
-            } else {
-                // Subsequent iteration: responder = previous step's next_hop.
-                // Their record was the previous step's returned record.
-                ordered_records.last().cloned()
-            };
-
-            // The record returned by resolve_step is the NEXT hop's record
-            // (what the responder claims is the next hop). Add it to
-            // ordered_records.
-            //
-            // But first, we need to add the responder's record (if not already
-            // present). The responder's record is added BEFORE the next hop's
-            // record to maintain the chain order.
-            if let Some(r) = responder_record {
-                // Add the responder's record if it's not already the last
-                // record (which would happen if the responder was the
-                // previous step's next_hop).
-                let already_last = ordered_records
-                    .last()
-                    .map_or(false, |last| last.node_id() == r.node_id());
-                if !already_last {
-                    ordered_records.push(r);
-                    ordered_node_ids.push(next_responder);
-                }
-            } else {
-                // We don't have the responder's record (e.g., it's not in
-                // the topology). This happens when the responder was the
-                // previous step's next_hop. In that case, the responder's
-                // record WAS the previous step's returned record, which is
-                // already in ordered_records.
-                //
-                // Make sure the responder is in ordered_node_ids.
-                if !ordered_node_ids.contains(&next_responder) {
-                    ordered_node_ids.push(next_responder);
-                }
-            }
-
-            // 9. Add the assertion + next hop's record.
-            ordered_assertions.push(assertion.clone());
-            ordered_node_ids.push(record.node_id());
-            ordered_records.push(record.clone());
-
-            // 10. Check if destination reached.
-            if assertion.claims_destination_reached() {
-                // Destination reached — construct the resolution.
-                let num_hops = ordered_node_ids.len() - 1;
-                let final_remaining = initial_budget
-                    .saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
-                let expiry = now_unix().saturating_add(MAX_ROUTE_RESPONSE_AGE_SECS);
-                return Some(DistributedRouteResolution {
-                    source: self.local_node_id,
-                    destination: *destination,
-                    ordered_node_ids,
-                    ordered_records,
-                    ordered_assertions,
-                    query_chain,
-                    initial_hop_budget: initial_budget,
-                    remaining_hop_budget: final_remaining,
-                    expiry,
-                });
-            }
-
-            // 11. Set up the next iteration.
-            // The next responder is the current step's next_hop.
-            current_hint = RemoteNodeHint {
-                target_node_id: *destination,
-                learned_from: assertion.next_hop_node_id,
-                claimed_sequence: 0,
-                claimed_capabilities: Vec::new(),
-                claimed_visibility: String::new(),
-                claimed_last_seen: 0,
-                distance_hint: 0,
-                received_at: 0,
-                source_propagation_sequence: 0,
-            };
+        // 3. If the response indicates NotFound, resolution failed.
+        if response.not_found || !response.destination_reached {
+            return None;
         }
+
+        // 4. Verify the destination's advertisement independently.
+        //    The destination's advert comes from the response.
+        let dest_advert = response.destination_advertisement.as_ref()?;
+        let dest_verified = dest_advert.verify_into_verified()?;
+        if dest_verified.node_id() != *destination {
+            return None;
+        }
+
+        // 5. Construct the ordered_node_ids chain.
+        //    Chain: [A, first_hop, ...accumulated_records' node_ids, destination]
+        //    But accumulated_records already includes the destination's record
+        //    (added by the last forwarder). So:
+        //    - ordered_node_ids = [A, first_hop] ++ accumulated_records.node_ids
+        //      (but first_hop's record is NOT in accumulated_records — it's
+        //      added by A from its topology below).
+        //    - ordered_records = [first_hop's record (from topology)]
+        //                       ++ accumulated_records
+        //
+        //    accumulated_records from the response:
+        //    - For A→B→C→G: accumulated_records = [C's record, G's record]
+        //      (B added C's record, C added G's record).
+        //    - A adds B's record from its topology.
+        //    - Final ordered_records = [B, C, G].
+
+        // Look up the first hop's record in A's topology.
+        let first_hop_record = self.topology.get_record(&first_hop).cloned()?;
+
+        // Assemble ordered_records: [first_hop, ...accumulated_records].
+        let mut ordered_records: Vec<AuthenticatedNodeRecord> =
+            Vec::with_capacity(response.accumulated_records.len() + 1);
+        ordered_records.push(first_hop_record);
+        ordered_records.extend(response.accumulated_records.iter().cloned());
+
+        // Assemble ordered_node_ids: [A, first_hop, ...accumulated_records.node_ids].
+        let mut ordered_node_ids: Vec<[u8; 32]> =
+            Vec::with_capacity(ordered_records.len() + 1);
+        ordered_node_ids.push(self.local_node_id);
+        ordered_node_ids.push(first_hop);
+        for record in &response.accumulated_records {
+            ordered_node_ids.push(record.node_id());
+        }
+
+        // 6. Assemble the query_chain.
+        //    The response's query_chain has steps for B→C, C→G, etc.
+        //    A prepends its own step (A→B) at the front.
+        let mut query_chain: Vec<QueryStep> =
+            Vec::with_capacity(response.query_chain.len() + 1);
+        query_chain.push(QueryStep {
+            source_node_id: self.local_node_id,
+            responder_node_id: first_hop,
+            query_id: initial_query.query_id,
+            remaining_hops: initial_budget.saturating_sub(1),
+        });
+        query_chain.extend(response.query_chain.iter().cloned());
+
+        // 7. The accumulated_assertions are already in order (B's, C's).
+        let ordered_assertions = response.accumulated_assertions.clone();
+
+        // 8. Compute the remaining hop budget.
+        //    The response carries the budget at the destination.
+        //    Verify it matches initial - num_hops.
+        let num_hops = ordered_node_ids.len() - 1;
+        let expected_remaining = initial_budget
+            .saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
+        // Use the response's remaining_hop_budget if it matches; otherwise
+        // compute from the chain length (defensive).
+        let remaining_hop_budget = if response.remaining_hop_budget == expected_remaining {
+            response.remaining_hop_budget
+        } else {
+            expected_remaining
+        };
+
+        // 9. Construct the DistributedRouteResolution.
+        let expiry = now_unix().saturating_add(MAX_ROUTE_RESPONSE_AGE_SECS);
+        Some(DistributedRouteResolution {
+            source: self.local_node_id,
+            destination: *destination,
+            ordered_node_ids,
+            ordered_records,
+            ordered_assertions,
+            query_chain,
+            initial_hop_budget: initial_budget,
+            remaining_hop_budget,
+            expiry,
+        })
     }
 
     /// **N2.1.3.2.** Get the local node's NodeId.
     #[must_use]
     pub fn local_node_id(&self) -> [u8; 32] {
         self.local_node_id
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.1.3.2-fix — InMemoryRecursiveTransport + ForwardingNode
+//
+// Test-only infrastructure that simulates REAL protocol participants.
+// Each `ForwardingNode` (B, C, G) has its own NodeId, Ed25519 keypair, and
+// neighbor map. When it receives a `ForwardedQuery`:
+//   1. Verifies the query signature + parent binding.
+//   2. Checks visited_nodes (loop prevention).
+//   3. Checks remaining hop budget (> 0).
+//   4. If IT is the destination → return RecursiveRouteResponse.
+//   5. Otherwise → find next hop, construct a NEW ForwardedQuery with
+//      decremented budget + updated visited_nodes + parent binding, and
+//      forward via the shared `InMemoryRecursiveTransport`.
+//   6. Receive RecursiveRouteResponse from next hop.
+//   7. Prepend own assertion + record + query_step.
+//   8. Return augmented response.
+//
+// NOTE: This creates a reference cycle (transport → nodes → transport).
+// This is acceptable for test-only code — the leaked memory is reclaimed
+// when the test process exits.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.1.3.2-fix.** A shared in-memory `RecursiveNextHopTransport` that
+/// routes `ForwardedQuery` messages to registered `ForwardingNode`
+/// participants.
+///
+/// Multiple `ForwardingNode`s register with this transport. When a query
+/// is forwarded to a NodeId, the transport looks up the registered
+/// `ForwardingNode` for that NodeId and calls its `handle_query` method.
+///
+/// This is the recursive counterpart to `InMemoryNextHopTransport`. The
+/// key difference: instead of closures that produce single `NextHopResponse`
+/// values, this transport routes to real `ForwardingNode` participants that
+/// recursively forward the query.
+#[derive(Default)]
+pub struct InMemoryRecursiveTransport {
+    /// Map from NodeId → registered ForwardingNode.
+    nodes: Arc<Mutex<HashMap<[u8; 32], Arc<ForwardingNode>>>>,
+}
+
+impl InMemoryRecursiveTransport {
+    /// Create a new empty transport.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a `ForwardingNode` with this transport.
+    ///
+    /// After registration, queries forwarded to `node.node_id()` will be
+    /// routed to `node.handle_query()`.
+    pub fn register_node(&self, node: Arc<ForwardingNode>) {
+        let node_id = node.node_id();
+        let mut nodes = self.nodes.lock().expect("nodes mutex poisoned");
+        nodes.insert(node_id, node);
+    }
+
+    /// Get the inner `Arc<Mutex<...>>` so `ForwardingNode`s can hold a
+    /// back-reference to this transport.
+    #[must_use]
+    pub fn shared_handle(&self) -> Arc<Mutex<HashMap<[u8; 32], Arc<ForwardingNode>>>> {
+        Arc::clone(&self.nodes)
+    }
+}
+
+impl RecursiveNextHopTransport for InMemoryRecursiveTransport {
+    fn forward_query(
+        &self,
+        neighbor_node_id: &[u8; 32],
+        query: &ForwardedQuery,
+    ) -> Option<RecursiveRouteResponse> {
+        let nodes = self.nodes.lock().expect("nodes mutex poisoned");
+        let node = nodes.get(neighbor_node_id)?.clone();
+        drop(nodes);
+        node.handle_query(query)
+    }
+}
+
+/// **N2.1.3.2-fix.** A test-only struct that simulates a REAL protocol
+/// participant (B, C, or G in the A → B → C → G chain).
+///
+/// Each `ForwardingNode`:
+/// - Has its own NodeId, Ed25519 keypair, and self-advertisement.
+/// - Knows its neighbors (map: NodeId → NodeAdvertisement).
+/// - When it receives a `ForwardedQuery`:
+///   1. Verifies the query signature + parent binding.
+///   2. Checks visited_nodes (loop prevention).
+///   3. Checks remaining hop budget (> 0).
+///   4. If IT is the destination → return RecursiveRouteResponse with
+///      destination reached.
+///   5. Otherwise → find next hop, construct a NEW ForwardedQuery with
+///      decremented hop budget + updated visited_nodes + parent binding,
+///      and forward via the shared transport.
+///   6. Receive RecursiveRouteResponse from next hop.
+///   7. Prepend own assertion + record + query_step.
+///   8. Return augmented RecursiveRouteResponse.
+pub struct ForwardingNode {
+    /// This node's NodeId.
+    node_id: [u8; 32],
+    /// This node's Ed25519 secret key.
+    ed25519_secret: [u8; 32],
+    /// This node's Ed25519 public key.
+    ed25519_public: [u8; 32],
+    /// This node's own advertisement (signed). Used when this node IS the
+    /// destination — returned in `RecursiveRouteResponse.destination_advertisement`.
+    self_advert: NodeAdvertisement,
+    /// Known neighbors: NodeId → NodeAdvertisement. Used to find next hops
+    /// and to construct records for the accumulated chain.
+    neighbors: HashMap<[u8; 32], NodeAdvertisement>,
+    /// Transport to reach other nodes (shared with other ForwardingNodes).
+    transport: Arc<InMemoryRecursiveTransport>,
+}
+
+impl ForwardingNode {
+    /// Create a new `ForwardingNode`.
+    ///
+    /// The node's `self_advert` is constructed from the provided keypair
+    /// and capabilities.
+    #[must_use]
+    pub fn new(
+        ed25519_secret: [u8; 32],
+        ed25519_public: [u8; 32],
+        capabilities: Vec<Capability>,
+        endpoints: Vec<TransportEndpoint>,
+        x25519_circuit_public: Option<[u8; 32]>,
+        transport: Arc<InMemoryRecursiveTransport>,
+    ) -> Self {
+        let node_id = derive_node_id(&ed25519_public);
+        let self_advert = NodeAdvertisement::create_and_sign(
+            &ed25519_secret,
+            &ed25519_public,
+            capabilities,
+            endpoints,
+            x25519_circuit_public,
+            3600,
+            1,
+        );
+        Self {
+            node_id,
+            ed25519_secret,
+            ed25519_public,
+            self_advert,
+            neighbors: HashMap::new(),
+            transport,
+        }
+    }
+
+    /// Get this node's NodeId.
+    #[must_use]
+    pub fn node_id(&self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Get this node's own advertisement (signed). Used by tests to set up
+    /// topology entries and neighbor maps.
+    #[must_use]
+    pub fn self_advert(&self) -> &NodeAdvertisement {
+        &self.self_advert
+    }
+
+    /// Add a known neighbor.
+    ///
+    /// The neighbor's advertisement is stored and used to find next hops
+    /// and to construct records for the accumulated chain.
+    pub fn add_neighbor(&mut self, neighbor_id: [u8; 32], advert: NodeAdvertisement) {
+        self.neighbors.insert(neighbor_id, advert);
+    }
+
+    /// **N2.1.3.2-fix.** Handle an incoming `ForwardedQuery`.
+    ///
+    /// This is the core forwarding logic. See the type-level documentation
+    /// for the full algorithm.
+    ///
+    /// # Returns
+    /// - `Some(RecursiveRouteResponse)` if the query was successfully
+    ///   handled (either this node is the destination, or the query was
+    ///   forwarded and a response was received).
+    /// - `None` if the query was rejected (bad signature, loop detected,
+    ///   hop budget exhausted, no path to destination, etc.).
+    pub fn handle_query(&self, query: &ForwardedQuery) -> Option<RecursiveRouteResponse> {
+        // 1. Verify the query signature + parent binding.
+        if !query.verify_all() {
+            return None;
+        }
+
+        // 2. Loop prevention — if we're already in visited_nodes, the query
+        //    has come back to us. Reject.
+        if query.has_visited(&self.node_id) {
+            return None;
+        }
+
+        // 3. Check remaining hop budget (> 0).
+        if query.max_hops == 0 {
+            return None;
+        }
+
+        // 4. If we ARE the destination, return a terminal response.
+        if query.destination_node_id == self.node_id {
+            return Some(RecursiveRouteResponse {
+                destination_node_id: query.destination_node_id,
+                destination_reached: true,
+                destination_advertisement: Some(self.self_advert.clone()),
+                accumulated_assertions: Vec::new(),
+                accumulated_records: Vec::new(),
+                query_chain: Vec::new(),
+                remaining_hop_budget: query.max_hops.saturating_sub(1),
+                not_found: false,
+            });
+        }
+
+        // 5. Check budget: need max_hops > 1 to forward (the new query needs
+        //    max_hops > 0, which means current max_hops must be > 1).
+        if query.max_hops <= 1 {
+            // Budget exhausted — can't forward. Return a not-found response.
+            return Some(RecursiveRouteResponse {
+                destination_node_id: query.destination_node_id,
+                destination_reached: false,
+                destination_advertisement: None,
+                accumulated_assertions: Vec::new(),
+                accumulated_records: Vec::new(),
+                query_chain: Vec::new(),
+                remaining_hop_budget: 0,
+                not_found: true,
+            });
+        }
+
+        // 6. Find the next hop toward the destination.
+        let next_hop_id = self.find_next_hop(
+            &query.destination_node_id,
+            &query.visited_nodes,
+        )?;
+
+        // 7. Loop prevention — next hop must not be in visited_nodes.
+        if query.has_visited(&next_hop_id) {
+            return None;
+        }
+
+        // 8. Get the next hop's advertisement (we must know it to forward).
+        let next_hop_advert = self.neighbors.get(&next_hop_id)?.clone();
+
+        // 9. Construct a NEW ForwardedQuery with:
+        //    - Decremented hop budget (query.max_hops - 1)
+        //    - Updated visited_nodes (add self)
+        //    - Parent binding to the current query
+        let mut new_visited = query.visited_nodes.clone();
+        new_visited.push(self.node_id);
+        let new_query = ForwardedQuery::create_and_sign(
+            &self.ed25519_secret,
+            &self.ed25519_public,
+            self.node_id,
+            query.destination_node_id,
+            query.max_hops - 1,
+            query.query_id,   // parent_query_id (the query we received)
+            self.node_id,     // parent_responder_node_id (us — we're forwarding)
+            new_visited,
+        );
+
+        // 10. Forward to next hop via the shared transport.
+        let mut response = self.transport.forward_query(&next_hop_id, &new_query)?;
+
+        // If the response is not_found, propagate it (don't add our assertion).
+        if response.not_found {
+            return Some(response);
+        }
+
+        // 11. Verify the next hop's advertisement and create a record.
+        let verified = next_hop_advert.verify_into_verified()?;
+        let record = verified.into_record();
+
+        // 12. Construct our routing assertion.
+        //     `is_destination` is true iff the next_hop IS the destination.
+        //     B forwards to C (C != G) → is_destination=false.
+        //     C forwards to G (G == G) → is_destination=true.
+        let is_destination = next_hop_id == query.destination_node_id;
+        let our_assertion = RoutingAssertion {
+            responder_node_id: self.node_id,
+            destination_node_id: query.destination_node_id,
+            next_hop_node_id: next_hop_id,
+            is_destination,
+            query_id: new_query.query_id,
+            timestamp: now_unix(),
+        };
+
+        // 13. Prepend our assertion + record + query_step to the response.
+        response.accumulated_assertions.insert(0, our_assertion);
+        response.accumulated_records.insert(0, record);
+        response.query_chain.insert(0, QueryStep {
+            source_node_id: self.node_id,
+            responder_node_id: next_hop_id,
+            query_id: new_query.query_id,
+            remaining_hops: new_query.max_hops.saturating_sub(1),
+        });
+
+        Some(response)
+    }
+
+    /// Find the next hop toward the destination.
+    ///
+    /// Strategy:
+    /// 1. If the destination is a direct neighbor, return it.
+    /// 2. Otherwise, return any neighbor not in `visited` (and not self).
+    /// 3. If no suitable neighbor is found, return `None`.
+    fn find_next_hop(
+        &self,
+        destination: &[u8; 32],
+        visited: &[[u8; 32]],
+    ) -> Option<[u8; 32]> {
+        // 1. If destination is a direct neighbor, return it.
+        if self.neighbors.contains_key(destination) {
+            return Some(*destination);
+        }
+        // 2. Return any unvisited neighbor (excluding self).
+        for neighbor_id in self.neighbors.keys() {
+            if *neighbor_id != self.node_id && !visited.contains(neighbor_id) {
+                return Some(*neighbor_id);
+            }
+        }
+        None
     }
 }

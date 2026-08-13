@@ -154,9 +154,10 @@ pub use route_engine::{
 };
 pub use route_discovery_protocol::{
     DistributedRouteResolution, DistributedRouteResolutionError, DistributedRouteResolver,
-    ForwardedQuery, InMemoryNextHopTransport, NextHopQuery, NextHopResolution, NextHopResolver,
-    NextHopResponse, NextHopResult, NextHopTransport, PendingRouteQuery, QueryProvenance,
-    QueryStep, RoutingAssertion, MAX_PENDING_ROUTE_QUERIES, MAX_RESPONSE_HOPS,
+    ForwardedQuery, ForwardingNode, InMemoryNextHopTransport, InMemoryRecursiveTransport,
+    NextHopQuery, NextHopResolution, NextHopResolver, NextHopResponse, NextHopResult,
+    NextHopTransport, PendingRouteQuery, QueryProvenance, QueryStep, RecursiveNextHopTransport,
+    RecursiveRouteResponse, RoutingAssertion, MAX_PENDING_ROUTE_QUERIES, MAX_RESPONSE_HOPS,
     MAX_ROUTE_CLOCK_SKEW_SECS, MAX_ROUTE_QUERY_AGE_SECS, MAX_ROUTE_RESPONSE_AGE_SECS,
     ROUTE_DISCOVERY_MSG_CONTEXT,
 };
