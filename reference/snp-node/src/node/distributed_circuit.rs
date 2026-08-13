@@ -55,7 +55,7 @@ use crate::node::circuit_handshake::{
 use crate::node::route_discovery::{
     CommittedRoute, RouteRole, RouteSerializationError, AuthenticatedHop,
 };
-use snp_cbor::CborValue;
+use snp_cbor::{CborLimits, CborValue, decode_with_limits};
 use snp_crypto::{
     ed25519_sign, ed25519_verify, derive_node_id, sha256, hkdf_sha256,
     x25519_dh, x25519_public_from_bytes,
@@ -274,6 +274,22 @@ pub fn derive_signed_hop_authorizations(
 /// A malicious intermediary cannot tamper with any position field
 /// (predecessor, successor, role, hop_index, relay_x25519_public_key) without
 /// breaking the authorization's source signature.
+/// Maximum number of authorization hashes a [`RelayHandshakeRequest`] may
+/// carry on the wire.
+///
+/// Derived from `ROUTE_MAX_HOPS - 1` (the maximum number of non-source hops
+/// in any committed route). This is a **wire-level** bound, enforced by
+/// [`RelayHandshakeRequest::decode_from_cbor`] at the CBOR array head — BEFORE
+/// any `Vec` allocation — independently of the signed `authorization_count`
+/// (which is a **semantic** bound verified afterward inside
+/// [`accept_relay_handshake`]).
+///
+/// The signed `authorization_count` cannot by itself protect wire-level
+/// allocation, because the attacker-controlled message must be safely parsed
+/// before that signed field can be trusted.
+pub const MAX_AUTHORIZATION_HASHES: usize =
+    crate::node::route_discovery::ROUTE_MAX_HOPS - 1;
+
 #[derive(Debug, Clone)]
 pub struct RelayHandshakeRequest {
     /// The circuit handshake (signed by source, bound to committed route).
@@ -296,6 +312,346 @@ pub struct RelayHandshakeRequest {
     /// a different validly-signed authorization for the same relay/circuit.
     /// The relay rejects the substitution BEFORE installing forwarding state.
     pub authorization_hashes: Vec<[u8; 32]>,
+}
+
+impl RelayHandshakeRequest {
+    /// Encode this request to canonical CBOR wire bytes.
+    ///
+    /// The wire format is a CBOR map:
+    ///
+    /// ```text
+    /// {
+    ///   "handshake":          <CircuitHandshake wire map>,
+    ///   "authorization":      <SignedHopAuthorization wire map>,
+    ///   "authorizationHashes": [ <32-byte bstr>, ... ]
+    /// }
+    /// ```
+    ///
+    /// where each nested wire map is the struct's canonical preimage map plus
+    /// a `"sourceSignature"` sibling field. Encoding is **unrestricted** — the
+    /// wire-level bound is enforced on the receive side by
+    /// [`decode_from_cbor`](Self::decode_from_cbor).
+    ///
+    /// # Errors
+    /// Returns [`DistributedCircuitError::CborEncodingFailed`] if canonical
+    /// CBOR encoding fails (fail-closed).
+    pub fn encode_to_cbor(&self) -> Result<Vec<u8>, DistributedCircuitError> {
+        let handshake_wire = self.handshake.to_wire_cbor()
+            .map_err(|_| DistributedCircuitError::CborEncodingFailed)?;
+
+        let mut auth_entries = match self.authorization.canonical_preimage() {
+            CborValue::Map(e) => e,
+            // canonical_preimage() always returns a Map; defensive only.
+            _ => return Err(DistributedCircuitError::CborEncodingFailed),
+        };
+        auth_entries.push((
+            CborValue::TextString("sourceSignature".into()),
+            CborValue::ByteString(self.authorization.source_signature.to_vec()),
+        ));
+        let authorization_wire = CborValue::Map(auth_entries);
+
+        let hashes_array = CborValue::Array(
+            self.authorization_hashes
+                .iter()
+                .map(|h| CborValue::ByteString(h.to_vec()))
+                .collect(),
+        );
+
+        let request_map = CborValue::Map(vec![
+            (CborValue::TextString("handshake".into()), handshake_wire),
+            (CborValue::TextString("authorization".into()), authorization_wire),
+            (CborValue::TextString("authorizationHashes".into()), hashes_array),
+        ]);
+
+        snp_cbor::encode(&request_map)
+            .map_err(|_| DistributedCircuitError::CborEncodingFailed)
+    }
+
+    /// Decode a [`RelayHandshakeRequest`] from canonical CBOR wire bytes, with
+    /// an explicit **wire-level** bound on the `authorization_hashes` array.
+    ///
+    /// # Wire-level bound (DoS protection)
+    ///
+    /// The `authorizationHashes` array is the only array in the message. It is
+    /// capped at [`MAX_AUTHORIZATION_HASHES`] (`ROUTE_MAX_HOPS - 1`) at the
+    /// CBOR head — BEFORE `Vec::with_capacity` runs — so an attacker cannot
+    /// force the decoder to allocate an oversized vector. This is the
+    /// protection the signed `authorization_count` cannot provide on its own:
+    /// the attacker-controlled message must be safely parsed before that
+    /// signed field can be trusted.
+    ///
+    /// # Pipeline
+    ///
+    /// ```text
+    /// wire bytes
+    ///     ↓
+    /// bounded decoder (decode_with_limits)   ← array count rejected at head
+    ///     ↓
+    /// RelayHandshakeRequest
+    ///     ↓
+    /// accept_relay_handshake (authorization_count validation,
+    ///     ↓                   membership/root verification, state install)
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DistributedCircuitError::AuthorizationHashListTooLarge`] when
+    /// the `authorizationHashes` array exceeds [`MAX_AUTHORIZATION_HASHES`] —
+    /// rejected at decode time, before normal request processing. Returns
+    /// [`DistributedCircuitError::WireDecodeFailed`] for any other decode
+    /// failure (malformed/non-canonical CBOR, missing field, wrong type, or a
+    /// non-array resource-limit violation).
+    pub fn decode_from_cbor(bytes: &[u8]) -> Result<Self, DistributedCircuitError> {
+        // Conservative wire-level limits for a relay-handshake message. The
+        // handshake map has 12 entries, the authorization map 9, the request
+        // map 3. The longest byte string is a 64-byte signature; the longest
+        // text string is a map key ("ephemeralX25519Public", 21 bytes).
+        let limits = CborLimits {
+            max_array_items: MAX_AUTHORIZATION_HASHES as u64,
+            max_map_entries: 32,
+            max_byte_string_len: 128,
+            max_text_string_len: 32,
+            max_nesting_depth: 6,
+        };
+        let value = match decode_with_limits(bytes, &limits) {
+            Ok(v) => v,
+            Err(snp_cbor::CborError::LimitExceeded { kind: "array", actual, max }) => {
+                // authorizationHashes is the ONLY array in the message, so any
+                // array-limit violation is an oversized hash list.
+                return Err(DistributedCircuitError::AuthorizationHashListTooLarge {
+                    actual: usize::try_from(actual).unwrap_or(usize::MAX),
+                    max: usize::try_from(max).unwrap_or(usize::MAX),
+                });
+            }
+            Err(snp_cbor::CborError::LimitExceeded { kind, .. }) => {
+                return Err(DistributedCircuitError::WireDecodeFailed {
+                    reason: format!("CBOR {kind} limit exceeded"),
+                });
+            }
+            Err(e) => {
+                return Err(DistributedCircuitError::WireDecodeFailed {
+                    reason: e.to_string(),
+                });
+            }
+        };
+        let entries = match value {
+            CborValue::Map(e) => e,
+            _ => {
+                return Err(DistributedCircuitError::WireDecodeFailed {
+                    reason: "expected top-level CBOR map".into(),
+                });
+            }
+        };
+
+        let handshake = decode_handshake_wire(
+            map_get(&entries, "handshake").ok_or_else(|| field_err("handshake", "missing"))?,
+        )?;
+        let authorization = decode_auth_wire(
+            map_get(&entries, "authorization")
+                .ok_or_else(|| field_err("authorization", "missing"))?,
+        )?;
+        let hashes_value = map_get(&entries, "authorizationHashes")
+            .ok_or_else(|| field_err("authorizationHashes", "missing"))?;
+        let authorization_hashes = decode_hash_array(hashes_value)?;
+
+        // Defense-in-depth: explicit semantic cardinality check. Redundant
+        // with the bounded decoder's array cap, but yields a precise error
+        // and guards against any future code path that bypasses the bound.
+        if authorization_hashes.len() > MAX_AUTHORIZATION_HASHES {
+            return Err(DistributedCircuitError::AuthorizationHashListTooLarge {
+                actual: authorization_hashes.len(),
+                max: MAX_AUTHORIZATION_HASHES,
+            });
+        }
+
+        Ok(Self { handshake, authorization, authorization_hashes })
+    }
+}
+
+// ─── private wire-decode helpers ──────────────────────────────────────────
+//
+// These extract typed Rust fields from a decoded CBOR map. Each returns
+// `Option<T>` (None on missing key or wrong type/value); the caller maps
+// `None` to `WireDecodeFailed`.
+
+/// Look up a text-string key in a CBOR map.
+#[must_use]
+fn map_get<'a>(entries: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a CborValue> {
+    entries.iter().find_map(|(k, v)| match k {
+        CborValue::TextString(s) if s == key => Some(v),
+        _ => None,
+    })
+}
+
+/// Extract a `u64` value for `key`.
+#[must_use]
+fn map_get_u64(entries: &[(CborValue, CborValue)], key: &str) -> Option<u64> {
+    match map_get(entries, key)? {
+        CborValue::UnsignedInt(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Extract a `u8` value for `key` (rejects values > 255 without truncation).
+#[must_use]
+fn map_get_u8(entries: &[(CborValue, CborValue)], key: &str) -> Option<u8> {
+    u8::try_from(map_get_u64(entries, key)?).ok()
+}
+
+/// Extract a `usize` value for `key` (rejects oversized values).
+#[must_use]
+fn map_get_usize(entries: &[(CborValue, CborValue)], key: &str) -> Option<usize> {
+    usize::try_from(map_get_u64(entries, key)?).ok()
+}
+
+/// Extract a fixed-size byte array for `key` (rejects wrong-length strings
+/// without truncation).
+#[must_use]
+fn map_get_fixed<const N: usize>(
+    entries: &[(CborValue, CborValue)],
+    key: &str,
+) -> Option<[u8; N]> {
+    match map_get(entries, key)? {
+        CborValue::ByteString(b) => {
+            let arr: [u8; N] = b.as_slice().try_into().ok()?;
+            Some(arr)
+        }
+        _ => None,
+    }
+}
+
+/// Extract an `Option<[u8; 32]>` for `key` — `Null` decodes to `None`, a
+/// 32-byte byte string to `Some(arr)`.
+#[must_use]
+fn map_get_opt_array32(
+    entries: &[(CborValue, CborValue)],
+    key: &str,
+) -> Option<Option<[u8; 32]>> {
+    match map_get(entries, key)? {
+        CborValue::Null => Some(None),
+        CborValue::ByteString(b) => {
+            let arr: [u8; 32] = b.as_slice().try_into().ok()?;
+            Some(Some(arr))
+        }
+        _ => None,
+    }
+}
+
+/// Extract a [`RouteRole`] for `key` (text string `"relay"`/`"gateway"`).
+#[must_use]
+fn map_get_role(entries: &[(CborValue, CborValue)], key: &str) -> Option<RouteRole> {
+    match map_get(entries, key)? {
+        CborValue::TextString(s) => match s.as_str() {
+            "relay" => Some(RouteRole::Relay),
+            "gateway" => Some(RouteRole::Gateway),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Build a `WireDecodeFailed` error for a missing/invalid field.
+fn field_err(field: &str, reason: &str) -> DistributedCircuitError {
+    DistributedCircuitError::WireDecodeFailed {
+        reason: format!("field '{field}': {reason}"),
+    }
+}
+
+/// Decode a [`CircuitHandshake`] from its wire CBOR map (preimage + signature).
+fn decode_handshake_wire(value: &CborValue) -> Result<CircuitHandshake, DistributedCircuitError> {
+    let entries = match value {
+        CborValue::Map(e) => e,
+        _ => return Err(field_err("handshake", "not a map")),
+    };
+    Ok(CircuitHandshake {
+        protocol_version: map_get_u8(entries, "protocolVersion")
+            .ok_or_else(|| field_err("protocolVersion", "missing/invalid"))?,
+        circuit_id: map_get_fixed(entries, "circuitId")
+            .ok_or_else(|| field_err("circuitId", "missing/invalid"))?,
+        commitment_hash: map_get_fixed(entries, "commitmentHash")
+            .ok_or_else(|| field_err("commitmentHash", "missing/invalid"))?,
+        source: map_get_fixed(entries, "source")
+            .ok_or_else(|| field_err("source", "missing/invalid"))?,
+        source_public_key: map_get_fixed(entries, "sourcePublicKey")
+            .ok_or_else(|| field_err("sourcePublicKey", "missing/invalid"))?,
+        ephemeral_x25519_public: map_get_fixed(entries, "ephemeralX25519Public")
+            .ok_or_else(|| field_err("ephemeralX25519Public", "missing/invalid"))?,
+        authorization_root: map_get_fixed(entries, "authorizationRoot")
+            .ok_or_else(|| field_err("authorizationRoot", "missing/invalid"))?,
+        authorization_count: map_get_u8(entries, "authorizationCount")
+            .ok_or_else(|| field_err("authorizationCount", "missing/invalid"))?,
+        timestamp: map_get_u64(entries, "timestamp")
+            .ok_or_else(|| field_err("timestamp", "missing/invalid"))?,
+        expiry: map_get_u64(entries, "expiry")
+            .ok_or_else(|| field_err("expiry", "missing/invalid"))?,
+        nonce: map_get_fixed(entries, "nonce")
+            .ok_or_else(|| field_err("nonce", "missing/invalid"))?,
+        source_signature: map_get_fixed(entries, "sourceSignature")
+            .ok_or_else(|| field_err("sourceSignature", "missing/invalid"))?,
+    })
+}
+
+/// Decode a [`SignedHopAuthorization`] from its wire CBOR map.
+fn decode_auth_wire(
+    value: &CborValue,
+) -> Result<SignedHopAuthorization, DistributedCircuitError> {
+    let entries = match value {
+        CborValue::Map(e) => e,
+        _ => return Err(field_err("authorization", "not a map")),
+    };
+    Ok(SignedHopAuthorization {
+        circuit_id: map_get_fixed(entries, "circuitId")
+            .ok_or_else(|| field_err("circuitId", "missing/invalid"))?,
+        commitment_hash: map_get_fixed(entries, "commitmentHash")
+            .ok_or_else(|| field_err("commitmentHash", "missing/invalid"))?,
+        relay_node_id: map_get_fixed(entries, "relayNodeId")
+            .ok_or_else(|| field_err("relayNodeId", "missing/invalid"))?,
+        predecessor_node_id: map_get_fixed(entries, "predecessorNodeId")
+            .ok_or_else(|| field_err("predecessorNodeId", "missing/invalid"))?,
+        successor_node_id: map_get_opt_array32(entries, "successorNodeId")
+            .ok_or_else(|| field_err("successorNodeId", "missing/invalid"))?,
+        role: map_get_role(entries, "role")
+            .ok_or_else(|| field_err("role", "missing/invalid"))?,
+        hop_index: map_get_usize(entries, "hopIndex")
+            .ok_or_else(|| field_err("hopIndex", "missing/invalid"))?,
+        relay_x25519_public_key: map_get_fixed(entries, "relayX25519PublicKey")
+            .ok_or_else(|| field_err("relayX25519PublicKey", "missing/invalid"))?,
+        source_signature: map_get_fixed(entries, "sourceSignature")
+            .ok_or_else(|| field_err("sourceSignature", "missing/invalid"))?,
+    })
+}
+
+/// Decode the `authorizationHashes` array (each element a 32-byte bstr).
+/// The array length is already bounded by `decode_with_limits`, so this
+/// allocation is guaranteed small.
+fn decode_hash_array(value: &CborValue) -> Result<Vec<[u8; 32]>, DistributedCircuitError> {
+    let items = match value {
+        CborValue::Array(items) => items,
+        _ => {
+            return Err(DistributedCircuitError::WireDecodeFailed {
+                reason: "authorizationHashes must be a CBOR array".into(),
+            });
+        }
+    };
+    let mut hashes = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let bytes = match item {
+            CborValue::ByteString(b) => b,
+            _ => {
+                return Err(DistributedCircuitError::WireDecodeFailed {
+                    reason: format!("authorizationHashes[{i}] must be a byte string"),
+                });
+            }
+        };
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| DistributedCircuitError::WireDecodeFailed {
+                reason: format!("authorizationHashes[{i}] must be 32 bytes"),
+            })?;
+        hashes.push(arr);
+    }
+    Ok(hashes)
 }
 
 /// A relay's signed response proving X25519 key possession + acknowledging
@@ -519,6 +875,18 @@ pub enum DistributedCircuitError {
     AuthorizationSetCardinalityMismatch { expected: usize, actual: usize },
     /// P1: the authorization hash set contains duplicate entries.
     DuplicateAuthorizationHash { hash: [u8; 32] },
+    /// Wire-level bound violated: the `authorization_hashes` array exceeds
+    /// [`MAX_AUTHORIZATION_HASHES`] (`ROUTE_MAX_HOPS - 1`). Enforced at the
+    /// CBOR decoder head — BEFORE allocating the `Vec<[u8; 32]>` — so an
+    /// attacker cannot force the decoder to allocate an oversized vector.
+    /// This is a **wire-level** bound, distinct from the signed
+    /// `authorization_count` (a **semantic** bound verified afterward inside
+    /// [`accept_relay_handshake`]).
+    AuthorizationHashListTooLarge { actual: usize, max: usize },
+    /// Wire-level decode of a [`RelayHandshakeRequest`] failed (malformed or
+    /// non-canonical CBOR, missing field, wrong type, or a non-array resource
+    /// limit violation). The request never reached semantic validation.
+    WireDecodeFailed { reason: String },
 }
 
 impl std::fmt::Display for DistributedCircuitError {
@@ -538,6 +906,8 @@ impl std::fmt::Display for DistributedCircuitError {
             Self::AuthorizationNotInRoot { relay_node_id } => write!(f, "relay {} authorization not in handshake's authorization_root — split-view attack or wrong authorization", hex_short(relay_node_id)),
             Self::AuthorizationSetCardinalityMismatch { expected, actual } => write!(f, "authorization hash set cardinality mismatch: expected {expected}, got {actual}"),
             Self::DuplicateAuthorizationHash { hash } => write!(f, "duplicate authorization hash: {}", hex_short(hash)),
+            Self::AuthorizationHashListTooLarge { actual, max } => write!(f, "authorization hash list too large: declared {actual}, max {max} (wire-level bound violated before allocation)"),
+            Self::WireDecodeFailed { reason } => write!(f, "wire decode failed: {reason}"),
         }
     }
 }

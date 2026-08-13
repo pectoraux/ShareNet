@@ -38,6 +38,21 @@ pub enum CborError {
     /// Input was not well-formed CBOR (truncated, bad major type, …).
     #[error("malformed CBOR: {0}")]
     Malformed(String),
+    /// A CBOR structure exceeded the decoder's resource limit (DoS
+    /// protection). Enforced at the head-reading stage, BEFORE any
+    /// allocation proportional to the declared length. `kind` is one of
+    /// `"array"`, `"map"`, `"byte_string"`, `"text_string"`, or
+    /// `"depth"`. `actual` is the declared length/depth; `max` is the limit.
+    #[error("CBOR {kind} limit exceeded: declared {actual}, max {max}")]
+    LimitExceeded {
+        /// Which kind of structure exceeded its limit (`"array"`, `"map"`,
+        /// `"byte_string"`, `"text_string"`, or `"depth"`).
+        kind: &'static str,
+        /// The declared length/depth found in the CBOR head.
+        actual: u64,
+        /// The configured maximum for that kind.
+        max: u64,
+    },
 }
 
 impl CborError {
@@ -51,12 +66,60 @@ impl CborError {
             CborError::TrailingBytes => "TRAILING_BYTES",
             CborError::Unsupported(_) => "UNSUPPORTED",
             CborError::Malformed(_) => "MALFORMED",
+            CborError::LimitExceeded { .. } => "LIMIT_EXCEEDED",
         }
     }
 }
 
 /// Convenience `Result` alias.
 pub type CborResult<T> = Result<T, CborError>;
+
+/// Resource limits for bounded CBOR decoding (denial-of-service protection).
+///
+/// [`decode_with_limits`] enforces these at the CBOR head-reading stage —
+/// BEFORE any allocation proportional to the declared length. This prevents
+/// an attacker from forcing the decoder to allocate a huge `Vec` for an
+/// array whose declared count exceeds the protocol maximum.
+///
+/// Use [`CborLimits::NONE`] (all bounds set to their type's maximum) for the
+/// original unbounded behaviour used by [`decode`].
+///
+/// # Wire-level vs semantic bounds
+///
+/// These are **wire-level** bounds: they protect the decoder itself from
+/// attacker-controlled structure sizes. They are distinct from, and run
+/// before, any **semantic** validation (e.g. an authenticated
+/// `authorization_count` inside a signed message). A message must be safely
+/// parsed before any signed field inside it can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CborLimits {
+    /// Maximum number of items in any single CBOR array.
+    pub max_array_items: u64,
+    /// Maximum number of entries in any single CBOR map.
+    pub max_map_entries: u64,
+    /// Maximum length (in bytes) of any single byte string.
+    pub max_byte_string_len: u64,
+    /// Maximum length (in bytes) of any single text string.
+    pub max_text_string_len: u64,
+    /// Maximum nesting depth of arrays/maps inside arrays/maps. The
+    /// top-level value is at depth 0; its direct children at depth 1, etc.
+    pub max_nesting_depth: u32,
+}
+
+impl CborLimits {
+    /// No limits — backward-compatible with the original unbounded [`decode`].
+    ///
+    /// Each bound is set to its type's maximum, so every limit check is a
+    /// no-op. [`decode`] uses this. Callers that handle attacker-controlled
+    /// input MUST instead supply concrete limits via [`decode_with_limits`].
+    pub const NONE: Self = Self {
+        max_array_items: u64::MAX,
+        max_map_entries: u64::MAX,
+        max_byte_string_len: u64::MAX,
+        max_text_string_len: u64::MAX,
+        max_nesting_depth: u32::MAX,
+    };
+}
 
 /// A CBOR value in SNP's supported subset.
 ///
@@ -193,16 +256,50 @@ fn encode_head(major: u8, n: u64, out: &mut Vec<u8>) {
 /// # Errors
 /// Returns [`CborError`] if the input is malformed, non-canonical, contains a
 /// duplicate key, contains an unsupported value, or has trailing bytes.
+///
+/// This function is **unbounded** — it imposes no resource limits and is
+/// retained for backward compatibility (conformance vectors, frame decoding).
+/// Callers decoding attacker-controlled protocol messages MUST use
+/// [`decode_with_limits`] instead, so that an oversized declared structure
+/// is rejected at the CBOR head before allocation.
 pub fn decode(bytes: &[u8]) -> CborResult<CborValue> {
     let mut cursor = 0usize;
-    let value = decode_one(bytes, &mut cursor)?;
+    let value = decode_one(bytes, &mut cursor, &CborLimits::NONE, 0)?;
     if cursor != bytes.len() {
         return Err(CborError::TrailingBytes);
     }
     Ok(value)
 }
 
-fn decode_one(buf: &[u8], cursor: &mut usize) -> CborResult<CborValue> {
+/// Decode canonical CBOR bytes into a [`CborValue`] with explicit resource
+/// limits.
+///
+/// Limits are enforced at the head-reading stage — BEFORE any allocation
+/// proportional to the declared length. An array whose declared item count
+/// exceeds `limits.max_array_items` is rejected with
+/// [`CborError::LimitExceeded`] before `Vec::with_capacity` runs; likewise for
+/// maps, byte strings, text strings, and nesting depth.
+///
+/// # Errors
+/// Returns [`CborError::LimitExceeded`] when a declared structure exceeds a
+/// limit. Returns any other [`CborError`] variant for malformed, non-canonical,
+/// duplicate-key, unsupported, or trailing-byte input.
+pub fn decode_with_limits(bytes: &[u8], limits: &CborLimits) -> CborResult<CborValue> {
+    let mut cursor = 0usize;
+    let value = decode_one(bytes, &mut cursor, limits, 0)?;
+    if cursor != bytes.len() {
+        return Err(CborError::TrailingBytes);
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_one(
+    buf: &[u8],
+    cursor: &mut usize,
+    limits: &CborLimits,
+    depth: u32,
+) -> CborResult<CborValue> {
     let head = read_u8(buf, cursor)?;
     let major = head >> 5;
     let info = head & 0x1f;
@@ -227,12 +324,26 @@ fn decode_one(buf: &[u8], cursor: &mut usize) -> CborResult<CborValue> {
         }
         MT_BYTE_STRING => {
             let len = decode_argument(info, buf, cursor)?;
+            if len > limits.max_byte_string_len {
+                return Err(CborError::LimitExceeded {
+                    kind: "byte_string",
+                    actual: len,
+                    max: limits.max_byte_string_len,
+                });
+            }
             let len = usize_arg(len)?;
             let bytes = read_slice(buf, cursor, len)?;
             Ok(CborValue::ByteString(bytes.to_vec()))
         }
         MT_TEXT_STRING => {
             let len = decode_argument(info, buf, cursor)?;
+            if len > limits.max_text_string_len {
+                return Err(CborError::LimitExceeded {
+                    kind: "text_string",
+                    actual: len,
+                    max: limits.max_text_string_len,
+                });
+            }
             let len = usize_arg(len)?;
             let bytes = read_slice(buf, cursor, len)?;
             match std::str::from_utf8(bytes) {
@@ -247,10 +358,28 @@ fn decode_one(buf: &[u8], cursor: &mut usize) -> CborResult<CborValue> {
                 ));
             }
             let len = decode_argument(info, buf, cursor)?;
+            // Wire-level bound: reject at the CBOR head BEFORE allocating the
+            // items Vec. This is the DoS protection the signed
+            // `authorization_count` cannot provide on its own (the message
+            // must be safely parsed before that signed field can be trusted).
+            if len > limits.max_array_items {
+                return Err(CborError::LimitExceeded {
+                    kind: "array",
+                    actual: len,
+                    max: limits.max_array_items,
+                });
+            }
+            if depth >= limits.max_nesting_depth {
+                return Err(CborError::LimitExceeded {
+                    kind: "depth",
+                    actual: u64::from(depth),
+                    max: u64::from(limits.max_nesting_depth),
+                });
+            }
             let len = usize_arg(len)?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(decode_one(buf, cursor)?);
+                items.push(decode_one(buf, cursor, limits, depth + 1)?);
             }
             Ok(CborValue::Array(items))
         }
@@ -261,6 +390,21 @@ fn decode_one(buf: &[u8], cursor: &mut usize) -> CborResult<CborValue> {
                 ));
             }
             let len = decode_argument(info, buf, cursor)?;
+            // Wire-level bound: reject oversized maps at the head.
+            if len > limits.max_map_entries {
+                return Err(CborError::LimitExceeded {
+                    kind: "map",
+                    actual: len,
+                    max: limits.max_map_entries,
+                });
+            }
+            if depth >= limits.max_nesting_depth {
+                return Err(CborError::LimitExceeded {
+                    kind: "depth",
+                    actual: u64::from(depth),
+                    max: u64::from(limits.max_nesting_depth),
+                });
+            }
             let len = usize_arg(len)?;
             let mut entries: Vec<(Vec<u8>, (CborValue, CborValue))> = Vec::with_capacity(len);
             for _ in 0..len {
@@ -268,10 +412,10 @@ fn decode_one(buf: &[u8], cursor: &mut usize) -> CborResult<CborValue> {
                 // sort order on the wire. Decode the value, re-encode it
                 // (canonical), and compare with the previous encoded key.
                 let key_start = *cursor;
-                let key = decode_one(buf, cursor)?;
+                let key = decode_one(buf, cursor, limits, depth + 1)?;
                 let mut kbuf = Vec::new();
                 encode_into(&key, &mut kbuf)?;
-                let value = decode_one(buf, cursor)?;
+                let value = decode_one(buf, cursor, limits, depth + 1)?;
                 // Verify strictly increasing canonical order, no duplicates.
                 if let Some(prev) = entries.last() {
                     if kbuf <= prev.0 {
@@ -517,5 +661,105 @@ mod tests {
         // Expect: a(2) {"a":2, "bcd":1}
         let expected = [0xa2, 0x61, b'a', 0x02, 0x63, b'b', b'c', b'd', 0x01];
         assert_eq!(out, expected);
+    }
+
+    // ─── Bounded decode (decode_with_limits) ───────────────────────────────
+
+    fn array_of(n: u64) -> CborValue {
+        CborValue::Array((0..n).map(CborValue::UnsignedInt).collect())
+    }
+
+    #[test]
+    fn decode_with_limits_rejects_oversized_array() {
+        // An array of 5 items, decoded with max_array_items = 4, is rejected
+        // at the CBOR head — BEFORE allocating the items Vec.
+        let wire = encode(&array_of(5)).unwrap();
+        let limits = CborLimits {
+            max_array_items: 4,
+            ..CborLimits::NONE
+        };
+        let err = decode_with_limits(&wire, &limits).unwrap_err();
+        match err {
+            CborError::LimitExceeded { kind, actual, max } => {
+                assert_eq!(kind, "array");
+                assert_eq!(actual, 5);
+                assert_eq!(max, 4);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
+        assert_eq!(err.code(), "LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn decode_with_limits_accepts_array_at_limit() {
+        // An array of exactly max_array_items items is accepted.
+        let wire = encode(&array_of(4)).unwrap();
+        let limits = CborLimits {
+            max_array_items: 4,
+            ..CborLimits::NONE
+        };
+        let decoded = decode_with_limits(&wire, &limits).unwrap();
+        assert_eq!(decoded, array_of(4));
+    }
+
+    #[test]
+    fn decode_unbounded_accepts_what_limited_rejects() {
+        // decode() (CborLimits::NONE) must still accept the oversized array
+        // that decode_with_limits rejects — backward compatibility.
+        let wire = encode(&array_of(5)).unwrap();
+        assert!(decode(&wire).is_ok());
+    }
+
+    #[test]
+    fn decode_with_limits_rejects_oversized_map() {
+        let mut entries = Vec::new();
+        for i in 0..5u64 {
+            entries.push((
+                CborValue::TextString(format!("k{i}")),
+                CborValue::UnsignedInt(i),
+            ));
+        }
+        let wire = encode(&CborValue::Map(entries)).unwrap();
+        let limits = CborLimits {
+            max_map_entries: 4,
+            ..CborLimits::NONE
+        };
+        let err = decode_with_limits(&wire, &limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CborError::LimitExceeded { kind: "map", actual: 5, max: 4 }
+        ));
+    }
+
+    #[test]
+    fn decode_with_limits_rejects_oversized_byte_string() {
+        let wire = encode(&CborValue::ByteString(vec![0u8; 8])).unwrap();
+        let limits = CborLimits {
+            max_byte_string_len: 4,
+            ..CborLimits::NONE
+        };
+        let err = decode_with_limits(&wire, &limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CborError::LimitExceeded { kind: "byte_string", actual: 8, max: 4 }
+        ));
+    }
+
+    #[test]
+    fn decode_with_limits_rejects_excessive_nesting() {
+        // [[[[1]]]] — depth 3 of arrays. With max_nesting_depth = 2, the
+        // innermost array (decoded at depth 2) trips the depth check.
+        let inner = CborValue::Array(vec![CborValue::UnsignedInt(1)]);
+        let nested = CborValue::Array(vec![CborValue::Array(vec![inner])]);
+        let wire = encode(&nested).unwrap();
+        let limits = CborLimits {
+            max_nesting_depth: 2,
+            ..CborLimits::NONE
+        };
+        let err = decode_with_limits(&wire, &limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CborError::LimitExceeded { kind: "depth", .. }
+        ));
     }
 }

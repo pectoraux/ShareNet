@@ -37,7 +37,8 @@ use snp_crypto::{
 use snp_node::node::{
     ActiveCircuit, Capability, CircuitAcceptanceStore, CircuitHandshake,
     CircuitSetup, CommittedRoute, CommitError, DistributedCircuitError,
-    HopForwardingState, Link as Link_, LinkKey, NodeAdvertisement,
+    HopForwardingState, Link as Link_, LinkKey, MAX_AUTHORIZATION_HASHES,
+    NodeAdvertisement,
     RelayForwardingState, RelayHandshakeRequest, RelayHandshakeResponse,
     RelayHandshakeTransport, RouteAcceptance, RouteProposal, RouteRole,
     ServiceAgreement, SignedHopAuthorization, TopologyGraph,
@@ -1278,5 +1279,173 @@ fn duplicate_authorization_hash_rejected() {
     assert!(
         matches!(result, Err(DistributedCircuitError::DuplicateAuthorizationHash { .. })),
         "duplicate authorization hash must be rejected"
+    );
+}
+
+// ─── N2.2 final hardening: wire-level resource bound ──────────────────────
+//
+// The signed `authorization_count` protects SEMANTIC cardinality, but only
+// AFTER `RelayHandshakeRequest` has been decoded. These tests verify the
+// separate WIRE-LEVEL bound: the decoder rejects an oversized
+// `authorization_hashes` array at the CBOR head, BEFORE allocating the Vec
+// and BEFORE `accept_relay_handshake`'s semantic checks run.
+
+/// A well-formed `RelayHandshakeRequest` round-trips through the wire format:
+/// encode → decode reproduces a request whose handshake + authorization still
+/// verify cryptographically, and which `accept_relay_handshake` accepts.
+#[test]
+fn relay_handshake_request_wire_round_trip() {
+    let ts = setup();
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .unwrap();
+    let original = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth,
+        authorization_hashes: compute_test_auth_hashes(&ts),
+    };
+
+    // Encode → decode round trip.
+    let wire = original.encode_to_cbor().expect("encode must succeed");
+    let decoded = RelayHandshakeRequest::decode_from_cbor(&wire)
+        .expect("decode must succeed for a well-formed request");
+
+    // Cryptographic faithfulness: the decoded handshake + authorization still
+    // verify. This proves the wire format preserved every signature-relevant
+    // field byte-for-byte.
+    assert!(decoded.handshake.verify(), "decoded handshake must verify");
+    assert!(
+        decoded.authorization.verify_signature(&decoded.handshake.source_public_key),
+        "decoded authorization signature must verify"
+    );
+    // The bounded array survives the round trip.
+    assert_eq!(decoded.authorization_hashes, original.authorization_hashes);
+    // Key identifier + signature fields match.
+    assert_eq!(decoded.handshake.circuit_id, original.handshake.circuit_id);
+    assert_eq!(decoded.handshake.source_signature, original.handshake.source_signature);
+    assert_eq!(decoded.authorization.relay_node_id, original.authorization.relay_node_id);
+    assert_eq!(decoded.authorization.source_signature, original.authorization.source_signature);
+    assert_eq!(decoded.authorization.hop_index, original.authorization.hop_index);
+    assert_eq!(decoded.handshake.authorization_count, original.handshake.authorization_count);
+
+    // End-to-end: the decoded request is accepted by accept_relay_handshake,
+    // proving the wire round trip preserves everything needed for normal
+    // request processing.
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+    let result = accept_relay_handshake(
+        &decoded, &ts.relay_x25519_sk, &ts.relay_sk, &ts.relay_pk,
+        &mut acceptance_store,
+    );
+    assert!(result.is_ok(), "decoded request must be accepted by accept_relay_handshake");
+}
+
+/// P1 (wire-level): an oversized authorization-hash list is rejected at DECODE
+/// time — at the CBOR array head, before any Vec allocation and before
+/// `accept_relay_handshake`'s semantic `authorization_count` validation runs.
+///
+/// This is the DoS protection the signed `authorization_count` cannot provide
+/// on its own: the attacker-controlled message must be safely parsed before
+/// that signed field can be trusted.
+#[test]
+fn oversized_authorization_hash_list_rejected_at_decode() {
+    let ts = setup();
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .unwrap();
+
+    // Start from the honest hash set, then pad it past the wire-level maximum.
+    let mut oversized_hashes = compute_test_auth_hashes(&ts);
+    // Pad to MAX_AUTHORIZATION_HASHES + 1 (one over the limit).
+    while oversized_hashes.len() <= MAX_AUTHORIZATION_HASHES {
+        oversized_hashes.push([0xff; 32]);
+    }
+    assert_eq!(
+        oversized_hashes.len(),
+        MAX_AUTHORIZATION_HASHES + 1,
+        "test must construct a list exactly one over the limit"
+    );
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth,
+        authorization_hashes: oversized_hashes,
+    };
+
+    // Encoding succeeds — encoding is unrestricted; the bound is on decode.
+    let wire = request.encode_to_cbor()
+        .expect("encode must succeed even for an oversized list");
+
+    // Decode REJECTS at the CBOR array head — before allocating the Vec and
+    // before accept_relay_handshake ever runs.
+    let result = RelayHandshakeRequest::decode_from_cbor(&wire);
+    assert!(
+        matches!(
+            &result,
+            Err(DistributedCircuitError::AuthorizationHashListTooLarge { actual, max })
+                if *actual == MAX_AUTHORIZATION_HASHES + 1 && *max == MAX_AUTHORIZATION_HASHES
+        ),
+        "oversized authorization-hash list must be rejected at decode time \
+         with AuthorizationHashListTooLarge, got {result:?}"
+    );
+
+    // Crucially: accept_relay_handshake is NEVER called with the oversized
+    // request — the rejection happened at the decode boundary, before normal
+    // request processing. No forwarding state could be installed.
+}
+
+/// P1 (wire-level): a hash list exactly AT the wire-level maximum
+/// (`MAX_AUTHORIZATION_HASHES`) is ACCEPTED by the decoder (the bound is
+/// inclusive). It is still rejected later by the SEMANTIC
+/// `authorization_count` check inside `accept_relay_handshake` — proving the
+/// two bounds are separate layers: wire-level (inclusive count cap at the CBOR
+/// head) vs semantic (signed `authorization_count` match).
+#[test]
+fn authorization_hash_list_at_wire_limit_decodes() {
+    let ts = setup();
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .unwrap();
+
+    // Pad to exactly MAX_AUTHORIZATION_HASHES (the inclusive wire limit).
+    let mut limit_hashes = compute_test_auth_hashes(&ts);
+    while limit_hashes.len() < MAX_AUTHORIZATION_HASHES {
+        limit_hashes.push([0xab; 32]);
+    }
+    assert_eq!(limit_hashes.len(), MAX_AUTHORIZATION_HASHES);
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth,
+        authorization_hashes: limit_hashes,
+    };
+    let wire = request.encode_to_cbor().expect("encode must succeed");
+    let decoded = RelayHandshakeRequest::decode_from_cbor(&wire)
+        .expect("a list at exactly the wire limit must decode successfully");
+    assert_eq!(decoded.authorization_hashes.len(), MAX_AUTHORIZATION_HASHES);
+
+    // Semantic validation rejects this: the signed authorization_count is 2
+    // (relay + gateway), not 15. But that check runs INSIDE
+    // accept_relay_handshake, AFTER decode — exactly the layering the
+    // architecture requires.
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+    let result = accept_relay_handshake(
+        &decoded, &ts.relay_x25519_sk, &ts.relay_sk, &ts.relay_pk,
+        &mut acceptance_store,
+    );
+    assert!(
+        matches!(&result, Err(DistributedCircuitError::AuthorizationSetCardinalityMismatch { .. })),
+        "semantic cardinality check (not the wire bound) rejects the count mismatch, got {result:?}"
     );
 }

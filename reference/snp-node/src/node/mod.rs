@@ -166,7 +166,7 @@ pub use distributed_circuit::{
     CircuitAcceptanceStore, SignedHopAuthorization, DistributedCircuitError,
     RelayHandshakeTransport, establish_distributed_circuit, accept_relay_handshake,
     derive_signed_hop_authorizations, compute_authorization_root,
-    authorization_in_root, verify_dh_proof,
+    authorization_in_root, verify_dh_proof, MAX_AUTHORIZATION_HASHES,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

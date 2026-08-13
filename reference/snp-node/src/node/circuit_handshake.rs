@@ -265,6 +265,36 @@ impl CircuitHandshake {
         Ok(msg)
     }
 
+    /// Encode this handshake for WIRE transport — the full signed message,
+    /// including `source_signature`.
+    ///
+    /// This is distinct from [`preimage_bytes`](Self::preimage_bytes), which
+    /// produces the context-prefixed canonical preimage that the source
+    /// **signs over** and which **excludes** the signature. The wire encoding
+    /// instead carries the signature as a sibling map field
+    /// (`"sourceSignature"`), so a receiver can reconstruct the handshake and
+    /// verify the signature itself.
+    ///
+    /// The returned [`CborValue`] is a map with 12 entries: the 11 unsigned
+    /// fields from [`preimage`](Self::preimage) plus `"sourceSignature"`.
+    ///
+    /// # Errors
+    /// Returns `RouteSerializationError::CborEncodingFailed` only if
+    /// [`preimage`](Self::preimage) does not return a map (defensive — it
+    /// always does).
+    pub fn to_wire_cbor(&self) -> Result<CborValue, RouteSerializationError> {
+        if let CborValue::Map(mut entries) = self.preimage() {
+            entries.push((
+                CborValue::TextString("sourceSignature".into()),
+                CborValue::ByteString(self.source_signature.to_vec()),
+            ));
+            Ok(CborValue::Map(entries))
+        } else {
+            // preimage() always returns a Map; this branch is defensive only.
+            Err(RouteSerializationError::CborEncodingFailed)
+        }
+    }
+
     /// Verify the handshake's signature + NodeId binding + freshness.
     ///
     /// Returns `false` on any failure (fail-closed — P0).
