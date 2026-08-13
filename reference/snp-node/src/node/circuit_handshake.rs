@@ -1,6 +1,6 @@
 //! N2.1.3 — Circuit Cryptographic Setup.
 //!
-//! Spec: spec/08-circuits.md (Section 38 of the frozen spec).
+//! Spec: public/spec/08-circuits.md (N2.1.3 — Circuit Cryptographic Setup).
 //!
 //! ## CRITICAL: This is LOCAL preparation, NOT distributed establishment.
 //!
@@ -16,12 +16,13 @@
 //! A `CommittedRoute` is a **cryptographically consented route agreement**
 //! backed by validated evidence. It is NOT source-side preparation.
 //!
-//! A `Circuit` is **live cryptographic execution state** — actual secure
-//! forwarding keys, per-hop state, and an active session bound to a specific
-//! committed route.
+//! A `CircuitSetup` is **source-side cryptographic preparation** — per-hop
+//! forwarding keys derived locally, NOT installed on any relay. It is NOT
+//! live distributed state, NOT an established session, and NOT forwarding
+//! state on remote nodes.
 //!
-//! The transition from `CommittedRoute` to `Circuit` is a new cryptographic
-//! protocol boundary:
+//! The transition from `CommittedRoute` to `CircuitSetup` is a local
+//! cryptographic preparation step:
 //!
 //! ```text
 //! CommittedRoute (agreement + evidence)
@@ -30,11 +31,10 @@
 //!         ↓
 //! Per-hop X25519 DH + HKDF key derivation
 //!         ↓
-//! CircuitState (source-side preparation)
+//! CircuitSetup (source-side preparation artifact — NOT distributed)
 //!         ↓
-//! Traffic (encrypted + authenticated per-hop)
-//!         ↓
-//! CircuitTeardown (authenticated close)
+//! [N2.2+: distributed handshake → relay installs forwarding state →
+//!          ActiveCircuit (live distributed state) → Traffic → Teardown]
 //! ```
 //!
 //! ## What the circuit protocol answers (per architecture review)
@@ -97,8 +97,11 @@ pub const CIRCUIT_MSG_CONTEXT: &[u8] = b"SNP/0.1 circuit-msg\0";
 /// Maximum circuit lifetime (must be ≤ route proposal lifetime).
 pub const CIRCUIT_MAX_LIFETIME_SECS: u64 = 3600; // 1 hour
 
-/// A per-hop forwarding state entry — the live cryptographic state for one
-/// relay or gateway in the circuit.
+/// A per-hop forwarding-state description for one route hop.
+///
+/// In N2.1.3, this is source-side prepared data — NOT installed on the
+/// remote relay. It describes the forwarding key and predecessor/successor
+/// that WILL be used when the circuit is distributed (N2.2+).
 ///
 /// Each relay knows:
 /// - Its own NodeId
@@ -127,13 +130,15 @@ pub struct HopForwardingState {
 ///
 /// The handshake is the INITIATION message. It proves the source authorized
 /// this circuit and binds it to a specific committed route. The actual
-/// `CircuitState` (source-side preparation) is produced by `prepare_circuit_setup()`
+/// `CircuitSetup` is produced by `prepare_circuit_setup()`
 /// after verifying the handshake.
 ///
 /// ## Binding
 ///
 /// The handshake signs:
-/// - `circuit_id`: a unique 32-byte random identifier (replay prevention)
+/// - `circuit_id`: a unique 32-byte random identifier. Uniqueness helps
+///   distinguish circuit instances but is NOT replay protection. Replay
+///   protection requires receiver-side acceptance state (N2.2+).
 /// - `commitment_hash`: the committed route's commitment hash
 /// - `ephemeral_x25519_public`: the initiator's ephemeral X25519 public key
 ///   (used for per-hop DH key derivation)
@@ -282,15 +287,14 @@ impl CircuitHandshake {
 ///
 /// This is the source-side cryptographic preparation derived from a committed route. It
 /// contains:
-/// - The circuit ID (replay prevention)
+/// - The circuit ID (instance identification — NOT replay protection)
 /// - The binding to the committed route (commitment hash)
 /// - Per-hop forwarding state (keys + predecessor/successor)
 /// - Creation timestamp + expiry
-/// - Active/teardown state
 ///
 /// ## Construction
 ///
-/// `CircuitState` can ONLY be constructed by `prepare_circuit_setup()`, which
+/// `CircuitSetup` can ONLY be constructed by `prepare_circuit_setup()`, which
 /// verifies the handshake + committed route + derives per-hop keys. The
 /// fields are private — callers cannot construct one directly.
 #[derive(Debug, Clone)]
@@ -309,9 +313,6 @@ pub struct CircuitSetup {
     created_at: u64,
     /// When the circuit expires.
     expires_at: u64,
-    /// Whether the setup is valid (not torn down). LOCAL state only —
-    /// does NOT imply the circuit is active on any relay.
-    active: bool,
 }
 
 /// Error from `prepare_circuit_setup()`.
@@ -356,9 +357,14 @@ impl std::fmt::Display for CircuitError {
 
 impl std::error::Error for CircuitError {}
 
-/// Establish a circuit from a committed route + signed handshake.
+/// Prepare source-side cryptographic circuit setup from a committed route
+/// and signed handshake.
 ///
-/// This is the ONLY way to construct a `CircuitState`. It:
+/// This does NOT establish a distributed circuit and does NOT install
+/// forwarding state on remote participants. No relay receives this state.
+/// Distributed circuit establishment is deferred to N2.2+.
+///
+/// This is the ONLY way to construct a `CircuitSetup`. It:
 ///
 /// 1. Verifies the handshake signature + freshness + NodeId binding.
 /// 2. Verifies the handshake is bound to the committed route (commitment hash match).
@@ -470,12 +476,13 @@ pub fn prepare_circuit_setup(
         hops: forwarding_hops,
         created_at: now,
         expires_at: handshake.expiry,
-        active: true,
     })
 }
 
 impl CircuitSetup {
-    /// The circuit ID (unique per circuit — replay prevention).
+    /// The circuit ID. Uniqueness helps distinguish circuit instances but
+    /// is NOT replay protection. Replay protection requires receiver-side
+    /// acceptance state (CircuitReplayState — future distributed use).
     #[must_use] pub fn circuit_id(&self) -> &[u8; 32] { &self.circuit_id }
     /// The committed route's commitment hash (binding).
     #[must_use] pub fn commitment_hash(&self) -> &[u8; 32] { &self.commitment_hash }
@@ -489,8 +496,6 @@ impl CircuitSetup {
     #[must_use] pub fn created_at(&self) -> u64 { self.created_at }
     /// When the circuit expires.
     #[must_use] pub fn expires_at(&self) -> u64 { self.expires_at }
-    /// Is the setup valid (not torn down)? LOCAL state only.
-    #[must_use] pub fn is_active(&self) -> bool { self.active }
     /// Has the circuit expired?
     #[must_use] pub fn is_expired(&self, now: u64) -> bool { self.expires_at <= now }
 
@@ -500,11 +505,6 @@ impl CircuitSetup {
         self.hops.iter().find(|h| &h.node_id == node_id)
     }
 
-    /// Mark the setup as torn down (local state only — does NOT tear down
-    /// any relay's forwarding state, since none is installed).
-    pub fn teardown(&mut self) {
-        self.active = false;
-    }
 }
 
 /// A signed circuit teardown message.
