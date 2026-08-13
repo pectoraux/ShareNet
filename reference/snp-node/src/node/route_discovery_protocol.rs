@@ -907,12 +907,24 @@ impl<'a> NextHopResolver<'a> {
     }
 }
 
+/// **N2.1.3.1.2.** Maximum number of pending (unconsumed) route queries.
+/// Prevents unbounded memory growth from route-discovery requests.
+pub const MAX_PENDING_ROUTE_QUERIES: usize = 256;
+
 impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
     fn resolve_step(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
     ) -> Option<NextHopResolution> {
+        // Step 0: Purge expired pending queries (resource management).
+        self.purge_expired_pending_queries();
+
+        // Step 0b: Check capacity — reject if too many pending queries.
+        if self.pending_queries.values().filter(|p| !p.consumed).count() >= MAX_PENDING_ROUTE_QUERIES {
+            return None;
+        }
+
         // Step 1: Select the neighbor to query.
         let expected_responder = hint.learned_from;
 
@@ -935,48 +947,72 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
 
         // Step 5: Verify response signature + I4.
         if !response.verify_signature() {
-            return None;
+            return None; // Query NOT consumed — legitimate retry possible.
         }
 
         // Step 6: Verify response freshness.
         if !response.is_fresh() {
-            return None;
+            return None; // Query NOT consumed — legitimate retry possible.
         }
 
         // Step 7: Verify response matches pending query (responder binding + replay).
-        let pending = self.pending_queries.get_mut(&query.query_id)?;
-        if !pending.matches_response(&response) {
-            return None;
+        // Check that the pending query exists and matches.
+        let pending_match = self.pending_queries.get(&query.query_id)
+            .map_or(false, |p| p.matches_response(&response));
+        if !pending_match {
+            return None; // Query NOT consumed — legitimate retry possible.
         }
 
-        // Step 8: Mark query as consumed (replay protection).
-        pending.consume();
-
-        // Step 9: Process the result.
-        match &response.result {
-            NextHopResult::Found { next_hop_node_id, advertisement, is_destination } => {
+        // Step 8: N2.1.3.1.2 — Transactional consumption.
+        // Process the result FULLY before consuming the query.
+        // A failed advertisement verification MUST NOT consume the query.
+        let resolution = match &response.result {
+            NextHopResult::Found { next_hop_node_id, advertisement, is_destination: _ } => {
                 // Verify the advertisement independently.
-                let verified = advertisement.verify_into_verified()?;
+                let verified = match advertisement.verify_into_verified() {
+                    Some(v) => v,
+                    None => return None, // Query NOT consumed — legitimate retry possible.
+                };
 
                 // Check that the advertisement's NodeId matches next_hop_node_id.
                 if verified.node_id() != *next_hop_node_id {
-                    return None;
+                    return None; // Query NOT consumed — legitimate retry possible.
                 }
 
                 // Construct the routing assertion.
-                let assertion = RoutingAssertion::from_verified_response(
+                let assertion = match RoutingAssertion::from_verified_response(
                     &response,
                     *destination,
-                )?;
+                ) {
+                    Some(a) => a,
+                    None => return None, // Query NOT consumed — legitimate retry possible.
+                };
 
-                // Return the resolution.
-                Some(NextHopResolution {
+                // All validation passed — construct the resolution.
+                NextHopResolution {
                     assertion,
                     record: verified.into_record(),
-                })
+                }
             }
-            NextHopResult::NotFound => None,
+            NextHopResult::NotFound => {
+                // NotFound is a valid protocol response. Consume the query
+                // (the responder explicitly said it doesn't know the path).
+                // But we return None since no resolution was found.
+                if let Some(pending) = self.pending_queries.get_mut(&query.query_id) {
+                    pending.consume();
+                }
+                return None;
+            }
+        };
+
+        // Step 9: N2.1.3.1.2 — ONLY NOW consume the query.
+        // All validation has passed. The resolution is fully constructed.
+        // This is the transactional commit point.
+        if let Some(pending) = self.pending_queries.get_mut(&query.query_id) {
+            pending.consume();
         }
+
+        Some(resolution)
     }
 
     fn pending_query_count(&self) -> usize {
@@ -985,6 +1021,34 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
 
     fn is_query_consumed(&self, query_id: &[u8; 16]) -> bool {
         self.pending_queries.get(query_id).map_or(false, |p| p.consumed)
+    }
+}
+
+impl<'a> NextHopResolver<'a> {
+    /// **N2.1.3.1.2.** Remove expired pending queries.
+    ///
+    /// Expired queries are removed to prevent unbounded memory growth.
+    /// Consumed queries that are still within their retention window are
+    /// kept for replay detection (a replayed response for a consumed query
+    /// is rejected by `matches_response`).
+    ///
+    /// Queries that are both expired AND consumed are safe to remove —
+    /// they can no longer be replayed (the query_id is expired, so any
+    /// response with that query_id would fail freshness checks).
+    pub fn purge_expired_pending_queries(&mut self) {
+        let now = now_unix();
+        self.pending_queries.retain(|_, pending| {
+            // Keep if not expired (still within freshness window).
+            // Remove if expired (both consumed and unconsumed — expired
+            // queries can no longer accept valid responses).
+            now < pending.expires_at
+        });
+    }
+
+    /// Get the total number of pending queries (consumed + unconsumed).
+    #[must_use]
+    pub fn total_pending_queries(&self) -> usize {
+        self.pending_queries.len()
     }
 }
 
