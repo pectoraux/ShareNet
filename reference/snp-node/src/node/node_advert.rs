@@ -235,14 +235,14 @@ impl NodeAdvertisement {
             return None;
         }
         // 4. Role/key consistency.
+        // N2.1.3: relays MAY now have an X25519 circuit public key — it is
+        // REQUIRED for per-hop circuit key derivation. The old check that
+        // rejected non-gateway nodes with X25519 keys is REMOVED.
+        // Gateways MUST still have an X25519 key (enforced by route validation).
         let has_gateway = self.capabilities.contains(&Capability::Gateway);
         let has_x25519 = self.x25519_circuit_public.is_some();
         if has_gateway && !has_x25519 {
             // Gateway MUST have X25519 key.
-            return None;
-        }
-        if !has_gateway && has_x25519 {
-            // Non-gateway MUST NOT have X25519 key.
             return None;
         }
         Some(VerifiedNodeAdvertisement { advert: self.clone() })

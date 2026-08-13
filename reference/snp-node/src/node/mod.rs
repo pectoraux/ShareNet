@@ -157,8 +157,8 @@ pub use route_discovery::{
     ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS, ROUTE_MAX_LIFETIME_SECS,
 };
 pub use circuit_handshake::{
-    CircuitHandshake, ActiveCircuit, CircuitTeardown, CircuitError, HopForwardingState,
-    establish_circuit, CIRCUIT_MAX_LIFETIME_SECS,
+    CircuitHandshake, CircuitSetup, CircuitTeardown, CircuitError, HopForwardingState,
+    CircuitReplayState, prepare_circuit_setup, CIRCUIT_MAX_LIFETIME_SECS,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
@@ -2317,7 +2317,7 @@ mod tests {
     /// - `serve_gateway_persistent_async_with_handshake` (gateway: handshake + serve)
     /// - `serve_gateway_persistent_async_with_handshake_and_connector` (test variant)
     /// - `serve_relay_persistent_async_with_handshake` (relay: handshake + forward)
-    /// - `establish_circuit_and_send_async` (client: circuit DH + handshake + send)
+    /// - `prepare_circuit_setup_and_send_async` (client: circuit DH + handshake + send)
     #[test]
     fn canonical_production_async_entry_points_exist() {
         let source = include_str!("async_node.rs");
@@ -2325,7 +2325,7 @@ mod tests {
             "pub async fn serve_gateway_persistent_async_with_handshake(",
             "pub async fn serve_gateway_persistent_async_with_handshake_and_connector",
             "pub async fn serve_relay_persistent_async_with_handshake(",
-            "pub async fn establish_circuit_and_send_async(",
+            "pub async fn prepare_circuit_setup_and_send_async(",
         ];
         for sig in required {
             assert!(
@@ -2593,7 +2593,7 @@ mod tests {
             "pub async fn serve_gateway_persistent_async_with_handshake_and_connector",
             "pub async fn serve_one_gateway_request_async_with_connector",
             "pub async fn send_request_via_gateway_full_with_relay_async(",
-            "pub async fn establish_circuit_and_send_async(",
+            "pub async fn prepare_circuit_setup_and_send_async(",
             "pub async fn send_request_with_full_snp_ik_handshake_async(",
         ];
         let lines: Vec<&str> = source.lines().collect();

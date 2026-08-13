@@ -75,8 +75,6 @@ pub enum RouteError {
     DestinationNotGateway,
     #[error("destination gateway descriptor has no X25519 circuit public key")]
     GatewayMissingCircuitKey,
-    #[error("relay hop {hop_index} incorrectly advertises an X25519 circuit key")]
-    RelayHasCircuitKey { hop_index: usize },
     #[error("hop {hop_index} has no endpoints (cannot connect)")]
     HopMissingEndpoint { hop_index: usize },
 }
@@ -527,9 +525,10 @@ impl Route {
             if !hop.descriptor.verify_node_id_consistency() {
                 return Err(RouteError::NodeIdInconsistent { hop_index: i });
             }
-            if !hop.descriptor.is_gateway() && hop.descriptor.circuit_x25519_pub().is_some() {
-                return Err(RouteError::RelayHasCircuitKey { hop_index: i });
-            }
+            // N2.1.3: relays MAY now have an X25519 circuit public key — it is
+            // REQUIRED for per-hop circuit key derivation. The old
+            // old relay-circuit-key check (N2.0.7.3) is REMOVED because N2.1.3
+            // requires every non-source forwarding hop to have one.
             if hop.endpoints.is_empty() {
                 return Err(RouteError::HopMissingEndpoint { hop_index: i });
             }

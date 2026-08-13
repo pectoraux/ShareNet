@@ -20,7 +20,7 @@
 //!      (gateway: handshake-on-accept + serve loop, all internal).
 //!    - [`snp_node::node::async_node::serve_relay_persistent_async_with_handshake`]
 //!      (relay: handshake both sides + bidirectional forward, all internal).
-//!    - [`snp_node::node::async_node::establish_circuit_and_send_async`]
+//!    - [`snp_node::node::async_node::prepare_circuit_setup_and_send_async`]
 //!      (client: fresh X25519 circuit DH + SNP-IK handshake with relay + send).
 //!
 //! 2. **Canonical async transport** — `AsyncLink` (Tokio-based AEAD framing).
@@ -35,7 +35,7 @@
 //!    X25519 DH with the gateway's static X25519 public key to derive the
 //!    circuit keys (via `derive_circuit_keys_from_dh` — NOT the deterministic
 //!    `derive_circuit_keys`). This is internal to
-//!    `establish_circuit_and_send_async`.
+//!    `prepare_circuit_setup_and_send_async`.
 //!
 //! 5. **Dynamic Route/Circuit objects** — `Route::new` + `Circuit::new` with
 //!    arbitrary NodeIds (no `GatewayChoice`, no compile-time topology).
@@ -141,7 +141,7 @@ fn north_star_test_uses_only_canonical_entry_points() {
                      The north-star test MUST use ONLY the canonical production Node entry \
                      points (serve_gateway_persistent_async_with_handshake, \
                      serve_relay_persistent_async_with_handshake, \
-                     establish_circuit_and_send_async). Direct calls to low-level \
+                     prepare_circuit_setup_and_send_async). Direct calls to low-level \
                      transport/handshake functions are FORBIDDEN.",
                     lineno + 1
                 );
@@ -166,7 +166,7 @@ fn now_unix() -> u64 {
 /// A node's full identity: Ed25519 (signing) + X25519 (rendezvous) + NodeId.
 ///
 /// The X25519 secret is wrapped in `Arc` so it can be shared between the
-/// circuit-DH computation (in `establish_circuit_and_send_async`) and the
+/// circuit-DH computation (in `prepare_circuit_setup_and_send_async`) and the
 /// SNP-IK/0.1 handshake (internal to the production entry points).
 struct NodeIdents {
     ed_sk: [u8; 32],
@@ -261,7 +261,7 @@ fn hex_short(b: &[u8]) -> String {
 ///
 /// - `serve_gateway_persistent_async_with_handshake_and_connector` (gateway)
 /// - `serve_relay_persistent_async_with_handshake` (relay A + relay B)
-/// - `establish_circuit_and_send_async` (client)
+/// - `prepare_circuit_setup_and_send_async` (client)
 ///
 /// All SNP-IK/0.1 handshakes, all AsyncLink construction, all relay
 /// forwarding, all circuit establishment — INTERNAL to the production
@@ -289,7 +289,7 @@ async fn north_star_canonical_production_path() {
     // ═══ 3. Establish the gateway-side circuit keys ═══
     // The gateway needs the SAME circuit keys as the client (derived from the
     // client↔gateway X25519 DH). The client's DH is internal to
-    // `establish_circuit_and_send_async`; the gateway's DH is computed here
+    // `prepare_circuit_setup_and_send_async`; the gateway's DH is computed here
     // (using the gateway's X25519 secret + the client's X25519 public).
     let gateway_circuit_dh = x25519_dh(&gateway_idents.x_sk, &client_idents.x_pk);
     let gateway_circuit_keys = derive_circuit_keys_from_dh(&gateway_circuit_dh, false);
@@ -401,7 +401,7 @@ async fn north_star_canonical_production_path() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // ═══ 8. CLIENT: establish circuit + send request via the canonical entry point ═══
-    // `establish_circuit_and_send_async` does:
+    // `prepare_circuit_setup_and_send_async` does:
     //   1. Establish fresh circuit keys via client↔gateway X25519 DH — INTERNAL.
     //   2. Insert the Circuit into the Node's circuit table — INTERNAL.
     //   3. Perform the SNP-IK/0.1 handshake with Relay A (initiator, pinning Relay A's NodeId) — INTERNAL.
@@ -416,7 +416,7 @@ async fn north_star_canonical_production_path() {
     let client_x_sk = Arc::clone(&client_idents.x_sk);
     let client_x_pk = client_idents.x_pk;
 
-    let transit_resp = async_node::establish_circuit_and_send_async(
+    let transit_resp = async_node::prepare_circuit_setup_and_send_async(
         &client_node,
         &http_url,
         &gateway_idents.node_id,

@@ -1,6 +1,15 @@
-//! N2.1.3 — Circuit Establishment.
+//! N2.1.3 — Circuit Cryptographic Setup.
 //!
 //! Spec: spec/08-circuits.md (Section 38 of the frozen spec).
+//!
+//! ## CRITICAL: This is LOCAL preparation, NOT distributed establishment.
+//!
+//! `prepare_circuit_setup()` creates the cryptographic material the source
+//! needs to initiate a circuit. It does NOT establish a circuit across the
+//! participating nodes. No relay receives the handshake, verifies it, derives
+//! its key, or acknowledges establishment. Distributed circuit establishment
+//! (where each participant independently installs forwarding state) is
+//! deferred to the transport milestone (N2.2+).
 //!
 //! ## CRITICAL: CommittedRoute ≠ Circuit
 //!
@@ -58,7 +67,7 @@
 //!   identity is rejected.
 //! - **Stale evidence?** If the committed route's evidence is stale (e.g.
 //!   attested links have expired), the route's `is_expired()` returns true
-//!   and `establish_circuit()` rejects it.
+//!   and `prepare_circuit_setup()` rejects it.
 //! - **Teardown?** `CircuitTeardown` is signed by the initiator. Each relay
 //!   can verify the teardown is authentic.
 //!
@@ -118,7 +127,7 @@ pub struct HopForwardingState {
 ///
 /// The handshake is the INITIATION message. It proves the source authorized
 /// this circuit and binds it to a specific committed route. The actual
-/// `CircuitState` (live forwarding state) is produced by `establish_circuit()`
+/// `CircuitState` (live forwarding state) is produced by `prepare_circuit_setup()`
 /// after verifying the handshake.
 ///
 /// ## Binding
@@ -281,11 +290,11 @@ impl CircuitHandshake {
 ///
 /// ## Construction
 ///
-/// `CircuitState` can ONLY be constructed by `establish_circuit()`, which
+/// `CircuitState` can ONLY be constructed by `prepare_circuit_setup()`, which
 /// verifies the handshake + committed route + derives per-hop keys. The
 /// fields are private — callers cannot construct one directly.
 #[derive(Debug, Clone)]
-pub struct ActiveCircuit {
+pub struct CircuitSetup {
     /// Unique circuit identifier.
     circuit_id: [u8; 32],
     /// The committed route's commitment hash (binding).
@@ -304,7 +313,7 @@ pub struct ActiveCircuit {
     active: bool,
 }
 
-/// Error from `establish_circuit()`.
+/// Error from `prepare_circuit_setup()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitError {
     /// The handshake signature is invalid or the handshake failed freshness checks.
@@ -317,6 +326,13 @@ pub enum CircuitError {
     EmptyRoute,
     /// A hop's authenticated record lacks the required X25519 circuit public key.
     HopMissingCircuitKey { hop_index: usize, node_id: [u8; 32] },
+    /// P0 #1: the handshake's source does not match the CommittedRoute's source.
+    SourceMismatch { handshake_source: [u8; 32], route_source: [u8; 32] },
+    /// P0 #2: the supplied ephemeral X25519 secret's public key does not match
+    /// the signed ephemeral_x25519_public in the handshake.
+    EphemeralKeyMismatch,
+    /// P1 #6: the teardown's source does not match the circuit's source.
+    TeardownSourceMismatch { teardown_source: [u8; 32], circuit_source: [u8; 32] },
     /// CBOR encoding failed (fail-closed).
     CborEncodingFailed,
 }
@@ -329,6 +345,9 @@ impl std::fmt::Display for CircuitError {
             Self::RouteExpired { now, expiry } => write!(f, "committed route expired (now={now}, expiry={expiry})"),
             Self::EmptyRoute => write!(f, "committed route has no hops"),
             Self::HopMissingCircuitKey { hop_index, node_id } => write!(f, "hop {hop_index} ({}) has no X25519 circuit key", hex_short(node_id)),
+            Self::SourceMismatch { handshake_source, route_source } => write!(f, "handshake source {} does not match route source {}", hex_short(handshake_source), hex_short(route_source)),
+            Self::EphemeralKeyMismatch => write!(f, "supplied ephemeral secret does not match signed ephemeral public key"),
+            Self::TeardownSourceMismatch { teardown_source, circuit_source } => write!(f, "teardown source {} does not match circuit source {}", hex_short(teardown_source), hex_short(circuit_source)),
             Self::CborEncodingFailed => write!(f, "canonical CBOR encoding failed"),
         }
     }
@@ -355,11 +374,11 @@ impl std::error::Error for CircuitError {}
 /// `AuthenticatedNodeRecord` in the committed route's `validated_hops`.
 /// An attacker cannot substitute a different X25519 key — it would not
 /// match the authenticated record.
-pub fn establish_circuit(
+pub fn prepare_circuit_setup(
     route: &CommittedRoute,
     handshake: &CircuitHandshake,
     ephemeral_x25519_secret: &X25519Secret,
-) -> Result<ActiveCircuit, CircuitError> {
+) -> Result<CircuitSetup, CircuitError> {
     // 1. Verify the handshake.
     let now = now_unix();
     if !handshake.verify_at(now) {
@@ -369,6 +388,20 @@ pub fn establish_circuit(
     // 2. Verify binding to the committed route.
     if !handshake.is_bound_to(route) {
         return Err(CircuitError::CommitmentMismatch);
+    }
+
+    // P0 #1: handshake.source MUST match route.source().
+    if handshake.source != route.source() {
+        return Err(CircuitError::SourceMismatch {
+            handshake_source: handshake.source,
+            route_source: route.source(),
+        });
+    }
+
+    // P0 #2: supplied ephemeral secret MUST match signed ephemeral public key.
+    let derived_pub = X25519PubKey::from(ephemeral_x25519_secret);
+    if derived_pub.to_bytes() != handshake.ephemeral_x25519_public {
+        return Err(CircuitError::EphemeralKeyMismatch);
     }
 
     // 3. Verify the route hasn't expired.
@@ -386,15 +419,7 @@ pub fn establish_circuit(
     let mut forwarding_hops = Vec::with_capacity(hops.len());
 
     for (i, hop) in hops.iter().enumerate() {
-        // Get the hop's X25519 circuit public key from the authenticated record.
-        // The source (first hop) doesn't need a circuit key — it's the initiator.
-        // The gateway (last hop) MUST have a circuit key (enforced by route validation).
-        // Intermediate relays MAY have a circuit key for per-hop forwarding; if not,
-        // their forwarding_key is all-zeros (no per-hop encryption for that hop —
-        // acceptable for the minimal N2.1.3 circuit).
-        let x25519_pub_bytes = hop.record.descriptor.circuit_x25519_pub();
-
-        // For the source (hop 0), we skip the DH — the source IS the initiator.
+        // For the source (hop 0), skip the DH — the source IS the initiator.
         if i == 0 {
             forwarding_hops.push(HopForwardingState {
                 node_id: hop.node_id,
@@ -405,42 +430,38 @@ pub fn establish_circuit(
             continue;
         }
 
-        // For the gateway (last hop), the X25519 circuit key is REQUIRED
-        // (enforced by route validation — the gateway must have one).
-        // For intermediate relays, it's OPTIONAL (may be None if the relay
-        // doesn't advertise a circuit key).
-        if let Some(x25519_pub_bytes) = x25519_pub_bytes {
-            // X25519 DH: initiator's ephemeral secret + hop's X25519 circuit public key.
-            let peer_pub = x25519_public_from_bytes(&x25519_pub_bytes);
-            let dh_secret = x25519_dh(ephemeral_x25519_secret, &peer_pub);
-
-            // HKDF-SHA256: derive the forwarding key from the DH secret.
-            let salt = &handshake.circuit_id;
-            let info = format!("SNP/0.1 circuit hop-key hop-{}", hex_short(&hop.node_id));
-            let key_material = hkdf_sha256(&dh_secret, salt, info.as_bytes(), 32)
-                .map_err(|_| CircuitError::CborEncodingFailed)?;
-            let mut forwarding_key = [0u8; 32];
-            forwarding_key.copy_from_slice(&key_material[..32]);
-
-            forwarding_hops.push(HopForwardingState {
+        // P0 #3: EVERY non-source hop MUST have an authenticated X25519 circuit
+        // public key. An all-zero forwarding key is NOT a secure forwarding key.
+        let x25519_pub_bytes = hop.record.descriptor.circuit_x25519_pub()
+            .ok_or(CircuitError::HopMissingCircuitKey {
+                hop_index: i,
                 node_id: hop.node_id,
-                predecessor_node_id: hops.get(i - 1).map(|h| h.node_id),
-                successor_node_id: hops.get(i + 1).map(|h| h.node_id),
-                forwarding_key,
-            });
-        } else {
-            // Intermediate relay without an X25519 circuit key — no per-hop
-            // forwarding key (all-zeros). Acceptable for the minimal N2.1.3 circuit.
-            forwarding_hops.push(HopForwardingState {
-                node_id: hop.node_id,
-                predecessor_node_id: hops.get(i - 1).map(|h| h.node_id),
-                successor_node_id: hops.get(i + 1).map(|h| h.node_id),
-                forwarding_key: [0u8; 32],
-            });
-        }
+            })?;
+
+        let peer_pub = x25519_public_from_bytes(&x25519_pub_bytes);
+        let dh_secret = x25519_dh(ephemeral_x25519_secret, &peer_pub);
+
+        // P1 #5: HKDF with FULL NodeId (not hex_short).
+        let salt = &handshake.circuit_id;
+        let mut info = Vec::with_capacity(64);
+        info.extend_from_slice(b"SNP/0.1/circuit/hop-key/");
+        info.extend_from_slice(&hop.node_id);
+        info.extend_from_slice(b"/");
+        info.extend_from_slice(&handshake.commitment_hash);
+        let key_material = hkdf_sha256(&dh_secret, salt, &info, 32)
+            .map_err(|_| CircuitError::CborEncodingFailed)?;
+        let mut forwarding_key = [0u8; 32];
+        forwarding_key.copy_from_slice(&key_material[..32]);
+
+        forwarding_hops.push(HopForwardingState {
+            node_id: hop.node_id,
+            predecessor_node_id: hops.get(i - 1).map(|h| h.node_id),
+            successor_node_id: hops.get(i + 1).map(|h| h.node_id),
+            forwarding_key,
+        });
     }
 
-    Ok(ActiveCircuit {
+    Ok(CircuitSetup {
         circuit_id: handshake.circuit_id,
         commitment_hash: handshake.commitment_hash,
         source: route.source(),
@@ -452,7 +473,7 @@ pub fn establish_circuit(
     })
 }
 
-impl ActiveCircuit {
+impl CircuitSetup {
     /// The circuit ID (unique per circuit — replay prevention).
     #[must_use] pub fn circuit_id(&self) -> &[u8; 32] { &self.circuit_id }
     /// The committed route's commitment hash (binding).
@@ -510,7 +531,7 @@ impl CircuitTeardown {
     /// # Errors
     /// Returns `RouteSerializationError` on CBOR or RNG failure.
     pub fn create_and_sign(
-        circuit: &ActiveCircuit,
+        circuit: &CircuitSetup,
         source_secret_key: &[u8; 32],
         source_public_key: &[u8; 32],
     ) -> Result<Self, RouteSerializationError> {
@@ -566,8 +587,38 @@ impl CircuitTeardown {
 
     /// Check that this teardown is for a specific circuit.
     #[must_use]
-    pub fn is_for(&self, circuit: &ActiveCircuit) -> bool {
+    pub fn is_for(&self, circuit: &CircuitSetup) -> bool {
         self.circuit_id == circuit.circuit_id
+    }
+
+    /// P1 #6: Verify this teardown is authorized for a specific circuit.
+    /// Checks that the teardown source matches the circuit source.
+    #[must_use]
+    pub fn verify_for_circuit(&self, circuit: &CircuitSetup) -> bool {
+        if self.source != circuit.source() { return false; }
+        if !self.is_for(circuit) { return false; }
+        self.verify()
+    }
+}
+
+/// P1 #7: Circuit replay acceptance state (for future distributed establishment).
+///
+/// A random circuit_id alone is NOT replay protection. When distributed
+/// establishment is implemented (N2.2+), each relay should maintain this
+/// state and reject duplicate handshakes.
+#[derive(Debug, Clone)]
+pub struct CircuitReplayState {
+    pub circuit_id: [u8; 32],
+    pub commitment_hash: [u8; 32],
+    pub source: [u8; 32],
+    pub accepted_at: u64,
+    pub expires_at: u64,
+}
+
+impl CircuitReplayState {
+    #[must_use]
+    pub fn is_replay_of(&self, handshake: &CircuitHandshake) -> bool {
+        self.circuit_id == handshake.circuit_id
     }
 }
 

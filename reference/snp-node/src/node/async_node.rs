@@ -1384,7 +1384,7 @@ pub async fn serve_relay_persistent_async_with_handshake(
     since = "N2.0.7.1",
     note = "use `send_via_route` — circuit keys must be derived from the protocol via seal_circuit_payload_with_fresh_eph"
 )]
-pub async fn establish_circuit_and_send_async(
+pub async fn prepare_circuit_setup_and_send_async(
     node: &Node,
     url: &str,
     gateway_node_id: &[u8; 32],

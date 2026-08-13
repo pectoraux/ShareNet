@@ -524,21 +524,22 @@ fn gateway_without_x25519_key_rejected() {
         "Gateway capability without X25519 key must be rejected");
     eprintln!("[test 23] PASS: gateway without X25519 key rejected");
 }
-/// 24. relay_with_x25519_key_rejected
+/// 24. relay_with_x25519_key_accepted (N2.1.3: relays MAY now have X25519 keys)
 #[test]
 fn relay_with_x25519_key_rejected() {
     let (sk, pk) = fresh_keypair(b"relay-with-key");
     let (_x_sk, x_pk) = x25519_static_keypair();
-    // Relay capability but WITH X25519 key (should not have one).
+    // N2.1.3: Relay capability WITH X25519 key is now ACCEPTED — it is
+    // REQUIRED for per-hop circuit key derivation.
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Relay],
         vec![TransportEndpoint::tcp("127.0.0.1:1")],
-        Some(x_pk.to_bytes()), // Relays shouldn't have this!
+        Some(x_pk.to_bytes()), // N2.1.3: relays CAN have this
         3600, 1,
     );
-    assert!(advert.verify_into_verified().is_none(),
-        "Relay with X25519 key must be rejected");
-    eprintln!("[test 24] PASS: relay with X25519 key rejected");
+    assert!(advert.verify_into_verified().is_some(),
+        "N2.1.3: Relay with X25519 key must be ACCEPTED (required for circuit establishment)");
+    eprintln!("[test 24] PASS: relay with X25519 key accepted (N2.1.3)");
 }
 /// 25. authenticated_node_record_binds_descriptor_and_endpoints
 #[test]

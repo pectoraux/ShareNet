@@ -1002,16 +1002,18 @@ fn route_validation_rejects_gateway_without_circuit_key() {
 /// **N2.0.7.3:** The type system prevents constructing a `VerifiedNodeDescriptor`
 /// with Relay capability + X25519 key (all verified descriptors come from
 /// `VerifiedGatewayAdvertisement` which always carries Gateway capability).
-/// This test verifies the validation logic EXISTS in the source for defence
-/// in depth.
+/// N2.1.3: relays MAY now have an X25519 circuit public key — it is REQUIRED
+/// for per-hop circuit key derivation. The old old relay-circuit-key check
+/// (N2.0.7.3) is REMOVED because N2.1.3 requires every non-source forwarding
+/// hop to have one. This test verifies the check is GONE.
 #[test]
-fn route_validation_rejects_relay_with_circuit_key() {
+fn route_validation_allows_relay_with_circuit_key() {
     let source = include_str!("../src/node/route.rs");
     assert!(
-        source.contains("RelayHasCircuitKey"),
-        "Route::validate() must check for relay with X25519 circuit key (defence in depth)"
+        !source.contains("RelayHasCircuitKey"),
+        "Route::validate() must NOT reject relays with X25519 circuit keys (N2.1.3: required for circuit establishment)"
     );
-    eprintln!("[route-validation-relay] PASS: RelayHasCircuitKey check exists (type system prevents the invalid case)");
+    eprintln!("[route-validation-relay] PASS: old relay-circuit-key check removed (N2.1.3 allows relays with circuit keys)");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
