@@ -119,6 +119,7 @@ pub mod topology_protocol;
 pub mod peer_directory;
 pub mod topology;
 pub mod route_engine;
+pub mod route_discovery_protocol;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -150,6 +151,10 @@ pub use route_engine::{
     CandidateOrigin, DestinationResolver, DistributedRouteDiscovery, HopCountCost,
     InMemoryResolver, LowLatencyCost, NullResolver, RouteCandidate, RouteCandidateState,
     RouteCostModel, RouteDiscoveryError, RouteEngine, DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
+};
+pub use route_discovery_protocol::{
+    InMemoryNextHopTransport, NextHopQuery, NextHopResolver, NextHopResponse, NextHopResult,
+    NextHopTransport, MAX_RESPONSE_HOPS, ROUTE_DISCOVERY_MSG_CONTEXT,
 };
 pub use route::RouteCommitment;
 pub use session::{

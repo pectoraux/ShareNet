@@ -1546,40 +1546,20 @@ fn in_memory_resolver_is_test_only_route_resolution() {
     eprintln!("[test 25] PASS: InMemoryResolver is test-only route resolution");
 }
 
-/// 26. distributed_route_discovery_is_explicitly_unimplemented
+/// 26. distributed_route_discovery_is_now_implemented
 ///
-/// N2.1.2.1: The architecture explicitly marks distributed route discovery
-/// as unimplemented. The DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED constant
-/// is false, and the DistributedRouteDiscovery trait has no production
-/// implementation.
+/// N2.1.3: Distributed route discovery is now implemented via the
+/// `NextHopResolver` in `route_discovery_protocol.rs`. The
+/// DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED constant is now true.
 #[test]
-fn distributed_route_discovery_is_explicitly_unimplemented() {
-    // The constant must be false — distributed discovery is NOT implemented.
-    assert!(!DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
-        "DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED must be false in this milestone");
+fn distributed_route_discovery_is_now_implemented() {
+    // N2.1.3: The constant is now true — distributed discovery IS implemented.
+    assert!(DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
+        "N2.1.3: DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED must be true");
 
-    // The DistributedRouteDiscovery trait exists (it compiles), but no
-    // production implementation is available. The trait defines the
-    // interface for future implementation:
-    //
-    //   fn discover_path(
-    //       &mut self,
-    //       source: &[u8; 32],
-    //       destination: &[u8; 32],
-    //   ) -> Option<Vec<([u8; 32], LinkKey)>>;
-    //
-    // A production implementation would:
-    // 1. Query an authenticated next-hop peer for the next segment.
-    // 2. Receive and verify the next-hop node's advertisement.
-    // 3. Discover the usable link from the current hop to the next hop.
-    // 4. Continue until the destination is reached and authenticated.
-    //
-    // This is explicitly NOT implemented. The RouteEngine currently performs
-    // LOCAL path computation only.
-
-    // Verify the trait can be referenced (it exists in the type system).
+    // The DistributedRouteDiscovery trait still exists for future
+    // full-path discovery implementations.
     fn _assert_trait_exists<T: snp_node::node::DistributedRouteDiscovery>() {}
-    // (No concrete type to pass — there is no implementation.)
 
-    eprintln!("[test 26] PASS: distributed route discovery is explicitly unimplemented");
+    eprintln!("[test 26] PASS: distributed route discovery is now implemented (N2.1.3)");
 }

@@ -1,38 +1,34 @@
-//! N2.1.2 / N2.1.2.1 — Route Computation, Construction, and Validation.
+//! N2.1.2 / N2.1.3 — Route Computation, Construction, and Validation.
 //!
-//! ## N2.1.2.1 correction: honest LOCAL vs DISTRIBUTED boundary
+//! ## N2.1.3: Distributed route discovery is now implemented
 //!
-//! **This module implements LOCAL route computation over an authenticated
-//! topology graph, plus a destination-resolution abstraction. It does NOT
-//! implement a distributed route-discovery protocol.**
+//! **N2.1.3 implements the distributed route-discovery protocol in
+//! `route_discovery_protocol.rs`.** The `NextHopResolver` implements the
+//! `DestinationResolver` trait by querying authenticated next-hop peers
+//! using signed `NextHopQuery`/`NextHopResponse` messages.
 //!
-//! The distinction is critical:
+//! This module (`route_engine.rs`) implements LOCAL route computation.
+//! The distributed protocol lives in `route_discovery_protocol.rs`.
+//! Together they form the full route-discovery pipeline:
 //!
-//! ### LOCAL GRAPH PATH COMPUTATION (implemented here)
+//! ```text
+//! RemoteNodeHint
+//!     ↓
+//! NextHopResolver (distributed protocol — queries neighbors)
+//!     ↓
+//! AuthenticatedNodeRecord (destination resolved)
+//!     ↓
+//! RouteEngine (local Dijkstra over authenticated links)
+//!     ↓
+//! Route (with RouteCommitment)
+//! ```
+//!
+//! ## LOCAL GRAPH PATH COMPUTATION (implemented here)
 //!
 //! The `RouteEngine` runs Dijkstra over the **local** `TopologyGraph`'s
 //! `LinkTable`. It only traverses links that are already present locally
-//! and whose remote nodes are already authenticated locally (or injected
-//! via the `DestinationResolver` as already-verified records).
-//!
-//! This is sufficient when:
-//! - The local node already has authenticated links to all intermediate hops.
-//! - The destination's authenticated advertisement is available (either
-//!   locally or via the resolver).
-//!
-//! ### DISTRIBUTED ROUTE DISCOVERY (NOT implemented here)
-//!
-//! In a real ShareNet mesh, node A may know only B, while the full path
-//! A → B → C → G requires discovering B→C and C→G links that A does NOT
-//! locally possess. This requires a distributed next-hop resolution
-//! protocol where A queries B (an authenticated next-hop peer) for
-//! C's advertisement and the B→C link, then queries C for G's
-//! advertisement and the C→G link.
-//!
-//! That protocol is **explicitly unimplemented** in this milestone. The
-//! `DistributedRouteDiscovery` trait below defines the interface, but no
-//! production implementation exists. The `InMemoryResolver` is a TEST-ONLY
-//! stub that simulates resolution by returning pre-authenticated records.
+//! and whose remote nodes are already authenticated locally (or resolved
+//! via the `DestinationResolver` — which may be a `NextHopResolver`).
 //!
 //! ## Core principle: Hints are NOT routes
 //!
@@ -551,13 +547,13 @@ pub trait DistributedRouteDiscovery {
     ) -> Option<Vec<([u8; 32], crate::node::link::LinkKey)>>;
 }
 
-/// **N2.1.2.1.** A compile-time and runtime marker indicating whether
-/// distributed route discovery is implemented.
+/// **N2.1.2.1 / N2.1.3.** A compile-time and runtime marker indicating
+/// whether distributed route discovery is implemented.
 ///
-/// This is `false` in the current milestone. Tests can check this value
-/// to verify that the architecture explicitly marks distributed discovery
-/// as unimplemented.
-pub const DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED: bool = false;
+/// **N2.1.3:** This is now `true`. The `NextHopResolver` in
+/// `route_discovery_protocol.rs` implements distributed route discovery
+/// using the `NextHopQuery`/`NextHopResponse` protocol messages.
+pub const DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED: bool = true;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Route cost model
