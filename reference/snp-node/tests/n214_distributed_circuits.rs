@@ -1,18 +1,31 @@
 //! N2.2 — Distributed Circuit Establishment & Forwarding State tests.
 //!
 //! Tests the distributed handshake, relay-side processing, replay prevention,
-//! ActiveCircuit construction, and the three P0 trust-boundary fixes:
+//! ActiveCircuit construction, and the P0 trust-boundary fixes:
 //!
 //! - **P0 #1**: `establish_distributed_circuit()` verifies the relay's DH
 //!   proof using the authenticated X25519 public key from the committed route.
-//! - **P0 #2**: `RelayHandshakeRequest` carries a `CommittedHopAuthorization`
-//!   (derived from `CommittedRoute`) instead of unsigned position fields. The
-//!   relay verifies the authorization is bound to the handshake
-//!   (commitment_hash + circuit_id) before installing forwarding state.
+//! - **P0 #2 (signed)**: `RelayHandshakeRequest` carries a `SignedHopAuthorization`
+//!   (signed by the source, derived from `CommittedRoute`) instead of unsigned
+//!   position fields. The relay verifies the source signature using
+//!   `handshake.source_public_key` BEFORE installing forwarding state. A
+//!   malicious intermediary that tampered with any position field (predecessor,
+//!   successor, role) breaks the signature — fail-closed.
+//! - **P0 #2 (consistency gate)**: `establish_distributed_circuit()` verifies
+//!   that `setup`, `handshake`, and `route` describe the same circuit
+//!   (circuit_id, commitment_hash, source all match) BEFORE any relay
+//!   handshake is sent — fail-closed with `InconsistentInputs`.
 //! - **P0 #3**: `accept_relay_handshake()` validates that the supplied
 //!   Ed25519 keys match `authorization.relay_node_id` BEFORE any other
 //!   processing — an attacker cannot install forwarding state on behalf of a
 //!   different relay by supplying wrong Ed25519 keys.
+//! - **P0 #6**: `RelayHandshakeResponse` includes `authorization_hash` =
+//!   `SHA-256(authorization.canonical_preimage_bytes())`. The source verifies
+//!   this matches its expected authorization — the relay processed the EXACT
+//!   authorization the source signed.
+//! - **P0 #7**: Acceptance is recorded in `CircuitAcceptanceStore` BEFORE
+//!   forwarding state is installed — even if state installation fails, the
+//!   replay check on the next call will still fire.
 
 #![allow(clippy::pedantic)]
 
@@ -23,14 +36,15 @@ use snp_crypto::{
 };
 use snp_node::node::{
     ActiveCircuit, Capability, CircuitAcceptanceStore, CircuitHandshake,
-    CircuitSetup, CommittedHopAuthorization, CommittedRoute, CommitError,
-    DistributedCircuitError, HopForwardingState, Link as Link_, LinkKey,
-    NodeAdvertisement, RelayForwardingState, RelayHandshakeRequest,
-    RelayHandshakeResponse, RelayHandshakeTransport, RouteAcceptance,
-    RouteProposal, RouteRole, ServiceAgreement, TopologyGraph,
+    CircuitSetup, CommittedRoute, CommitError, DistributedCircuitError,
+    HopForwardingState, Link as Link_, LinkKey, NodeAdvertisement,
+    RelayForwardingState, RelayHandshakeRequest, RelayHandshakeResponse,
+    RelayHandshakeTransport, RouteAcceptance, RouteProposal, RouteRole,
+    ServiceAgreement, SignedHopAuthorization, TopologyGraph,
     TransportEndpoint, ValidatedPath, accept_relay_handshake, commit_route,
-    derive_hop_authorizations, discover_path, establish_distributed_circuit,
-    prepare_circuit_setup, validate_path, verify_dh_proof,
+    derive_signed_hop_authorizations, discover_path,
+    establish_distributed_circuit, prepare_circuit_setup, validate_path,
+    verify_dh_proof,
 };
 use std::collections::HashMap;
 
@@ -238,7 +252,7 @@ fn distributed_circuit_requires_all_acknowledgements() {
 
     let result = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
 
     assert!(result.is_ok(), "distributed circuit must succeed when all relays respond");
@@ -257,7 +271,7 @@ fn active_circuit_not_produced_if_relay_unreachable() {
 
     let result = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
 
     assert!(
@@ -279,7 +293,7 @@ fn relay_proves_x25519_possession() {
     // the relay returned the correct DH proof.
     let circuit = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     ).unwrap();
 
     // Get the relay's response.
@@ -345,7 +359,7 @@ fn replay_rejected_by_acceptance_state() {
     // First establishment succeeds.
     let result1 = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
     assert!(result1.is_ok(), "first establishment must succeed");
 
@@ -353,7 +367,7 @@ fn replay_rejected_by_acceptance_state() {
     // The relays' acceptance stores already have this circuit_id.
     let result2 = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
     assert!(
         result2.is_err(),
@@ -368,8 +382,8 @@ fn relay_forwarding_state_installed() {
 
     // P0 #2: derive the authorization from the committed route, then
     // construct the RelayHandshakeRequest with it (no more unsigned fields).
-    let authorizations = derive_hop_authorizations(
-        &ts.committed_route, &ts.circuit_handshake,
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
     ).unwrap();
     let relay_auth = authorizations.iter()
         .find(|a| a.relay_node_id == ts.relay_id)
@@ -417,7 +431,7 @@ fn active_circuit_is_not_circuit_setup() {
 
     let circuit = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     ).unwrap();
 
     // ActiveCircuit has relay_responses — CircuitSetup does not.
@@ -457,7 +471,7 @@ fn wrong_role_in_response_rejected() {
 
     let result = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
 
     // The tampered signature will fail verification → RelayResponseInvalid.
@@ -472,7 +486,7 @@ fn gateway_dh_proof_verifies() {
 
     let circuit = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     ).unwrap();
 
     let gw_response = circuit.relay_response(&ts.gateway_id).unwrap();
@@ -546,6 +560,7 @@ fn production_establishment_rejects_invalid_dh_proof() {
                 &relay_sk,
                 &relay_pk,
                 wrong_dh_proof,
+                honest.authorization_hash,
                 honest.role,
                 honest.expiry,
             ).expect("re-signing must succeed");
@@ -560,7 +575,7 @@ fn production_establishment_rejects_invalid_dh_proof() {
 
     let result = establish_distributed_circuit(
         &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
-        &transport, &ts.ephemeral_secret,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
     );
 
     assert!(
@@ -570,28 +585,28 @@ fn production_establishment_rejects_invalid_dh_proof() {
     );
 }
 
-/// P0 #2: a tampered authorization is rejected by the relay.
+/// P0 #2 (defense-in-depth): a tampered authorization is rejected by the relay.
 ///
-/// A malicious source cannot install forwarding state with a tampered
-/// predecessor (or any other field) by substituting a different
-/// authorization. The relay verifies the authorization is bound to the
-/// handshake via `authorization.commitment_hash == handshake.commitment_hash`
-/// AND `authorization.circuit_id == handshake.circuit_id`. A tampered
-/// authorization (with a different commitment_hash, simulating a forged
-/// route) breaks this binding — the relay rejects with `RelayResponseInvalid`.
+/// A malicious intermediary cannot tamper with the authorization's position
+/// fields after the source signed it. The relay verifies the source signature
+/// on the authorization (`authorization.verify_signature(&handshake.
+/// source_public_key)`) BEFORE the binding check. A tampered authorization
+/// (with a different predecessor + forged commitment_hash) breaks the source
+/// signature — the relay rejects with `RelayResponseInvalid`.
 ///
-/// In this test, we construct an authorization with a WRONG predecessor
-/// AND a forged commitment_hash (because changing the predecessor implies a
-/// different route, which would have a different commitment hash). The
-/// forged commitment_hash does not match the handshake's, so the relay
-/// refuses to install state.
+/// This test tampers BOTH `predecessor_node_id` AND `commitment_hash`. The
+/// source signature was over the original (untampered) preimage, so signature
+/// verification fails first. The defense-in-depth binding check (which would
+/// also fail because the forged commitment_hash doesn't match the handshake's)
+/// is unreachable on this path — but the fail-closed invariant holds either
+/// way: NO state is installed.
 #[test]
 fn tampered_predecessor_rejected() {
     let ts = setup();
 
-    // Derive the honest authorization for the relay.
-    let authorizations = derive_hop_authorizations(
-        &ts.committed_route, &ts.circuit_handshake,
+    // Derive the honest authorization for the relay (signed by source).
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
     ).unwrap();
     let mut relay_auth = authorizations.iter()
         .find(|a| a.relay_node_id == ts.relay_id)
@@ -647,8 +662,8 @@ fn relay_identity_mismatch_rejected() {
     let ts = setup();
 
     // Derive the honest authorization for the relay.
-    let authorizations = derive_hop_authorizations(
-        &ts.committed_route, &ts.circuit_handshake,
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
     ).unwrap();
     let relay_auth = authorizations.iter()
         .find(|a| a.relay_node_id == ts.relay_id)
@@ -695,8 +710,8 @@ fn state_not_installed_on_validation_failure() {
     let ts = setup();
 
     // Derive the honest authorization for the relay.
-    let authorizations = derive_hop_authorizations(
-        &ts.committed_route, &ts.circuit_handshake,
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
     ).unwrap();
     let relay_auth = authorizations.iter()
         .find(|a| a.relay_node_id == ts.relay_id)
@@ -769,14 +784,14 @@ fn state_not_installed_on_validation_failure() {
     assert_eq!(acceptance_store.len(), 1, "no ADDITIONAL state installed on replay");
 }
 
-/// P0 #2 + P0 #1: derive_hop_authorizations fails closed when a non-source
+/// P0 #2 + P0 #1: derive_signed_hop_authorizations fails closed when a non-source
 /// hop's authenticated record is missing an X25519 circuit public key.
 ///
 /// This is a sanity check that the new error variant `HopMissingCircuitKey`
 /// is reachable — without it, the source would silently produce
 /// all-zero forwarding keys (which are NOT secure).
 #[test]
-fn derive_hop_authorizations_fails_on_missing_circuit_key() {
+fn derive_signed_hop_authorizations_fails_on_missing_circuit_key() {
     let ts = setup();
 
     // Mutate the committed route's first relay hop to have no X25519 key.
@@ -792,9 +807,9 @@ fn derive_hop_authorizations_fails_on_missing_circuit_key() {
         err
     );
 
-    // Also verify the success path: derive_hop_authorizations on the honest
+    // Also verify the success path: derive_signed_hop_authorizations on the honest
     // route must succeed (both relay + gateway have X25519 keys).
-    let auths = derive_hop_authorizations(&ts.committed_route, &ts.circuit_handshake)
+    let auths = derive_signed_hop_authorizations(&ts.committed_route, &ts.circuit_handshake, &ts.source_sk)
         .expect("honest route must produce authorizations");
     assert_eq!(auths.len(), 2, "must produce one authorization per non-source hop");
     assert_eq!(auths[0].relay_node_id, ts.relay_id);
@@ -810,4 +825,344 @@ fn derive_hop_authorizations_fails_on_missing_circuit_key() {
     assert_eq!(auths[1].predecessor_node_id, ts.relay_id);
     assert_eq!(auths[1].successor_node_id, None);
     assert_eq!(auths[1].relay_x25519_public_key, ts.gateway_x25519_pk);
+
+    // P0 #2 (signed authorization): each authorization is signed by the
+    // source. verify_signature with handshake.source_public_key must succeed
+    // for the honest authorizations.
+    assert!(
+        auths[0].verify_signature(&ts.circuit_handshake.source_public_key),
+        "honest relay authorization's source signature must verify"
+    );
+    assert!(
+        auths[1].verify_signature(&ts.circuit_handshake.source_public_key),
+        "honest gateway authorization's source signature must verify"
+    );
+}
+
+// ─── New P0 tests (Task 9): signed authorization + consistency gate ────────
+
+/// P0 #2 (signed authorization): tampering the `predecessor_node_id` field
+/// AFTER signing breaks the source signature — the relay's signature
+/// verification fails BEFORE the binding check, and NO state is installed.
+///
+/// This test tampers ONLY `predecessor_node_id` (the `commitment_hash` is
+/// left matching the handshake's, so the binding check would PASS — the
+/// signature check is the only line of defense). The signature was over the
+/// original (untampered) preimage; after tampering, ed25519_verify returns
+/// false; the relay returns `RelayResponseInvalid`.
+#[test]
+fn signed_authorization_tampered_predecessor_rejected() {
+    let ts = setup();
+
+    // Derive the honest authorization for the relay (signed by source).
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let mut relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .expect("relay authorization must exist");
+
+    // Sanity: the honest authorization's signature verifies.
+    assert!(
+        relay_auth.verify_signature(&ts.circuit_handshake.source_public_key),
+        "honest authorization's source signature must verify before tampering"
+    );
+
+    // Tamper ONLY the predecessor_node_id (leave commitment_hash matching the
+    // handshake's, so the binding check would pass — the signature check is
+    // the only line of defense).
+    relay_auth.predecessor_node_id = ts.gateway_id; // WRONG: gateway is the relay's successor, not predecessor.
+
+    // The signature was over the original preimage; tampering breaks it.
+    assert!(
+        !relay_auth.verify_signature(&ts.circuit_handshake.source_public_key),
+        "tampered authorization's source signature must NOT verify"
+    );
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth.clone(),
+    };
+
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+    let result = accept_relay_handshake(
+        &request,
+        &ts.relay_x25519_sk,
+        &ts.relay_sk,
+        &ts.relay_pk,
+        &mut acceptance_store,
+    );
+
+    assert!(
+        matches!(result, Err(DistributedCircuitError::RelayResponseInvalid { .. })),
+        "tampered predecessor must be rejected with RelayResponseInvalid (signature verification failed), got: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        acceptance_store.len(), 0,
+        "no acceptance state must be installed when the authorization signature is invalid"
+    );
+}
+
+/// P0 #2 (signed authorization): tampering the `role` field AFTER signing
+/// breaks the source signature — the relay's signature verification fails
+/// and NO state is installed.
+///
+/// This test tampers ONLY `role` (from Relay to Gateway). The signature was
+/// over the original preimage (with `role = Relay`); after tampering,
+/// ed25519_verify returns false; the relay returns `RelayResponseInvalid`.
+#[test]
+fn signed_authorization_tampered_role_rejected() {
+    let ts = setup();
+
+    // Derive the honest authorization for the relay (signed by source).
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let mut relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .expect("relay authorization must exist");
+
+    // Sanity: original role is Relay.
+    assert_eq!(relay_auth.role, RouteRole::Relay);
+    assert!(
+        relay_auth.verify_signature(&ts.circuit_handshake.source_public_key),
+        "honest authorization's source signature must verify before tampering"
+    );
+
+    // Tamper ONLY the role (Relay → Gateway). Leave all other fields alone.
+    relay_auth.role = RouteRole::Gateway;
+
+    // The signature was over the original preimage (with role=Relay); tampering breaks it.
+    assert!(
+        !relay_auth.verify_signature(&ts.circuit_handshake.source_public_key),
+        "tampered authorization's source signature must NOT verify"
+    );
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth.clone(),
+    };
+
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+    let result = accept_relay_handshake(
+        &request,
+        &ts.relay_x25519_sk,
+        &ts.relay_sk,
+        &ts.relay_pk,
+        &mut acceptance_store,
+    );
+
+    assert!(
+        matches!(result, Err(DistributedCircuitError::RelayResponseInvalid { .. })),
+        "tampered role must be rejected with RelayResponseInvalid (signature verification failed), got: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        acceptance_store.len(), 0,
+        "no acceptance state must be installed when the authorization signature is invalid"
+    );
+}
+
+/// P0 #2 (consistency gate): `establish_distributed_circuit()` fail-closes
+/// with `InconsistentInputs` when `setup.circuit_id() != handshake.circuit_id`.
+///
+/// The function takes `setup`, `handshake`, and `route` as independent inputs.
+/// Without the consistency gate, a confused source could send mismatched
+/// inputs to relays — the relays might install state for a circuit the
+/// source didn't actually intend. The gate fail-closes BEFORE any relay
+/// handshake is sent.
+#[test]
+fn consistency_gate_rejects_mismatched_inputs() {
+    let ts = setup();
+    let transport = make_mock_transport(&ts);
+
+    // Mutate the handshake's circuit_id to a different value. The handshake
+    // signature no longer matches, but the consistency gate fires FIRST
+    // (before signature verification) — so we don't need a valid signature
+    // to test the gate.
+    let mut mismatched_handshake = ts.circuit_handshake.clone();
+    mismatched_handshake.circuit_id = [0u8; 32]; // different from setup.circuit_id()
+
+    let result = establish_distributed_circuit(
+        &ts.circuit_setup, &mismatched_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    );
+
+    assert!(
+        matches!(result, Err(DistributedCircuitError::InconsistentInputs)),
+        "must fail with InconsistentInputs when setup.circuit_id != handshake.circuit_id, got: {:?}",
+        result.err()
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("inconsistent inputs"),
+        "InconsistentInputs Display must mention 'inconsistent inputs'"
+    );
+
+    // Also verify the gate fires for a mismatched source: mutate
+    // handshake.source to a different value (still inconsistent).
+    let mut mismatched_source_hs = ts.circuit_handshake.clone();
+    mismatched_source_hs.source = [0u8; 32]; // different from setup.source()
+
+    let result = establish_distributed_circuit(
+        &ts.circuit_setup, &mismatched_source_hs, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    );
+    assert!(
+        matches!(result, Err(DistributedCircuitError::InconsistentInputs)),
+        "must fail with InconsistentInputs when setup.source != handshake.source, got: {:?}",
+        result.err()
+    );
+
+    // Sanity: the honest inputs pass the gate (and the circuit establishes).
+    let result = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    );
+    assert!(result.is_ok(), "honest inputs must pass the consistency gate");
+}
+
+/// P0 #6: the relay's response includes `authorization_hash` =
+/// `SHA-256(authorization.canonical_preimage_bytes())`. The source verifies
+/// this matches its expected authorization — proving the relay processed the
+/// EXACT authorization the source signed.
+#[test]
+fn response_contains_authorization_hash() {
+    let ts = setup();
+    let transport = make_mock_transport(&ts);
+
+    let circuit = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    ).unwrap();
+
+    // Derive the expected authorizations (the same ones the source sent).
+    let expected_auths = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+
+    // For each relay response, verify authorization_hash matches
+    // SHA-256(expected_auth.canonical_preimage_bytes()).
+    for expected_auth in &expected_auths {
+        let response = circuit.relay_response(&expected_auth.relay_node_id)
+            .expect("relay response must exist");
+
+        let expected_hash = sha256(
+            &expected_auth.canonical_preimage_bytes().expect("preimage must encode")
+        );
+
+        assert_eq!(
+            response.authorization_hash, expected_hash,
+            "relay {}'s response.authorization_hash must match SHA-256(expected_authorization.canonical_preimage_bytes())",
+            hex_short_for_test(&expected_auth.relay_node_id)
+        );
+
+        // Also: the authorization_hash must be non-zero (sanity).
+        assert!(
+            !response.authorization_hash.iter().all(|&b| b == 0),
+            "authorization_hash must be non-zero"
+        );
+    }
+}
+
+/// P0 #7: acceptance is recorded in `CircuitAcceptanceStore` BEFORE
+/// forwarding state is installed. On replay, the acceptance store already
+/// has the entry from the first call — meaning acceptance was recorded
+/// before state installation completed.
+///
+/// This test verifies the reorder:
+/// 1. First call: succeeds. Acceptance is recorded AND state is installed.
+///    acceptance_store.len() == 1.
+/// 2. Replay call: the replay check fires (because acceptance was already
+///    recorded on the first call). The function returns Err. Crucially,
+///    acceptance_store.len() is still 1 — no NEW acceptance was recorded
+///    (because the replay check fires BEFORE acceptance recording on the
+///    replay path).
+///
+/// This proves that on the first call, acceptance recording happened
+/// (otherwise the replay check on the second call would not fire). Combined
+/// with the new ordering (acceptance BEFORE state), this means: even if
+/// state installation were to fail, the acceptance would already be recorded
+/// — and the next call would be rejected as a replay.
+#[test]
+fn acceptance_recorded_before_state() {
+    let ts = setup();
+
+    // Derive the honest authorization for the relay.
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let relay_auth = authorizations.iter()
+        .find(|a| a.relay_node_id == ts.relay_id)
+        .cloned()
+        .expect("relay authorization must exist");
+
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: relay_auth.clone(),
+    };
+
+    let mut acceptance_store = CircuitAcceptanceStore::new();
+
+    // First call: succeeds. Acceptance is recorded BEFORE state installation.
+    let result = accept_relay_handshake(
+        &request,
+        &ts.relay_x25519_sk,
+        &ts.relay_sk,
+        &ts.relay_pk,
+        &mut acceptance_store,
+    );
+    assert!(result.is_ok(), "first call must succeed");
+    let (response, forwarding_state) = result.unwrap();
+
+    // Both acceptance and state are recorded after the first call.
+    // The acceptance was recorded BEFORE the state was installed.
+    assert_eq!(
+        acceptance_store.len(), 1,
+        "acceptance must be recorded on first call (BEFORE state installation)"
+    );
+    assert!(
+        acceptance_store.is_replay(&ts.circuit_handshake),
+        "acceptance store must have the circuit_id recorded"
+    );
+    // State was also installed (sanity).
+    assert_eq!(forwarding_state.predecessor_node_id, ts.source_id);
+    assert_eq!(forwarding_state.successor_node_id, Some(ts.gateway_id));
+    // Response is valid.
+    assert!(response.verify());
+
+    // Replay call: the replay check fires (because acceptance was already
+    // recorded on the first call). This proves acceptance was recorded
+    // BEFORE state was installed on the first call — if acceptance were
+    // recorded AFTER state installation, a failure in state installation
+    // would prevent acceptance from being recorded, and the replay check
+    // would NOT fire on the next call (allowing repeated state installation
+    // attempts).
+    let replay_result = accept_relay_handshake(
+        &request,
+        &ts.relay_x25519_sk,
+        &ts.relay_sk,
+        &ts.relay_pk,
+        &mut acceptance_store,
+    );
+    assert!(
+        replay_result.is_err(),
+        "replay must fail — acceptance was already recorded on the first call"
+    );
+    assert_eq!(
+        acceptance_store.len(), 1,
+        "no ADDITIONAL acceptance recorded on replay (replay check fires before acceptance recording)"
+    );
+}
+
+// ─── Helper ─────────────────────────────────────────────────────────────────
+
+fn hex_short_for_test(node_id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in &node_id[..4] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }

@@ -163,9 +163,9 @@ pub use circuit_handshake::{
 };
 pub use distributed_circuit::{
     ActiveCircuit, RelayHandshakeRequest, RelayHandshakeResponse, RelayForwardingState,
-    CircuitAcceptanceStore, CommittedHopAuthorization, DistributedCircuitError,
+    CircuitAcceptanceStore, SignedHopAuthorization, DistributedCircuitError,
     RelayHandshakeTransport, establish_distributed_circuit, accept_relay_handshake,
-    derive_hop_authorizations, verify_dh_proof,
+    derive_signed_hop_authorizations, verify_dh_proof,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

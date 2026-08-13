@@ -482,7 +482,8 @@ pub fn prepare_circuit_setup(
 impl CircuitSetup {
     /// The circuit ID. Uniqueness helps distinguish circuit instances but
     /// is NOT replay protection. Replay protection requires receiver-side
-    /// acceptance state (CircuitReplayState — future distributed use).
+    /// acceptance state (CircuitReplayState — used by N2.2 distributed
+    /// circuit establishment).
     #[must_use] pub fn circuit_id(&self) -> &[u8; 32] { &self.circuit_id }
     /// The committed route's commitment hash (binding).
     #[must_use] pub fn commitment_hash(&self) -> &[u8; 32] { &self.commitment_hash }
@@ -603,11 +604,12 @@ impl CircuitTeardown {
     }
 }
 
-/// P1 #7: Circuit replay acceptance state (for future distributed establishment).
+/// P1 #7: Circuit replay acceptance state, used by N2.2 distributed circuit
+/// establishment.
 ///
-/// A random circuit_id alone is NOT replay protection. When distributed
-/// establishment is implemented (N2.2+), each relay should maintain this
-/// state and reject duplicate handshakes.
+/// A random circuit_id alone is NOT replay protection. Each relay maintains
+/// this state (via `CircuitAcceptanceStore`) and rejects duplicate
+/// handshakes — see `snp-node/src/node/distributed_circuit.rs`.
 #[derive(Debug, Clone)]
 pub struct CircuitReplayState {
     pub circuit_id: [u8; 32],
