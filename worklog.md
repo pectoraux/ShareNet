@@ -4522,3 +4522,187 @@ Stage Summary:
   > unforgeable VerifiedHandshake proof that the SNP-IK handshake occurred
   > with the advertised peer identity (NodeId + Ed25519 + X25519)."
 - Ready for the next task.
+
+---
+Task ID: 9 (test update for N2.1.2.5 — transport binding)
+Agent: Z.ai (sub-agent — test update for transport binding API)
+
+Task: Update the n2122_authenticated_link.rs integration tests for the
+N2.1.2.5 transport binding feature. `snp_link::test_support::verified_handshake_from_fields`
+now takes 5 arguments (added `transport_binding: TransportBinding`); a new
+helper `snp_link::test_support::transport_binding_tcp(canonical_addr: &str)`
+was added. `AuthenticatedLink::from_verified_handshake` performs a new 7th
+check: the proof's `transport_binding` MUST match the `LinkKey.endpoint`,
+else `Err(AuthenticatedLinkError::TransportBindingMismatch)`. The check
+ordering inside `from_verified_handshake` is: (1) NodeIdMismatch, (2)
+UnauthorizedEndpoint, (3) HandshakePeerNodeIdMismatch, (4)
+HandshakePublicKeyMismatch, (5) HandshakeX25519Mismatch, (6) MissingHandshake
+(zero session_id), (7) TransportBindingMismatch. Adversarial tests must be
+designed so the check under test fires BEFORE the others.
+
+Work Log:
+
+- **Constraint respected:** Do NOT modify any source files in `src/`. Only
+  the test file `tests/n2122_authenticated_link.rs` was modified. The source
+  changes (`snp-link/src/lib.rs` adding `TransportBinding` + the 5-arg
+  factory + `transport_binding_tcp`, `snp-node/src/node/link.rs` adding
+  check #7 + the `TransportBindingMismatch` variant + the
+  `transport_endpoint_matches_binding` helper, `snp-node/src/test_support.rs`
+  updating `test_authenticated_link` to pass a binding derived from
+  `key.endpoint`) were already in place from the previous agent's work.
+
+- **Module docstring:** updated header from "N2.1.2.2 / N2.1.2.4" →
+  "N2.1.2.2 / N2.1.2.4 / N2.1.2.5", added a new "N2.1.2.5 update — transport
+  binding" section documenting the 7th check, the `TransportBindingMismatch`
+  variant, and the adversarial-test design rationale (proof bound to A,
+  LinkKey claims B → reject).
+
+- **`make_verified_handshake` helper** (the test-file-local synthesis helper
+  used by adversarial tests): changed signature from
+  `(advert, session_id)` to `(advert, session_id, endpoint_addr: &str)`.
+  The helper now calls
+  `snp_link::test_support::transport_binding_tcp(endpoint_addr)` to mint the
+  proof's `TransportBinding`. Docstring updated to explain that the caller
+  supplies the endpoint the proof should be bound to (in production this
+  comes from `TcpStream::peer_addr()` inside
+  `perform_snp_ik_handshake_verified`), and that the binding can be set to
+  ANY endpoint — including ones that DON'T match `LinkKey.endpoint` — which
+  is the basis of the `TransportBindingMismatch` adversarial tests.
+
+- **Existing tests that call `make_verified_handshake` directly** (6 tests):
+  * Test 2 (`missing_handshake_cannot_create_up_link`): pass
+    `"127.0.0.1:1234"` (the advert's endpoint, matching `key.endpoint`).
+    Only check #6 (zero session_id) fires — transport binding check #7 would
+    pass anyway.
+  * Test 3 (`handshake_identity_mismatch_rejected`): pass
+    `"127.0.0.1:1234"`. The key.endpoint also uses `127.0.0.1:1234`, so the
+    binding would match — but check #1 (NodeIdMismatch) fires first because
+    `key.remote_node_id` was set to a wrong value (`[0x99; 32]`).
+  * Test 4 (`unauthorized_endpoint_rejected`): pass `"127.0.0.1:1111"` (the
+    advert's only authorized endpoint). The LinkKey.endpoint is
+    `"127.0.0.1:9999"` (not advertised), so check #2 (UnauthorizedEndpoint)
+    fires before check #7.
+  * Test 7 (`failed_handshake_creates_no_forwardable_link`): pass
+    `"127.0.0.1:4444"` (matches key.endpoint). Only check #6 (zero
+    session_id) fires.
+  * Test 12 (`public_handshake_result_cannot_construct_authenticated_link`):
+    pass `"127.0.0.1:8888"` (matches key.endpoint) so the N2.1.2.5 check
+    passes and the test reaches its positive assertion.
+  * Test 14 (`authenticated_link_preserves_verified_handshake`): pass
+    `"127.0.0.1:7000"` (matches key.endpoint). Also added a NEW assertion
+    that the preserved proof's `transport_binding()` equals the binding
+    supplied to the factory — confirming the binding travels with the proof
+    through the AuthenticatedLink boundary.
+
+- **Existing tests that call `verified_handshake_from_fields` directly** (3
+  tests — these bypass `make_verified_handshake` to inject adversarial
+  identity fields):
+  * Test 11 (`peer_x25519_mismatch_rejected`): added 5th arg
+    `transport_binding_tcp("127.0.0.1:7777")` (matches key.endpoint). Only
+    check #5 (HandshakeX25519Mismatch) fires — transport binding #7 would
+    pass anyway.
+  * Test 13 (`test_only_verified_handshake_creates_authenticated_link`):
+    added 5th arg `transport_binding_tcp("127.0.0.1:9999")` (matches
+    key.endpoint).
+  * Test 15 (`production_build_excludes_test_handshake_factory`): added 5th
+    arg `transport_binding_tcp("127.0.0.1:7001")` (matches key.endpoint).
+
+- **Tests that use `test_authenticated_link(key, &advert)`** (tests 1, 5, 6,
+  8, 9, 10): UNCHANGED. As the task noted, `test_authenticated_link` (in
+  `snp-node/src/test_support.rs`) already creates a transport binding
+  derived from `key.endpoint` internally, so these tests don't need
+  changes. (Verified by regression run below.)
+
+- **NEW helper** `make_gateway_advert_two_endpoints(label, seq,
+  endpoint_a, endpoint_b)`: creates a gateway advertisement (signed,
+  verified, with X25519) advertising TWO endpoints. Required by the
+  transport-binding mismatch tests — the mismatch scenario needs both the
+  proof's binding endpoint AND the LinkKey.endpoint to be AUTHORIZED
+  (otherwise `UnauthorizedEndpoint` would fire before
+  `TransportBindingMismatch`). Single-endpoint adverts would not suffice.
+
+- **7 NEW tests** (numbered 16–22, all PASS):
+  * 16. `handshake_endpoint_binding_mismatch_rejected` — advertisement lists
+    endpoints A (`:8001`) and B (`:8002`); proof bound to A; LinkKey uses B
+    (advertised, so check #2 passes). `from_verified_handshake` MUST reject
+    with `TransportBindingMismatch` (check #7). Verifies the error fields
+    `link_endpoint` (contains "8002") and `proof_endpoint` (contains
+    "8001") are correctly populated. This is the central N2.1.2.5
+    adversarial case described in the task.
+  * 17. `advertised_endpoint_but_not_actual_handshake_endpoint_rejected` —
+    inverse direction of test 16: proof bound to B, LinkKey uses A (both
+    advertised). Still rejects with `TransportBindingMismatch`. Confirms
+    BOTH directions of the A/B mismatch are rejected.
+  * 18. `authenticated_link_requires_both_bindings` — exercises all three
+    outcomes in one test: (1) unauthorized endpoint →
+    `UnauthorizedEndpoint` (check #2 fires); (2) authorized endpoint but
+    proof bound elsewhere → `TransportBindingMismatch` (check #7 fires);
+    (3) both pass → `Ok(AuthenticatedLink)`. Confirms the two security
+    checks are independent and both are required.
+  * 19. `different_sessions_same_peer_same_endpoint_allowed` — two proofs
+    with different session_ids but same transport endpoint both produce
+    valid `AuthenticatedLink`s. Models session re-keying over a stable
+    transport endpoint. Verifies each link's `session_id()` matches its
+    proof and the two links have different session_ids but equal transport
+    bindings.
+  * 20. `different_sessions_different_endpoints_produce_different_bindings`
+    — two proofs bound to different endpoints (A and B) have different
+    `TransportBinding`s (different `canonical_addr`). Each produces a
+    valid link over its own endpoint. Cross-check: proof A CANNOT mint a
+    link over endpoint B → `TransportBindingMismatch`. Confirms the
+    binding is per-proof, not per-peer.
+  * 21. `handshake_endpoint_binding_matches_actual_tcp_peer` — verifies
+    the `transport_binding()` accessor on the preserved proof returns the
+    correct values after a successful `from_verified_handshake`:
+    `transport()` == `TransportType::Tcp` and `canonical_addr()` ==
+    `"127.0.0.1:8501"` (the endpoint the proof was bound to).
+  * 22. `actual_endpoint_not_advertised_rejected` — advertisement lists
+    endpoint A only; LinkKey uses A (authorized, check #2 passes); proof
+    bound to X (`:8699`, NOT advertised). `from_verified_handshake` MUST
+    reject with `TransportBindingMismatch` (check #7) — the LinkKey says
+    A, the proof says X, they disagree. Verifies the error fields mention
+    both endpoints. Models a MITM that performs the handshake over a
+    non-advertised endpoint: the proof itself records the actual endpoint,
+    exposing the mismatch.
+
+- **Production build check:** `cargo build -p snp-node` (without
+  `test-support`) still compiles cleanly. The `snp_link::test_support` and
+  `snp_node::test_support` modules are `#[cfg(any(test, feature =
+  "test-support"))]` and are physically absent from the production binary.
+
+Test results:
+- `cargo test -p snp-node --test n2122_authenticated_link`:
+  - 22 passed, 0 failed, 0 ignored (was 15; +7 new)
+- `cargo test -p snp-node --test n211_topology`:
+  - 40 passed, 0 failed, 0 ignored (unchanged — `test_authenticated_link`
+    handles transport binding internally)
+- `cargo test -p snp-node --test n212_route_engine`:
+  - 26 passed, 0 failed, 0 ignored (unchanged — same reason)
+- Total across the three target test files: 88 passed, 0 failed.
+- Production build (`cargo build -p snp-node`, no `test-support`): compiles cleanly.
+
+Stage Summary:
+- The n2122 test file now exercises the N2.1.2.5 transport binding API
+  exclusively. Every `verified_handshake_from_fields` call (whether via the
+  `make_verified_handshake` helper or directly) supplies a `TransportBinding`
+  via `snp_link::test_support::transport_binding_tcp`. The 7 new tests cover:
+  * The central transport-binding mismatch adversarial case (test 16).
+  * The inverse direction of the mismatch (test 17).
+  * The dual-check independence (endpoint authorization + transport binding,
+    test 18).
+  * Session re-keying over a stable endpoint (test 19).
+  * Per-proof bindings across different endpoints (test 20).
+  * The transport binding accessor's correctness (test 21).
+  * Proof bound to a non-advertised endpoint rejected (test 22).
+- All adversarial cases (zero session_id, NodeIdMismatch, UnauthorizedEndpoint,
+  HandshakeX25519Mismatch, TransportBindingMismatch) are now tested with
+  `VerifiedHandshake` proofs whose fields (including the new transport
+  binding) are injected via the test-only factory.
+- The security invariant holds:
+  > "Every AuthenticatedLink consumed by RouteEngine is backed by an
+  > unforgeable VerifiedHandshake proof that the SNP-IK handshake occurred
+  > with the advertised peer identity (NodeId + Ed25519 + X25519) AND over
+  > the specific transport endpoint recorded in the proof — preventing
+  > identity/location confusion where a handshake over endpoint A is
+  > claimed to authorize a link over endpoint B."
+- Ready for the next task.

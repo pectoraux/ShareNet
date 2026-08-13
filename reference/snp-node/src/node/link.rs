@@ -381,6 +381,20 @@ pub enum AuthenticatedLinkError {
     /// defensively.
     #[error("handshake session_id is all-zero — invalid VerifiedHandshake")]
     MissingHandshake,
+    /// **N2.1.2.5.** The transport endpoint in the `LinkKey` does not match
+    /// the actual transport endpoint used by the handshake (as recorded in
+    /// the `VerifiedHandshake`'s `TransportBinding`).
+    ///
+    /// This prevents identity/location confusion: a caller cannot perform a
+    /// handshake over endpoint A, then construct an `AuthenticatedLink`
+    /// claiming endpoint B.
+    #[error("transport binding mismatch: LinkKey says {link_endpoint}, handshake proof says {proof_endpoint}")]
+    TransportBindingMismatch {
+        /// The endpoint from the LinkKey.
+        link_endpoint: String,
+        /// The endpoint from the handshake proof's transport binding.
+        proof_endpoint: String,
+    },
 }
 
 /// A wrapper for `[u8; 32]` that implements `Display` as hex.
@@ -466,6 +480,17 @@ impl AuthenticatedLink {
         if proof.session_id() == [0u8; 32] {
             return Err(AuthenticatedLinkError::MissingHandshake);
         }
+        // 7. N2.1.2.5: Transport binding — the actual endpoint used by the
+        //    handshake MUST match the LinkKey.endpoint. This prevents
+        //    identity/location confusion: a caller cannot perform a handshake
+        //    over endpoint A, then construct an AuthenticatedLink claiming
+        //    endpoint B (even if B is also advertised).
+        if !transport_endpoint_matches_binding(&key.endpoint, proof.transport_binding()) {
+            return Err(AuthenticatedLinkError::TransportBindingMismatch {
+                link_endpoint: key.endpoint.as_str().to_string(),
+                proof_endpoint: proof.transport_binding().canonical_addr().to_string(),
+            });
+        }
         // Construct the underlying Link with the session_id set.
         let link = Link::new_up(key, Some(proof.session_id()));
         Ok(Self { link, proof: proof.clone() })
@@ -547,6 +572,58 @@ impl AuthenticatedLink {
     #[must_use]
     pub fn endpoint(&self) -> &TransportEndpoint {
         &self.link.key.endpoint
+    }
+}
+
+// ─── Transport endpoint ↔ binding comparison (N2.1.2.5) ─────────────────────
+
+/// **N2.1.2.5.** Compare a `TransportEndpoint` (from `snp-node`) with a
+/// `TransportBinding` (from `snp-link`).
+///
+/// Returns `true` if they represent the same transport endpoint.
+///
+/// For TCP, the comparison canonicalizes both sides by parsing as a
+/// `SocketAddr` and re-encoding. This ensures that `"127.0.0.1:12345"` and
+/// `"127.0.0.1:12345"` match, and that IPv6 addresses are normalized
+/// consistently.
+///
+/// For non-TCP transports (BLE, Wi-Fi Direct, Nearby Connections), a simple
+/// string comparison is used (these transports are not yet implemented).
+fn transport_endpoint_matches_binding(
+    endpoint: &TransportEndpoint,
+    binding: &snp_link::TransportBinding,
+) -> bool {
+    match (endpoint, binding.transport()) {
+        (TransportEndpoint::Tcp(addr_str), snp_link::TransportType::Tcp) => {
+            // Canonicalize both sides by parsing as SocketAddr.
+            let endpoint_canon = canonicalize_tcp_addr_str(addr_str);
+            let binding_canon = binding.canonical_addr();
+            endpoint_canon == binding_canon
+        }
+        (TransportEndpoint::Ble(addr_str), snp_link::TransportType::Ble) => {
+            endpoint.as_str() == binding.canonical_addr()
+        }
+        (TransportEndpoint::WifiDirect(addr_str), snp_link::TransportType::WifiDirect) => {
+            endpoint.as_str() == binding.canonical_addr()
+        }
+        (TransportEndpoint::NearbyConnections(addr_str), snp_link::TransportType::NearbyConnections) => {
+            endpoint.as_str() == binding.canonical_addr()
+        }
+        _ => false, // Transport type mismatch.
+    }
+}
+
+/// Canonicalize a TCP address string by parsing it as a `SocketAddr`.
+///
+/// If parsing fails, return the original string (the caller will see a
+/// mismatch, which is the safe behavior for an unparseable address).
+fn canonicalize_tcp_addr_str(addr: &str) -> String {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(socket_addr) => match socket_addr {
+            std::net::SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+            std::net::SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+        },
+        Err(_) => addr.to_string(),
     }
 }
 

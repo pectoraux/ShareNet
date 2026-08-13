@@ -346,10 +346,109 @@ pub struct HandshakeResult {
     pub session_id: [u8; 32],
 }
 
-// ─── VerifiedHandshake (N2.1.2.4) ───────────────────────────────────────────
+// ─── TransportBinding (N2.1.2.5) ───────────────────────────────────────────
 
-/// **N2.1.2.4.** An **unforgeable** proof that a successful SNP-IK/0.1
-/// handshake was completed with a specific peer.
+/// **N2.1.2.5.** An authenticated binding to the actual transport endpoint
+/// used by a successful handshake.
+///
+/// `TransportBinding` records **which transport endpoint the handshake
+/// actually occurred over**. This is distinct from "which endpoint the
+/// advertisement authorized" — both checks are needed for a complete
+/// security boundary:
+///
+/// 1. **Advertisement authorization**: `key.endpoint ∈ advert.endpoints()`
+///    (checked by `AuthenticatedLink::from_verified_handshake`).
+/// 2. **Actual transport binding**: `proof.transport_binding == key.endpoint`
+///    (checked by `AuthenticatedLink::from_verified_handshake`).
+///
+/// Without the second check, a caller could perform a handshake over
+/// endpoint A, then construct an `AuthenticatedLink` claiming endpoint B
+/// (as long as B is also advertised). The transport binding prevents this
+/// identity/location confusion.
+///
+/// ## Canonical representation
+///
+/// For TCP, the binding is the canonical `host:port` string obtained from
+/// `TcpStream::peer_addr()`. The canonicalization normalizes IPv6 addresses
+/// (e.g., `::1` → `[::1]:port`) to ensure consistent comparison.
+///
+/// ## Future transports
+///
+/// The `TransportType` enum is designed to support future transports (BLE,
+/// Wi-Fi Direct, Nearby Connections, QUIC) without redefining the identity
+/// model. Each transport will provide its own canonical binding
+/// representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TransportBinding {
+    /// The transport type.
+    transport: TransportType,
+    /// The canonical address string (e.g. `"127.0.0.1:12345"` for TCP).
+    canonical_addr: String,
+}
+
+/// The type of transport used for a handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportType {
+    /// TCP transport.
+    Tcp,
+    /// BLE transport (not yet implemented).
+    Ble,
+    /// Wi-Fi Direct transport (not yet implemented).
+    WifiDirect,
+    /// Nearby Connections transport (not yet implemented).
+    NearbyConnections,
+}
+
+impl TransportBinding {
+    /// **Private constructor.** Only callable from within `snp-link`.
+    #[must_use]
+    pub(crate) fn new(transport: TransportType, canonical_addr: String) -> Self {
+        Self { transport, canonical_addr }
+    }
+
+    /// Create a TCP transport binding from a `SocketAddr`.
+    ///
+    /// This canonicalizes the address representation.
+    #[must_use]
+    pub(crate) fn from_tcp_socket_addr(addr: std::net::SocketAddr) -> Self {
+        Self {
+            transport: TransportType::Tcp,
+            canonical_addr: canonicalize_tcp_addr(&addr),
+        }
+    }
+
+    /// Get the transport type.
+    #[must_use]
+    pub fn transport(&self) -> TransportType {
+        self.transport
+    }
+
+    /// Get the canonical address string.
+    #[must_use]
+    pub fn canonical_addr(&self) -> &str {
+        &self.canonical_addr
+    }
+}
+
+/// Canonicalize a TCP `SocketAddr` into a stable string representation.
+///
+/// IPv4: `"a.b.c.d:port"` (e.g., `"127.0.0.1:12345"`)
+/// IPv6: `"[::1]:port"` (e.g., `"[::1]:12345"`)
+///
+/// This normalization ensures that the same socket address always produces
+/// the same canonical string, enabling reliable equality comparison.
+fn canonicalize_tcp_addr(addr: &std::net::SocketAddr) -> String {
+    match addr {
+        std::net::SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        std::net::SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+// ─── VerifiedHandshake (N2.1.2.4 / N2.1.2.5) ─────────────────────────────────
+
+/// **N2.1.2.4 / N2.1.2.5.** An **unforgeable** proof that a successful
+/// SNP-IK/0.1 handshake was completed with a specific peer, **bound to the
+/// actual transport endpoint used**.
 ///
 /// ## Why this exists
 ///
@@ -360,10 +459,17 @@ pub struct HandshakeResult {
 ///
 /// `VerifiedHandshake` solves this by having **private fields and a private
 /// constructor**. The ONLY way to create a `VerifiedHandshake` is through
-/// [`perform_snp_ik_handshake`] (or the async variant), which performs the
-/// actual SNP-IK/0.1 protocol over a real transport. The proof is minted
-/// inside the handshake implementation and cannot be manufactured by
-/// external code.
+/// [`perform_snp_ik_handshake_verified`], which performs the actual
+/// SNP-IK/0.1 protocol over a real transport. The proof is minted inside
+/// the handshake implementation and cannot be manufactured by external code.
+///
+/// ## N2.1.2.5: Transport binding
+///
+/// The proof includes a [`TransportBinding`] that records **which transport
+/// endpoint the handshake actually occurred over**. This prevents
+/// identity/location confusion: a caller cannot perform a handshake over
+/// endpoint A, then construct an `AuthenticatedLink` claiming endpoint B
+/// (even if B is also advertised).
 ///
 /// ## Usage
 ///
@@ -397,6 +503,9 @@ pub struct VerifiedHandshake {
     peer_ephemeral_public: [u8; 32],
     /// Directional AEAD link keys.
     link_keys: LinkKeys,
+    /// **N2.1.2.5.** The actual transport endpoint used by the handshake.
+    /// Bound to the proof at mint time.
+    transport_binding: TransportBinding,
 }
 
 impl VerifiedHandshake {
@@ -411,6 +520,7 @@ impl VerifiedHandshake {
         peer_x25519_public: [u8; 32],
         peer_ephemeral_public: [u8; 32],
         link_keys: LinkKeys,
+        transport_binding: TransportBinding,
     ) -> Self {
         Self {
             session_id,
@@ -419,6 +529,7 @@ impl VerifiedHandshake {
             peer_x25519_public,
             peer_ephemeral_public,
             link_keys,
+            transport_binding,
         }
     }
 
@@ -461,13 +572,24 @@ impl VerifiedHandshake {
         self.link_keys.clone()
     }
 
+    /// **N2.1.2.5.** Get the transport binding — the actual transport
+    /// endpoint used by the handshake.
+    ///
+    /// This is the proof that the handshake occurred over this specific
+    /// endpoint, not just any advertised endpoint.
+    #[must_use]
+    pub fn transport_binding(&self) -> &TransportBinding {
+        &self.transport_binding
+    }
+
     /// Convert from a `HandshakeResult` (internal only).
     ///
     /// This is private — only callable from within `snp-link`. It is used
-    /// by `perform_snp_ik_handshake` to convert its internal `HandshakeResult`
-    /// into the unforgeable `VerifiedHandshake` proof.
+    /// by `perform_snp_ik_handshake_verified` to convert its internal
+    /// `HandshakeResult` into the unforgeable `VerifiedHandshake` proof,
+    /// binding it to the actual transport endpoint.
     #[must_use]
-    fn from_handshake_result(result: &HandshakeResult) -> Self {
+    fn from_handshake_result(result: &HandshakeResult, transport_binding: TransportBinding) -> Self {
         Self::new(
             result.session_id,
             result.peer_node_id,
@@ -475,6 +597,7 @@ impl VerifiedHandshake {
             result.peer_x25519_public,
             result.peer_ephemeral_public,
             result.link_keys.clone(),
+            transport_binding,
         )
     }
 }
@@ -885,22 +1008,28 @@ pub fn perform_snp_ik_handshake(
     })
 }
 
-/// **N2.1.2.4.** Perform the SNP-IK/0.1 handshake and return an **unforgeable**
-/// `VerifiedHandshake` proof.
+/// **N2.1.2.4 / N2.1.2.5.** Perform the SNP-IK/0.1 handshake and return an
+/// **unforgeable** `VerifiedHandshake` proof, **bound to the actual transport
+/// endpoint**.
 ///
 /// This is the same as [`perform_snp_ik_handshake`], but returns a
 /// `VerifiedHandshake` instead of a `HandshakeResult`. The
 /// `VerifiedHandshake` has private fields and a private constructor — it
-/// can ONLY be created by this function (or the async variant). External
-/// code cannot manufacture a `VerifiedHandshake`.
+/// can ONLY be created by this function. External code cannot manufacture
+/// a `VerifiedHandshake`.
+///
+/// **N2.1.2.5:** The proof includes a `TransportBinding` obtained from
+/// `stream.peer_addr()` — the actual TCP endpoint the handshake occurred
+/// over. This prevents identity/location confusion.
 ///
 /// Use this function when you need to create an `AuthenticatedLink` in
 /// `snp-node`. The `VerifiedHandshake` is the security proof that the
-/// handshake actually occurred.
+/// handshake actually occurred over a specific endpoint.
 ///
 /// # Errors
 /// Returns `LinkError` if the handshake fails (I/O error, signature
-/// verification failure, NodeId mismatch, etc.).
+/// verification failure, NodeId mismatch, etc.) or if the transport
+/// binding cannot be obtained.
 pub fn perform_snp_ik_handshake_verified(
     stream: &mut TcpStream,
     is_initiator: bool,
@@ -919,9 +1048,13 @@ pub fn perform_snp_ik_handshake_verified(
         my_x25519_public,
         expected_peer_node_id,
     )?;
-    // Mint the unforgeable proof from the internal HandshakeResult.
+    // N2.1.2.5: Extract the actual transport endpoint from the TcpStream.
+    // This binds the proof to the specific endpoint the handshake occurred over.
+    let peer_addr = stream.peer_addr().map_err(|e| LinkError::Io(e.to_string()))?;
+    let transport_binding = TransportBinding::from_tcp_socket_addr(peer_addr);
+    // Mint the unforgeable proof from the internal HandshakeResult + transport binding.
     // This conversion is private — external code cannot call it.
-    Ok(VerifiedHandshake::from_handshake_result(&result))
+    Ok(VerifiedHandshake::from_handshake_result(&result, transport_binding))
 }
 
 // ─── Circuit keys (N1.9 — end-to-end client↔gateway) ────────────────────────
@@ -1700,10 +1833,10 @@ mod tests {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// N2.1.2.4: Test-only VerifiedHandshake factory
+// N2.1.2.4 / N2.1.2.5: Test-only VerifiedHandshake factory
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **N2.1.2.4 test-support module.**
+/// **N2.1.2.4 / N2.1.2.5 test-support module.**
 ///
 /// ONLY compiled when the `test-support` Cargo feature is enabled.
 /// Provides a test-only factory for creating `VerifiedHandshake` proofs
@@ -1717,11 +1850,14 @@ mod tests {
 ///
 /// The factory creates a genuine `VerifiedHandshake` (using the private
 /// constructor) — the proof is real, it just bypasses the transport layer.
+/// The caller must supply the `transport_binding` that the proof should
+/// be bound to (N2.1.2.5).
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
 
-    /// **TEST-ONLY.** Create a `VerifiedHandshake` from explicit fields.
+    /// **TEST-ONLY.** Create a `VerifiedHandshake` from explicit fields,
+    /// including the transport binding.
     ///
     /// This bypasses the actual SNP-IK handshake but produces a genuine
     /// `VerifiedHandshake` using the private constructor. The proof is
@@ -1732,6 +1868,8 @@ pub mod test_support {
     /// - `peer_public_key`: The authenticated peer Ed25519 public key.
     /// - `peer_x25519_public`: The authenticated peer static X25519 public key.
     /// - `session_id`: The session ID (must be non-zero).
+    /// - `transport_binding`: The transport endpoint the proof is bound to
+    ///   (N2.1.2.5). Use `transport_binding_tcp(addr)` to create one.
     ///
     /// **Production code MUST NOT use this.**
     #[must_use]
@@ -1740,6 +1878,7 @@ pub mod test_support {
         peer_public_key: [u8; 32],
         peer_x25519_public: [u8; 32],
         session_id: [u8; 32],
+        transport_binding: TransportBinding,
     ) -> VerifiedHandshake {
         VerifiedHandshake::new(
             session_id,
@@ -1751,6 +1890,18 @@ pub mod test_support {
                 send_key: [0u8; 32],
                 recv_key: [0u8; 32],
             },
+            transport_binding,
         )
+    }
+
+    /// **TEST-ONLY.** Create a TCP `TransportBinding` from an address string.
+    ///
+    /// The address should be in canonical `host:port` form (e.g.,
+    /// `"127.0.0.1:12345"` or `"[::1]:12345"`).
+    ///
+    /// **Production code MUST NOT use this.**
+    #[must_use]
+    pub fn transport_binding_tcp(canonical_addr: &str) -> TransportBinding {
+        TransportBinding::new(TransportType::Tcp, canonical_addr.to_string())
     }
 }
