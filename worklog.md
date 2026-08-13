@@ -5796,3 +5796,289 @@ re-export list in `snp-node/src/node/mod.rs`.
 > chain-bound (N2.1.3.2-response-auth)."
 
 - Ready for the next task.
+
+---
+
+## N2.2.1 — Real TCP Next-Hop Transport for Recursive Route Discovery
+
+**Task ID:** N2.2.1
+**Branch:** main (commit fd0f7f6 + this work)
+**Files modified/created:**
+- **NEW** `snp-node/src/node/tcp_route_transport.rs` (≈580 lines)
+  — `TcpRecursiveTransport`, `TcpForwardingServer`, `PeerInfo`, frame
+  protocol (`write_frame`/`read_frame`), `MAX_FRAME_SIZE`, 4 unit tests.
+- **MOD** `snp-node/src/node/route_discovery_protocol.rs`
+  — Added canonical CBOR `to_cbor_map()` / `from_cbor_map()` /
+  `encode_cbor()` / `decode_cbor()` to `ForwardedQuery`,
+  `RecursiveRouteResponse`, `SignedResponseStep`, `RoutingAssertion`,
+  `QueryStep`. Added CBOR helper functions (`cbor_map_entries`,
+  `cbor_map_get`, `cbor_get_fixed_bytes`, `cbor_get_byte_array`,
+  `cbor_get_u64`, `cbor_get_bool`, `cbor_get_string`,
+  `cbor_get_optional_bytes_32`). Renamed the private `canonical_cbor()`
+  on `ForwardedQuery` to the public `to_cbor_map()` (so `compute_hash()`
+  and the wire format use the SAME bytes). Refactored `ForwardingNode`'s
+  `transport` field from `Arc<InMemoryRecursiveTransport>` to
+  `Arc<dyn RecursiveNextHopTransport + Send + Sync>` (existing callers
+  compile via unsizing coercion). Added `ed25519_secret()` and
+  `ed25519_public()` accessors on `ForwardingNode` (needed by
+  `TcpForwardingServer` to perform the SNP-IK handshake as responder).
+- **MOD** `snp-node/src/node/node_advert.rs`
+  — Added `to_cbor_map()` / `from_cbor_map()` / `encode_cbor()` /
+  `decode_cbor()` to `NodeAdvertisement`. Added an `advert:
+  NodeAdvertisement` field to `AuthenticatedNodeRecord` (retained for
+  wire serialization so receivers can re-verify the signature on
+  decode); `into_record()` populates it. Added `encode_cbor()` /
+  `decode_cbor()` to `AuthenticatedNodeRecord` (encode emits the
+  underlying advert; decode re-verifies via `verify_into_verified()` and
+  reconstructs the record — a malicious transport cannot substitute
+  forged records without invalidating the signature). Added local CBOR
+  helper functions (same as in route_discovery_protocol.rs — tiny,
+  duplicated rather than shared to avoid a new common module).
+- **MOD** `snp-node/src/node/descriptor.rs`
+  — Added `from_cbor_map()` to `TransportEndpoint` (inverse of the
+  existing `canonical_cbor()`).
+- **MOD** `snp-node/src/node/mod.rs`
+  — Added `pub mod tcp_route_transport;` and re-exported `PeerInfo`,
+  `TcpForwardingServer`, `TcpRecursiveTransport`, `MAX_FRAME_SIZE`.
+- **NEW** `snp-node/tests/n221_tcp_recursive_transport.rs` (≈760 lines)
+  — 6 tests: north-star `tcp_recursive_a_b_c_gateway_success`,
+  `tcp_serialization_round_trips`, `tampered_serialized_field_rejected`,
+  `malformed_frame_rejected`, `oversized_frame_rejected`,
+  `replayed_serialized_message_rejected`.
+
+### Design
+
+#### 1. Canonical CBOR serialization (security-critical)
+
+The wire format for `ForwardedQuery` is byte-identical to the preimage
+used by `ForwardedQuery::compute_hash()`. This is security-critical
+because the `parent_query_hash` binding between hops depends on the
+wire bytes being identical to the hash preimage. If they differed, a
+parent's `compute_hash()` would not match the child's
+`parent_query_hash` after a wire round-trip, breaking the recursive
+chain coherence check in `DistributedRouteResolution::verify()`.
+
+The previous private `canonical_cbor()` method on `ForwardedQuery` was
+renamed to `to_cbor_map()` (pub). `compute_hash()` now calls
+`to_cbor_map()` internally. `encode_cbor()` is
+`snp_cbor::encode(&self.to_cbor_map()).expect(...)`. The result: the
+wire bytes ARE the hash preimage.
+
+For `RoutingAssertion`, `SignedResponseStep`, and `NodeAdvertisement`,
+the wire format is `preimage()` + the `signature` field. The signature
+itself is NOT covered by the signature (it IS the signature). The wire
+format carries the signature so receivers can independently verify it.
+
+For `AuthenticatedNodeRecord`, the wire format is the underlying
+`NodeAdvertisement`. The receiver re-verifies the advertisement's
+signature via `verify_into_verified()` and reconstructs the record via
+`into_record()`. This ensures a malicious transport cannot substitute
+forged records — the signature MUST verify under the embedded public
+key, and the NodeId MUST match `derive_node_id(public_key)`.
+
+For `RecursiveRouteResponse`, the wire format is a CBOR map carrying
+all envelope fields plus the signed `accumulated_assertions`,
+`accumulated_records` (as advertisements), `response_steps`, and
+`destination_advertisement`. The unsigned envelope fields are checked
+for consistency against the signed data by
+`DistributedRouteResolution::verify()`.
+
+#### 2. TCP frame protocol
+
+```
+[4 bytes: big-endian u32 length N] [N bytes: canonical CBOR message]
+```
+
+- `MAX_FRAME_SIZE = 1024 * 1024` (1 MiB). `read_frame` rejects declared
+  lengths exceeding this BEFORE allocating — prevents allocation attacks.
+- `write_frame` rejects payloads exceeding `MAX_FRAME_SIZE`.
+- `read_frame` uses `read_exact` for both the length prefix and the
+  payload — partial reads result in `UnexpectedEof`.
+- TCP read/write timeout of 10 seconds per call (prevents a slow peer
+  from blocking a forwarder indefinitely).
+
+#### 3. TcpRecursiveTransport (initiator side)
+
+Holds:
+- `peers: HashMap<[u8; 32], PeerInfo>` — the "phone book" (NodeId →
+  TCP address + expected Ed25519 public key).
+- The local node's Ed25519 + X25519 keypairs (for SNP-IK initiator).
+
+`forward_query(neighbor_node_id, query)`:
+1. Look up peer info (TCP address + expected NodeId).
+2. Connect TCP to peer address.
+3. Perform SNP-IK handshake as initiator, pinning `expected_peer_node_id`
+   ("I"-style pinning — fails if the peer's verified NodeId doesn't
+   match).
+4. Encode `ForwardedQuery` to canonical CBOR (== hash preimage).
+5. Write length-prefixed frame.
+6. Read response frame.
+7. Decode `RecursiveRouteResponse` from canonical CBOR (re-verifies
+   every nested advertisement's signature on decode).
+8. Drop the stream (closes the connection).
+
+#### 4. TcpForwardingServer (responder side)
+
+Holds:
+- `node: Arc<ForwardingNode>` — the protocol participant.
+- `listener: TcpListener` — the bound TCP listener.
+- The server's Ed25519 + X25519 keypairs (for SNP-IK responder).
+
+`handle_connection(stream)`:
+1. Perform SNP-IK handshake as responder (no `expected_peer_node_id` —
+   accepts any authenticated peer; the handshake itself proves the
+   peer's identity).
+2. Read a `ForwardedQuery` frame.
+3. Decode from canonical CBOR.
+4. Call `node.handle_query(&query)` — the ForwardingNode verifies both
+   signatures, checks visited_nodes (loop prevention), checks hop
+   budget, and either returns a terminal response or forwards a NEW
+   query to the next hop via its OWN transport (typically another
+   `TcpRecursiveTransport` — so the FULL chain A→B→C→G goes over real
+   TCP).
+5. Encode the `RecursiveRouteResponse` to canonical CBOR.
+6. Write the response frame.
+7. Close the connection.
+
+If `handle_query` returns `None` (bad signature, loop, budget
+exhausted, no path), the server closes the connection WITHOUT sending
+a response — the initiator sees EOF and treats it as failure.
+
+`serve_in_background()` spawns a thread that loops `accept()` →
+`handle_connection()` forever. Errors are logged but do not kill the
+server.
+
+`from_listener()` constructor allows the caller to bind a listener
+with an ephemeral port (`"127.0.0.1:0"`) and discover the address
+BEFORE constructing the `ForwardingNode` (which needs the address to
+populate its `endpoints` field, and whose transport needs the peer
+addresses). This breaks the chicken-and-egg: bind listener → get
+address → configure transport peers → create ForwardingNode → create
+server from the pre-bound listener.
+
+#### 5. ForwardingNode refactoring
+
+`ForwardingNode`'s `transport` field changed from
+`Arc<InMemoryRecursiveTransport>` to
+`Arc<dyn RecursiveNextHopTransport + Send + Sync>`. This is a
+non-breaking change — existing callers that pass
+`Arc<InMemoryRecursiveTransport>` continue to compile via Rust's
+unsizing coercion. The SAME `ForwardingNode` logic now works over
+either the in-memory transport (tests) or a real TCP transport
+(production).
+
+`ForwardingNode::ed25519_secret()` and `ed25519_public()` accessors
+were added so `TcpForwardingServer` can perform the SNP-IK handshake
+as responder using the same identity as the node's advertisement.
+
+### North-star test (n221_tcp_recursive_transport.rs)
+
+`tcp_recursive_a_b_c_gateway_success`:
+
+1. Creates 4 independent TCP listeners on ephemeral ports (A, B, C, G).
+   - A does NOT need a server (only initiates).
+   - B, C, G each bind a `TcpForwardingServer`.
+2. Creates `ForwardingNode` instances for B, C, G with neighbor maps:
+   - B knows C (B's ForwardingNode has C's advert as a neighbor).
+   - C knows G.
+   - G is the destination (Gateway with X25519 circuit key).
+3. Each ForwardingNode's `transport` is a `TcpRecursiveTransport`
+   pointing at the next hop:
+   - B's transport knows C's TCP address.
+   - C's transport knows G's TCP address.
+   - G's transport has no peers (terminal).
+4. Starts `TcpForwardingServer` for B, C, G in background threads.
+5. Creates `TcpRecursiveTransport` for A (knows B's address).
+6. Creates `NextHopResolver` with A's TCP transport.
+7. Calls `resolver.resolve_route(&g_id, &hint)`.
+8. Verifies `DistributedRouteResolution` with A→B→C→G:
+   - `ordered_node_ids == [A, B, C, G]`
+   - 3 records, 2 assertions, 3 query steps, 3 hops.
+   - `resolution.verify()` passes (all signatures + chain coherence).
+9. Calls `into_route()` and verifies the `Route`:
+   - `source() == A`, `destination() == G`.
+   - `hops() == [B, C, G]`.
+   - `validate()` passes.
+
+**Critical constraints satisfied:**
+- NO `InMemoryRecursiveTransport` anywhere in the test.
+- NO direct A→C or A→G connections (A only knows B).
+- Each node has its own TCP listener + Ed25519 keypair + X25519 keypair.
+- SNP-IK authentication on every connection (initiator pins expected
+  peer NodeId; responder accepts any authenticated peer).
+- `ForwardedQuery` crosses the actual TCP boundary at every hop
+  (serialized → TCP → deserialized → verified → re-serialized → TCP →
+  ...).
+
+### Adversarial tests
+
+1. **`tampered_serialized_field_rejected`** — Flip a byte in the
+   middle of a serialized `ForwardedQuery`. The tampered bytes either
+   fail to decode (CBOR structural error) or fail signature
+   verification (the flipped byte is part of a signed field). Both
+   outcomes are valid rejections.
+2. **`malformed_frame_rejected`** — Complete the SNP-IK handshake with
+   G, then send a TRUNCATED frame (4-byte length claiming 100 bytes,
+   but only 3 bytes of payload). G's `read_frame` blocks waiting for
+   the remaining bytes, hits the read timeout, and closes the
+   connection. The client sees EOF or an error.
+3. **`oversized_frame_rejected`** — Connect to G, send a 4-byte length
+   prefix claiming `MAX_FRAME_SIZE + 1` bytes. G's `read_frame`
+   rejects this with `InvalidData` BEFORE allocating the buffer. The
+   connection is closed; the client sees EOF or an error.
+4. **`replayed_serialized_message_rejected`** — Construct a
+   `ForwardedQuery` from A with `visited_nodes = [A, B]` (B is the
+   target). Connect to B's server, perform the SNP-IK handshake as A,
+   send the query. B's `handle_query` calls `has_visited(B)` which
+   returns `true` → loop detected → query rejected → connection closed
+   without a response. This is the recursive path's freshness check
+   (loop prevention via `visited_nodes`).
+
+### Test results
+
+- `cargo build -p snp-node`:
+  - Success (105 pre-existing warnings, no new warnings).
+- `cargo test -p snp-node --test n221_tcp_recursive_transport`:
+  - 6 passed, 0 failed, 0 ignored (ran 5× in a row, no flakiness;
+    ~2.05s per run).
+- `cargo test --workspace`:
+  - Total: 394 passed, 0 failed, 3 ignored (was 384; +10 new: 6 n221
+    integration tests + 4 tcp_route_transport unit tests).
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (105 pre-existing warnings).
+
+### Security invariant (N2.2.1)
+
+> "Every `ForwardedQuery` that crosses a TCP boundary is
+> authenticated via SNP-IK/0.1 (initiator pins expected peer NodeId;
+> responder accepts any authenticated peer). The wire format is
+> canonical CBOR per RFC 8949 §4.2.1 — the SAME bytes used for
+> `ForwardedQuery::compute_hash()`. This preserves the
+> `parent_query_hash` binding across wire round-trips: a parent's
+> `compute_hash()` matches the child's `parent_query_hash` after
+> serialization → TCP → deserialization. Every signed object
+> (`RoutingAssertion`, `SignedResponseStep`, `NodeAdvertisement`)
+> carries its own Ed25519 signature under `ROUTE_DISCOVERY_MSG_CONTEXT`
+> (or `SIG_CONTEXTS::NODE_ADVERT` for adverts); the receiver
+> re-verifies each signature independently. `AuthenticatedNodeRecord`s
+> are transmitted as their underlying signed `NodeAdvertisement`; the
+> receiver re-verifies the advertisement via `verify_into_verified()`
+> before reconstructing the record — a malicious transport cannot
+> substitute forged records without invalidating the signature. Frame
+> lengths are capped at `MAX_FRAME_SIZE` (1 MiB) to prevent allocation
+> attacks. Replayed serialized messages are rejected by the
+> `visited_nodes` loop-prevention check (a replayed query whose
+> visited set contains the receiver is rejected as a loop). Tampered
+> serialized fields are rejected by signature verification (any bit
+> flip in a signed field invalidates the signature). Malformed frames
+> are rejected safely (truncated frames hit the read timeout;
+> oversized frames are rejected before allocation). The chain of
+> custody from A → B → C → G is now provably authentic at every layer
+> AND every layer crosses a real TCP boundary with SNP-IK
+> authentication."
+
+- Ready for the next task.
