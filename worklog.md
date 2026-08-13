@@ -5316,3 +5316,207 @@ A constructs DistributedRouteResolution
 > independently verified `NodeAdvertisement`."
 
 - Ready for the next task.
+
+---
+
+## N2.1.3.2-security — Cryptographic authentication for recursive route discovery
+
+**Task ID:** N2.1.3.2-security
+**Repository:** `/home/z/my-project/reference`
+**Base commit:** `46f9e0f`
+
+### The three problems fixed
+
+The previous N2.1.3.2-fix implementation made `ForwardedQuery` the wire
+message and added parent-binding signatures, but three cryptographic gaps
+remained:
+
+1. **`RoutingAssertion` had no signature.** B's claim "next hop is C" was
+   just a data struct. A malicious transport could tamper with the
+   assertion fields (responder, next_hop, is_destination) and A had no
+   way to detect it.
+2. **Parent binding didn't commit to the actual parent message.** B
+   signed `parent_query_id`, but B could invent ANY `parent_query_id`
+   — there was no proof that the parent query was actually sent.
+3. **`RecursiveRouteResponse` had no end-to-end signature.** Each
+   `RoutingAssertion` was unsigned, so A could not verify the chain of
+   custody for the accumulated claims.
+
+### Fixes
+
+#### Problem 1: `RoutingAssertion` is now signed
+
+Added `ed25519_public_key: [u8; 32]` and `signature: [u8; 64]` fields
+to `RoutingAssertion`. Added:
+
+- `preimage() -> CborValue` — canonical CBOR of all assertion fields
+  EXCEPT the signature itself (responder_node_id, destination_node_id,
+  next_hop_node_id, is_destination, query_id, timestamp,
+  responder_public_key).
+- `create_and_sign(secret_key, public_key, responder_node_id,
+  destination, next_hop, is_destination, query_id) -> Self` — signs
+  the preimage under `ROUTE_DISCOVERY_MSG_CONTEXT` and stores both the
+  signature and the public key in the assertion.
+- `verify_signature(&self) -> bool` — verifies the signature under the
+  embedded public key AND checks I4 consistency (responder_node_id ==
+  derive_node_id(ed25519_public_key)).
+- `sign(&mut self, secret_key)` — re-signs after field mutation.
+
+`ForwardingNode::handle_query()` now constructs assertions via
+`RoutingAssertion::create_and_sign(&self.ed25519_secret, ...)` instead
+of a struct literal. Every assertion in the chain is provably authored
+by its claimed responder.
+
+#### Problem 2: `parent_query_hash` commits to the parent message
+
+Added `parent_query_hash: [u8; 32]` field to `ForwardedQuery`. This is
+`SHA-256(canonical_CBOR(parent_query))` — a hash of the COMPLETE parent
+`ForwardedQuery` (all fields, including both signatures). For the
+initial query (no parent), it is all-zero.
+
+- Updated `create_and_sign()` to accept `parent_query_hash`.
+- Updated `parent_binding_preimage()` to include `parent_query_hash`,
+  so the `parent_signature` now covers it. Tampering with
+  `parent_query_hash` invalidates the parent binding signature.
+- Added `compute_hash(&self) -> [u8; 32]` — computes
+  `SHA-256(canonical_CBOR(self))` over ALL fields (including both
+  signatures). This is what the next forwarding step uses as its
+  `parent_query_hash`.
+- Updated `ForwardingNode::handle_query()` to compute
+  `parent_query_hash = query.compute_hash()` from the ACTUAL received
+  query, not an invented value.
+- Updated `is_initial()` to also require `parent_query_hash == [0u8; 32]`.
+- Updated `NextHopResolver::resolve_route_with_budget()` to pass
+  `[0u8; 32]` for the initial query's `parent_query_hash`.
+
+A malicious forwarder can no longer invent a `parent_query_id` for a
+query that was never sent — the `parent_query_hash` would not match
+any real parent message.
+
+#### Problem 3: `DistributedRouteResolution::verify()` checks every assertion signature
+
+Rather than adding a redundant `responder_signature` to
+`RecursiveRouteResponse` (which would require every forwarding node to
+re-sign the entire response), we rely on the fact that each
+`RoutingAssertion` is now individually signed (Problem 1 fix) and each
+`NodeAdvertisement` is already individually signed. A can verify each
+component independently.
+
+Updated `DistributedRouteResolution::verify()` to check that every
+`RoutingAssertion::verify_signature()` returns true. Added a new error
+variant:
+
+```rust
+#[error("assertion at index {index} has an invalid signature")]
+AssertionSignatureInvalid { index: usize }
+```
+
+The check runs at the top of the assertion loop (step 8a), BEFORE the
+hop-order coherence check. This means a tampered assertion is caught
+by signature verification first; a swapped-but-validly-signed
+assertion is caught by the hop-order coherence check
+(`HopOrderIncoherent`).
+
+### Backward compatibility: single-step path
+
+`RoutingAssertion::from_verified_response()` (used by the SINGLE-STEP
+`NextHopResolver::resolve_step()` method) still works — the new
+`ed25519_public_key` and `signature` fields are all-zero in this path.
+The single-step path does NOT call
+`DistributedRouteResolution::verify()`, so the all-zero assertion
+signature is never checked. The single-step path's security is provided
+by the enclosing `NextHopResponse::verify_signature()`, which already
+binds the responder's claim. This is documented in
+`RoutingAssertion`'s rustdoc.
+
+### Files modified
+
+- **`snp-node/src/node/route_discovery_protocol.rs`**:
+  * Imported `sha256` from `snp_crypto`.
+  * `RoutingAssertion`: added `ed25519_public_key`, `signature` fields;
+    added `preimage()`, `create_and_sign()`, `verify_signature()`,
+    `sign()` methods; updated `from_verified_response()` to set
+    signature fields to all-zero (single-step path); extensive rustdoc
+    explaining the two construction paths.
+  * `ForwardedQuery`: added `parent_query_hash` field; updated
+    `create_and_sign()` signature to accept `parent_query_hash`; updated
+    `parent_binding_preimage()` to include `parent_query_hash`; added
+    `compute_hash()` and a private `canonical_cbor()` helper; updated
+    `is_initial()` to also check `parent_query_hash == [0u8; 32]`.
+  * `ForwardingNode::handle_query()`: now computes
+    `parent_query_hash = query.compute_hash()` from the actual received
+    query; constructs the assertion via
+    `RoutingAssertion::create_and_sign(...)` instead of a struct literal.
+  * `DistributedRouteResolutionError`: added `AssertionSignatureInvalid
+    { index: usize }` variant.
+  * `DistributedRouteResolution::verify()`: added step 8a — every
+    assertion's `verify_signature()` must return true, else
+    `AssertionSignatureInvalid { index }`.
+  * `NextHopResolver::resolve_route_with_budget()`: passes `[0u8; 32]`
+    for the initial query's `parent_query_hash`.
+
+- **`snp-node/tests/n2132_recursive_discovery.rs`**:
+  * Updated all 4 existing `ForwardedQuery::create_and_sign` call sites
+    to pass the new `parent_query_hash` argument.
+  * Updated test 13 (`forwarded_query_signs_and_verifies`) to also
+    verify that tampering with `parent_query_hash` fails
+    `verify_parent_signature` (while `verify_signature` still passes).
+  * Added 4 new tests:
+    * **14. `tampered_assertion_rejected`** — flip one byte of an
+      assertion's signature → `verify()` fails with
+      `AssertionSignatureInvalid { index: 0 }`.
+    * **15. `tampered_parent_hash_rejected`** — flip one byte of
+      `parent_query_hash` → `verify_parent_signature()` fails (while
+      `verify_signature()` still passes); `ForwardingNode::handle_query`
+      also rejects the tampered query.
+    * **16. `assertion_signature_verified`** — positive test: every
+      assertion in a successful resolution has a valid signature, AND
+      the public key derives to the responder's NodeId (I4). Also
+      verifies that tampering with assertion 1's signature fails
+      `AssertionSignatureInvalid { index: 1 }`.
+    * **17. `swapped_assertion_entries_rejected`** — swap two
+      assertions in the chain → `verify()` fails with
+      `HopOrderIncoherent { index: 0 }` (responder mismatch), even
+      though both assertions have individually valid signatures. This
+      proves the hop-order coherence check is independent of the
+      signature check.
+
+- **`snp-node/src/node/mod.rs`** — no changes needed. All new fields
+  and methods are on already-exported types; the new error variant is
+  part of the already-exported `DistributedRouteResolutionError` enum.
+
+### Test results
+
+- `cargo build -p snp-node`:
+  - Success (only pre-existing warnings, no new warnings).
+- `cargo test -p snp-node --test n2132_recursive_discovery`:
+  - 17 passed, 0 failed, 0 ignored (was 13; +4 new).
+- `cargo test --workspace`:
+  - Total: 378 passed, 0 failed, 3 ignored (was 374; +4 new).
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (only pre-existing warnings).
+
+### Security invariant (updated)
+
+> "Every `RoutingAssertion` in a `DistributedRouteResolution` is
+> individually signed by its claimed responder under
+> `ROUTE_DISCOVERY_MSG_CONTEXT`. The signature covers the assertion
+> preimage (responder_node_id, destination_node_id, next_hop_node_id,
+> is_destination, query_id, timestamp, responder_public_key) — any
+> tampering with these fields invalidates the signature. The responder's
+> NodeId MUST equal `derive_node_id(ed25519_public_key)` (I4
+> consistency), so a forged claim from a different responder is
+> rejected. Every `ForwardedQuery`'s `parent_signature` now covers
+> `parent_query_hash` — `SHA-256(canonical_CBOR(parent_query))` — which
+> cryptographically binds the forwarded query to the ACTUAL parent
+> message that was received. A malicious forwarder cannot invent a
+> `parent_query_id` for a query that was never sent. The chain of
+> custody from A → B → C → G is provably authentic: every hop's
+> advertisement is signed (existing), every hop's assertion is signed
+> (new), and every parent-child query relationship is hash-bound (new)."
+
+- Ready for the next task.
