@@ -121,6 +121,7 @@ pub mod topology;
 pub mod propagation_state;
 pub mod route_discovery;
 pub mod circuit_handshake;
+pub mod distributed_circuit;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -159,6 +160,11 @@ pub use route_discovery::{
 pub use circuit_handshake::{
     CircuitHandshake, CircuitSetup, CircuitTeardown, CircuitError, HopForwardingState,
     CircuitReplayState, prepare_circuit_setup, CIRCUIT_MAX_LIFETIME_SECS,
+};
+pub use distributed_circuit::{
+    ActiveCircuit, RelayHandshakeRequest, RelayHandshakeResponse, RelayForwardingState,
+    CircuitAcceptanceStore, DistributedCircuitError, RelayHandshakeTransport,
+    establish_distributed_circuit, accept_relay_handshake, verify_dh_proof,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
