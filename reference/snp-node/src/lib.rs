@@ -98,6 +98,12 @@
 
 pub mod node;
 
+// N2.1.2.3: Test-only helpers for constructing AuthenticatedLink objects
+// without performing actual network handshakes. ONLY compiled when the
+// `test-support` feature is enabled. MUST NOT be used in production.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // LEGACY DEMO / TEST-ONLY CODE
 // ═══════════════════════════════════════════════════════════════════════════

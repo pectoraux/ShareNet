@@ -4,11 +4,12 @@
 
 use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_static_keypair};
 use snp_node::node::{
-    Capability, Link, LinkKey, LinkState, NodeAdvertisement, PeerDirectory, PeerSummary,
+    Capability, LinkKey, LinkState, NodeAdvertisement, PeerDirectory, PeerSummary,
     PeerSummaryList, PeerVisibility, TopologyGraph, TransportEndpoint,
     VerifiedPeerSummaryList, MAX_CLOCK_SKEW_SECS, MAX_DISTANCE_HINT,
     MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,
 };
+use snp_node::test_support::test_authenticated_link;
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -23,22 +24,23 @@ fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
     (sk, pk)
 }
 
-fn make_relay_advert(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+fn make_relay_advert(label: &[u8], seq: u64, endpoint: &str) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
     let (sk, pk) = fresh_keypair(label);
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Relay],
-        vec![TransportEndpoint::tcp("127.0.0.1:1234")],
+        vec![TransportEndpoint::tcp(endpoint)],
         None, 1, seq, // 1 second expiry for purge test
     );
     (advert, sk, pk)
 }
 
-fn make_gateway_advert(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+fn make_gateway_advert(label: &[u8], seq: u64, endpoint: &str) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
     let (sk, pk) = fresh_keypair(label);
     let (x_sk, x_pk) = x25519_static_keypair();
+    let _ = x_sk; // suppress unused warning
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Gateway],
-        vec![TransportEndpoint::tcp("127.0.0.1:5678")],
+        vec![TransportEndpoint::tcp(endpoint)],
         Some(x_pk.to_bytes()), 3600, seq,
     );
     (advert, sk, pk)
@@ -48,77 +50,80 @@ fn make_gateway_advert(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], 
 
 #[test]
 fn link_state_transitions() {
-    let (sk_a, pk_a) = fresh_keypair(b"link-a");
-    let (sk_b, pk_b) = fresh_keypair(b"link-b");
+    let (_sk_a, pk_a) = fresh_keypair(b"link-a");
     let node_a = derive_node_id(&pk_a);
-    let node_b = derive_node_id(&pk_b);
+    let (advert_b, _, _) = make_relay_advert(b"link-b", 1, "127.0.0.1:1");
+    let verified_b = advert_b.verify_into_verified().expect("verify B");
+    let node_b = verified_b.node_id();
     let key = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    let mut link = Link::new_up_for_testing(key.clone(), None);
-    assert_eq!(link.state, LinkState::Up);
+    let mut link = test_authenticated_link(key.clone(), &verified_b).expect("authenticated link");
+    assert_eq!(link.state(), LinkState::Up);
     assert!(link.is_usable());
 
     // One failure → Degraded.
     link.record_failure();
-    assert_eq!(link.state, LinkState::Degraded);
+    assert_eq!(link.state(), LinkState::Degraded);
     assert!(link.is_usable());
 
     // Success → Up.
     link.record_success(1000);
-    assert_eq!(link.state, LinkState::Up);
-    assert_eq!(link.metrics.success_count, 1);
-    assert_eq!(link.metrics.rtt_micros, Some(1000));
+    assert_eq!(link.state(), LinkState::Up);
+    assert_eq!(link.metrics().success_count, 1);
+    assert_eq!(link.metrics().rtt_micros, Some(1000));
 
     // Three consecutive failures → Down.
     link.record_failure();
     link.record_failure();
     link.record_failure();
-    assert_eq!(link.state, LinkState::Down);
+    assert_eq!(link.state(), LinkState::Down);
     assert!(!link.is_usable());
-    assert_eq!(link.consecutive_failures, 3);
+    assert_eq!(link.as_link().consecutive_failures, 3);
 }
 
 #[test]
 fn link_metrics_recorded() {
-    let (sk_a, pk_a) = fresh_keypair(b"link-metrics-a");
-    let (sk_b, pk_b) = fresh_keypair(b"link-metrics-b");
+    let (_sk_a, pk_a) = fresh_keypair(b"link-metrics-a");
+    let (advert_b, _, _) = make_relay_advert(b"link-metrics-b", 1, "127.0.0.1:1");
+    let verified_b = advert_b.verify_into_verified().expect("verify B");
     let key = LinkKey::new(
         derive_node_id(&pk_a),
-        derive_node_id(&pk_b),
+        verified_b.node_id(),
         TransportEndpoint::tcp("127.0.0.1:1"),
     );
-    let mut link = Link::new_up_for_testing(key, None);
+    let mut link = test_authenticated_link(key, &verified_b).expect("authenticated link");
     link.record_success(500);
     link.record_success(750);
     link.record_failure();
-    assert_eq!(link.metrics.success_count, 2);
-    assert_eq!(link.metrics.failure_count, 1);
-    assert_eq!(link.metrics.rtt_micros, Some(750));
-    let rate = link.metrics.success_rate().unwrap();
+    assert_eq!(link.metrics().success_count, 2);
+    assert_eq!(link.metrics().failure_count, 1);
+    assert_eq!(link.metrics().rtt_micros, Some(750));
+    let rate = link.metrics().success_rate().unwrap();
     assert!((rate - 0.6667).abs() < 0.01);
 }
 
 #[test]
 fn link_table_directed() {
     use snp_node::node::LinkTable;
-    let (sk_a, pk_a) = fresh_keypair(b"lt-a");
-    let (sk_b, pk_b) = fresh_keypair(b"lt-b");
+    let (_sk_a, pk_a) = fresh_keypair(b"lt-a");
     let node_a = derive_node_id(&pk_a);
-    let node_b = derive_node_id(&pk_b);
+    let (advert_b, _, _) = make_relay_advert(b"lt-b", 1, "127.0.0.1:1");
+    let verified_b = advert_b.verify_into_verified().expect("verify B");
+    let node_b = verified_b.node_id();
 
     let mut table = LinkTable::new();
     // A → B link.
     let key_ab = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    table.insert_for_testing(Link::new_up_for_testing(key_ab.clone(), None));
+    table.insert_authenticated(test_authenticated_link(key_ab.clone(), &verified_b).unwrap());
 
     // links_from(A) should return the A→B link.
     let from_a = table.links_from(&node_a);
     assert_eq!(from_a.len(), 1);
-    assert_eq!(from_a[0].key.remote_node_id, node_b);
+    assert_eq!(from_a[0].key().remote_node_id, node_b);
 
     // links_to(B) should return the A→B link.
     let to_b = table.links_to(&node_b);
     assert_eq!(to_b.len(), 1);
-    assert_eq!(to_b[0].key.local_node_id, node_a);
+    assert_eq!(to_b[0].key().local_node_id, node_a);
 
     // links_from(B) should be empty (no B→A link).
     let from_b = table.links_from(&node_b);
@@ -130,7 +135,7 @@ fn link_table_directed() {
 #[test]
 fn peer_directory_accepts_new_advertisement() {
     let mut dir = PeerDirectory::new();
-    let (advert, _, pk) = make_relay_advert(b"dir-relay", 1);
+    let (advert, _, pk) = make_relay_advert(b"dir-relay", 1, "127.0.0.1:1234");
     let verified = advert.verify_into_verified().expect("must verify");
     let result = dir.accept_advertisement(verified).expect("accept");
     assert!(matches!(result, snp_node::node::AcceptanceResult::Accepted(_)));
@@ -140,11 +145,11 @@ fn peer_directory_accepts_new_advertisement() {
 #[test]
 fn peer_directory_rejects_stale_advertisement() {
     let mut dir = PeerDirectory::new();
-    let (advert2, _, _) = make_relay_advert(b"dir-stale", 2);
+    let (advert2, _, _) = make_relay_advert(b"dir-stale", 2, "127.0.0.1:1234");
     let verified2 = advert2.verify_into_verified().expect("must verify");
     dir.accept_advertisement(verified2).expect("accept 2");
 
-    let (advert1, _, _) = make_relay_advert(b"dir-stale", 1);
+    let (advert1, _, _) = make_relay_advert(b"dir-stale", 1, "127.0.0.1:1234");
     let verified1 = advert1.verify_into_verified().expect("must verify");
     let result = dir.accept_advertisement(verified1).expect("accept 1");
     assert!(matches!(result, snp_node::node::AcceptanceResult::Stale { .. }));
@@ -153,7 +158,7 @@ fn peer_directory_rejects_stale_advertisement() {
 #[test]
 fn peer_directory_rejects_duplicate_advertisement() {
     let mut dir = PeerDirectory::new();
-    let (advert, sk, _) = make_relay_advert(b"dir-dup", 5);
+    let (advert, sk, _) = make_relay_advert(b"dir-dup", 5, "127.0.0.1:1");
     let verified1 = advert.verify_into_verified().expect("must verify");
     dir.accept_advertisement(verified1).expect("accept 1");
 
@@ -171,7 +176,7 @@ fn peer_directory_rejects_duplicate_advertisement() {
 #[test]
 fn peer_directory_purge_makes_stale_not_removed() {
     let mut dir = PeerDirectory::new();
-    let (advert, _, pk) = make_relay_advert(b"dir-purge", 1);
+    let (advert, _, pk) = make_relay_advert(b"dir-purge", 1, "127.0.0.1:1234");
     let verified = advert.verify_into_verified().expect("must verify");
     dir.accept_advertisement(verified).expect("accept");
     let node_id = derive_node_id(&pk);
@@ -191,7 +196,7 @@ fn peer_directory_purge_makes_stale_not_removed() {
 #[test]
 fn peer_directory_remove_peer_is_explicit() {
     let mut dir = PeerDirectory::new();
-    let (advert, _, pk) = make_relay_advert(b"dir-remove", 1);
+    let (advert, _, pk) = make_relay_advert(b"dir-remove", 1, "127.0.0.1:1234");
     let verified = advert.verify_into_verified().expect("must verify");
     dir.accept_advertisement(verified).expect("accept");
     let node_id = derive_node_id(&pk);
@@ -209,14 +214,15 @@ fn peer_directory_remove_peer_is_explicit() {
 #[test]
 fn topology_graph_directed_links() {
     let mut graph = TopologyGraph::new();
-    let (sk_a, pk_a) = fresh_keypair(b"tg-a");
-    let (sk_b, pk_b) = fresh_keypair(b"tg-b");
+    let (_sk_a, pk_a) = fresh_keypair(b"tg-a");
     let node_a = derive_node_id(&pk_a);
+    let (advert_b, _, pk_b) = make_relay_advert(b"tg-b", 1, "127.0.0.1:1");
+    let verified_b = advert_b.verify_into_verified().expect("verify B");
     let node_b = derive_node_id(&pk_b);
 
     // A → B link only.
     let key_ab = LinkKey::new(node_a, node_b, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(key_ab, None));
+    graph.add_authenticated_link(test_authenticated_link(key_ab, &verified_b).unwrap());
 
     // neighbors(A) should return 1 link.
     let neighbors_a = graph.neighbors(&node_a);
@@ -235,20 +241,20 @@ fn topology_graph_directed_links() {
 #[test]
 fn topology_graph_reachable_gateways() {
     let mut graph = TopologyGraph::new();
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"tg-gw", 1);
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"tg-gw", 1, "127.0.0.1:1");
     let gw_verified = gw_advert.verify_into_verified().expect("must verify");
-    graph.accept_advertisement(gw_verified).expect("accept");
+    graph.accept_advertisement(gw_verified.clone()).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
 
-    let (relay_advert, _, relay_pk) = make_relay_advert(b"tg-relay", 1);
+    let (relay_advert, _, relay_pk) = make_relay_advert(b"tg-relay", 1, "127.0.0.1:1234");
     let relay_verified = relay_advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(relay_verified).expect("accept");
-    let relay_id = derive_node_id(&relay_pk);
+    let _relay_id = derive_node_id(&relay_pk);
 
     // Add a link to the gateway (making it directly reachable).
     let local_id = [0xAA; 32]; // Our own NodeId.
     let gw_link_key = LinkKey::new(local_id, gw_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(gw_link_key, None));
+    graph.add_authenticated_link(test_authenticated_link(gw_link_key, &gw_verified).unwrap());
 
     // direct_gateways() should return 1 gateway.
     let gateways = graph.direct_gateways();
@@ -263,14 +269,14 @@ fn topology_graph_reachable_gateways() {
 #[test]
 fn topology_graph_snapshot_is_immutable() {
     let mut graph = TopologyGraph::new();
-    let (advert, _, pk) = make_relay_advert(b"tg-snap", 1);
+    let (advert, _, pk) = make_relay_advert(b"tg-snap", 1, "127.0.0.1:1");
     let verified = advert.verify_into_verified().expect("must verify");
-    graph.accept_advertisement(verified).expect("accept");
+    graph.accept_advertisement(verified.clone()).expect("accept");
     let node_id = derive_node_id(&pk);
 
     let local_id = [0xBB; 32];
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
+    graph.add_authenticated_link(test_authenticated_link(key.clone(), &verified).unwrap());
 
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.links.len(), 1);
@@ -287,14 +293,14 @@ fn topology_graph_remote_propagation() {
     let mut graph = TopologyGraph::new();
 
     // We know about a direct relay.
-    let (relay_advert, _, relay_pk) = make_relay_advert(b"tg-prop-relay", 1);
+    let (relay_advert, _, relay_pk) = make_relay_advert(b"tg-prop-relay", 1, "127.0.0.1:1234");
     let relay_verified = relay_advert.verify_into_verified().expect("must verify");
     graph.accept_advertisement(relay_verified).expect("accept");
     let relay_id = derive_node_id(&relay_pk);
 
     // Simulate receiving a PeerSummaryList from the relay.
     // The relay tells us about a remote gateway.
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"tg-prop-gw", 42);
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"tg-prop-gw", 42, "127.0.0.1:5678");
     let gw_id = derive_node_id(&gw_pk);
     let gw_summary = PeerSummary {
         node_id: gw_id,
@@ -334,17 +340,17 @@ fn topology_graph_generate_peer_summaries() {
     let mut graph = TopologyGraph::new();
 
     // Add a direct relay.
-    let (relay_advert, _, _) = make_relay_advert(b"tg-gen-relay", 1);
+    let (relay_advert, _, _) = make_relay_advert(b"tg-gen-relay", 1, "127.0.0.1:1");
     let relay_verified = relay_advert.verify_into_verified().expect("must verify");
-    graph.accept_advertisement(relay_verified).expect("accept");
+    graph.accept_advertisement(relay_verified.clone()).expect("accept");
 
     // Add a link to the relay (making it "active").
-    let (sk_local, pk_local) = fresh_keypair(b"tg-gen-local");
+    let (_sk_local, pk_local) = fresh_keypair(b"tg-gen-local");
     let local_id = derive_node_id(&pk_local);
-    let (relay_sk, relay_pk) = fresh_keypair(b"tg-gen-relay");
+    let (_relay_sk, relay_pk) = fresh_keypair(b"tg-gen-relay");
     let relay_id = derive_node_id(&relay_pk);
     let key = LinkKey::new(local_id, relay_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(key, None));
+    graph.add_authenticated_link(test_authenticated_link(key, &relay_verified).unwrap());
 
     let summaries = graph.generate_peer_summaries();
     assert!(summaries.len() >= 1, "should generate at least 1 summary");
@@ -354,15 +360,15 @@ fn topology_graph_generate_peer_summaries() {
 #[test]
 fn node_churn_appears_disappears_returns() {
     let mut graph = TopologyGraph::new();
-    let (advert, _, pk) = make_relay_advert(b"tg-churn", 1);
+    let (advert, _, pk) = make_relay_advert(b"tg-churn", 1, "127.0.0.1:1");
     let verified = advert.verify_into_verified().expect("must verify");
-    graph.accept_advertisement(verified).expect("accept");
+    graph.accept_advertisement(verified.clone()).expect("accept");
     let node_id = derive_node_id(&pk);
     let local_id = [0xCC; 32];
 
     // Node appears: add link.
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
+    graph.add_authenticated_link(test_authenticated_link(key.clone(), &verified).unwrap());
     assert!(graph.is_directly_reachable(&node_id));
     assert_eq!(graph.visibility(&node_id), PeerVisibility::Active);
 
@@ -446,7 +452,7 @@ fn peer_summary_list_tampered_rejected() {
 
 #[test]
 fn peer_summary_from_record() {
-    let (advert, _, _) = make_gateway_advert(b"summary-record", 1);
+    let (advert, _, _) = make_gateway_advert(b"summary-record", 1, "127.0.0.1:5678");
     let verified = advert.verify_into_verified().expect("must verify");
     let record = verified.into_record();
     let summary = PeerSummary::from_record(&record, 2, now_unix());
@@ -460,14 +466,14 @@ fn peer_summary_from_record() {
 #[test]
 fn link_failure_makes_node_unreachable_but_known() {
     let mut graph = TopologyGraph::new();
-    let (advert, _, pk) = make_relay_advert(b"tg-fail", 1);
+    let (advert, _, pk) = make_relay_advert(b"tg-fail", 1, "127.0.0.1:1");
     let verified = advert.verify_into_verified().expect("must verify");
-    graph.accept_advertisement(verified).expect("accept");
+    graph.accept_advertisement(verified.clone()).expect("accept");
     let node_id = derive_node_id(&pk);
     let local_id = [0xFF; 32];
 
     let key = LinkKey::new(local_id, node_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    graph.add_link_for_testing(Link::new_up_for_testing(key.clone(), None));
+    graph.add_authenticated_link(test_authenticated_link(key.clone(), &verified).unwrap());
     assert!(graph.is_directly_reachable(&node_id));
     assert!(graph.is_known(&node_id));
 
@@ -550,14 +556,15 @@ fn direct_gateways_excludes_remote_hints() {
     let mut graph = TopologyGraph::new();
 
     // Add an authenticated direct relay (not a gateway).
-    let (relay_advert, _, relay_pk) = make_relay_advert(b"direct-relay", 1);
-    graph.accept_advertisement(relay_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (relay_advert, _, relay_pk) = make_relay_advert(b"direct-relay", 1, "127.0.0.1:1");
+    let relay_verified = relay_advert.verify_into_verified().expect("verify");
+    graph.accept_advertisement(relay_verified.clone()).expect("accept");
     let relay_id = derive_node_id(&relay_pk);
     let local = [0xCC; 32];
-    graph.add_link_for_testing(Link::new_up_for_testing(
+    graph.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, relay_id, TransportEndpoint::tcp("127.0.0.1:1")),
-        None,
-    ));
+        &relay_verified,
+    ).unwrap());
 
     // Add a remote hint claiming a gateway exists.
     let fake_gw = PeerSummary {
@@ -648,14 +655,15 @@ fn multi_hop_destination_discovery_without_authentication() {
     let mut graph_a = TopologyGraph::new();
 
     // A knows B directly (authenticated).
-    let (b_advert, _, b_pk) = make_relay_advert(b"multi-b", 1);
-    graph_a.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (b_advert, _, b_pk) = make_relay_advert(b"multi-b", 1, "127.0.0.1:1");
+    let b_verified = b_advert.verify_into_verified().expect("verify");
+    graph_a.accept_advertisement(b_verified.clone()).expect("accept");
     let b_id = derive_node_id(&b_pk);
     let a_local = [0x11; 32];
-    graph_a.add_link_for_testing(Link::new_up_for_testing(
+    graph_a.add_authenticated_link(test_authenticated_link(
         LinkKey::new(a_local, b_id, TransportEndpoint::tcp("127.0.0.1:1")),
-        None,
-    ));
+        &b_verified,
+    ).unwrap());
 
     // B sends a summary to A claiming C exists (1 hop from B).
     let c_id = [0x22; 32];

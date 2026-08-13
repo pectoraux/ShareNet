@@ -222,32 +222,16 @@ impl TopologyGraph {
 
     // ─── Link operations ──────────────────────────────────────────────────
 
-    /// **N2.1.2.2: Production path.** Add an authenticated link to the topology.
+    /// **N2.1.2.3: Production path.** Add an authenticated link to the topology.
     ///
-    /// This is the ONLY public method for adding links in production builds.
-    /// It requires an `AuthenticatedLink`, which can only be constructed
-    /// via `AuthenticatedLink::from_verified_handshake` — proving the remote
-    /// identity was verified and the endpoint was authorized by the remote
-    /// node's authenticated advertisement.
+    /// This is the ONLY public method for adding links. It requires an
+    /// `AuthenticatedLink`, which can only be constructed via
+    /// `AuthenticatedLink::from_handshake` — requiring an actual
+    /// `snp_link::HandshakeResult` whose peer identity and public key match
+    /// the verified advertisement, and whose endpoint is authorized by the
+    /// advertisement.
     pub fn add_authenticated_link(&mut self, auth_link: AuthenticatedLink) {
         self.directory.add_authenticated_link(auth_link);
-    }
-
-    /// **N2.1.2.2: NOT public in production.** Add a link to the topology.
-    ///
-    /// This method is `pub(crate)` — available only within the `snp-node`
-    /// crate. In production, use `add_authenticated_link()`.
-    pub(crate) fn add_link(&mut self, link: Link) {
-        self.directory.add_link(link);
-    }
-
-    /// Add a link to the topology without authentication.
-    ///
-    /// This is available ONLY when the `test-support` Cargo feature is enabled.
-    /// **Production code MUST NOT use this.**
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn add_link_for_testing(&mut self, link: Link) {
-        self.directory.add_link_for_testing(link);
     }
 
     /// Update a link's state.
@@ -435,15 +419,15 @@ impl TopologyGraph {
 
     // ─── Queries ──────────────────────────────────────────────────────────
 
-    /// Get all outgoing links from a node (direct knowledge only).
+    /// Get all outgoing authenticated links from a node (direct knowledge only).
     #[must_use]
-    pub fn neighbors(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn neighbors(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.directory.links_from(node_id)
     }
 
-    /// Get all usable outgoing links from a node.
+    /// Get all usable outgoing authenticated links from a node.
     #[must_use]
-    pub fn usable_neighbors(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn usable_neighbors(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.directory.usable_links_from(node_id)
     }
 
@@ -575,8 +559,8 @@ impl Default for TopologyGraph {
 pub struct TopologySnapshot {
     /// Direct authenticated nodes (NodeId → AuthenticatedNodeRecord).
     pub direct_nodes: HashMap<[u8; 32], AuthenticatedNodeRecord>,
-    /// Direct links (LinkKey → Link).
-    pub links: HashMap<LinkKey, Link>,
+    /// Direct authenticated links (LinkKey → AuthenticatedLink).
+    pub links: HashMap<LinkKey, AuthenticatedLink>,
     /// Remote hints (NodeId → RemoteNodeHint). Non-authoritative.
     pub remote_hints: HashMap<[u8; 32], RemoteNodeHint>,
 }
@@ -590,7 +574,7 @@ impl TopologySnapshot {
             .directory
             .link_table()
             .all()
-            .flat_map(|l| [l.key.local_node_id, l.key.remote_node_id])
+            .flat_map(|l| [l.local_node_id(), l.remote_node_id()])
             .collect::<HashSet<_>>()
         {
             if let Some(record) = graph.directory.get_record(&node_id) {
@@ -601,7 +585,7 @@ impl TopologySnapshot {
         // Collect links.
         let mut links = HashMap::new();
         for link in graph.directory.link_table().all() {
-            links.insert(link.key.clone(), link.clone());
+            links.insert(link.key().clone(), link.clone());
         }
 
         // Collect remote hints.
@@ -614,12 +598,12 @@ impl TopologySnapshot {
         }
     }
 
-    /// Get usable outgoing links from a node.
+    /// Get usable outgoing authenticated links from a node.
     #[must_use]
-    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links
             .values()
-            .filter(|l| l.key.local_node_id == *node_id && l.is_usable())
+            .filter(|l| l.local_node_id() == *node_id && l.is_usable())
             .collect()
     }
 
@@ -633,7 +617,7 @@ impl TopologySnapshot {
             .filter(|r| {
                 self.links
                     .values()
-                    .any(|l| l.key.remote_node_id == r.descriptor.node_id() && l.is_usable())
+                    .any(|l| l.remote_node_id() == r.descriptor.node_id() && l.is_usable())
             })
             .collect()
     }
@@ -652,6 +636,6 @@ impl TopologySnapshot {
     pub fn is_directly_reachable(&self, node_id: &[u8; 32]) -> bool {
         self.links
             .values()
-            .any(|l| l.key.remote_node_id == *node_id && l.is_usable())
+            .any(|l| l.remote_node_id() == *node_id && l.is_usable())
     }
 }

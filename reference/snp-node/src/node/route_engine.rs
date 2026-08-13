@@ -127,7 +127,7 @@
 //! The `InMemoryResolver` is TEST-ONLY and MUST NOT be used in production.
 
 use super::*;
-use crate::node::link::{Link, LinkKey, LinkState};
+use crate::node::link::{AuthenticatedLink, Link, LinkKey, LinkState};
 use crate::node::topology::RemoteNodeHint;
 use std::collections::{HashMap, HashSet};
 
@@ -136,14 +136,14 @@ use std::collections::{HashMap, HashSet};
 /// Ordered by (cost, counter) — BinaryHeap is a max-heap, so we use
 /// `Reverse` ordering via `Ord` implementation to make it a min-heap.
 /// The `counter` breaks ties in cost to ensure deterministic ordering
-/// and avoids comparing `Vec<Link>` (which doesn't implement `Ord`).
+/// and avoids comparing `Vec<AuthenticatedLink>` (which doesn't implement `Ord`).
 #[derive(Debug, Clone)]
 struct HeapEntry {
     cost: u64,
     counter: u64,
     node: [u8; 32],
     path: Vec<[u8; 32]>,
-    links: Vec<Link>,
+    links: Vec<AuthenticatedLink>,
 }
 
 impl PartialEq for HeapEntry {
@@ -586,7 +586,7 @@ pub trait RouteCostModel {
     /// - `links`: The ordered directed links forming the path.
     /// - `nodes`: The ordered authenticated nodes (excluding source, including
     ///   destination).
-    fn path_cost(&self, links: &[&Link], nodes: &[&AuthenticatedNodeRecord]) -> u64;
+    fn path_cost(&self, links: &[&AuthenticatedLink], nodes: &[&AuthenticatedNodeRecord]) -> u64;
 }
 
 /// The default cost model: minimize hop count.
@@ -597,13 +597,13 @@ pub trait RouteCostModel {
 pub struct HopCountCost;
 
 impl RouteCostModel for HopCountCost {
-    fn path_cost(&self, links: &[&Link], _nodes: &[&AuthenticatedNodeRecord]) -> u64 {
+    fn path_cost(&self, links: &[&AuthenticatedLink], _nodes: &[&AuthenticatedNodeRecord]) -> u64 {
         // Primary: hop count. Each hop contributes a large base cost.
         // Secondary: total RTT (measured). Lower RTT is better.
         let hop_cost = links.len() as u64 * 1_000_000;
         let rtt_cost: u64 = links
             .iter()
-            .map(|l| l.metrics.rtt_micros.unwrap_or(0))
+            .map(|l| l.metrics().rtt_micros.unwrap_or(0))
             .sum();
         hop_cost + rtt_cost
     }
@@ -614,10 +614,10 @@ impl RouteCostModel for HopCountCost {
 pub struct LowLatencyCost;
 
 impl RouteCostModel for LowLatencyCost {
-    fn path_cost(&self, links: &[&Link], _nodes: &[&AuthenticatedNodeRecord]) -> u64 {
+    fn path_cost(&self, links: &[&AuthenticatedLink], _nodes: &[&AuthenticatedNodeRecord]) -> u64 {
         links
             .iter()
-            .map(|l| l.metrics.rtt_micros.unwrap_or(100_000)) // penalize unknown RTT
+            .map(|l| l.metrics().rtt_micros.unwrap_or(100_000)) // penalize unknown RTT
             .sum()
     }
 }
@@ -812,20 +812,20 @@ impl RouteEngine {
         // topology. The path engine checks these if the local topology
         // doesn't have the record.
         extra_records: &HashMap<[u8; 32], AuthenticatedNodeRecord>,
-    ) -> Option<(Vec<[u8; 32]>, Vec<Link>, u64)> {
+    ) -> Option<(Vec<[u8; 32]>, Vec<AuthenticatedLink>, u64)> {
         if self.source == [0u8; 32] {
             return None;
         }
 
         // Build adjacency: for each node, list of outgoing LinkKeys.
-        // Only usable directed links are included.
+        // Only usable directed authenticated links are included.
         let mut adjacency: HashMap<[u8; 32], Vec<LinkKey>> = HashMap::new();
-        for link in topology.directory().link_table().all() {
-            if link.is_usable() {
+        for auth in topology.directory().link_table().all() {
+            if auth.is_usable() {
                 adjacency
-                    .entry(link.key.local_node_id)
+                    .entry(auth.local_node_id())
                     .or_default()
-                    .push(link.key.clone());
+                    .push(auth.key().clone());
             }
         }
 
@@ -880,8 +880,8 @@ impl RouteEngine {
                     if visited.contains(&neighbor) {
                         continue;
                     }
-                    // Get the link object.
-                    let link = topology.directory().link_table().get(nkey)?;
+                    // Get the authenticated link object.
+                    let auth_link = topology.directory().link_table().get(nkey)?;
                     // Get the neighbor's authenticated record (local or extra).
                     let neighbor_record = topology
                         .get_record(&neighbor)
@@ -893,8 +893,8 @@ impl RouteEngine {
                     let neighbor_record = neighbor_record?;
 
                     // Compute incremental cost.
-                    let mut new_links: Vec<&Link> = links.iter().collect::<Vec<_>>();
-                    new_links.push(link);
+                    let mut new_links: Vec<&AuthenticatedLink> = links.iter().collect::<Vec<_>>();
+                    new_links.push(auth_link);
                     let mut new_nodes: Vec<&AuthenticatedNodeRecord> =
                         path.iter()
                             .filter_map(|nid| {
@@ -910,7 +910,7 @@ impl RouteEngine {
                         let mut new_path = path.clone();
                         new_path.push(neighbor);
                         let mut new_links_vec = links.clone();
-                        new_links_vec.push(link.clone());
+                        new_links_vec.push(auth_link.clone());
                         counter = counter.saturating_add(1);
                         heap.push(HeapEntry {
                             cost: new_cost,
@@ -1039,7 +1039,7 @@ impl RouteEngine {
         );
 
         let mut hop_details: Vec<RouteHop> = Vec::with_capacity(path.len());
-        for (hop_index, (node_id, link)) in path.iter().zip(links.iter()).enumerate() {
+        for (hop_index, (node_id, auth_link)) in path.iter().zip(links.iter()).enumerate() {
             let record = topology
                 .get_record(node_id)
                 .or_else(|| extra_records.get(node_id))
@@ -1065,7 +1065,9 @@ impl RouteEngine {
             // record.endpoints.first(). The link was proven usable by
             // Dijkstra, and its endpoint is the one that must appear in
             // the RouteHop and RouteCommitment.
-            let endpoint = link.key.endpoint.clone();
+            // N2.1.2.3: The link is an AuthenticatedLink — its endpoint
+            // is proven to be authorized by the remote node's advertisement.
+            let endpoint = auth_link.endpoint().clone();
             hop_details.push(RouteHop::new(record.descriptor.clone(), endpoint));
         }
 

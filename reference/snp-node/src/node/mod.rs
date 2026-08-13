@@ -138,7 +138,7 @@ pub use node_advert::{
 };
 pub use link::{
     AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
-    TransportType,
+    TransportType, VerifiedHandshake,
 };
 pub use topology_protocol::{
     GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,

@@ -4,11 +4,12 @@
 
 use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_static_keypair};
 use snp_node::node::{
-    CandidateOrigin, Capability, HopCountCost, InMemoryResolver, Link, LinkKey, LinkState,
+    CandidateOrigin, Capability, HopCountCost, InMemoryResolver, LinkKey, LinkState,
     NodeAdvertisement, NullResolver, RouteCandidateState, RouteDiscoveryError, RouteEngine,
     TopologyGraph, TransportEndpoint, VerifiedPeerSummaryList,
     DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
 };
+use snp_node::test_support::test_authenticated_link;
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
@@ -26,35 +27,35 @@ fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// Create a relay advertisement (signed, verified).
-fn make_relay_advert(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+fn make_relay_advert(label: &[u8], seq: u64, endpoint: &str) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
     let (sk, pk) = fresh_keypair(label);
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Relay],
-        vec![TransportEndpoint::tcp("127.0.0.1:1234")],
+        vec![TransportEndpoint::tcp(endpoint)],
         None, 3600, seq,
     );
     (advert, sk, pk)
 }
 
 /// Create a gateway advertisement (signed, verified, with X25519 key).
-fn make_gateway_advert(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+fn make_gateway_advert(label: &[u8], seq: u64, endpoint: &str) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
     let (sk, pk) = fresh_keypair(label);
     let (x_sk, x_pk) = x25519_static_keypair();
     let _ = x_sk; // suppress unused warning
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Gateway],
-        vec![TransportEndpoint::tcp("127.0.0.1:5678")],
+        vec![TransportEndpoint::tcp(endpoint)],
         Some(x_pk.to_bytes()), 3600, seq,
     );
     (advert, sk, pk)
 }
 
 /// Create a gateway advertisement WITHOUT an X25519 key (invalid for routing).
-fn make_gateway_no_x25519(label: &[u8], seq: u64) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+fn make_gateway_no_x25519(label: &[u8], seq: u64, endpoint: &str) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
     let (sk, pk) = fresh_keypair(label);
     let advert = NodeAdvertisement::create_and_sign(
         &sk, &pk, vec![Capability::Gateway],
-        vec![TransportEndpoint::tcp("127.0.0.1:9999")],
+        vec![TransportEndpoint::tcp(endpoint)],
         None, 3600, seq,
     );
     (advert, sk, pk)
@@ -85,43 +86,49 @@ fn build_chain(num_relays: usize) -> ChainTopology {
     let mut relays = Vec::new();
     let mut prev_id = local;
     let mut prev_label = b"chain-local".to_vec();
+    let mut prev_verified: Option<snp_node::node::VerifiedNodeAdvertisement> = None;
 
     for i in 0..num_relays {
         let label = format!("chain-relay-{i}");
-        let (advert, _, pk) = make_relay_advert(label.as_bytes(), 1);
+        let endpoint = format!("127.0.0.1:{port}", port = 2000 + i);
+        let (advert, _, pk) = make_relay_advert(label.as_bytes(), 1, &endpoint);
         let verified = advert.verify_into_verified().expect("relay must verify");
-        topology.accept_advertisement(verified).expect("accept relay");
+        topology.accept_advertisement(verified.clone()).expect("accept relay");
         let relay_id = derive_node_id(&pk);
         // Directed link: prev → relay
         let key = LinkKey::new(
             prev_id, relay_id,
-            TransportEndpoint::tcp(format!("127.0.0.1:{port}", port = 2000 + i)),
+            TransportEndpoint::tcp(endpoint),
         );
-        topology.add_link_for_testing(Link::new_up_for_testing(key, None));
+        // The remote side of this link is `relay_id`, so we authenticate against
+        // `verified` (the relay's advert), NOT `prev_verified`.
+        topology.add_authenticated_link(test_authenticated_link(key, &verified).unwrap());
         relays.push(relay_id);
         prev_id = relay_id;
         prev_label = label.into_bytes();
+        prev_verified = Some(verified);
     }
     let _ = prev_label;
+    let _ = prev_verified;
 
     // Gateway at the end.
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"chain-gateway", 1);
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"chain-gateway", 1, "127.0.0.1:3000");
     let gw_verified = gw_advert.verify_into_verified().expect("gateway must verify");
-    topology.accept_advertisement(gw_verified).expect("accept gateway");
+    topology.accept_advertisement(gw_verified.clone()).expect("accept gateway");
     let gateway = derive_node_id(&gw_pk);
     // Directed link: last relay → gateway
     let key = LinkKey::new(
         prev_id, gateway,
         TransportEndpoint::tcp("127.0.0.1:3000"),
     );
-    topology.add_link_for_testing(Link::new_up_for_testing(key, None));
+    topology.add_authenticated_link(test_authenticated_link(key, &gw_verified).unwrap());
 
     ChainTopology {
         topology,
         local,
         relays,
         gateway,
-        gateway_advert: make_gateway_advert(b"chain-gateway", 1).0,
+        gateway_advert: make_gateway_advert(b"chain-gateway", 1, "127.0.0.1:3000").0,
     }
 }
 
@@ -139,15 +146,16 @@ fn direct_gateway_route() {
     let local = derive_node_id(&local_pk);
     let _ = local_sk;
 
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"direct-gw", 1);
-    topology.accept_advertisement(gw_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"direct-gw", 1, "127.0.0.1:1");
+    let gw_verified = gw_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(gw_verified.clone()).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
 
     // Directed link: local → gw
-    topology.add_link_for_testing(Link::new_up_for_testing(
+    topology.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")),
-        None,
-    ));
+        &gw_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -302,16 +310,17 @@ fn directed_link_required() {
     let _ = local_sk;
 
     // Relay B (authenticated, link local → B).
-    let (b_advert, _, b_pk) = make_relay_advert(b"dir-relay-b", 1);
-    topology.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (b_advert, _, b_pk) = make_relay_advert(b"dir-relay-b", 1, "127.0.0.1:1");
+    let b_verified = b_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(b_verified.clone()).expect("accept");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
+    topology.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1")),
-        None,
-    ));
+        &b_verified,
+    ).unwrap());
 
     // Gateway C (authenticated, but NO link B → C).
-    let (c_advert, _, c_pk) = make_gateway_advert(b"dir-gw-c", 1);
+    let (c_advert, _, c_pk) = make_gateway_advert(b"dir-gw-c", 1, "127.0.0.1:5678");
     topology.accept_advertisement(c_advert.verify_into_verified().expect("verify")).expect("accept");
     let c_id = derive_node_id(&c_pk);
     // Add link local → C? No. We want to show that without B→C, no path.
@@ -344,15 +353,16 @@ fn stale_link_rejected() {
     let local = derive_node_id(&local_pk);
     let _ = local_sk;
 
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"stale-gw", 1);
-    topology.accept_advertisement(gw_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"stale-gw", 1, "127.0.0.1:1");
+    let gw_verified = gw_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(gw_verified.clone()).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
 
     // Link local → gw, but DOWN.
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1"));
-    let mut link = Link::new_up_for_testing(key.clone(), None);
-    link.state = LinkState::Down;
-    topology.add_link_for_testing(link);
+    let mut auth = test_authenticated_link(key.clone(), &gw_verified).expect("authenticated link");
+    auth.set_state(LinkState::Down);
+    topology.add_authenticated_link(auth);
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -426,7 +436,7 @@ fn unauthenticated_hop_rejected() {
     let _ = local_sk;
 
     // Gateway G — create advertisement but DON'T add to local topology.
-    let (g_advert, _, g_pk) = make_gateway_advert(b"unauth-gw", 1);
+    let (g_advert, _, g_pk) = make_gateway_advert(b"unauth-gw", 1, "127.0.0.1:5678");
     let g_id = derive_node_id(&g_pk);
     let g_verified = g_advert.verify_into_verified().expect("G must verify");
 
@@ -487,17 +497,15 @@ fn gateway_without_x25519_rejected() {
     // Note: NodeAdvertisement::create_and_sign allows this, but
     // verify_into_verified() enforces role/key consistency:
     // Gateway MUST have X25519. So this won't verify.
-    let (gw_advert, _, gw_pk) = make_gateway_no_x25519(b"nox25519-gw", 1);
+    let (gw_advert, _, gw_pk) = make_gateway_no_x25519(b"nox25519-gw", 1, "127.0.0.1:1");
     assert!(gw_advert.verify_into_verified().is_none(),
         "gateway without X25519 must not verify (role/key consistency)");
 
-    // Since it can't be verified, it can't be accepted into the topology.
-    // So it won't appear as a candidate.
+    // Since it can't be verified, it can't be accepted into the topology,
+    // and no AuthenticatedLink can be constructed for it (construction
+    // requires a VerifiedNodeAdvertisement). So no link can be added,
+    // and the gateway won't appear as a candidate.
     let gw_id = derive_node_id(&gw_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")),
-        None,
-    ));
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -516,35 +524,37 @@ fn route_commitment_changes_when_hop_changes() {
     let _ = local_sk;
 
     // Two relays, both leading to the same gateway.
-    let (r1_advert, _, r1_pk) = make_relay_advert(b"commit-relay-1", 1);
-    topology.accept_advertisement(r1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r1_advert, _, r1_pk) = make_relay_advert(b"commit-relay-1", 1, "127.0.0.1:1");
+    let r1_verified = r1_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r1_verified.clone()).expect("accept");
     let r1_id = derive_node_id(&r1_pk);
 
-    let (r2_advert, _, r2_pk) = make_relay_advert(b"commit-relay-2", 1);
-    topology.accept_advertisement(r2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r2_advert, _, r2_pk) = make_relay_advert(b"commit-relay-2", 1, "127.0.0.1:3");
+    let r2_verified = r2_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r2_verified.clone()).expect("accept");
     let r2_id = derive_node_id(&r2_pk);
 
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"commit-gw", 1);
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"commit-gw", 1, "127.0.0.1:5678");
     let gw_verified = gw_advert.verify_into_verified().expect("verify");
-    let gw_record = gw_verified.into_record();
+    let gw_record = gw_verified.clone().into_record();
     topology.accept_advertisement(
-        make_gateway_advert(b"commit-gw", 1).0.verify_into_verified().expect("verify")
+        make_gateway_advert(b"commit-gw", 1, "127.0.0.1:5678").0.verify_into_verified().expect("verify")
     ).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
 
     // Links: local → r1 → gw, and local → r2 → gw.
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
-    ));
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
-    ));
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), &r1_verified,
+    ).unwrap());
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:5678")), &gw_verified,
+    ).unwrap());
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:3")), &r2_verified,
+    ).unwrap());
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:5678")), &gw_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -692,12 +702,13 @@ fn route_resolution_survives_alternate_candidate() {
     let _ = local_sk;
 
     // Two gateways: G1 (reachable) and G2 (only a hint, unresolvable).
-    let (g1_advert, _, g1_pk) = make_gateway_advert(b"alt-gw-1", 1);
-    topology.accept_advertisement(g1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (g1_advert, _, g1_pk) = make_gateway_advert(b"alt-gw-1", 1, "127.0.0.1:1");
+    let g1_verified = g1_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(g1_verified.clone()).expect("accept");
     let g1_id = derive_node_id(&g1_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, g1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, g1_id, TransportEndpoint::tcp("127.0.0.1:1")), &g1_verified,
+    ).unwrap());
 
     // Hint about G2 (fake, unresolvable).
     let (sender_sk, sender_pk) = fresh_keypair(b"alt-sender");
@@ -742,16 +753,17 @@ fn candidate_gateway_discovery_from_remote_hint() {
     let _ = local_sk;
 
     // Relay B (authenticated, link local → B).
-    let (b_advert, _, b_pk) = make_relay_advert(b"cand-relay-b", 1);
-    topology.accept_advertisement(b_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (b_advert, _, b_pk) = make_relay_advert(b"cand-relay-b", 1, "127.0.0.1:1");
+    let b_verified = b_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(b_verified.clone()).expect("accept");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1")), &b_verified,
+    ).unwrap());
 
     // Gateway G (create advertisement, but DON'T add to local topology).
     // G is only known through a hint.
-    let (g_advert, _, g_pk) = make_gateway_advert(b"cand-gw-g", 1);
+    let (g_advert, _, g_pk) = make_gateway_advert(b"cand-gw-g", 1, "127.0.0.1:2");
     let g_id = derive_node_id(&g_pk);
     let g_verified = g_advert.verify_into_verified().expect("G must verify");
 
@@ -776,7 +788,7 @@ fn candidate_gateway_discovery_from_remote_hint() {
 
     // Resolver: can resolve G's advertisement.
     let mut resolver = InMemoryResolver::new();
-    resolver.register_verified(g_verified);
+    resolver.register_verified(g_verified.clone());
 
     // BUT: there's no link B → G in the local topology!
     // So path computation will fail (NoPathFound) because the local
@@ -785,9 +797,9 @@ fn candidate_gateway_discovery_from_remote_hint() {
     // For a complete test, we need to also add a link B → G.
     // In a real system, this link would be discovered through the relay.
     // For this test, we simulate it by adding the link.
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(b_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(b_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), &g_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &resolver, &HopCountCost);
@@ -850,34 +862,36 @@ fn local_topology_multi_hop_route_with_destination_resolution() {
     let _ = a_sk;
 
     // Relay B (authenticated, link A → B).
-    let (b_advert, b_sk, b_pk) = make_relay_advert(b"north-b", 1);
-    topology.accept_advertisement(b_advert.verify_into_verified().expect("verify B")).expect("accept B");
+    let (b_advert, b_sk, b_pk) = make_relay_advert(b"north-b", 1, "127.0.0.1:1001");
+    let b_verified = b_advert.verify_into_verified().expect("verify B");
+    topology.accept_advertisement(b_verified.clone()).expect("accept B");
     let b_id = derive_node_id(&b_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(a_id, b_id, TransportEndpoint::tcp("127.0.0.1:1001")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(a_id, b_id, TransportEndpoint::tcp("127.0.0.1:1001")), &b_verified,
+    ).unwrap());
 
     // Relay C (authenticated, link B → C).
     // C is NOT directly known to A through a link, but B has a link to C.
     // For the path to work, C must be in the local topology (authenticated)
     // and the link B → C must exist.
-    let (c_advert, _, c_pk) = make_relay_advert(b"north-c", 1);
-    topology.accept_advertisement(c_advert.verify_into_verified().expect("verify C")).expect("accept C");
+    let (c_advert, _, c_pk) = make_relay_advert(b"north-c", 1, "127.0.0.1:1002");
+    let c_verified = c_advert.verify_into_verified().expect("verify C");
+    topology.accept_advertisement(c_verified.clone()).expect("accept C");
     let c_id = derive_node_id(&c_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(b_id, c_id, TransportEndpoint::tcp("127.0.0.1:1002")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(b_id, c_id, TransportEndpoint::tcp("127.0.0.1:1002")), &c_verified,
+    ).unwrap());
 
     // Gateway G — create advertisement but DON'T add to local topology.
     // G is only known through a hint.
-    let (g_advert, _, g_pk) = make_gateway_advert(b"north-g", 1);
+    let (g_advert, _, g_pk) = make_gateway_advert(b"north-g", 1, "127.0.0.1:1003");
     let g_id = derive_node_id(&g_pk);
     let g_verified = g_advert.verify_into_verified().expect("G must verify");
 
     // Link C → G (exists in the topology, simulating that C has probed G).
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(c_id, g_id, TransportEndpoint::tcp("127.0.0.1:1003")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(c_id, g_id, TransportEndpoint::tcp("127.0.0.1:1003")), &g_verified,
+    ).unwrap());
 
     // A receives a hint from B: "G is a gateway, ~1 hop from B (2 hops from A)."
     let summary = snp_node::node::PeerSummary {
@@ -970,12 +984,13 @@ fn candidate_origin_distinguishes_direct_vs_remote() {
     let _ = local_sk;
 
     // Direct gateway.
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"origin-direct-gw", 1);
-    topology.accept_advertisement(gw_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"origin-direct-gw", 1, "127.0.0.1:1");
+    let gw_verified = gw_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(gw_verified.clone()).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1")), &gw_verified,
+    ).unwrap());
 
     // Remote hint.
     let (sender_sk, sender_pk) = fresh_keypair(b"origin-sender");
@@ -1025,19 +1040,20 @@ fn distance_hint_does_not_affect_route_cost() {
     let _ = local_sk;
 
     // Relay + gateway chain.
-    let (r_advert, _, r_pk) = make_relay_advert(b"dist-relay", 1);
-    topology.accept_advertisement(r_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r_advert, _, r_pk) = make_relay_advert(b"dist-relay", 1, "127.0.0.1:1");
+    let r_verified = r_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r_verified.clone()).expect("accept");
     let r_id = derive_node_id(&r_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, r_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, r_id, TransportEndpoint::tcp("127.0.0.1:1")), &r_verified,
+    ).unwrap());
 
-    let (g_advert, _, g_pk) = make_gateway_advert(b"dist-gw", 1);
+    let (g_advert, _, g_pk) = make_gateway_advert(b"dist-gw", 1, "127.0.0.1:2");
     let g_verified = g_advert.verify_into_verified().expect("verify");
     let g_id = derive_node_id(&g_pk);
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(r_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(r_id, g_id, TransportEndpoint::tcp("127.0.0.1:2")), &g_verified,
+    ).unwrap());
 
     // Hint 1: distance_hint = 1.
     let (s1_sk, s1_pk) = fresh_keypair(b"dist-sender-1");
@@ -1143,42 +1159,53 @@ fn low_latency_cost_model_selects_better_path() {
     // Two paths to the same gateway:
     // Path 1: local → r1 → gw (r1 has high RTT)
     // Path 2: local → r2 → gw (r2 has low RTT)
-    let (r1_advert, _, r1_pk) = make_relay_advert(b"lat-relay-1", 1);
-    topology.accept_advertisement(r1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r1_advert, _, r1_pk) = make_relay_advert(b"lat-relay-1", 1, "127.0.0.1:1");
+    let r1_verified = r1_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r1_verified.clone()).expect("accept");
     let r1_id = derive_node_id(&r1_pk);
-    let (r2_advert, _, r2_pk) = make_relay_advert(b"lat-relay-2", 1);
-    topology.accept_advertisement(r2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r2_advert, _, r2_pk) = make_relay_advert(b"lat-relay-2", 1, "127.0.0.1:2");
+    let r2_verified = r2_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r2_verified.clone()).expect("accept");
     let r2_id = derive_node_id(&r2_pk);
 
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"lat-gw", 1);
-    topology.accept_advertisement(gw_advert.verify_into_verified().expect("verify")).expect("accept");
+    // Gateway G advertises BOTH endpoints used by the two upstream relays
+    // (r1→gw uses 127.0.0.1:3, r2→gw uses 127.0.0.1:4).
+    let (gw_advert, _, gw_pk) = make_gateway_advert_multi_endpoint(
+        b"lat-gw", 1,
+        vec![
+            TransportEndpoint::tcp("127.0.0.1:3"),
+            TransportEndpoint::tcp("127.0.0.1:4"),
+        ],
+    );
+    let gw_verified = gw_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(gw_verified.clone()).expect("accept");
     let gw_id = derive_node_id(&gw_pk);
 
     // Links with different RTTs.
-    let mut link1 = Link::new_up_for_testing(
-        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    );
+    let mut link1 = test_authenticated_link(
+        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), &r1_verified,
+    ).unwrap();
     link1.record_success(500_000); // 500ms RTT
 
-    let mut link2 = Link::new_up_for_testing(
-        LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
-    );
+    let mut link2 = test_authenticated_link(
+        LinkKey::new(local, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), &r2_verified,
+    ).unwrap();
     link2.record_success(10_000); // 10ms RTT
 
-    topology.add_link_for_testing(link1);
-    topology.add_link_for_testing(link2);
+    topology.add_authenticated_link(link1);
+    topology.add_authenticated_link(link2);
 
-    let mut link3 = Link::new_up_for_testing(
-        LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
-    );
+    let mut link3 = test_authenticated_link(
+        LinkKey::new(r1_id, gw_id, TransportEndpoint::tcp("127.0.0.1:3")), &gw_verified,
+    ).unwrap();
     link3.record_success(500_000);
-    topology.add_link_for_testing(link3);
+    topology.add_authenticated_link(link3);
 
-    let mut link4 = Link::new_up_for_testing(
-        LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
-    );
+    let mut link4 = test_authenticated_link(
+        LinkKey::new(r2_id, gw_id, TransportEndpoint::tcp("127.0.0.1:4")), &gw_verified,
+    ).unwrap();
     link4.record_success(10_000);
-    topology.add_link_for_testing(link4);
+    topology.add_authenticated_link(link4);
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &LowLatencyCost);
@@ -1251,15 +1278,16 @@ fn selected_link_endpoint_is_route_endpoint() {
             TransportEndpoint::tcp("127.0.0.1:2222"),  // ep2 (second in advertisement)
         ],
     );
-    topology.accept_advertisement(g_advert.verify_into_verified().expect("verify")).expect("accept");
+    let g_verified = g_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(g_verified.clone()).expect("accept");
     let g_id = derive_node_id(&g_pk);
 
     // Create a link using the SECOND endpoint (ep2).
     let selected_endpoint = TransportEndpoint::tcp("127.0.0.1:2222");
-    topology.add_link_for_testing(Link::new_up_for_testing(
+    topology.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, g_id, selected_endpoint.clone()),
-        None,
-    ));
+        &g_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -1302,19 +1330,19 @@ fn route_commitment_changes_with_selected_link_endpoint() {
     let g_id = derive_node_id(&g_pk);
 
     topology1.accept_advertisement(g_verified.clone()).expect("accept");
-    topology2.accept_advertisement(g_verified).expect("accept");
+    topology2.accept_advertisement(g_verified.clone()).expect("accept");
 
     // Topology 1: link via ep1.
-    topology1.add_link_for_testing(Link::new_up_for_testing(
+    topology1.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:1111")),
-        None,
-    ));
+        &g_verified,
+    ).unwrap());
 
     // Topology 2: link via ep2.
-    topology2.add_link_for_testing(Link::new_up_for_testing(
+    topology2.add_authenticated_link(test_authenticated_link(
         LinkKey::new(local, g_id, TransportEndpoint::tcp("127.0.0.1:2222")),
-        None,
-    ));
+        &g_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates1 = engine.discover_and_compute(&topology1, &NullResolver, &HopCountCost);
@@ -1359,36 +1387,40 @@ fn best_route_selects_lowest_computed_cost() {
     let _ = local_sk;
 
     // Gateway G1: 3-hop route (local → r1 → r2 → g1).
-    let (r1_advert, _, r1_pk) = make_relay_advert(b"best-relay-1", 1);
-    topology.accept_advertisement(r1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r1_advert, _, r1_pk) = make_relay_advert(b"best-relay-1", 1, "127.0.0.1:1");
+    let r1_verified = r1_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r1_verified.clone()).expect("accept");
     let r1_id = derive_node_id(&r1_pk);
 
-    let (r2_advert, _, r2_pk) = make_relay_advert(b"best-relay-2", 1);
-    topology.accept_advertisement(r2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (r2_advert, _, r2_pk) = make_relay_advert(b"best-relay-2", 1, "127.0.0.1:2");
+    let r2_verified = r2_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(r2_verified.clone()).expect("accept");
     let r2_id = derive_node_id(&r2_pk);
 
-    let (g1_advert, _, g1_pk) = make_gateway_advert(b"best-gw-1", 1);
-    topology.accept_advertisement(g1_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (g1_advert, _, g1_pk) = make_gateway_advert(b"best-gw-1", 1, "127.0.0.1:3");
+    let g1_verified = g1_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(g1_verified.clone()).expect("accept");
     let g1_id = derive_node_id(&g1_pk);
 
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
-    ));
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(r1_id, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
-    ));
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(r2_id, g1_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, r1_id, TransportEndpoint::tcp("127.0.0.1:1")), &r1_verified,
+    ).unwrap());
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(r1_id, r2_id, TransportEndpoint::tcp("127.0.0.1:2")), &r2_verified,
+    ).unwrap());
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(r2_id, g1_id, TransportEndpoint::tcp("127.0.0.1:3")), &g1_verified,
+    ).unwrap());
 
     // Gateway G2: 1-hop route (local → g2).
-    let (g2_advert, _, g2_pk) = make_gateway_advert(b"best-gw-2", 1);
-    topology.accept_advertisement(g2_advert.verify_into_verified().expect("verify")).expect("accept");
+    let (g2_advert, _, g2_pk) = make_gateway_advert(b"best-gw-2", 1, "127.0.0.1:4");
+    let g2_verified = g2_advert.verify_into_verified().expect("verify");
+    topology.accept_advertisement(g2_verified.clone()).expect("accept");
     let g2_id = derive_node_id(&g2_pk);
 
-    topology.add_link_for_testing(Link::new_up_for_testing(
-        LinkKey::new(local, g2_id, TransportEndpoint::tcp("127.0.0.1:4")), None,
-    ));
+    topology.add_authenticated_link(test_authenticated_link(
+        LinkKey::new(local, g2_id, TransportEndpoint::tcp("127.0.0.1:4")), &g2_verified,
+    ).unwrap());
 
     let engine = RouteEngine::new(local);
     let candidates = engine.discover_and_compute(&topology, &NullResolver, &HopCountCost);
@@ -1476,7 +1508,7 @@ fn in_memory_resolver_is_test_only_route_resolution() {
     let mut resolver = InMemoryResolver::new();
 
     // Create a gateway advertisement and register it.
-    let (gw_advert, _, gw_pk) = make_gateway_advert(b"resolver-test-gw", 1);
+    let (gw_advert, _, gw_pk) = make_gateway_advert(b"resolver-test-gw", 1, "127.0.0.1:5678");
     let gw_id = derive_node_id(&gw_pk);
     let gw_verified = gw_advert.verify_into_verified().expect("verify");
     resolver.register_verified(gw_verified);

@@ -54,6 +54,11 @@ url.workspace = true
 # N2.1.2.2: Enable test-only constructors (Link::new_up_for_testing, etc.)
 # for integration tests. This feature MUST NOT be enabled in production.
 snp-node = { path = ".", features = ["test-support"] }
+# N2.1.2.3: Direct access to snp_link::HandshakeResult is needed by the
+# n2122_authenticated_link.rs integration tests so they can construct
+# adversarial handshake results (zero session_id, mismatched peer_node_id)
+# to verify AuthenticatedLink::from_handshake's rejection paths.
+snp-link.workspace = true
 
 # N2.0.7.3: The legacy-circuit-keys feature is NOT enabled by default for
 # tests. `cargo test` runs ONLY the new production architecture. To run the

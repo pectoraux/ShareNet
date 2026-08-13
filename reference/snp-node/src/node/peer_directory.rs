@@ -66,36 +66,20 @@ impl PeerDirectory {
         self.acceptance.accept(verified)
     }
 
-    /// **N2.1.2.2: Production path.** Add an authenticated link to the directory.
+    /// **N2.1.2.3: Production path.** Add an authenticated link to the directory.
     ///
-    /// This is the ONLY public method for adding links in production builds.
-    /// It requires an `AuthenticatedLink`, which can only be constructed
-    /// via `AuthenticatedLink::from_verified_handshake`.
+    /// This is the ONLY public method for adding links. It requires an
+    /// `AuthenticatedLink`, which can only be constructed via
+    /// `AuthenticatedLink::from_handshake` (requiring an actual
+    /// `snp_link::HandshakeResult`).
     pub fn add_authenticated_link(&mut self, auth_link: AuthenticatedLink) {
         self.links.insert_authenticated(auth_link);
     }
 
-    /// **N2.1.2.2: NOT public in production.** Add a link to the directory.
-    ///
-    /// This method is `pub(crate)` — available only within the `snp-node`
-    /// crate. In production, use `add_authenticated_link()`.
-    pub(crate) fn add_link(&mut self, link: Link) {
-        self.links.insert(link);
-    }
-
-    /// Add a link to the directory without authentication.
-    ///
-    /// This is available ONLY when the `test-support` Cargo feature is enabled.
-    /// **Production code MUST NOT use this.**
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn add_link_for_testing(&mut self, link: Link) {
-        self.links.insert_for_testing(link);
-    }
-
     /// Update a link's state.
     pub fn update_link_state(&mut self, key: &LinkKey, state: LinkState) {
-        if let Some(link) = self.links.get_mut(key) {
-            link.state = state;
+        if let Some(auth) = self.links.get_mut(key) {
+            auth.set_state(state);
         }
     }
 
@@ -106,15 +90,15 @@ impl PeerDirectory {
 
     /// Record a successful transmission on a link.
     pub fn record_link_success(&mut self, key: &LinkKey, rtt_micros: u64) {
-        if let Some(link) = self.links.get_mut(key) {
-            link.record_success(rtt_micros);
+        if let Some(auth) = self.links.get_mut(key) {
+            auth.record_success(rtt_micros);
         }
     }
 
     /// Record a failed transmission on a link.
     pub fn record_link_failure(&mut self, key: &LinkKey) {
-        if let Some(link) = self.links.get_mut(key) {
-            link.record_failure();
+        if let Some(auth) = self.links.get_mut(key) {
+            auth.record_failure();
         }
     }
 
@@ -155,8 +139,8 @@ impl PeerDirectory {
         // add an iterator to AdvertisementAcceptanceStore.
         self.links
             .all()
-            .map(|l| l.key.remote_node_id)
-            .chain(self.links.all().map(|l| l.key.local_node_id))
+            .map(|l| l.remote_node_id())
+            .chain(self.links.all().map(|l| l.local_node_id()))
             .filter_map(|node_id| self.acceptance.get(&node_id))
             .collect()
     }
@@ -167,7 +151,7 @@ impl PeerDirectory {
         self.links
             .all()
             .filter(|l| l.is_usable())
-            .map(|l| l.key.remote_node_id)
+            .map(|l| l.remote_node_id())
             .collect()
     }
 
@@ -218,21 +202,21 @@ impl PeerDirectory {
             .collect()
     }
 
-    /// Get all outgoing links from a node.
+    /// Get all outgoing authenticated links from a node.
     #[must_use]
-    pub fn links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn links_from(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links.links_from(node_id)
     }
 
-    /// Get all usable outgoing links from a node.
+    /// Get all usable outgoing authenticated links from a node.
     #[must_use]
-    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links.usable_links_from(node_id)
     }
 
-    /// Get all incoming links to a node.
+    /// Get all incoming authenticated links to a node.
     #[must_use]
-    pub fn links_to(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn links_to(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links.links_to(node_id)
     }
 
@@ -246,8 +230,8 @@ impl PeerDirectory {
         let keys_to_remove: Vec<LinkKey> = self
             .links
             .all()
-            .filter(|l| l.key.local_node_id == *node_id || l.key.remote_node_id == *node_id)
-            .map(|l| l.key.clone())
+            .filter(|l| l.local_node_id() == *node_id || l.remote_node_id() == *node_id)
+            .map(|l| l.key().clone())
             .collect();
         for key in keys_to_remove {
             self.links.remove(&key);

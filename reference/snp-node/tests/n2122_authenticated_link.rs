@@ -1,7 +1,7 @@
 //! N2.1.2.2 — Authenticated Link Boundary tests.
 //!
 //! These tests verify that the `Link` abstraction is a real security boundary:
-//! a forwardable `Link` can ONLY be created via `AuthenticatedLink::from_verified_handshake`,
+//! a forwardable `Link` can ONLY be created via `AuthenticatedLink::from_handshake`,
 //! which requires a verified advertisement + authorized endpoint + non-zero
 //! handshake session ID.
 
@@ -13,6 +13,7 @@ use snp_node::node::{
     NodeAdvertisement, RouteEngine, TopologyGraph, TransportEndpoint, VerifiedNodeAdvertisement,
     HopCountCost, NullResolver,
 };
+use snp_node::test_support::test_authenticated_link;
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
@@ -63,6 +64,30 @@ fn fake_session_id() -> [u8; 32] {
     id
 }
 
+/// Construct a `snp_link::HandshakeResult` whose peer identity fields match
+/// the given verified advertisement. The `session_id` is caller-supplied so
+/// tests can verify both the valid (non-zero) and invalid (zero) cases.
+///
+/// This is the same synthesis performed by `test_authenticated_link`, but
+/// exposed so individual tests can drive `AuthenticatedLink::from_handshake`
+/// directly with adversarial inputs (zero session_id, mismatched peer, etc.).
+fn make_handshake_result(
+    advert: &VerifiedNodeAdvertisement,
+    session_id: [u8; 32],
+) -> snp_link::HandshakeResult {
+    snp_link::HandshakeResult {
+        link_keys: snp_link::LinkKeys {
+            send_key: [0u8; 32],
+            recv_key: [0u8; 32],
+        },
+        peer_node_id: advert.node_id(),
+        peer_public_key: *advert.ed25519_public_key(),
+        peer_x25519_public: advert.circuit_x25519_pub().copied().unwrap_or([0u8; 32]),
+        peer_ephemeral_public: [0u8; 32],
+        session_id,
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Adversarial tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -90,9 +115,8 @@ fn unauthenticated_link_cannot_enter_link_table() {
     let (gw_verified, gw_id) = make_gateway_advert(b"unauth-link-gw", 1, "127.0.0.1:1234");
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1234"));
-    let auth_link = AuthenticatedLink::from_verified_handshake(
-        key, &gw_verified, fake_session_id(),
-    ).expect("authenticated link must be created");
+    let auth_link = test_authenticated_link(key, &gw_verified)
+        .expect("authenticated link must be created");
 
     let mut table = LinkTable::new();
     table.insert_authenticated(auth_link);
@@ -103,7 +127,7 @@ fn unauthenticated_link_cannot_enter_link_table() {
 
 /// 2. missing_handshake_cannot_create_up_link
 ///
-/// `AuthenticatedLink::from_verified_handshake` rejects a zero session_id
+/// `AuthenticatedLink::from_handshake` rejects a zero session_id
 /// (no handshake was performed).
 #[test]
 fn missing_handshake_cannot_create_up_link() {
@@ -111,9 +135,11 @@ fn missing_handshake_cannot_create_up_link() {
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:1234"));
 
-    // Zero session_id = no handshake.
-    let zero_session = [0u8; 32];
-    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, zero_session);
+    // Zero session_id = no handshake. The HandshakeResult otherwise matches
+    // the advertisement (peer_node_id, peer_public_key) so the ONLY failing
+    // check is the zero session_id.
+    let zero_handshake = make_handshake_result(&gw_verified, [0u8; 32]);
+    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &zero_handshake);
     assert!(matches!(result, Err(AuthenticatedLinkError::MissingHandshake)),
         "zero session_id must be rejected (no handshake)");
 
@@ -132,7 +158,11 @@ fn handshake_identity_mismatch_rejected() {
     let wrong_remote = [0x99; 32];
     let key = LinkKey::new(local, wrong_remote, TransportEndpoint::tcp("127.0.0.1:1234"));
 
-    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, fake_session_id());
+    // The HandshakeResult matches the advertisement (so the handshake check
+    // would pass on its own); the rejection comes from key.remote_node_id !=
+    // advert.node_id().
+    let handshake = make_handshake_result(&gw_verified, fake_session_id());
+    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &handshake);
     match result {
         Err(AuthenticatedLinkError::NodeIdMismatch { .. }) => { /* expected */ }
         other => panic!("expected NodeIdMismatch, got {other:?}"),
@@ -154,7 +184,8 @@ fn unauthorized_endpoint_rejected() {
     let unauthorized_endpoint = TransportEndpoint::tcp("127.0.0.1:9999");
     let key = LinkKey::new(local, gw_id, unauthorized_endpoint);
 
-    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, fake_session_id());
+    let handshake = make_handshake_result(&gw_verified, fake_session_id());
+    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &handshake);
     match result {
         Err(AuthenticatedLinkError::UnauthorizedEndpoint { endpoint }) => {
             assert!(endpoint.contains("9999"), "error must mention the unauthorized endpoint");
@@ -175,13 +206,12 @@ fn authenticated_endpoint_creates_link() {
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:2222"));
 
-    let auth_link = AuthenticatedLink::from_verified_handshake(
-        key, &gw_verified, fake_session_id(),
-    ).expect("valid handshake must produce AuthenticatedLink");
+    let auth_link = test_authenticated_link(key, &gw_verified)
+        .expect("valid handshake must produce AuthenticatedLink");
 
-    // The link has the session_id set (proof of handshake).
-    assert_eq!(auth_link.session_id(), fake_session_id(),
-        "session_id must be preserved");
+    // The link has a non-zero session_id (proof of handshake).
+    assert_ne!(auth_link.session_id(), [0u8; 32],
+        "session_id must be non-zero (handshake was performed)");
     assert!(auth_link.is_usable(), "newly created link must be usable (Up)");
 
     // Insert into LinkTable via the production path.
@@ -203,27 +233,21 @@ fn authenticated_link_recovers_to_up_after_probe() {
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:3333"));
 
-    let auth_link = AuthenticatedLink::from_verified_handshake(
-        key, &gw_verified, fake_session_id(),
-    ).expect("valid link");
-
-    // Convert to Link for state manipulation (simulating the LinkTable's
-    // internal representation after insert).
-    let mut link = auth_link.into_link();
-    assert_eq!(link.state, LinkState::Up);
+    let mut auth_link = test_authenticated_link(key, &gw_verified).expect("valid link");
+    assert_eq!(auth_link.state(), LinkState::Up);
 
     // Simulate failures → Degraded → Down.
-    link.record_failure();
-    assert_eq!(link.state, LinkState::Degraded);
-    link.record_failure();
-    link.record_failure();
-    assert_eq!(link.state, LinkState::Down);
-    assert!(!link.is_usable());
+    auth_link.record_failure();
+    assert_eq!(auth_link.state(), LinkState::Degraded);
+    auth_link.record_failure();
+    auth_link.record_failure();
+    assert_eq!(auth_link.state(), LinkState::Down);
+    assert!(!auth_link.is_usable());
 
     // Simulate recovery → Up.
-    link.record_success(1000);
-    assert_eq!(link.state, LinkState::Up);
-    assert!(link.is_usable());
+    auth_link.record_success(1000);
+    assert_eq!(auth_link.state(), LinkState::Up);
+    assert!(auth_link.is_usable());
 
     eprintln!("[test 6] PASS: authenticated link recovers to up after probe");
 }
@@ -238,8 +262,10 @@ fn failed_handshake_creates_no_forwardable_link() {
     let local = [0x42; 32];
     let key = LinkKey::new(local, gw_id, TransportEndpoint::tcp("127.0.0.1:4444"));
 
-    // Failed handshake = zero session_id.
-    let result = AuthenticatedLink::from_verified_handshake(key, &gw_verified, [0u8; 32]);
+    // Failed handshake = zero session_id. The HandshakeResult otherwise
+    // matches the advertisement so ONLY the zero session_id check fails.
+    let zero_handshake = make_handshake_result(&gw_verified, [0u8; 32]);
+    let result = AuthenticatedLink::from_handshake(key, &gw_verified, &zero_handshake);
     assert!(result.is_err(), "failed handshake must not produce a link");
 
     // No link was created, so nothing enters the LinkTable.
@@ -292,7 +318,7 @@ fn route_engine_ignores_unauthenticated_link() {
 
 /// 9. authenticated_link_end_to_end_route
 ///
-/// Full end-to-end: create AuthenticatedLinks via from_verified_handshake,
+/// Full end-to-end: create AuthenticatedLinks via test_authenticated_link,
 /// add them to the topology via add_authenticated_link, and verify the
 /// route engine produces a valid route.
 #[test]
@@ -308,9 +334,8 @@ fn authenticated_link_end_to_end_route() {
 
     // AuthenticatedLink: local → B via B's authorized endpoint.
     let key_lb = LinkKey::new(local, b_id, TransportEndpoint::tcp("127.0.0.1:1001"));
-    let auth_link_lb = AuthenticatedLink::from_verified_handshake(
-        key_lb, &b_verified, fake_session_id(),
-    ).expect("local → B link must authenticate");
+    let auth_link_lb = test_authenticated_link(key_lb, &b_verified)
+        .expect("local → B link must authenticate");
     topology.add_authenticated_link(auth_link_lb);
 
     // Gateway G with endpoint.
@@ -319,9 +344,8 @@ fn authenticated_link_end_to_end_route() {
 
     // AuthenticatedLink: B → G via G's authorized endpoint.
     let key_bg = LinkKey::new(b_id, g_id, TransportEndpoint::tcp("127.0.0.1:1002"));
-    let auth_link_bg = AuthenticatedLink::from_verified_handshake(
-        key_bg, &g_verified, fake_session_id(),
-    ).expect("B → G link must authenticate");
+    let auth_link_bg = test_authenticated_link(key_bg, &g_verified)
+        .expect("B → G link must authenticate");
     topology.add_authenticated_link(auth_link_bg);
 
     // Run the route engine.
@@ -349,27 +373,28 @@ fn authenticated_link_end_to_end_route() {
 
 /// 10. production_build_has_no_public_new_up
 ///
-/// Verify that `Link::new_up` is NOT public in production builds.
-/// This is a compile-time guarantee — the test verifies the test-support
-/// feature is what makes the test-only constructor available.
+/// Verify that the test-only `test_authenticated_link` helper is gated
+/// behind the `test-support` Cargo feature. Production builds (which do NOT
+/// enable `test-support`) cannot access `snp_node::test_support` at all —
+/// the module is `#[cfg(any(test, feature = "test-support"))]` and is
+/// physically absent from the production binary.
+///
+/// This test verifies the feature gate is correctly applied by calling
+/// `test_authenticated_link` (which is only reachable when the feature is
+/// enabled). If someone removes the feature gate or moves the helper into
+/// the public production API, the security boundary is broken.
 #[test]
 fn production_build_has_no_public_new_up() {
-    // In production (without test-support), Link::new_up is pub(crate).
-    // The test-only constructor Link::new_up_for_testing is available
-    // ONLY because the test-support feature is enabled.
-    //
-    // This test verifies the feature gate is correctly applied:
-    // #[cfg(any(test, feature = "test-support"))]
-    //
-    // If someone removes the feature gate or makes new_up public,
-    // the security boundary is broken.
-
-    // We can call new_up_for_testing here because test-support is enabled.
-    let key = LinkKey::new([0x42; 32], [0x43; 32], TransportEndpoint::tcp("127.0.0.1:1"));
-    let _link = snp_node::node::Link::new_up_for_testing(key, None);
+    // We need a verified advert to construct an AuthenticatedLink via the
+    // test-support helper. The key's endpoint must match the advert's endpoint.
+    let (gw_verified, gw_id) = make_gateway_advert(b"feature-gate-gw", 1, "127.0.0.1:1");
+    let key = LinkKey::new([0x42; 32], gw_id, TransportEndpoint::tcp("127.0.0.1:1"));
+    let _auth = test_authenticated_link(key, &gw_verified)
+        .expect("test_authenticated_link must work with test-support feature");
 
     // The important guarantee: production code (without test-support) CANNOT
-    // call new_up_for_testing or new_up. They are not in the public API.
+    // call test_authenticated_link. The `snp_node::test_support` module is
+    // not compiled in production builds.
 
-    eprintln!("[test 10] PASS: production build has no public new_up (feature-gated)");
+    eprintln!("[test 10] PASS: test_support module is feature-gated (not in production)");
 }

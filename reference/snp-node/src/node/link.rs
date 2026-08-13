@@ -1,4 +1,4 @@
-//! N2.1.1 / N2.1.2.2 — Link model: directed, per-endpoint transport relationships.
+//! N2.1.1 / N2.1.2.3 — Link model: directed, per-endpoint transport relationships.
 //!
 //! A `Link` represents an actual probed, authenticated transport relationship
 //! between two nodes over a specific endpoint. It is NOT the same as "I saw
@@ -9,23 +9,37 @@
 //! to A. This models real-world asymmetry (firewalls, NAT, transport
 //! limitations).
 //!
-//! ## N2.1.2.2: AuthenticatedLink — real security boundary
+//! ## N2.1.2.3: VerifiedHandshake + AuthenticatedLink — proof-producing boundary
 //!
 //! **`Link::new_up()` is NOT public in production builds.** It is only
-//! available behind `cfg(test)` for deterministic route-engine testing.
-//! In production, the ONLY way to create a forwardable `Link` is via
-//! [`AuthenticatedLink::from_verified_handshake`], which requires:
+//! available behind `cfg(test)` / the `test-support` feature for
+//! deterministic route-engine testing.
+//!
+//! In production, the ONLY way to create a forwardable link is via
+//! [`AuthenticatedLink::from_handshake`], which requires:
 //!
 //! 1. A `VerifiedNodeAdvertisement` for the remote node (authenticated identity).
-//! 2. The endpoint must appear in that advertisement (endpoint authorization).
-//! 3. A `session_id` from a completed SNP-IK/0.1 handshake (proof of
-//!    transport reachability + key agreement).
-//! 4. The `LinkKey.remote_node_id` must match the advertisement's NodeId.
-//! 5. The `LinkKey.endpoint` must match one of the advertisement's endpoints.
+//! 2. An actual `snp_link::HandshakeResult` from a completed SNP-IK/0.1
+//!    handshake (NOT an arbitrary session ID).
+//! 3. The handshake's `peer_node_id` must match the advertisement's NodeId.
+//! 4. The handshake's `peer_public_key` must match the advertisement's
+//!    Ed25519 public key.
+//! 5. The `LinkKey.remote_node_id` must match the advertisement's NodeId.
+//! 6. The `LinkKey.endpoint` must appear in the advertisement's endpoints.
 //!
-//! This makes the type-level guarantee real: **every `Link` in a production
-//! `LinkTable` was established through the ShareNet identity handshake with
-//! an endpoint authorized by the remote node's authenticated advertisement.**
+//! The `HandshakeResult` is converted to a compact [`VerifiedHandshake`]
+//! proof whose constructor is private — only
+//! `AuthenticatedLink::from_handshake` can produce it, and it requires the
+//! actual `&HandshakeResult` from `snp-link`.
+//!
+//! ## N2.1.2.3: Authentication preserved in LinkTable
+//!
+//! The production `LinkTable` stores `AuthenticatedLink` (NOT plain `Link`).
+//! The type-level authentication proof is preserved at the storage boundary.
+//! `RouteEngine` consumes `&AuthenticatedLink`, so the invariant holds:
+//!
+//! > "Every link consumed by `RouteEngine` is an authenticated, endpoint-bound
+//! > relationship established through the ShareNet identity handshake."
 
 use super::*;
 use std::collections::HashMap;
@@ -271,7 +285,7 @@ impl Link {
     /// route-engine testing without performing actual SNP-IK handshakes.
     ///
     /// **Production code MUST NOT use this.** In production, use
-    /// [`AuthenticatedLink::from_verified_handshake`] to create a link that
+    /// [`AuthenticatedLink::from_handshake`] to create a link that
     /// is proven to be authenticated.
     #[must_use]
     pub fn new_up_for_testing(key: LinkKey, session_id: Option<[u8; 32]>) -> Self {
@@ -279,46 +293,115 @@ impl Link {
     }
 }
 
-// ─── AuthenticatedLink (N2.1.2.2) ───────────────────────────────────────────
+// ─── VerifiedHandshake proof (N2.1.2.3) ─────────────────────────────────────
 
-/// **N2.1.2.2.** Proof that a `Link` was established through the ShareNet
+/// **N2.1.2.3.** A compact proof that an actual SNP-IK/0.1 handshake was
+/// completed with a specific peer.
+///
+/// `VerifiedHandshake` has NO public constructor. The only way to create
+/// one is via [`AuthenticatedLink::from_handshake`], which consumes an
+/// actual `snp_link::HandshakeResult` and verifies its bindings against a
+/// `VerifiedNodeAdvertisement`.
+///
+/// ## Why this exists
+///
+/// A random `[u8; 32]` session ID is NOT sufficient proof of a handshake.
+/// The `HandshakeResult` from `snp-link` is returned only after the SNP-IK
+/// handshake has authenticated the peer (signature verified, DH completed,
+/// directional keys derived). By requiring `&HandshakeResult` at
+/// construction time, we make it impossible to manufacture an
+/// `AuthenticatedLink` without a real handshake.
+///
+/// ## Fields
+///
+/// The proof retains:
+/// - `session_id` — the handshake transcript binding value.
+/// - `peer_node_id` — the authenticated peer NodeId.
+/// - `peer_public_key` — the authenticated peer Ed25519 public key.
+///
+/// These are checked against the `VerifiedNodeAdvertisement` at
+/// construction time, then retained for later inspection.
+#[derive(Debug, Clone)]
+pub struct VerifiedHandshake {
+    /// The session ID from the completed handshake.
+    session_id: [u8; 32],
+    /// The authenticated peer NodeId (from HandshakeResult).
+    peer_node_id: [u8; 32],
+    /// The authenticated peer Ed25519 public key (from HandshakeResult).
+    peer_public_key: [u8; 32],
+}
+
+impl VerifiedHandshake {
+    /// Get the session ID.
+    #[must_use]
+    pub fn session_id(&self) -> [u8; 32] {
+        self.session_id
+    }
+
+    /// Get the authenticated peer NodeId.
+    #[must_use]
+    pub fn peer_node_id(&self) -> [u8; 32] {
+        self.peer_node_id
+    }
+
+    /// Get the authenticated peer Ed25519 public key.
+    #[must_use]
+    pub fn peer_public_key(&self) -> [u8; 32] {
+        self.peer_public_key
+    }
+}
+
+// ─── AuthenticatedLink (N2.1.2.3) ───────────────────────────────────────────
+
+/// **N2.1.2.3.** A `Link` proven to be established through the ShareNet
 /// identity handshake with an endpoint authorized by the remote node's
 /// authenticated advertisement.
 ///
 /// ## Construction
 ///
 /// `AuthenticatedLink` has NO public constructor that accepts arbitrary
-/// `LinkKey` values. The only production construction path is
-/// [`AuthenticatedLink::from_verified_handshake`], which requires:
+/// `LinkKey` values or arbitrary session IDs. The only production
+/// construction path is [`AuthenticatedLink::from_handshake`], which
+/// requires:
 ///
 /// 1. A `VerifiedNodeAdvertisement` for the remote node.
-/// 2. The `LinkKey.remote_node_id` must equal the advertisement's NodeId.
-/// 3. The `LinkKey.endpoint` must appear in the advertisement's endpoints.
-/// 4. A non-zero `session_id` from a completed SNP-IK/0.1 handshake.
+/// 2. An actual `snp_link::HandshakeResult` from a completed SNP-IK/0.1
+///    handshake (NOT an arbitrary session ID).
+/// 3. `handshake.peer_node_id == advert.node_id()` — the handshake's
+///    authenticated peer must match the advertisement.
+/// 4. `handshake.peer_public_key == advert.ed25519_public_key()` — the
+///    handshake's authenticated Ed25519 key must match the advertisement.
+/// 5. `key.remote_node_id == advert.node_id()` — the LinkKey's remote
+///    identity must match the advertisement.
+/// 6. `key.endpoint` must appear in `advert.endpoints()` — the endpoint
+///    must be authorized by the advertisement.
+/// 7. `handshake.session_id != [0u8; 32]` — the handshake must have
+///    produced a valid session ID (guaranteed by `snp-link` for successful
+///    handshakes, but checked defensively).
 ///
 /// ## Security invariant
 ///
 /// An `AuthenticatedLink` CANNOT be manufactured by an arbitrary caller.
-/// It can only be produced by supplying a verified advertisement + a
-/// handshake session ID. This makes the route engine's invariant real:
+/// It can only be produced by supplying a verified advertisement AND an
+/// actual `HandshakeResult` from `snp-link`. A random 32-byte value is
+/// NOT sufficient.
 ///
-/// > "Every `Link` consumed by `RouteEngine` is an authenticated,
-/// > endpoint-bound relationship established through the ShareNet identity
-/// > handshake."
+/// ## Proof preservation
 ///
-/// ## Conversion to `Link`
-///
-/// `AuthenticatedLink` converts into `Link` via `into_link()` or `as_link()`.
-/// The resulting `Link` retains the `session_id` (proof of handshake) and
-/// the authorized `LinkKey`.
+/// The `VerifiedHandshake` proof is retained inside the `AuthenticatedLink`.
+/// It is NOT discarded at the storage boundary — the production `LinkTable`
+/// stores `AuthenticatedLink` (not plain `Link`), so the proof travels with
+/// the link through the entire route-engine pipeline.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedLink {
-    /// The underlying `Link`. Constructed ONLY via
-    /// `AuthenticatedLink::from_verified_handshake`.
+    /// The underlying `Link` (runtime state, metrics, key, endpoint).
     link: Link,
+    /// The proof that a real handshake was performed. Retained for the
+    /// lifetime of the link — NOT discarded at storage.
+    proof: VerifiedHandshake,
 }
 
-/// Error returned by `AuthenticatedLink::from_verified_handshake` when the
+/// Error returned by `AuthenticatedLink::from_handshake` when the
 /// construction parameters are invalid.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthenticatedLinkError {
@@ -338,8 +421,21 @@ pub enum AuthenticatedLinkError {
         /// The unauthorized endpoint.
         endpoint: String,
     },
-    /// The `session_id` is all-zero, which means no handshake was performed.
-    #[error("session_id is all-zero — no handshake was performed")]
+    /// The handshake's `peer_node_id` does not match the advertisement's NodeId.
+    #[error("handshake peer_node_id mismatch: handshake says {handshake_node_id}, advertisement says {advert_node_id}")]
+    HandshakePeerNodeIdMismatch {
+        /// The NodeId from the handshake.
+        handshake_node_id: NodeIdHex,
+        /// The NodeId from the advertisement.
+        advert_node_id: NodeIdHex,
+    },
+    /// The handshake's `peer_public_key` does not match the advertisement's
+    /// Ed25519 public key.
+    #[error("handshake peer_public_key mismatch: handshake key does not match advertisement")]
+    HandshakePublicKeyMismatch,
+    /// The handshake's `session_id` is all-zero, which should not happen
+    /// for a successful `snp-link` handshake but is checked defensively.
+    #[error("handshake session_id is all-zero — invalid HandshakeResult")]
     MissingHandshake,
 }
 
@@ -354,34 +450,37 @@ impl std::fmt::Display for NodeIdHex {
 }
 
 impl AuthenticatedLink {
-    /// **N2.1.2.2.** Construct an `AuthenticatedLink` from a verified
-    /// advertisement and a completed handshake session ID.
+    /// **N2.1.2.3.** Construct an `AuthenticatedLink` from a verified
+    /// advertisement and an **actual** `snp_link::HandshakeResult`.
     ///
-    /// ## Requirements
+    /// ## Requirements (all enforced)
     ///
-    /// 1. `key.remote_node_id` must equal `advert.node_id()`. This binds
-    ///    the link's remote identity to the authenticated advertisement.
-    /// 2. `key.endpoint` must appear in `advert.endpoints()`. This ensures
-    ///    the endpoint was authorized by the remote node's advertisement
-    ///    (not attacker-chosen).
-    /// 3. `session_id` must be non-zero (all-zero means no handshake was
-    ///    performed). A completed SNP-IK/0.1 handshake always produces a
-    ///    non-zero session ID.
+    /// 1. `key.remote_node_id == advert.node_id()` — LinkKey identity binding.
+    /// 2. `key.endpoint` in `advert.endpoints()` — endpoint authorization.
+    /// 3. `handshake.peer_node_id == advert.node_id()` — handshake identity
+    ///    matches advertisement.
+    /// 4. `handshake.peer_public_key == advert.ed25519_public_key()` —
+    ///    handshake Ed25519 key matches advertisement.
+    /// 5. `handshake.session_id != [0u8; 32]` — valid session ID.
+    ///
+    /// ## Why `&HandshakeResult` and not `[u8; 32]`
+    ///
+    /// A random 32-byte value is NOT proof of a handshake. The
+    /// `HandshakeResult` from `snp-link` is returned only after the SNP-IK
+    /// handshake has authenticated the peer (signature verified, DH
+    /// completed, directional keys derived). Requiring `&HandshakeResult`
+    /// makes it impossible to manufacture an `AuthenticatedLink` without a
+    /// real handshake.
     ///
     /// ## Errors
     ///
     /// Returns `AuthenticatedLinkError` if any requirement is not met.
-    ///
-    /// # Parameters
-    /// - `key`: The `LinkKey` (local → remote + endpoint).
-    /// - `advert`: The verified advertisement for the remote node.
-    /// - `session_id`: The session ID from the completed handshake.
-    pub fn from_verified_handshake(
+    pub fn from_handshake(
         key: LinkKey,
         advert: &VerifiedNodeAdvertisement,
-        session_id: [u8; 32],
+        handshake: &snp_link::HandshakeResult,
     ) -> Result<Self, AuthenticatedLinkError> {
-        // 1. Remote NodeId must match the advertisement.
+        // 1. LinkKey.remote_node_id must match the advertisement.
         if key.remote_node_id != advert.node_id() {
             return Err(AuthenticatedLinkError::NodeIdMismatch {
                 link_node_id: NodeIdHex(key.remote_node_id),
@@ -394,28 +493,48 @@ impl AuthenticatedLink {
                 endpoint: key.endpoint.as_str().to_string(),
             });
         }
-        // 3. session_id must be non-zero (handshake was performed).
-        if session_id == [0u8; 32] {
+        // 3. Handshake peer_node_id must match the advertisement.
+        if handshake.peer_node_id != advert.node_id() {
+            return Err(AuthenticatedLinkError::HandshakePeerNodeIdMismatch {
+                handshake_node_id: NodeIdHex(handshake.peer_node_id),
+                advert_node_id: NodeIdHex(advert.node_id()),
+            });
+        }
+        // 4. Handshake peer_public_key must match the advertisement.
+        if handshake.peer_public_key != *advert.ed25519_public_key() {
+            return Err(AuthenticatedLinkError::HandshakePublicKeyMismatch);
+        }
+        // 5. session_id must be non-zero (defensive — snp-link guarantees this).
+        if handshake.session_id == [0u8; 32] {
             return Err(AuthenticatedLinkError::MissingHandshake);
         }
+        // Construct the proof from the actual handshake result.
+        let proof = VerifiedHandshake {
+            session_id: handshake.session_id,
+            peer_node_id: handshake.peer_node_id,
+            peer_public_key: handshake.peer_public_key,
+        };
         // Construct the underlying Link with the session_id set.
-        let mut link = Link::new_up(key, Some(session_id));
-        // The session_id is now guaranteed non-zero and bound to the
-        // authenticated advertisement.
-        let _ = &mut link; // (no additional mutation needed)
-        Ok(Self { link })
+        let link = Link::new_up(key, Some(handshake.session_id));
+        Ok(Self { link, proof })
     }
 
-    /// Get a reference to the underlying `Link`.
+    /// Get a reference to the underlying `Link` (read-only).
+    ///
+    /// This allows the route engine to read the link's key, state, metrics,
+    /// and endpoint without being able to modify identity-critical fields.
     #[must_use]
     pub fn as_link(&self) -> &Link {
         &self.link
     }
 
-    /// Consume this `AuthenticatedLink` and return the underlying `Link`.
+    /// Get a reference to the `VerifiedHandshake` proof.
+    ///
+    /// The proof is retained for the lifetime of the link. It is NOT
+    /// discarded at the storage boundary.
     #[must_use]
-    pub fn into_link(self) -> Link {
-        self.link
+    pub fn handshake_proof(&self) -> &VerifiedHandshake {
+        &self.proof
     }
 
     /// Get the `LinkKey`.
@@ -424,11 +543,10 @@ impl AuthenticatedLink {
         &self.link.key
     }
 
-    /// Get the session ID from the handshake.
+    /// Get the session ID from the handshake proof.
     #[must_use]
     pub fn session_id(&self) -> [u8; 32] {
-        // Guaranteed non-zero by construction.
-        self.link.peer_session_id.unwrap_or([0u8; 32])
+        self.proof.session_id
     }
 
     /// Check if the link is usable for forwarding.
@@ -436,24 +554,82 @@ impl AuthenticatedLink {
     pub fn is_usable(&self) -> bool {
         self.link.is_usable()
     }
+
+    /// Record a successful transmission on the underlying link.
+    ///
+    /// This mutates runtime state (metrics, link state) but does NOT affect
+    /// the authentication proof. The proof is immutable for the lifetime of
+    /// the `AuthenticatedLink`.
+    pub fn record_success(&mut self, rtt_micros: u64) {
+        self.link.record_success(rtt_micros);
+    }
+
+    /// Record a failed transmission on the underlying link.
+    pub fn record_failure(&mut self) {
+        self.link.record_failure();
+    }
+
+    /// Set the link state (e.g., for explicit state transitions).
+    pub fn set_state(&mut self, state: LinkState) {
+        self.link.state = state;
+    }
+
+    /// Get the current link state.
+    #[must_use]
+    pub fn state(&self) -> LinkState {
+        self.link.state
+    }
+
+    /// Get the remote NodeId.
+    #[must_use]
+    pub fn remote_node_id(&self) -> [u8; 32] {
+        self.link.key.remote_node_id
+    }
+
+    /// Get the local NodeId.
+    #[must_use]
+    pub fn local_node_id(&self) -> [u8; 32] {
+        self.link.key.local_node_id
+    }
+
+    /// Get the metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &LinkMetrics {
+        &self.link.metrics
+    }
+
+    /// Get the endpoint from the LinkKey.
+    #[must_use]
+    pub fn endpoint(&self) -> &TransportEndpoint {
+        &self.link.key.endpoint
+    }
 }
 
-/// A table of directed links, keyed by `LinkKey`.
+/// A table of directed **authenticated** links, keyed by `LinkKey`.
 ///
-/// ## N2.1.2.2: Authentication boundary
+/// ## N2.1.2.3: Authentication preserved at storage boundary
 ///
-/// In production, the ONLY way to add a link to a `LinkTable` is via
+/// The production `LinkTable` stores [`AuthenticatedLink`] (NOT plain
+/// `Link`). The type-level authentication proof is retained for the
+/// lifetime of each link. `RouteEngine` consumes `&AuthenticatedLink`,
+/// so the invariant holds:
+///
+/// > "Every link consumed by `RouteEngine` is an authenticated, endpoint-bound
+/// > relationship established through the ShareNet identity handshake."
+///
+/// ## Construction
+///
+/// The ONLY public method for adding links is
 /// [`LinkTable::insert_authenticated`], which accepts an
-/// [`AuthenticatedLink`]. This guarantees that every link in the table was
-/// established through the ShareNet identity handshake with an endpoint
-/// authorized by the remote node's advertisement.
+/// [`AuthenticatedLink`]. An `AuthenticatedLink` can only be constructed
+/// via [`AuthenticatedLink::from_handshake`], which requires an actual
+/// `snp_link::HandshakeResult`.
 ///
-/// The `insert(Link)` method is `pub(crate)` — available only within the
-/// `snp-node` crate (for internal use and `cfg(test)` test helpers). It is
-/// NOT available to external production callers.
+/// There is NO public `insert(Link)` method. An unauthenticated `Link`
+/// CANNOT enter the production `LinkTable`.
 #[derive(Debug, Clone, Default)]
 pub struct LinkTable {
-    links: HashMap<LinkKey, Link>,
+    links: HashMap<LinkKey, AuthenticatedLink>,
 }
 
 impl LinkTable {
@@ -463,75 +639,62 @@ impl LinkTable {
         Self::default()
     }
 
-    /// **N2.1.2.2: Production path.** Add or replace a link using an
+    /// **N2.1.2.3: Production path.** Add or replace a link using an
     /// `AuthenticatedLink`.
     ///
-    /// This is the ONLY public method for adding links to a `LinkTable`
-    /// in production builds. It requires an `AuthenticatedLink`, which
-    /// can only be constructed via
-    /// [`AuthenticatedLink::from_verified_handshake`].
+    /// This is the ONLY public method for adding links to a `LinkTable`.
+    /// It requires an `AuthenticatedLink`, which can only be constructed
+    /// via [`AuthenticatedLink::from_handshake`] — requiring an actual
+    /// `snp_link::HandshakeResult`.
     ///
     /// This guarantees the security invariant:
-    /// > "Every `Link` in a production `LinkTable` was established through
+    /// > "Every link in a production `LinkTable` was established through
     /// > the ShareNet identity handshake with an endpoint authorized by
     /// > the remote node's authenticated advertisement."
     pub fn insert_authenticated(&mut self, auth_link: AuthenticatedLink) {
-        let link = auth_link.into_link();
-        self.links.insert(link.key.clone(), link);
+        self.links.insert(auth_link.key().clone(), auth_link);
     }
 
-    /// **N2.1.2.2: NOT public in production.** Add or replace a link.
-    ///
-    /// This method is `pub(crate)` — it can only be called from within the
-    /// `snp-node` crate. In production, use `insert_authenticated()` with
-    /// an `AuthenticatedLink`.
-    ///
-    /// A `cfg(test)` re-export (`insert_for_testing`) is available for
-    /// deterministic route-engine testing.
-    pub(crate) fn insert(&mut self, link: Link) {
-        self.links.insert(link.key.clone(), link);
-    }
-
-    /// Get a link by key.
+    /// Get an authenticated link by key.
     #[must_use]
-    pub fn get(&self, key: &LinkKey) -> Option<&Link> {
+    pub fn get(&self, key: &LinkKey) -> Option<&AuthenticatedLink> {
         self.links.get(key)
     }
 
-    /// Get a mutable link by key.
-    pub fn get_mut(&mut self, key: &LinkKey) -> Option<&mut Link> {
+    /// Get a mutable authenticated link by key.
+    pub fn get_mut(&mut self, key: &LinkKey) -> Option<&mut AuthenticatedLink> {
         self.links.get_mut(key)
     }
 
     /// Remove a link.
-    pub fn remove(&mut self, key: &LinkKey) -> Option<Link> {
+    pub fn remove(&mut self, key: &LinkKey) -> Option<AuthenticatedLink> {
         self.links.remove(key)
     }
 
-    /// Get all outgoing links from a node (links where local_node_id matches).
+    /// Get all outgoing authenticated links from a node.
     #[must_use]
-    pub fn links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn links_from(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links
             .values()
-            .filter(|link| link.key.local_node_id == *node_id)
+            .filter(|auth| auth.local_node_id() == *node_id)
             .collect()
     }
 
-    /// Get all usable outgoing links from a node.
+    /// Get all usable outgoing authenticated links from a node.
     #[must_use]
-    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn usable_links_from(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links
             .values()
-            .filter(|link| link.key.local_node_id == *node_id && link.is_usable())
+            .filter(|auth| auth.local_node_id() == *node_id && auth.is_usable())
             .collect()
     }
 
-    /// Get all incoming links to a node (links where remote_node_id matches).
+    /// Get all incoming authenticated links to a node.
     #[must_use]
-    pub fn links_to(&self, node_id: &[u8; 32]) -> Vec<&Link> {
+    pub fn links_to(&self, node_id: &[u8; 32]) -> Vec<&AuthenticatedLink> {
         self.links
             .values()
-            .filter(|link| link.key.remote_node_id == *node_id)
+            .filter(|auth| auth.remote_node_id() == *node_id)
             .collect()
     }
 
@@ -540,12 +703,12 @@ impl LinkTable {
     pub fn is_reachable(&self, node_id: &[u8; 32]) -> bool {
         self.links
             .values()
-            .any(|link| link.key.remote_node_id == *node_id && link.is_usable())
+            .any(|auth| auth.remote_node_id() == *node_id && auth.is_usable())
     }
 
-    /// Get all links.
+    /// Get all authenticated links.
     #[must_use]
-    pub fn all(&self) -> impl Iterator<Item = &Link> {
+    pub fn all(&self) -> impl Iterator<Item = &AuthenticatedLink> {
         self.links.values()
     }
 
@@ -565,33 +728,18 @@ impl LinkTable {
     /// retention period. Links within the retention period are kept for
     /// metrics/recovery.
     pub fn purge_dead_links(&mut self, now: u64, retention_secs: u64) {
-        self.links.retain(|_, link| {
-            if link.state == LinkState::Down {
-                if let Some(last_fail) = link.last_failure {
-                    // Keep if within retention period.
+        self.links.retain(|_, auth| {
+            if auth.state() == LinkState::Down {
+                // Check the underlying link's last_failure.
+                let last_fail = auth.as_link().last_failure;
+                if let Some(last_fail) = last_fail {
                     now.saturating_sub(last_fail) < retention_secs
                 } else {
-                    // No last_failure recorded — keep (shouldn't happen for Down links).
                     true
                 }
             } else {
                 true
             }
         });
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl LinkTable {
-    /// **TEST-ONLY.** Add or replace a link without authentication.
-    ///
-    /// This is available ONLY when the `test-support` Cargo feature is
-    /// enabled (or during `cfg(test)` unit tests). It allows deterministic
-    /// route-engine testing without performing actual SNP-IK handshakes.
-    ///
-    /// **Production code MUST NOT use this.** In production, use
-    /// `insert_authenticated()` with an `AuthenticatedLink`.
-    pub fn insert_for_testing(&mut self, link: Link) {
-        self.insert(link);
     }
 }
