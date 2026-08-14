@@ -10,7 +10,7 @@
 
 #![allow(clippy::pedantic)]
 
-use snp_crypto::{aead_encrypt, aead_nonce, sha256, SymmetricKey};
+use snp_crypto::{aead_encrypt, aead_nonce, derive_public_key, sha256, SymmetricKey};
 use snp_gateway::{
     decode_transit_request, encode_transit_request, handle_transit_request, sign_transit_request,
     verify_transit_request, TransitRequest,
@@ -88,19 +88,23 @@ fn attack_2_unsigned_transit_request_reaches_egress() {
         max_response_bytes: 1024 * 1024,
         deadline: u64::MAX,
         reply_to: [0; 32],
+        client_ed25519_public_key: client_pk,
         client_sig: [0u8; 64], // ALL ZEROS — no signature at all
     };
 
     // Verify the signature is invalid
     assert!(
-        !verify_transit_request(&req, &client_pk),
+        !verify_transit_request(&req),
         "Zero signature should NOT verify"
     );
 
     // N1.9.2 FIX: handle_transit_request now verifies the client signature
     // BEFORE doing anything else. An unsigned request must be REJECTED with
     // a signature error — it must NOT reach egress.
-    let result = handle_transit_request(&req, &gw_sk, &client_pk);
+    //
+    // N2.2.2-hardening: handle_transit_request no longer takes a client_pk
+    // parameter — it reads the key from the embedded field.
+    let result = handle_transit_request(&req, &gw_sk);
 
     assert!(
         result.is_err(),
@@ -138,6 +142,7 @@ fn attack_3_circuit_ciphertext_replay() {
         max_response_bytes: 1024 * 1024,
         deadline: u64::MAX,
         reply_to: [0; 32],
+        client_ed25519_public_key: derive_public_key(&client_sk),
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &client_sk);

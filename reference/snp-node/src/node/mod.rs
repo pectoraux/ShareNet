@@ -915,6 +915,10 @@ impl Node {
         let link = self.get_or_connect_peer(relay_addr, relay_link_keys)?;
 
         // Build the TransitRequest.
+        //
+        // N2.2.2-hardening: the client's Ed25519 public key is now embedded
+        // inside the TransitRequest (`client_ed25519_public_key` field). The
+        // gateway reads it from the decrypted request — no out-of-band channel.
         let mut req = TransitRequest {
             req_id: random_req_id(),
             method: "GET".into(),
@@ -923,6 +927,7 @@ impl Node {
             max_response_bytes: 65536,
             deadline: now_unix() + 60,
             reply_to: [0u8; 32],
+            client_ed25519_public_key: self.identity.public_key,
             client_sig: [0u8; 64],
         };
         sign_transit_request(&mut req, &self.identity.secret_key);
@@ -1509,17 +1514,14 @@ pub fn serve_one_gateway_request_with_connector_factory<F>(
 where
     F: Fn(&str) -> NodeResult<PinnedConnector>,
 {
-    // Default: use the N1.9/N2.0 legacy client public key. This preserves
-    // backward compat with the n203_local_http.rs Gate K test (which uses
-    // the deterministic N2.0 client identity). New tests with dynamic
-    // client identities MUST call
-    // [`serve_one_gateway_request_with_connector_factory_and_client_key`]
-    // and pass the client's actual public key.
+    // N2.2.2-hardening: the client's Ed25519 public key is read from the
+    // embedded `client_ed25519_public_key` field inside the TransitRequest
+    // — no out-of-band `client_pk` parameter is needed. This wrapper now
+    // delegates directly to the (renamed) connector-factory serve function.
     serve_one_gateway_request_with_connector_factory_and_client_key(
         link,
         gateway_node_id,
         gateway_sk,
-        &client_public_key(),
         circuit,
         seen_req_ids,
         connector_factory,
@@ -1527,19 +1529,15 @@ where
 }
 
 /// **N2.0.3 (Gates F+G+H).** Like
-/// [`serve_one_gateway_request_with_connector_factory`] but accepts an
-/// EXPLICIT client public key (used to verify the `TransitRequest`'s
-/// `clientSig`). This is the production entry point for dynamic-mesh
-/// scenarios where the client identity is NOT the deterministic N2.0
-/// test identity.
+/// [`serve_one_gateway_request_with_connector_factory`] but the gateway
+/// accepts a dynamic client identity.
 ///
-/// In production, the gateway learns the client's public key from the
-/// SNP-IK/0.1 handshake (the handshake authenticates the client's
-/// Ed25519 identity). The circuit is established AFTER the handshake,
-/// so the gateway already knows the client's public key when it
-/// receives the first `TransitRequest` over the circuit. This function
-/// takes the client public key as a parameter so the caller (the
-/// gateway's serve loop) can pass in the handshake-authenticated key.
+/// **N2.2.2-hardening:** The `client_pk` parameter has been REMOVED. The
+/// client's Ed25519 public key is now embedded INSIDE the TransitRequest
+/// (`client_ed25519_public_key` field) — the gateway reads it from the
+/// decrypted request, not out-of-band. This function is kept under its
+/// original name for source-level backward compatibility with N2.0.3
+/// tests; the parameter list now matches `serve_one_gateway_request_with_connector_factory`.
 ///
 /// **TEST-ONLY SSRF bypass.** Like
 /// [`serve_one_gateway_request_with_connector_factory`], this function
@@ -1556,7 +1554,6 @@ pub fn serve_one_gateway_request_with_connector_factory_and_client_key<F>(
     link: &Arc<snp_link::Link>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
-    client_pk: &[u8; 32],
     circuit: &CircuitKeys,
     seen_req_ids: &mut HashSet<[u8; 16]>,
     connector_factory: &F,
@@ -1616,12 +1613,10 @@ where
     // handle_transit_request_with_connector verifies the client_sig (NOT
     // bypassed by the test-only escape hatch), validates tlsTermination,
     // fetches via the pre-built connector, caps the body, signs the response.
-    let fetched = handle_transit_request_with_connector(
-        &transit_req,
-        gateway_sk,
-        client_pk,
-        &connector,
-    )?;
+    //
+    // N2.2.2-hardening: the client's Ed25519 public key is read from
+    // `transit_req.client_ed25519_public_key` — no out-of-band parameter.
+    let fetched = handle_transit_request_with_connector(&transit_req, gateway_sk, &connector)?;
     eprintln!(
         "[gateway-persistent {}] fetched: status={} body={} bytes",
         hex_short(&gateway_node_id),

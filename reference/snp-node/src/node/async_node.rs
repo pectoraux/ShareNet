@@ -177,7 +177,6 @@ pub async fn serve_gateway_persistent_async_with_connector<F>(
     listen_addr: &str,
     link_keys: LinkKeys,
     circuit_keys: CircuitKeys,
-    client_pk: [u8; 32],
     connector_factory: F,
 ) -> NodeResult<()>
 where
@@ -207,15 +206,15 @@ where
         let link = Arc::new(AsyncLink::new(stream, link_keys));
         let mut seen_req_ids = HashSet::new();
         let gw_sk = gateway_sk;
-        let client_pk_local = client_pk;
         let circuit_keys_local = circuit_keys;
         let connector = Arc::clone(&connector);
         loop {
+            // N2.2.2-hardening: client identity is read from the
+            // TransitRequest — no out-of-band `client_pk` parameter.
             match serve_one_gateway_request_async_with_connector(
                 &link,
                 gateway_node_id,
                 &gw_sk,
-                &client_pk_local,
                 &circuit_keys_local,
                 &mut seen_req_ids,
                 connector.as_ref(),
@@ -258,12 +257,14 @@ async fn serve_one_gateway_request_async(
     seen_req_ids: &mut HashSet<[u8; 16]>,
 ) -> NodeResult<ServeOutcome> {
     // The production factory: PinnedConnector::new (SSRF defence enforced).
+    //
+    // N2.2.2-hardening: the client's Ed25519 public key is embedded inside
+    // the TransitRequest — no out-of-band parameter is passed.
     #[allow(deprecated)]
     serve_one_gateway_request_async_with_connector(
         link,
         gateway_node_id,
         gateway_sk,
-        &super::super::legacy::client_public_key(),
         circuit,
         seen_req_ids,
         &|url| PinnedConnector::new(url).map_err(NodeError::Gateway),
@@ -271,9 +272,14 @@ async fn serve_one_gateway_request_async(
     .await
 }
 
-/// Serve ONE transit request with a custom connector factory + explicit
-/// client public key (for dynamic-mesh scenarios where the client identity
-/// is NOT the deterministic N2.0 test identity).
+/// Serve ONE transit request with a custom connector factory.
+///
+/// **N2.2.2-hardening:** The client's Ed25519 public key is no longer a
+/// parameter — it is read from the embedded `client_ed25519_public_key`
+/// field inside the TransitRequest (the circuit-encrypted payload). The
+/// legacy comment about "explicit client public key for dynamic-mesh
+/// scenarios" is no longer applicable: ANY client identity is now
+/// self-identifying via the signed TransitRequest.
 ///
 /// **N2.0.7.1: DEPRECATED.** This function takes `CircuitKeys` as a parameter —
 /// use the protocol-driven path (`serve_gateway_with_protocol_circuit` →
@@ -289,7 +295,6 @@ pub async fn serve_one_gateway_request_async_with_connector<F>(
     link: &Arc<AsyncLink>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
-    client_pk: &[u8; 32],
     circuit: &CircuitKeys,
     seen_req_ids: &mut HashSet<[u8; 16]>,
     connector_factory: &F,
@@ -324,15 +329,12 @@ where
     // which uses blocking I/O. Wrap it in `spawn_blocking` so it doesn't
     // stall the tokio runtime (the async HTTP server on the other end needs
     // to be scheduled to accept the connection + send the response).
+    //
+    // N2.2.2-hardening: the client's Ed25519 public key is embedded inside
+    // the TransitRequest — no out-of-band parameter is passed.
     let gateway_sk_arr = *gateway_sk;
-    let client_pk_arr = *client_pk;
     let fetched = tokio::task::spawn_blocking(move || {
-        handle_transit_request_with_connector(
-            &transit_req,
-            &gateway_sk_arr,
-            &client_pk_arr,
-            &connector,
-        )
+        handle_transit_request_with_connector(&transit_req, &gateway_sk_arr, &connector)
     })
     .await
     .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))??;
@@ -789,6 +791,10 @@ pub async fn send_request_via_gateway_full_with_relay_async(
     let link = AsyncLink::new(stream, relay_link_keys);
 
     // Build + sign + encrypt the TransitRequest.
+    //
+    // N2.2.2-hardening: embed the client's Ed25519 public key inside the
+    // TransitRequest. The gateway extracts it from the decrypted request
+    // (no out-of-band parameter). Part of the signed preimage.
     let mut req = TransitRequest {
         req_id: random_req_id(),
         method: "GET".into(),
@@ -797,6 +803,7 @@ pub async fn send_request_via_gateway_full_with_relay_async(
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32],
+        client_ed25519_public_key: node.identity.public_key,
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &node.identity.secret_key);
@@ -901,7 +908,6 @@ pub async fn serve_gateway_with_protocol_circuit<F>(
     listen_addr: &str,
     gateway_x25519_secret: &snp_crypto::X25519Secret,
     gateway_x25519_public: &snp_crypto::X25519PubKey,
-    client_ed25519_public: [u8; 32],
     connector_factory: F,
 ) -> NodeResult<()>
 where
@@ -950,7 +956,6 @@ where
             &link,
             gateway_node_id,
             &gateway_ed_sk,
-            &client_ed25519_public,
             gateway_x25519_secret,
             &mut seen_req_ids,
             connector.as_ref(),
@@ -983,7 +988,6 @@ async fn serve_one_gateway_request_protocol_circuit<F>(
     link: &Arc<AsyncLink>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
-    client_pk: &[u8; 32],
     gateway_x25519_secret: &snp_crypto::X25519Secret,
     seen_req_ids: &mut HashSet<[u8; 16]>,
     connector_factory: &F,
@@ -1000,6 +1004,18 @@ where
         }
         Err(e) => return Err(async_err_to_node(e)),
     };
+    // N2.2.2-hardening: Reject frames not addressed to this gateway —
+    // BEFORE performing any circuit decryption (fail fast on wrong
+    // destination). Without this check, a misrouted frame would still be
+    // decrypted (wasting CPU) and would surface as a confusing decode error
+    // downstream. The frame header (dst/src/ttl/fid/seq) is visible to the
+    // gateway because the link layer has already stripped the outer AEAD.
+    if req_frame.dst != gateway_node_id {
+        return Err(NodeError::Other(format!(
+            "gateway {:?} received frame addressed to {:?} (dst mismatch)",
+            gateway_node_id, req_frame.dst
+        )));
+    }
     if should_drop(&req_frame) {
         return Ok(ServeOutcome::Continue);
     }
@@ -1025,6 +1041,23 @@ where
     );
 
     let transit_req = decode_transit_request(&req_bytes)?;
+
+    // N2.2.2-hardening: The client's identity is now read FROM THE PROTOCOL
+    // (the `client_ed25519_public_key` field embedded inside the
+    // circuit-encrypted TransitRequest) — NOT passed out-of-band. Verify
+    // that `derive_node_id(client_ed25519_public_key) == req_frame.src` so a
+    // client cannot impersonate a different NodeId. The signature itself is
+    // verified by `handle_transit_request_with_connector` further down.
+    let expected_src = derive_node_id(&transit_req.client_ed25519_public_key);
+    if expected_src != req_frame.src {
+        return Err(NodeError::Other(format!(
+            "frame source {:?} does not match the client identity derived \
+             from the TransitRequest's client_ed25519_public_key (expected {:?}) — \
+             possible impersonation attempt",
+            req_frame.src, expected_src
+        )));
+    }
+
     let req_id_arr: [u8; 16] = transit_req.req_id;
     if !seen_req_ids.insert(req_id_arr) {
         return Err(NodeError::Other(format!(
@@ -1035,14 +1068,8 @@ where
 
     let connector = connector_factory(&transit_req.url)?;
     let gateway_sk_arr = *gateway_sk;
-    let client_pk_arr = *client_pk;
     let fetched = tokio::task::spawn_blocking(move || {
-        handle_transit_request_with_connector(
-            &transit_req,
-            &gateway_sk_arr,
-            &client_pk_arr,
-            &connector,
-        )
+        handle_transit_request_with_connector(&transit_req, &gateway_sk_arr, &connector)
     })
     .await
     .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))??;
@@ -1107,7 +1134,6 @@ pub async fn serve_gateway_persistent_async_with_handshake(
     gateway_x25519_secret: &snp_crypto::X25519Secret,
     gateway_x25519_public: &snp_crypto::X25519PubKey,
     circuit_keys: CircuitKeys,
-    client_ed25519_public: [u8; 32],
 ) -> NodeResult<()> {
     let gateway_node_id = node.identity.node_id;
     let gateway_ed_sk = node.identity.secret_key;
@@ -1152,7 +1178,6 @@ pub async fn serve_gateway_persistent_async_with_handshake(
             &link,
             gateway_node_id,
             &gateway_ed_sk,
-            &client_ed25519_public,
             &circuit_keys,
             &mut seen_req_ids,
             &|url| PinnedConnector::new(url).map_err(NodeError::Gateway),
@@ -1193,7 +1218,6 @@ pub async fn serve_gateway_persistent_async_with_handshake_and_connector<F>(
     gateway_x25519_secret: &snp_crypto::X25519Secret,
     gateway_x25519_public: &snp_crypto::X25519PubKey,
     circuit_keys: CircuitKeys,
-    client_ed25519_public: [u8; 32],
     connector_factory: F,
 ) -> NodeResult<()>
 where
@@ -1236,7 +1260,6 @@ where
             &link,
             gateway_node_id,
             &gateway_ed_sk,
-            &client_ed25519_public,
             &circuit_keys,
             &mut seen_req_ids,
             connector.as_ref(),
@@ -1497,6 +1520,9 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
     }
 
     // 3. Build + sign + circuit-encrypt the TransitRequest.
+    //
+    // N2.2.2-hardening: embed the client's Ed25519 public key inside the
+    // TransitRequest (part of the signed preimage, bound to client_sig).
     let mut req = TransitRequest {
         req_id: random_req_id(),
         method: "GET".into(),
@@ -1505,6 +1531,7 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32],
+        client_ed25519_public_key: node.identity.public_key,
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, node_ed25519_secret);
@@ -1611,6 +1638,12 @@ pub async fn send_with_protocol_circuit_async(
     let link = AsyncLink::new(stream, handshake.link_keys);
 
     // 2. Build + sign the TransitRequest.
+    //
+    // N2.2.2-hardening: The client embeds its OWN Ed25519 public key in the
+    // TransitRequest (`client_ed25519_public_key` field). This field is part
+    // of the signed preimage, so it's cryptographically bound to `client_sig`.
+    // The gateway reads this field from the decrypted TransitRequest (no
+    // out-of-band parameter needed) and uses it to verify the signature.
     let mut req = TransitRequest {
         req_id: random_req_id(),
         method: "GET".into(),
@@ -1619,6 +1652,7 @@ pub async fn send_with_protocol_circuit_async(
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32],
+        client_ed25519_public_key: node.identity.public_key,
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &node.identity.secret_key);

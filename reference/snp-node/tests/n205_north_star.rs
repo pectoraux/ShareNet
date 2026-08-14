@@ -321,17 +321,18 @@ async fn north_star_canonical_production_path() {
         );
         let gateway_x_sk = Arc::clone(&gateway_idents.x_sk);
         let gateway_x_pk = gateway_idents.x_pk;
-        let client_ed_pk = client_idents.ed_pk;
         let circuit_keys = gateway_circuit_keys;
         let listen_addr = gateway_listen_addr.clone();
         tokio::spawn(async move {
+            // N2.2.2-hardening: client identity is read from the
+            // TransitRequest's embedded `client_ed25519_public_key` field —
+            // no out-of-band parameter.
             async_node::serve_gateway_persistent_async_with_handshake_and_connector(
                 &gateway_node,
                 &listen_addr,
                 &gateway_x_sk,
                 &gateway_x_pk,
                 circuit_keys,
-                client_ed_pk,
                 |url| test_connector_factory(url),
             )
             .await

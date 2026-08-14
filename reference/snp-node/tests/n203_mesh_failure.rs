@@ -281,7 +281,6 @@ fn start_gateway(
     identity: &NodeIdentity,
     link_keys: LinkKeys,
     circuit_keys: CircuitKeys,
-    client_pk: [u8; 32],
     http_port: u16,
     drop_after: usize,
 ) -> (String, thread::JoinHandle<()>) {
@@ -330,7 +329,6 @@ fn start_gateway(
                     &link,
                     node_id,
                     &sk,
-                    &client_pk,
                     &circuit_keys,
                     &mut seen_req_ids,
                     // TEST-ONLY SSRF bypass: pin to the local HTTP server.
@@ -624,7 +622,6 @@ fn setup_mesh_topology(relay_b_drop_after: usize, gateway_a_drop_after: usize) -
         &gateway_a_identity,
         gateway_a_relay_b_keys,
         gateway_a_circuit_keys,
-        client_identity.public_key,
         http_port,
         gateway_a_drop_after,
     );
@@ -634,7 +631,6 @@ fn setup_mesh_topology(relay_b_drop_after: usize, gateway_a_drop_after: usize) -
         &gateway_b_identity,
         gateway_b_relay_c_keys,
         gateway_b_circuit_keys,
-        client_identity.public_key,
         http_port,
         0, // Gateway B never drops (it's the failover target)
     );

@@ -204,10 +204,12 @@ fn sec_unsigned_transit_request_rejected() {
         max_response_bytes: 1024 * 1024,
         deadline: u64::MAX,
         reply_to: [0; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key.
+        client_ed25519_public_key: client_pk,
         client_sig: [0u8; 64], // ALL ZEROS — unsigned
     };
 
-    assert!(!verify_transit_request(&req, &client_pk),
+    assert!(!verify_transit_request(&req),
         "Unsigned TransitRequest must be rejected");
 }
 
@@ -224,13 +226,15 @@ fn sec_tampered_transit_request_rejected() {
         max_response_bytes: 1024 * 1024,
         deadline: u64::MAX,
         reply_to: [0; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key.
+        client_ed25519_public_key: client_pk,
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &client_sk);
 
     // Tamper with the URL after signing
     req.url = "https://evil.com/".to_string();
-    assert!(!verify_transit_request(&req, &client_pk),
+    assert!(!verify_transit_request(&req),
         "Tampered TransitRequest must be rejected");
 }
 

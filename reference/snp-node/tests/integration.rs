@@ -50,21 +50,9 @@ fn gateway_rejects_private_destinations() {
         "http://metadata.google.internal/",
     ];
     for url in &private_urls {
-        let req = TransitRequest {
-            req_id: [1u8; 16],
-            method: "GET".into(),
-            url: url.to_string(),
-            tls_termination: "GATEWAY_PLAINTEXT".into(),
-            max_response_bytes: 1024,
-            deadline: 2_000_000_000,
-            reply_to: [0u8; 32],
-            client_sig: [0u8; 64],
-        };
-        let client_pk = [0u8; 32]; // zero key — signature won't verify, but SSRF check happens after
-        // Actually, with N1.9.2, the signature check happens FIRST. So we need
-        // to sign the request properly, or accept that the error will be about
-        // the signature, not the SSRF. For the SSRF test, let's use a properly
-        // signed request.
+        // N2.2.2-hardening: the client's Ed25519 public key is embedded
+        // inside the TransitRequest. The gateway reads it from the request
+        // (no out-of-band parameter).
         let client_sk = snp_crypto::sha256(b"SSRF test client key");
         let client_pk = snp_crypto::derive_public_key(&client_sk);
         let mut req = TransitRequest {
@@ -75,10 +63,11 @@ fn gateway_rejects_private_destinations() {
             max_response_bytes: 1024,
             deadline: 2_000_000_000,
             reply_to: [0u8; 32],
+            client_ed25519_public_key: client_pk,
             client_sig: [0u8; 64],
         };
         snp_gateway::sign_transit_request(&mut req, &client_sk);
-        let result = handle_transit_request(&req, &gateway_sk, &client_pk);
+        let result = handle_transit_request(&req, &gateway_sk);
         match result {
             Ok(_) => panic!("SSRF defence failed: {url} should have been blocked"),
             Err(GatewayError::EgressBlocked(reason)) => {

@@ -132,25 +132,34 @@ pub type NodeIdBytes = [u8; 32];
 ///
 /// ```text
 /// TransitRequest = {
-///   reqId:            bstr .size 16,
-///   method:           tstr,
-///   url:              tstr,
-///   headers:          { * tstr => tstr },   ; empty for N1.8
-///   body:             bstr / null,           ; null for N1.8
-///   tlsTermination:   "GATEWAY_PLAINTEXT" / "PAYLOAD_E2E",
-///   maxResponseBytes: uint,
-///   deadline:         uint,
-///   replyTo:          bstr .size 32,         ; rendezvous identity, not NodeId
-///   acceptGateways:   "any" / [* bstr .size 32],  ; "any" for N1.8
-///   clientSig:        bstr .size 64
+///   reqId:                    bstr .size 16,
+///   method:                   tstr,
+///   url:                      tstr,
+///   headers:                  { * tstr => tstr },   ; empty for N1.8
+///   body:                     bstr / null,           ; null for N1.8
+///   tlsTermination:           "GATEWAY_PLAINTEXT" / "PAYLOAD_E2E",
+///   maxResponseBytes:         uint,
+///   deadline:                 uint,
+///   replyTo:                  bstr .size 32,         ; rendezvous identity, not NodeId
+///   acceptGateways:           "any" / [* bstr .size 32],  ; "any" for N1.8
+///   clientEd25519PublicKey:   bstr .size 32,   ; N2.2.2-hardening
+///   clientSig:                bstr .size 64
 /// }
 /// ```
 ///
 /// The Rust struct stores the simplified field set specified for N1.8
 /// (reqId, method, url, tlsTermination, maxResponseBytes, deadline, replyTo,
-/// clientSig). The CBOR encoder adds the empty headers map, null body, and
-/// "any" acceptGateways fields automatically so the wire format matches the
-/// TS reference exactly.
+/// clientEd25519PublicKey, clientSig). The CBOR encoder adds the empty headers
+/// map, null body, and "any" acceptGateways fields automatically so the wire
+/// format matches the TS reference exactly.
+///
+/// **N2.2.2-hardening:** The `client_ed25519_public_key` field is included
+/// INSIDE the circuit-encrypted payload (it's part of the `TransitRequest`
+/// struct that the client seals with `seal_circuit_payload_with_fresh_eph`).
+/// The gateway extracts this from the decrypted `TransitRequest` instead of
+/// receiving it out-of-band. Because it's part of the `clientSig` preimage,
+/// it's cryptographically bound to the client's signature — an attacker can't
+/// substitute a different key after the client signs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitRequest {
     /// 16-byte random request identifier (replay defence).
@@ -167,6 +176,12 @@ pub struct TransitRequest {
     pub deadline: u64,
     /// 32-byte X25519 rendezvous public key for response delivery.
     pub reply_to: NodeIdBytes,
+    /// N2.2.2-hardening: The client's Ed25519 public key, included INSIDE
+    /// the circuit-encrypted payload. The gateway extracts this from the
+    /// decrypted TransitRequest instead of receiving it out-of-band.
+    /// This field is part of the `client_sig` preimage, so it's
+    /// cryptographically bound to the client's signature.
+    pub client_ed25519_public_key: NodeIdBytes,
     /// 64-byte Ed25519 signature by the client under
     /// `SIG_CONTEXTS.transitRequest`.
     pub client_sig: SignatureBytes,
@@ -230,6 +245,9 @@ fn transit_request_preimage(req: &TransitRequest) -> CborValue {
         (t("deadline"), u(req.deadline)),
         (t("replyTo"), b(&req.reply_to)),
         (t("acceptGateways"), t("any")),
+        // N2.2.2-hardening: client_ed25519_public_key is part of the signed
+        // preimage so it's cryptographically bound to client_sig.
+        (t("clientEd25519PublicKey"), b(&req.client_ed25519_public_key)),
     ])
 }
 
@@ -280,6 +298,7 @@ pub fn decode_transit_request(bytes: &[u8]) -> GatewayResult<TransitRequest> {
     let mut max_response_bytes: Option<u64> = None;
     let mut deadline: Option<u64> = None;
     let mut reply_to: Option<NodeIdBytes> = None;
+    let mut client_ed25519_public_key: Option<NodeIdBytes> = None;
     let mut client_sig: Option<SignatureBytes> = None;
     for (k, v) in entries {
         let key = match k {
@@ -298,6 +317,10 @@ pub fn decode_transit_request(bytes: &[u8]) -> GatewayResult<TransitRequest> {
             "maxResponseBytes" => max_response_bytes = Some(extract_uint(v, "maxResponseBytes")?),
             "deadline" => deadline = Some(extract_uint(v, "deadline")?),
             "replyTo" => reply_to = Some(extract_bstr_32(v, "replyTo")?),
+            // N2.2.2-hardening: client Ed25519 public key (32 bytes).
+            "clientEd25519PublicKey" => {
+                client_ed25519_public_key = Some(extract_bstr_32(v, "clientEd25519PublicKey")?);
+            }
             "clientSig" => client_sig = Some(extract_bstr_64(v, "clientSig")?),
             // headers, body, acceptGateways are part of the preimage but the
             // N1.8 client always sends empty/null/"any". We tolerate their
@@ -321,6 +344,9 @@ pub fn decode_transit_request(bytes: &[u8]) -> GatewayResult<TransitRequest> {
         deadline: deadline.ok_or_else(|| GatewayError::MalformedRequest("deadline missing".into()))?,
         reply_to: reply_to
             .ok_or_else(|| GatewayError::MalformedRequest("replyTo missing".into()))?,
+        client_ed25519_public_key: client_ed25519_public_key.ok_or_else(|| {
+            GatewayError::MalformedRequest("clientEd25519PublicKey missing".into())
+        })?,
         client_sig: client_sig
             .ok_or_else(|| GatewayError::MalformedRequest("clientSig missing".into()))?,
     })
@@ -405,10 +431,18 @@ pub fn sign_transit_request(req: &mut TransitRequest, client_secret_key: &Symmet
     req.client_sig = ed25519_sign(client_secret_key, &msg);
 }
 
-/// Verify a TransitRequest's `clientSig` against the client's public key.
+/// Verify a TransitRequest's `clientSig`.
+///
+/// **N2.2.2-hardening:** The client's Ed25519 public key is now embedded
+/// inside the `TransitRequest` itself (`client_ed25519_public_key` field).
+/// This field is part of the signed preimage, so it's cryptographically
+/// bound to `client_sig` — an attacker can't substitute a different key
+/// after the client signs. The gateway extracts the key from the request
+/// (no out-of-band parameter needed).
+///
 /// Returns `false` on any failure (I20 — never throws).
 #[must_use]
-pub fn verify_transit_request(req: &TransitRequest, client_public_key: &[u8; 32]) -> bool {
+pub fn verify_transit_request(req: &TransitRequest) -> bool {
     let preimage = transit_request_preimage(req);
     let Ok(bytes) = snp_cbor::encode(&preimage) else {
         return false;
@@ -416,7 +450,7 @@ pub fn verify_transit_request(req: &TransitRequest, client_public_key: &[u8; 32]
     let mut msg = Vec::with_capacity(sig_contexts::TRANSIT_REQUEST.len() + bytes.len());
     msg.extend_from_slice(sig_contexts::TRANSIT_REQUEST);
     msg.extend_from_slice(&bytes);
-    ed25519_verify(client_public_key, &msg, &req.client_sig)
+    ed25519_verify(&req.client_ed25519_public_key, &msg, &req.client_sig)
 }
 
 /// Sign a TransitResponse with the gateway's Ed25519 secret key, producing
@@ -1069,15 +1103,20 @@ pub struct FetchedResponse {
 pub fn handle_transit_request(
     req: &TransitRequest,
     gateway_secret_key: &SymmetricKey,
-    client_public_key: &[u8; 32],
 ) -> GatewayResult<FetchedResponse> {
     // N1.9.2 FIX: Verify the client's signature BEFORE doing anything else.
     // Without this, anyone who can send a circuit-encrypted frame can make
     // the gateway fetch arbitrary URLs — no attribution, no accountability.
-    if !verify_transit_request(req, client_public_key) {
+    //
+    // N2.2.2-hardening: The client's Ed25519 public key is now embedded
+    // INSIDE the TransitRequest (the `client_ed25519_public_key` field),
+    // not passed out-of-band. The key is part of the signed preimage so it
+    // is cryptographically bound to `client_sig`.
+    if !verify_transit_request(req) {
         return Err(GatewayError::MalformedRequest(
             "TransitRequest client_sig verification FAILED — request is not \
-             authenticated (N1.9.2: unsigned requests must not reach egress)"
+             authenticated (N1.9.2: unsigned requests must not reach egress; \
+             N2.2.2: client identity is read from the request, not out-of-band)"
                 .to_string(),
         ));
     }
@@ -1122,15 +1161,19 @@ pub fn handle_transit_request(
 pub fn handle_transit_request_with_connector(
     req: &TransitRequest,
     gateway_secret_key: &SymmetricKey,
-    client_public_key: &[u8; 32],
     connector: &PinnedConnector,
 ) -> GatewayResult<FetchedResponse> {
     // Same client-signature verification as handle_transit_request — this
     // is NOT bypassed by the test-only escape hatch.
-    if !verify_transit_request(req, client_public_key) {
+    //
+    // N2.2.2-hardening: The client's Ed25519 public key is embedded INSIDE
+    // the TransitRequest (the `client_ed25519_public_key` field), not passed
+    // out-of-band.
+    if !verify_transit_request(req) {
         return Err(GatewayError::MalformedRequest(
             "TransitRequest client_sig verification FAILED — request is not \
-             authenticated (N1.9.2: unsigned requests must not reach egress)"
+             authenticated (N1.9.2: unsigned requests must not reach egress; \
+             N2.2.2: client identity is read from the request, not out-of-band)"
                 .to_string(),
         ));
     }
@@ -1400,17 +1443,25 @@ mod tests {
             max_response_bytes: 65536,
             deadline: 2_000_000_000,
             reply_to: [2u8; 32],
+            client_ed25519_public_key: client_public,
             client_sig: [0u8; 64],
         };
         sign_transit_request(&mut req, &client_secret);
-        assert!(verify_transit_request(&req, &client_public));
-        // Wrong key
-        let other_pub = derive_public_key(&[7u8; 32]);
-        assert!(!verify_transit_request(&req, &other_pub));
-        // Tamper
+        assert!(verify_transit_request(&req));
+        // Tamper: substitute the embedded public key with a DIFFERENT key.
+        // The signature was computed over the ORIGINAL key, so verification
+        // must fail (the embedded key is no longer the one that signed).
+        let mut tampered_key = req.clone();
+        tampered_key.client_ed25519_public_key = derive_public_key(&[7u8; 32]);
+        assert!(
+            !verify_transit_request(&tampered_key),
+            "substituting the embedded client_ed25519_public_key MUST break \
+             verification (it's part of the signed preimage)"
+        );
+        // Tamper: change a signed field (url).
         let mut tampered = req.clone();
         tampered.url = "https://evil.com/".into();
-        assert!(!verify_transit_request(&tampered, &client_public));
+        assert!(!verify_transit_request(&tampered));
     }
 
     #[test]
@@ -1447,6 +1498,7 @@ mod tests {
             max_response_bytes: 65536,
             deadline: 2_000_000_000,
             reply_to: [6u8; 32],
+            client_ed25519_public_key: [12u8; 32],
             client_sig: [7u8; 64],
         };
         let bytes = encode_transit_request(&req).unwrap();

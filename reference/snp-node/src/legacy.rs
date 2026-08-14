@@ -510,7 +510,7 @@ fn serve_one_request(
 
     // Handle the request: validate (signature!), build PinnedConnector (DNS pin), fetch,
     // sign. The PinnedConnector closes the N1.8 TOCTOU gap.
-    let fetched = handle_transit_request(&transit_req, gateway_sk, &client_public_key())?;
+    let fetched = handle_transit_request(&transit_req, gateway_sk)?;
     eprintln!(
         "[gateway] fetched: status={} body={} bytes object_id={}",
         fetched.response.status,
@@ -634,6 +634,10 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
     eprintln!("[client] connected");
 
     // Build the TransitRequest.
+    //
+    // N2.2.2-hardening: the client's Ed25519 public key is now embedded
+    // inside the TransitRequest (`client_ed25519_public_key` field). The
+    // gateway reads it from the decrypted request — no out-of-band channel.
     let mut req = TransitRequest {
         req_id: random_req_id(),
         method: "GET".into(),
@@ -642,6 +646,7 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32], // N1.9: not used; gateway replies via the frame
+        client_ed25519_public_key: client_public_key(),
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &CLIENT_SECRET);
@@ -800,7 +805,7 @@ fn serve_one_request_named(
 
     // handle_transit_request verifies the client_sig, builds the PinnedConnector
     // (DNS pin), fetches, signs the response.
-    let fetched = handle_transit_request(&transit_req, gateway_sk, &client_public_key())?;
+    let fetched = handle_transit_request(&transit_req, gateway_sk)?;
     eprintln!(
         "[gateway-{gw:?}] fetched: status={} body={} bytes object_id={}",
         fetched.response.status,
@@ -968,6 +973,8 @@ pub fn run_client_to_gateway(
         max_response_bytes: 65536,
         deadline: now_unix() + 60,
         reply_to: [0u8; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key.
+        client_ed25519_public_key: client_public_key(),
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, &CLIENT_SECRET);

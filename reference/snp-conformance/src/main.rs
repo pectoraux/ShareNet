@@ -3001,11 +3001,14 @@ fn run_gateway_vector(id: &str, vector: &Value) -> (Outcome, String) {
             max_response_bytes: 10 * 1024 * 1024,
             deadline: 1_710_003_600,
             reply_to,
+            // N2.2.2-hardening: the client's Ed25519 public key is embedded
+            // INSIDE the TransitRequest (no out-of-band parameter).
+            client_ed25519_public_key: alice_pub,
             client_sig: [0u8; 64],
         };
         sign_transit_request(&mut req, &alice_sec);
         let want = expected["verifies"].as_bool().unwrap_or(false);
-        let got = verify_transit_request(&req, &alice_pub);
+        let got = verify_transit_request(&req);
         if got == want {
             (Outcome::Independent, format!("transit-request ok (verifies={got})"))
         } else {

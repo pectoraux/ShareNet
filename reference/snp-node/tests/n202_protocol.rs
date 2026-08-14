@@ -124,6 +124,9 @@ fn build_transit_request(client_sk: &[u8; 32]) -> TransitRequest {
         max_response_bytes: 65536,
         deadline: u64::MAX,
         reply_to: [0u8; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key (part of
+        // the signed preimage, bound to client_sig).
+        client_ed25519_public_key: derive_public_key(client_sk),
         client_sig: [0u8; 64],
     };
     sign_transit_request(&mut req, client_sk);
@@ -477,7 +480,7 @@ fn test_2_generic_gateway_c() {
         // 5. Decode + verify the TransitRequest.
         let transit_req = decode_transit_request(&req_bytes).expect("decode req");
         assert!(
-            verify_transit_request(&transit_req, &client_ed_pk),
+            verify_transit_request(&transit_req),
             "client signature on TransitRequest MUST verify"
         );
         // 6. Build a stub TransitResponse (no real Internet fetch).
@@ -878,7 +881,7 @@ fn test_6_relay_cannot_derive_circuit_key() {
         let (client_eph_pub, req_bytes) = open_circuit_payload_with_fresh_eph(&gw_x_sk, &req_frame.body)
             .expect("gw open circuit payload");
         let transit_req = decode_transit_request(&req_bytes).expect("gw decode req");
-        assert!(verify_transit_request(&transit_req, &client_ed_pk), "gw verifies client sig");
+        assert!(verify_transit_request(&transit_req), "gw verifies client sig");
         let resp = build_stub_response(transit_req.req_id, &gw_ed_sk);
         let resp_keys = derive_gateway_response_keys(&gw_x_sk, &client_eph_pub);
         let resp_bytes = encode_transit_response(&resp).expect("gw encode resp");

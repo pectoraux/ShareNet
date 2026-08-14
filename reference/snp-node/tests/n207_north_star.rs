@@ -239,7 +239,6 @@ async fn north_star_protocol_circuit_route_authoritative() {
         );
         let gw_x_sk = Arc::clone(&gateway_idents.x_sk);
         let gw_x_pk = gateway_idents.x_pk;
-        let client_ed_pk = client_idents.ed_pk;
         let listen = gateway_listen_addr.clone();
         tokio::spawn(async move {
             async_node::serve_gateway_with_protocol_circuit(
@@ -247,7 +246,6 @@ async fn north_star_protocol_circuit_route_authoritative() {
                 &listen,
                 &gw_x_sk,
                 &gw_x_pk,
-                client_ed_pk,
                 |url| test_connector_factory(url),
             )
             .await
@@ -631,13 +629,11 @@ async fn failure_recovery_new_route_via_alternate_relay() {
             );
             let gw_x_sk = Arc::clone(&gateway_idents.x_sk);
             let gw_x_pk = gateway_idents.x_pk;
-            let client_ed_pk = client_idents.ed_pk;
             async_node::serve_gateway_with_protocol_circuit(
                 &gateway_node,
                 &gateway_listen_addr_gw,
                 &gw_x_sk,
                 &gw_x_pk,
-                client_ed_pk,
                 |url| test_connector_factory(url),
             )
             .await

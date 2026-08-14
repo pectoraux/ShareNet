@@ -576,6 +576,8 @@ fn test_6_frame_integrity_across_hops() {
         max_response_bytes: 65536,
         deadline: u64::MAX,
         reply_to: [0u8; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key.
+        client_ed25519_public_key: snp_crypto::derive_public_key(&client_sk),
         client_sig: [0u8; 64],
     };
     snp_gateway::sign_transit_request(&mut req, &client_sk);
@@ -929,6 +931,8 @@ fn send_client_request_with_ttl(
         max_response_bytes: 65536,
         deadline: now + 60,
         reply_to: [0u8; 32],
+        // N2.2.2-hardening: embed the client's Ed25519 public key.
+        client_ed25519_public_key: snp_crypto::derive_public_key(&client_sk),
         client_sig: [0u8; 64],
     };
     snp_gateway::sign_transit_request(&mut req, &client_sk);
