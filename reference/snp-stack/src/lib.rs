@@ -100,7 +100,11 @@ pub mod smol_device;
 pub mod tcp_engine;
 pub mod transport;
 
-pub use bridge::{BridgeError, MockUpstream, TcpFlowBridge, Upstream};
+pub use bridge::{
+    AsyncUpstream, BridgeError, MockUpstream, TcpFlowBridge, Upstream,
+};
+#[cfg(feature = "circuit-upstream")]
+pub use bridge::ShareNetCircuitUpstream;
 pub use dns::{
     intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,

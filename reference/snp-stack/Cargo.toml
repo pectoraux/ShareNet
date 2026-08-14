@@ -9,12 +9,30 @@ rust-version.workspace = true
 
 [dependencies]
 snp-tun.workspace = true
+snp-node = { workspace = true, optional = true }
+snp-gateway = { workspace = true, optional = true }
+snp-crypto = { workspace = true, optional = true }
+snp-link = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 smoltcp.workspace = true
+async-trait.workspace = true
+
+[features]
+default = []
+# Enable the real ShareNet circuit-backed upstream (requires the full
+# ShareNet stack). This is a production feature — tests use MockUpstream
+# which doesn't need this.
+circuit-upstream = ["dep:snp-node", "dep:snp-gateway", "dep:snp-crypto", "dep:snp-link"]
 
 [dev-dependencies]
 tokio.workspace = true
+snp-node.workspace = true
+snp-gateway.workspace = true
+snp-crypto.workspace = true
+snp-link.workspace = true
+url.workspace = true
+getrandom = "0.2"
 
 [lib]
 name = "snp_stack"

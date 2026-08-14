@@ -1029,10 +1029,17 @@ dependencies = [
 name = "snp-stack"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "getrandom",
  "smoltcp",
+ "snp-crypto",
+ "snp-gateway",
+ "snp-link",
+ "snp-node",
  "snp-tun",
  "thiserror 1.0.69",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -91,6 +91,7 @@ snp-circuit = { path = "snp-circuit" }
 snp-gateway = { path = "snp-gateway" }
 snp-civic = { path = "snp-civic" }
 snp-tun = { path = "snp-tun" }
+snp-node = { path = "snp-node" }
 
 [profile.release]
 opt-level = 3

@@ -89,6 +89,71 @@ pub trait Upstream: Send {
     fn close(&mut self);
 }
 
+/// **N2.3.6** — An async byte-level upstream — the production seam between
+/// the TCP flow bridge and the ShareNet circuit.
+///
+/// This trait mirrors [`Upstream`] but is async, matching the rest of
+/// ShareNet's production networking architecture (all ShareNet APIs from
+/// N2.0.7+ are Tokio-async). The synchronous [`Upstream`] trait is retained
+/// for test mocks; the production path uses [`AsyncUpstream`].
+///
+/// ## Why async?
+///
+/// The ShareNet circuit APIs (`send_via_route`, `send_via_route_with_body`)
+/// are async — they perform TCP handshakes, SNP-IK key agreement, circuit
+/// encryption, and multi-hop relay forwarding. A synchronous `Upstream`
+/// would require `spawn_blocking` or `block_on`, breaking the async
+/// architecture. `AsyncUpstream` keeps the entire pipeline async:
+///
+/// ```text
+/// smoltcp/TUN (async)
+///     ↓
+/// TcpFlowBridge (async pump)
+///     ↓
+/// AsyncUpstream (this trait)
+///     ↓
+/// send_via_route_with_body() (async)
+///     ↓
+/// Gateway (async)
+/// ```
+///
+/// ## Current limitation (Mode A)
+///
+/// The current ShareNet gateway is Mode A (HTTP fetch): the client sends a
+/// URL, the gateway fetches it and returns the response body. It is NOT a
+/// raw TCP byte stream (that would be Mode B / SOCKS5, a future protocol
+/// extension).
+///
+/// [`ShareNetCircuitUpstream`](crate::ShareNetCircuitUpstream) bridges this
+/// gap by buffering the application's TCP write data until a complete HTTP
+/// request is formed, then sending it as a single gateway HTTP fetch. The
+/// response body is returned and injected back into the smoltcp socket.
+///
+/// This is NOT a true transparent TCP byte stream — it's an HTTP-level
+/// adapter that proves the async circuit boundary. When Mode B is designed,
+/// a true streaming `AsyncUpstream` will replace this without changing the
+/// trait.
+#[async_trait::async_trait]
+pub trait AsyncUpstream: Send {
+    /// Send bytes to the upstream (from the application → gateway direction).
+    /// Returns the number of bytes accepted.
+    ///
+    /// # Errors
+    /// Returns [`BridgeError`] on failure.
+    async fn send(&mut self, data: &[u8]) -> Result<usize, BridgeError>;
+
+    /// Receive bytes from the upstream (from the gateway → application
+    /// direction). Returns `Ok(None)` if no bytes are available yet.
+    ///
+    /// # Errors
+    /// Returns [`BridgeError`] on failure.
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>, BridgeError>;
+
+    /// Close the upstream (tear down the circuit). After this, `send` and
+    /// `recv` should return [`BridgeError::Closed`].
+    async fn close(&mut self);
+}
+
 /// Errors from the TCP flow bridge.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BridgeError {
@@ -107,34 +172,35 @@ pub enum BridgeError {
 }
 
 /// A tracked TCP flow — maps a smoltcp socket handle to an upstream instance.
-struct FlowEntry {
-    /// The smoltcp socket handle (in the TcpEngine's SocketSet). Retained
-    /// for debugging/inspection (the pump loop already knows the handle).
-    #[allow(dead_code)]
-    socket_handle: SocketHandle,
-    /// The upstream (circuit adapter or mock).
-    upstream: Box<dyn Upstream>,
+/// Can hold either a synchronous [`Upstream`] or an async [`AsyncUpstream`].
+enum FlowEntry {
+    /// Synchronous upstream (for test mocks).
+    Sync(Box<dyn Upstream>),
+    /// Async upstream (for production ShareNet circuit).
+    Async(Box<dyn AsyncUpstream + Send>),
 }
 
 /// The TCP flow bridge — connects smoltcp TCP sockets to upstreams.
 ///
 /// The bridge is the packet-to-mesh adapter. It does NOT own the TcpEngine
-/// — the caller owns the engine and passes it to [`TcpFlowBridge::pump`],
-/// which does the bidirectional byte transfer.
+/// — the caller owns the engine and passes it to [`TcpFlowBridge::pump`]
+/// (sync) or [`TcpFlowBridge::pump_async`] (async), which does the
+/// bidirectional byte transfer.
 ///
 /// ## Lifecycle
 ///
 /// 1. The caller creates a TcpEngine and a TcpFlowBridge.
 /// 2. When a TCP connection is established (the caller detects this via
 ///    `engine.is_established(handle)`), the caller creates an upstream and
-///    calls `bridge.attach_upstream(handle, upstream)`.
-/// 3. The caller calls `bridge.pump(&mut engine)` periodically (or after
-///    each packet exchange) to transfer bytes between smoltcp and the
-///    upstreams.
+///    calls `bridge.attach_upstream(handle, upstream)` (sync) or
+///    `bridge.attach_async_upstream(handle, upstream)` (async).
+/// 3. The caller calls `bridge.pump(&mut engine)` (sync) or
+///    `bridge.pump_async(&mut engine)` (async) periodically to transfer
+///    bytes between smoltcp and the upstreams.
 /// 4. When a connection closes (FIN/RST), the caller calls
 ///    `bridge.detach_upstream(handle)`.
 pub struct TcpFlowBridge {
-    /// Tracked flows: socket handle → upstream.
+    /// Tracked flows: socket handle → upstream (sync or async).
     flows: HashMap<SocketHandle, FlowEntry>,
 }
 
@@ -161,24 +227,27 @@ impl TcpFlowBridge {
         }
     }
 
-    /// Attach an upstream to a smoltcp socket. After this, `pump` will
-    /// transfer bytes between the socket and the upstream.
+    /// Attach a synchronous upstream to a smoltcp socket. After this, `pump`
+    /// will transfer bytes between the socket and the upstream.
     pub fn attach_upstream(&mut self, socket_handle: SocketHandle, upstream: Box<dyn Upstream>) {
-        self.flows.insert(
-            socket_handle,
-            FlowEntry {
-                socket_handle,
-                upstream,
-            },
-        );
+        self.flows.insert(socket_handle, FlowEntry::Sync(upstream));
+    }
+
+    /// **N2.3.6** — Attach an async upstream to a smoltcp socket. After this,
+    /// `pump_async` will transfer bytes between the socket and the upstream.
+    pub fn attach_async_upstream(
+        &mut self,
+        socket_handle: SocketHandle,
+        upstream: Box<dyn AsyncUpstream + Send>,
+    ) {
+        self.flows
+            .insert(socket_handle, FlowEntry::Async(upstream));
     }
 
     /// Detach the upstream from a smoltcp socket. Closes the upstream and
     /// removes the flow from the bridge.
     pub fn detach_upstream(&mut self, socket_handle: SocketHandle) {
-        if let Some(mut entry) = self.flows.remove(&socket_handle) {
-            entry.upstream.close();
-        }
+        self.flows.remove(&socket_handle);
     }
 
     /// Returns the number of tracked flows.
@@ -193,28 +262,24 @@ impl TcpFlowBridge {
         self.flows.contains_key(&socket_handle)
     }
 
-    /// Pump bytes between smoltcp sockets and their upstreams.
-    ///
-    /// For each tracked flow:
-    /// 1. Read bytes from the smoltcp socket (application → upstream).
-    /// 2. Send those bytes to the upstream.
-    /// 3. Receive bytes from the upstream.
-    /// 4. Write those bytes into the smoltcp socket (upstream → application).
-    ///
-    /// This is the core bidirectional transfer. The caller should invoke
-    /// `pump` after each `engine.process_incoming()` / `engine.drain_outgoing()`
-    /// cycle, or periodically to advance data transfer.
+    /// Pump bytes between smoltcp sockets and their synchronous upstreams.
+    /// Only processes flows attached via [`attach_upstream`]. Async flows
+    /// are skipped (use [`pump_async`] for those).
     ///
     /// Returns the total number of bytes transferred in each direction.
     pub fn pump(&mut self, engine: &mut TcpEngine) -> (usize, usize) {
         let mut total_sent = 0; // app → upstream
         let mut total_recv = 0; // upstream → app
 
-        // Collect the socket handles to avoid borrowing issues (we need to
-        // borrow engine mutably, but the flows map holds the upstreams).
         let socket_handles: Vec<SocketHandle> = self.flows.keys().copied().collect();
 
         for socket_handle in socket_handles {
+            // Only process sync flows in pump().
+            let is_sync = matches!(self.flows.get(&socket_handle), Some(FlowEntry::Sync(_)));
+            if !is_sync {
+                continue;
+            }
+
             // 1. Read bytes from the smoltcp socket (app → upstream).
             let mut read_buf = vec![0u8; 8192];
             let n_read = {
@@ -227,28 +292,22 @@ impl TcpFlowBridge {
             };
 
             if n_read > 0 {
-                // Forward to the upstream.
-                if let Some(entry) = self.flows.get_mut(&socket_handle) {
-                    match entry.upstream.send(&read_buf[..n_read]) {
+                if let Some(FlowEntry::Sync(upstream)) = self.flows.get_mut(&socket_handle) {
+                    match upstream.send(&read_buf[..n_read]) {
                         Ok(n_sent) => {
                             total_sent += n_sent;
                         }
                         Err(BridgeError::Closed) => {
-                            // Upstream closed — close the smoltcp socket.
-                            let socket = engine.tcp_socket_mut(socket_handle);
-                            socket.close();
+                            engine.tcp_socket_mut(socket_handle).close();
                         }
-                        Err(_) => {
-                            // Other error — drop the flow.
-                            // (The next pump cycle will handle cleanup.)
-                        }
+                        Err(_) => {}
                     }
                 }
             }
 
             // 2. Receive bytes from the upstream (upstream → app).
-            if let Some(entry) = self.flows.get_mut(&socket_handle) {
-                match entry.upstream.recv() {
+            if let Some(FlowEntry::Sync(upstream)) = self.flows.get_mut(&socket_handle) {
+                match upstream.recv() {
                     Ok(Some(data)) => {
                         if !data.is_empty() {
                             let socket = engine.tcp_socket_mut(socket_handle);
@@ -257,22 +316,95 @@ impl TcpFlowBridge {
                                     total_recv += n_written;
                                 }
                                 Err(smoltcp::socket::tcp::SendError::InvalidState) => {
-                                    // Socket closed — drop the flow.
                                     self.flows.remove(&socket_handle);
                                 }
                             }
                         }
                     }
-                    Ok(None) => {
-                        // No data available — non-blocking, skip.
-                    }
+                    Ok(None) => {}
                     Err(BridgeError::Closed) => {
-                        // Upstream closed — close the smoltcp socket.
-                        let socket = engine.tcp_socket_mut(socket_handle);
-                        socket.close();
+                        engine.tcp_socket_mut(socket_handle).close();
                     }
                     Err(_) => {
-                        // Other error — drop the flow.
+                        self.flows.remove(&socket_handle);
+                    }
+                }
+            }
+        }
+
+        (total_sent, total_recv)
+    }
+
+    /// **N2.3.6** — Pump bytes between smoltcp sockets and their ASYNC
+    /// upstreams. Only processes flows attached via
+    /// [`attach_async_upstream`]. Sync flows are skipped (use [`pump`] for
+    /// those).
+    ///
+    /// This is the production path — the async upstream connects to the real
+    /// ShareNet circuit via `send_via_route_with_body()`.
+    ///
+    /// # Returns
+    /// Returns the total number of bytes transferred in each direction
+    /// (app→upstream, upstream→app).
+    pub async fn pump_async(&mut self, engine: &mut TcpEngine) -> (usize, usize) {
+        let mut total_sent = 0; // app → upstream
+        let mut total_recv = 0; // upstream → app
+
+        let socket_handles: Vec<SocketHandle> = self.flows.keys().copied().collect();
+
+        for socket_handle in socket_handles {
+            // Only process async flows in pump_async().
+            let is_async = matches!(self.flows.get(&socket_handle), Some(FlowEntry::Async(_)));
+            if !is_async {
+                continue;
+            }
+
+            // 1. Read bytes from the smoltcp socket (app → upstream).
+            let mut read_buf = vec![0u8; 8192];
+            let n_read = {
+                let socket = engine.tcp_socket_mut(socket_handle);
+                match socket.recv_slice(&mut read_buf) {
+                    Ok(n) => n,
+                    Err(smoltcp::socket::tcp::RecvError::Finished) => 0,
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => 0,
+                }
+            };
+
+            if n_read > 0 {
+                if let Some(FlowEntry::Async(upstream)) = self.flows.get_mut(&socket_handle) {
+                    match upstream.send(&read_buf[..n_read]).await {
+                        Ok(n_sent) => {
+                            total_sent += n_sent;
+                        }
+                        Err(BridgeError::Closed) => {
+                            engine.tcp_socket_mut(socket_handle).close();
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            // 2. Receive bytes from the upstream (upstream → app).
+            if let Some(FlowEntry::Async(upstream)) = self.flows.get_mut(&socket_handle) {
+                match upstream.recv().await {
+                    Ok(Some(data)) => {
+                        if !data.is_empty() {
+                            let socket = engine.tcp_socket_mut(socket_handle);
+                            match socket.send_slice(&data) {
+                                Ok(n_written) => {
+                                    total_recv += n_written;
+                                }
+                                Err(smoltcp::socket::tcp::SendError::InvalidState) => {
+                                    self.flows.remove(&socket_handle);
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(BridgeError::Closed) => {
+                        engine.tcp_socket_mut(socket_handle).close();
+                    }
+                    Err(_) => {
                         self.flows.remove(&socket_handle);
                     }
                 }
@@ -357,6 +489,270 @@ impl Upstream for MockUpstream {
         self.closed = true;
     }
 }
+
+// ─── ShareNetCircuitUpstream (production, behind feature flag) ──────────────
+
+#[cfg(feature = "circuit-upstream")]
+mod circuit_upstream {
+    use super::{AsyncUpstream, BridgeError};
+    use snp_crypto::{X25519PubKey, X25519Secret};
+    use snp_node::node::async_node;
+    use snp_node::node::{Node, Route};
+
+    /// **N2.3.6** — A production `AsyncUpstream` backed by a real ShareNet
+    /// circuit.
+    ///
+    /// This adapter connects the TCP flow bridge to the ShareNet mesh:
+    ///
+    /// ```text
+    /// TcpFlowBridge
+    ///     ↓
+    /// ShareNetCircuitUpstream (this struct)
+    ///     ↓
+    /// send_via_route_with_body() (async)
+    ///     ↓
+    /// ShareNet circuit (A → B → C → G)
+    ///     ↓
+    /// Gateway HTTP fetch
+    ///     ↓
+    /// Internet
+    /// ```
+    ///
+    /// ## Mode A limitation
+    ///
+    /// The current ShareNet gateway is Mode A (HTTP fetch). This adapter
+    /// buffers the application's TCP write data until it has a complete HTTP
+    /// request (detected by `\r\n\r\n`), then sends the URL from the HTTP
+    /// request line as a gateway fetch. The response body is returned via
+    /// `recv()`.
+    ///
+    /// This is NOT a true transparent TCP byte stream. It's an HTTP-level
+    /// adapter that proves the async circuit boundary. When Mode B (raw TCP
+    /// stream) is designed, a streaming `AsyncUpstream` will replace this
+    /// without changing the trait.
+    pub struct ShareNetCircuitUpstream {
+        /// The client node (identity + circuit keys).
+        node: Node,
+        /// The route to the gateway (A → B → C → G).
+        route: Route,
+        /// The client's X25519 secret key (for circuit establishment).
+        client_x25519_secret: X25519Secret,
+        /// The client's X25519 public key.
+        client_x25519_public: X25519PubKey,
+        /// Buffered request bytes (from the application's TCP writes).
+        request_buffer: Vec<u8>,
+        /// Response bytes ready for `recv()` to return.
+        response_buffer: Vec<u8>,
+        /// Whether the request has been sent and we're awaiting/delivering
+        /// the response.
+        request_sent: bool,
+        /// Whether the upstream is closed.
+        closed: bool,
+    }
+
+    impl std::fmt::Debug for ShareNetCircuitUpstream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ShareNetCircuitUpstream")
+                .field("request_buffered", &self.request_buffer.len())
+                .field("response_buffered", &self.response_buffer.len())
+                .field("request_sent", &self.request_sent)
+                .field("closed", &self.closed)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ShareNetCircuitUpstream {
+        /// Create a new circuit-backed upstream.
+        ///
+        /// # Arguments
+        /// * `node` — The client node (identity + seen-req-ids + current-gateway).
+        /// * `route` — The route to the gateway (from discovery).
+        /// * `client_x25519_secret` — The client's static X25519 secret.
+        /// * `client_x25519_public` — The client's static X25519 public.
+        #[must_use]
+        pub fn new(
+            node: Node,
+            route: Route,
+            client_x25519_secret: X25519Secret,
+            client_x25519_public: X25519PubKey,
+        ) -> Self {
+            Self {
+                node,
+                route,
+                client_x25519_secret,
+                client_x25519_public,
+                request_buffer: Vec::new(),
+                response_buffer: Vec::new(),
+                request_sent: false,
+                closed: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncUpstream for ShareNetCircuitUpstream {
+        async fn send(&mut self, data: &[u8]) -> Result<usize, BridgeError> {
+            if self.closed {
+                return Err(BridgeError::Closed);
+            }
+
+            // Buffer the application's TCP write data.
+            self.request_buffer.extend_from_slice(data);
+
+            // Check if we have a complete HTTP request (headers end at \r\n\r\n).
+            // If so, extract the URL and send it via the ShareNet circuit.
+            if !self.request_sent {
+                if let Some(header_end) = find_subslice(&self.request_buffer, b"\r\n\r\n") {
+                    let headers = &self.request_buffer[..header_end];
+                    if let Some(url) = extract_url_from_http_request(headers) {
+                        // We have a complete HTTP request. Send it via the
+                        // ShareNet circuit.
+                        self.request_sent = true;
+                        let (resp, body) = async_node::send_via_route_with_body(
+                            &self.node,
+                            &self.route,
+                            &url,
+                            &self.client_x25519_secret,
+                            &self.client_x25519_public,
+                        )
+                        .await
+                        .map_err(|e| {
+                            BridgeError::SmolTcp(format!(
+                                "ShareNet circuit error: {e}"
+                            ))
+                        })?;
+
+                        // Reconstruct the HTTP response (status line + headers
+                        // + body) for the application.
+                        let http_response = format_http_response(&resp, &body);
+                        self.response_buffer.extend_from_slice(&http_response);
+                    }
+                }
+            }
+
+            Ok(data.len())
+        }
+
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+            if self.closed {
+                return Err(BridgeError::Closed);
+            }
+            if self.response_buffer.is_empty() {
+                return Ok(None);
+            }
+            let data = std::mem::take(&mut self.response_buffer);
+            Ok(Some(data))
+        }
+
+        async fn close(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    /// Find the first occurrence of `needle` in `haystack`.
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        haystack
+            .windows(needle.len())
+            .position(|w| w == needle)
+    }
+
+    /// Extract the URL from an HTTP request's request line.
+    ///
+    /// Given `GET /path HTTP/1.1\r\nHost: example.com:8080\r\n...`, extracts
+    /// `http://example.com:8080/path`. If the Host header is missing or the
+    /// request line is malformed, returns `None`.
+    ///
+    /// The scheme is always `http` (the gateway will use the port from the
+    /// Host header to connect). For HTTPS (port 443), the gateway enforces
+    /// port 443 only — non-443 ports are rejected by the SSRF policy.
+    fn extract_url_from_http_request(headers: &[u8]) -> Option<String> {
+        let header_str = std::str::from_utf8(headers).ok()?;
+        let mut lines = header_str.split("\r\n");
+        let request_line = lines.next()?;
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let method = parts[0];
+        let path = parts[1];
+        if method != "GET" && method != "POST" && method != "HEAD" {
+            return None;
+        }
+
+        // Find the Host header (keep the port).
+        let mut host: Option<&str> = None;
+        for line in lines {
+            if line.to_ascii_lowercase().starts_with("host:") {
+                host = line[5..].trim().into();
+                break;
+            }
+        }
+        let host = host?;
+
+        // Construct the URL with the full host:port.
+        Some(format!("http://{host}{path}"))
+    }
+
+    /// Reconstruct a minimal HTTP response from a TransitResponse + body.
+    fn format_http_response(
+        resp: &snp_gateway::TransitResponse,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let status = resp.status;
+        // Find Content-Type from the response headers.
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("application/octet-stream");
+
+        let header = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut out = header.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn extract_url_from_get_request() {
+            let headers = b"GET /path HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test";
+            let url = extract_url_from_http_request(headers).unwrap();
+            assert_eq!(url, "http://example.com/path");
+        }
+
+        #[test]
+        fn extract_url_with_port() {
+            let headers = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n";
+            let url = extract_url_from_http_request(headers).unwrap();
+            assert_eq!(url, "http://example.com:8080/");
+        }
+
+        #[test]
+        fn extract_url_missing_host_returns_none() {
+            let headers = b"GET /path HTTP/1.1\r\nUser-Agent: test";
+            assert!(extract_url_from_http_request(headers).is_none());
+        }
+
+        #[test]
+        fn extract_url_malformed_request_line_returns_none() {
+            let headers = b"NOT_HTTP\r\nHost: example.com\r\n";
+            assert!(extract_url_from_http_request(headers).is_none());
+        }
+    }
+}
+
+#[cfg(feature = "circuit-upstream")]
+pub use circuit_upstream::ShareNetCircuitUpstream;
 
 #[cfg(test)]
 mod tests {
