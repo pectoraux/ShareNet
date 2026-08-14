@@ -72,6 +72,17 @@ if [ -n "$matches" ]; then
     REPORT+=$'\n'"[VIOLATION] new_for_testing() in production source (testing-only):"$'\n'"$matches"$'\n'
 fi
 
+# N2.3: CircuitSender::new_at_seq_for_testing() is testing-only (lets tests
+# start the sender near sequence exhaustion without ~4B sends). Forbidden in
+# production source. Allow the definition file itself (traffic.rs).
+matches=$(grep -rn "new_at_seq_for_testing" "$SRC_DIR" --include="*.rs" \
+    | grep -v "src/node/traffic.rs:" \
+    || true)
+if [ -n "$matches" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT+=$'\n'"[VIOLATION] CircuitSender::new_at_seq_for_testing() in production source (testing-only):"$'\n'"$matches"$'\n'
+fi
+
 # ───────────────────────────────────────────────────────────────────────
 # N2.3 security gate: forbid unbounded snp_cbor::decode() in production
 # source.

@@ -111,6 +111,30 @@ pub const REPLAY_WINDOW_SIZE: u32 = 1024;
 /// packet cannot loop indefinitely (invariant #9).
 pub const PACKET_TTL_MAX: u8 = ROUTE_MAX_HOPS as u8;
 
+/// The first sequence number a source may assign to a packet on a fresh
+/// circuit (P0: sequence lifecycle).
+///
+/// Sequence numbers start at 1 (NOT 0). `0` is reserved as an invalid value
+/// that the relay rejects — it prevents ambiguity with any
+/// uninitialized/sentinel state and makes the protocol's sequence lifecycle
+/// unambiguous.
+pub const FIRST_PACKET_SEQ: u32 = 1;
+
+/// The sequence number at which a circuit is considered exhausted (P0).
+///
+/// `u32::MAX` is the last valid sequence number. A circuit that has sent a
+/// packet with `seq == u32::MAX` is exhausted: the source MUST re-establish
+/// the circuit (new handshake, new keys, new circuit_id) before sending
+/// further traffic. There is **no wraparound** to 0 — consistent with
+/// ShareNet's no-wrap/no-reuse sequence-state philosophy.
+///
+/// Rationale: the AEAD nonce is derived from `(circuit_id, seq)`. Wrapping
+/// seq to 0 would eventually reuse a nonce under the same key, which is
+/// catastrophic for ChaCha20-Poly1305. Treating `u32::MAX` as a hard
+/// exhaustion point keeps the nonce space injective for the circuit's
+/// lifetime.
+pub const MAX_PACKET_SEQUENCE: u32 = u32::MAX;
+
 /// A forwarded packet on an established circuit.
 ///
 /// Wire fields (CBOR map):
@@ -197,6 +221,16 @@ pub enum TrafficError {
     /// The source tried to send a packet with no hops to traverse (empty
     /// ActiveCircuit).
     EmptyCircuit,
+    /// P0: the circuit's sequence space is exhausted. The source has already
+    /// sent a packet with `seq == u32::MAX` ([`MAX_PACKET_SEQUENCE`]). The
+    /// circuit MUST be torn down and re-established before further traffic —
+    /// there is no wraparound to 0.
+    SequenceExhausted { circuit_id: [u8; 32] },
+    /// P0: the relay received a packet with `seq == 0`. Sequence numbers
+    /// start at [`FIRST_PACKET_SEQ`] (= 1); `0` is not a valid packet
+    /// sequence and is rejected (prevents ambiguity with sentinel state and
+    /// enforces the protocol's sequence lifecycle).
+    SequenceZero { circuit_id: [u8; 32] },
 }
 
 impl std::fmt::Display for TrafficError {
@@ -238,6 +272,13 @@ impl std::fmt::Display for TrafficError {
                 f, "circuit {} expired", hex_short(circuit_id)
             ),
             Self::EmptyCircuit => write!(f, "circuit has no hops to traverse"),
+            Self::SequenceExhausted { circuit_id } => write!(
+                f, "circuit {} sequence exhausted (reached u32::MAX) — re-establish the circuit before further traffic",
+                hex_short(circuit_id)
+            ),
+            Self::SequenceZero { circuit_id } => write!(
+                f, "circuit {} packet seq 0 is invalid (sequences start at 1)", hex_short(circuit_id)
+            ),
         }
     }
 }
@@ -301,9 +342,16 @@ impl CircuitReplayWindow {
     ///
     /// [`commit`]: CircuitReplayWindow::commit
     fn check(&self, seq: u32) -> Result<(), TrafficError> {
-        // First packet on this circuit (initialized == false): any seq is
-        // acceptable. P1: uses an explicit `initialized` flag rather than
-        // `max_seen == 0`, so a first packet with seq=0 is handled correctly.
+        // P0: seq == 0 is never a valid packet sequence. The protocol starts
+        // at FIRST_PACKET_SEQ (= 1). Rejecting 0 at the relay prevents any
+        // ambiguity with sentinel state and enforces the no-wrap lifecycle.
+        if seq == 0 {
+            return Err(TrafficError::SequenceZero { circuit_id: [0u8; 32] });
+        }
+        // First packet on this circuit (initialized == false): any valid
+        // (non-zero) seq is acceptable. P1: uses an explicit `initialized`
+        // flag rather than `max_seen == 0`, so a first packet with seq=0 is
+        // handled correctly.
         if !self.initialized {
             return Ok(());
         }
@@ -330,8 +378,8 @@ impl CircuitReplayWindow {
     ///
     /// # Algorithm (O(WINDOW), never O(sequence delta) — P0 #2)
     ///
-    /// - If `seq` is the first packet (`max_seen == 0`): set `max_seen = seq`,
-    ///   mark the slot.
+    /// - If `seq` is the first packet (`!initialized`): set `initialized`,
+    ///   `max_seen = seq`, mark the slot.
     /// - If `seq > max_seen` and the jump `delta = seq - max_seen` is `< WINDOW`:
     ///   clear only the `delta` newly-exposed slots (O(delta) ≤ O(WINDOW)),
     ///   set `max_seen = seq`, mark the slot.
@@ -635,6 +683,128 @@ pub fn wrap_packet(
     })
 }
 
+// ─── Source-side: CircuitSender (circuit-owned sequence allocation) ───────
+
+/// Source-side circuit sender: owns per-circuit sequence allocation so that
+/// callers cannot supply arbitrary `u32` sequence numbers (P0: sequence
+/// exhaustion / no-wrap lifecycle).
+///
+/// A `CircuitSender` is constructed for a specific circuit and allocates
+/// monotonically-increasing sequence numbers starting at [`FIRST_PACKET_SEQ`]
+/// (= 1). When the sequence space is exhausted (`seq == u32::MAX`,
+/// [`MAX_PACKET_SEQUENCE`]), [`send_packet`](Self::send_packet) fails closed
+/// with [`TrafficError::SequenceExhausted`]. There is **no wraparound** —
+/// the circuit must be torn down and re-established before further traffic.
+///
+/// This is the production source-side API. The lower-level [`wrap_packet`]
+/// is retained for testing and explicit-sequence use cases, but production
+/// code SHOULD use `CircuitSender::send_packet` to guarantee the no-wrap
+/// lifecycle is enforced.
+///
+/// # Example
+///
+/// ```no_run
+/// # use snp_node::node::{CircuitSender, CircuitSetup, HopForwardingState, TrafficError};
+/// # fn setup() -> (CircuitSetup, [u8;32], [u8;32]) { unimplemented!() }
+/// let (setup, circuit_id, gateway_id) = setup();
+/// let mut sender = CircuitSender::new(circuit_id, setup.hops().to_vec(), gateway_id);
+/// let packet1 = sender.send_packet(b"hello")?;      // seq = 1
+/// let packet2 = sender.send_packet(b"world")?;      // seq = 2
+/// // ...
+/// # Ok::<(), TrafficError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct CircuitSender {
+    circuit_id: [u8; 32],
+    hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
+    final_dst: [u8; 32],
+    /// The next sequence number to assign. Starts at FIRST_PACKET_SEQ (1).
+    next_seq: u32,
+    /// Whether the sequence space is exhausted. Set to `true` after assigning
+    /// `u32::MAX`; further `send_packet` calls fail closed.
+    exhausted: bool,
+}
+
+impl CircuitSender {
+    /// Construct a new sender for a circuit. Sequence allocation starts at
+    /// [`FIRST_PACKET_SEQ`] (= 1).
+    #[must_use]
+    pub fn new(
+        circuit_id: [u8; 32],
+        hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
+        final_dst: [u8; 32],
+    ) -> Self {
+        Self {
+            circuit_id,
+            hops,
+            final_dst,
+            next_seq: FIRST_PACKET_SEQ,
+            exhausted: false,
+        }
+    }
+
+    /// The next sequence number that will be assigned (without sending).
+    /// Returns `None` if the sequence space is exhausted.
+    #[must_use]
+    pub fn peek_next_seq(&self) -> Option<u32> {
+        if self.exhausted { None } else { Some(self.next_seq) }
+    }
+
+    /// Whether this sender's sequence space is exhausted (a circuit
+    /// re-establishment is required before further traffic).
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Allocate the next sequence number and wrap a plaintext into a
+    /// `CircuitPacket`. Fails closed with [`TrafficError::SequenceExhausted`]
+    /// once `seq == u32::MAX` has been assigned — there is no wraparound.
+    ///
+    /// # Errors
+    /// - [`TrafficError::SequenceExhausted`] — the circuit's sequence space
+    ///   is exhausted; re-establish the circuit.
+    /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
+    /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
+    pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
+        if self.exhausted {
+            return Err(TrafficError::SequenceExhausted { circuit_id: self.circuit_id });
+        }
+        let seq = self.next_seq;
+        // Mark exhausted if this packet uses the last sequence number.
+        if seq == MAX_PACKET_SEQUENCE {
+            self.exhausted = true;
+        } else {
+            self.next_seq = seq.checked_add(1).ok_or(
+                TrafficError::SequenceExhausted { circuit_id: self.circuit_id }
+            )?;
+        }
+        // Delegate to the low-level wrapper (which enforces payload limits +
+        // constructs the per-hop authenticated AEAD layers).
+        wrap_packet(&self.hops, &self.circuit_id, seq, &self.final_dst, plaintext)
+    }
+
+    /// Test-only constructor that starts the sender at a specific `next_seq`,
+    /// so tests can exercise the exhaustion boundary without sending ~4
+    /// billion packets. Forbidden in production source (enforced by the
+    /// architectural guard script, same pattern as the topology graph's
+    /// testing-only constructor).
+    pub fn new_at_seq_for_testing(
+        circuit_id: [u8; 32],
+        hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
+        final_dst: [u8; 32],
+        next_seq: u32,
+    ) -> Self {
+        Self {
+            circuit_id,
+            hops,
+            final_dst,
+            next_seq,
+            exhausted: false,
+        }
+    }
+}
+
 // ─── Destination-side: the terminal gateway receives the plaintext ─────────
 
 /// Destination-side: the terminal gateway unwraps the final layer to recover
@@ -893,34 +1063,36 @@ mod tests {
         assert!(w.check(1000).is_ok());
     }
 
-    /// P1: a first packet with seq=0 must be tracked correctly. The old
-    /// `max_seen == 0` sentinel treated seq=0 as "uninitialized", so after
-    /// commit(0) the window was still treated as uninitialized — allowing a
-    /// replay of seq=0. The `initialized: bool` flag fixes this.
+    /// P0: the relay rejects seq == 0. The protocol's sequence lifecycle
+    /// starts at FIRST_PACKET_SEQ (= 1); seq=0 is reserved as invalid to keep
+    /// the AEAD nonce space unambiguous (no wraparound to 0 after exhaustion).
     #[test]
-    fn first_packet_sequence_zero_is_tracked() {
-        let mut w = CircuitReplayWindow::new();
-        // First packet with seq=0 → accepted.
-        assert!(w.check(0).is_ok());
-        w.commit(0);
-        // The window is now initialized. A future seq is acceptable.
-        assert!(w.check(1).is_ok());
-    }
-
-    /// P1: after commit(0), replaying seq=0 must be rejected. Under the old
-    /// `max_seen == 0` sentinel, the window was still "uninitialized" after
-    /// commit(0), so a replay of seq=0 would be accepted (bypassing replay
-    /// detection). The `initialized` flag fixes this.
-    #[test]
-    fn sequence_zero_replay_is_rejected() {
-        let mut w = CircuitReplayWindow::new();
-        // First packet with seq=0 → accepted + committed.
-        assert!(w.check(0).is_ok());
-        w.commit(0);
-        // Replay of seq=0 → MUST be rejected (window is initialized, slot marked).
+    fn relay_rejects_sequence_zero() {
+        let w = CircuitReplayWindow::new();
+        // seq=0 is rejected even on a fresh (uninitialized) window.
         assert!(matches!(
             w.check(0),
-            Err(TrafficError::PacketReplayOrStale { seq: 0, .. })
+            Err(TrafficError::SequenceZero { .. })
         ));
+    }
+
+    /// P1: the `initialized` flag correctly tracks the first-packet
+    /// transition. After commit(1), the window is initialized and a replay
+    /// of seq=1 is rejected (the old `max_seen == 0` sentinel would have
+    /// treated commit(1) as leaving the window uninitialized if max_seen
+    /// were compared against 0 — but `initialized` is now explicit).
+    #[test]
+    fn initialized_flag_tracks_first_packet() {
+        let mut w = CircuitReplayWindow::new();
+        // First packet with seq=1 → accepted.
+        assert!(w.check(1).is_ok());
+        w.commit(1);
+        // The window is now initialized. A replay of seq=1 → rejected.
+        assert!(matches!(
+            w.check(1),
+            Err(TrafficError::PacketReplayOrStale { seq: 1, .. })
+        ));
+        // A future seq is acceptable.
+        assert!(w.check(2).is_ok());
     }
 }

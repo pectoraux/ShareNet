@@ -35,7 +35,7 @@ use snp_crypto::{
 };
 use snp_node::node::{
     accept_relay_handshake, Capability, CircuitAcceptanceStore,
-    CircuitHandshake, CircuitSetup, CircuitTeardown, CommittedRoute,
+    CircuitHandshake, CircuitSender, CircuitSetup, CircuitTeardown, CommittedRoute,
     commit_route, derive_signed_hop_authorizations, discover_path,
     Link as Link_, LinkKey, MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES,
     NodeAdvertisement, prepare_circuit_setup,
@@ -994,4 +994,130 @@ fn forwarded_ttl_tampering_rejected() {
         matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
         "tampered forwarded TTL must cause AEAD failure at C, got {result:?}"
     );
+}
+
+// ─── P0: sequence exhaustion / no-wrap lifecycle ──────────────────────────
+
+/// P0: a CircuitSender allocates monotonically-increasing sequence numbers
+/// starting at FIRST_PACKET_SEQ (= 1). The caller does not supply seq.
+#[test]
+fn circuit_sender_allocates_monotonic_sequences() {
+    let ts = setup();
+    let mut sender = CircuitSender::new(
+        ts.circuit_handshake.circuit_id,
+        ts.circuit_setup.hops().to_vec(),
+        ts.gateway_id,
+    );
+    // First packet → seq = 1.
+    let p1 = sender.send_packet(b"first").unwrap();
+    assert_eq!(p1.seq, 1);
+    // Second → seq = 2.
+    let p2 = sender.send_packet(b"second").unwrap();
+    assert_eq!(p2.seq, 2);
+    // Third → seq = 3.
+    let p3 = sender.send_packet(b"third").unwrap();
+    assert_eq!(p3.seq, 3);
+    assert!(!sender.is_exhausted());
+}
+
+/// P0: when the sequence space reaches u32::MAX, the sender fails closed with
+/// SequenceExhausted. There is NO wraparound to 0 — the circuit must be
+/// re-established before further traffic.
+#[test]
+fn packet_sequence_exhaustion_is_fail_closed() {
+    let ts = setup();
+    // Start the sender at u32::MAX so the very next send uses the last seq.
+    let mut sender = CircuitSender::new_at_seq_for_testing(
+        ts.circuit_handshake.circuit_id,
+        ts.circuit_setup.hops().to_vec(),
+        ts.gateway_id,
+        u32::MAX,
+    );
+    assert!(!sender.is_exhausted());
+    assert_eq!(sender.peek_next_seq(), Some(u32::MAX));
+
+    // The packet at u32::MAX succeeds — it's the last valid sequence.
+    let p = sender.send_packet(b"last packet").unwrap();
+    assert_eq!(p.seq, u32::MAX);
+
+    // The sender is now exhausted. Further sends fail closed.
+    assert!(sender.is_exhausted());
+    assert_eq!(sender.peek_next_seq(), None);
+    let result = sender.send_packet(b"should fail");
+    assert!(
+        matches!(result, Err(TrafficError::SequenceExhausted { .. })),
+        "exhausted sender must fail closed with SequenceExhausted, got {result:?}"
+    );
+}
+
+/// P0: the sender never wraps to 0. After exhaustion, the next_seq does NOT
+/// become 0 (which would reuse nonce(circuit_id, 0) — catastrophic for AEAD).
+/// The sender stays exhausted and rejects all further sends.
+#[test]
+fn packet_sequence_cannot_wrap() {
+    let ts = setup();
+    let mut sender = CircuitSender::new_at_seq_for_testing(
+        ts.circuit_handshake.circuit_id,
+        ts.circuit_setup.hops().to_vec(),
+        ts.gateway_id,
+        u32::MAX,
+    );
+    // Send the u32::MAX packet → sender becomes exhausted.
+    let _ = sender.send_packet(b"max").unwrap();
+    assert!(sender.is_exhausted());
+
+    // Repeated attempts to send must all fail with SequenceExhausted —
+    // never succeed, never produce seq=0.
+    for _ in 0..10 {
+        let result = sender.send_packet(b"wrap attempt");
+        assert!(
+            matches!(result, Err(TrafficError::SequenceExhausted { .. })),
+            "exhausted sender must not wrap to 0"
+        );
+        // peek_next_seq stays None (not 0).
+        assert_eq!(sender.peek_next_seq(), None);
+    }
+}
+
+/// P0: a relay rejects seq == 0 at the forwarding layer. The protocol starts
+/// at FIRST_PACKET_SEQ (= 1); seq=0 is invalid (no wraparound after
+/// exhaustion). This tests the relay-side enforcement (complementing the
+/// source-side CircuitSender, which never produces seq=0).
+#[test]
+fn sequence_zero_not_valid_after_exhaustion() {
+    let mut lc = live_circuit();
+    // Construct a packet with seq=0 (the source's CircuitSender would never
+    // do this, but an attacker might try). The relay must reject it.
+    let plaintext = b"seq-zero attack".to_vec();
+    let mut packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,  // legitimate seq=1 first
+    ).unwrap();
+    // Now mutate the seq to 0. The AEAD AAD was sealed with seq=1, so this
+    // also breaks authentication — but the relay checks seq==0 BEFORE AEAD,
+    // so it returns SequenceZero (a more precise error) rather than
+    // PacketUnauthentic.
+    packet.seq = 0;
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(
+        matches!(result, Err(TrafficError::SequenceZero { .. })),
+        "relay must reject seq=0 with SequenceZero, got {result:?}"
+    );
+}
+
+/// P0: the CircuitSender produces packets that the relay accepts. This is a
+/// round-trip test: sender.send_packet → forward_packet succeeds.
+#[test]
+fn circuit_sender_packet_accepted_by_relay() {
+    let mut lc = live_circuit();
+    let mut sender = CircuitSender::new(
+        lc.ts.circuit_handshake.circuit_id,
+        lc.ts.circuit_setup.hops().to_vec(),
+        lc.ts.gateway_id,
+    );
+    let packet = sender.send_packet(b"sender round-trip").unwrap();
+    assert_eq!(packet.seq, 1);
+    // B accepts and forwards.
+    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    assert!(matches!(outcome, UnwrappedPacket::Forward { .. }));
 }

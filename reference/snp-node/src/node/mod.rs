@@ -170,10 +170,10 @@ pub use distributed_circuit::{
     authorization_in_root, verify_dh_proof, MAX_AUTHORIZATION_HASHES,
 };
 pub use traffic::{
-    CircuitPacket, RelayForwardingTable, TrafficError, UnwrappedPacket,
+    CircuitPacket, CircuitSender, RelayForwardingTable, TrafficError, UnwrappedPacket,
     wrap_packet, unwrap_final,
     MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
-    REPLAY_WINDOW_SIZE, PACKET_TTL_MAX,
+    REPLAY_WINDOW_SIZE, PACKET_TTL_MAX, FIRST_PACKET_SEQ, MAX_PACKET_SEQUENCE,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
