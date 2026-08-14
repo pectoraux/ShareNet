@@ -35,7 +35,8 @@ use snp_crypto::{
 };
 use snp_node::node::{
     accept_relay_handshake, Capability, CircuitAcceptanceStore,
-    CircuitHandshake, CircuitSender, CircuitSetup, CircuitTeardown, CommittedRoute,
+    CircuitHandshake, CircuitPacketV1, CircuitSender, CircuitSetup,
+    CircuitTeardown, CommittedRoute, UnwrappedPacketV1,
     commit_route, derive_signed_hop_authorizations, discover_path,
     establish_distributed_circuit,
     Link as Link_, LinkKey, MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES,
@@ -44,7 +45,7 @@ use snp_node::node::{
     RelayHandshakeRequest, RelayHandshakeTransport, RouteAcceptance, RouteProposal, RouteRole,
     ServiceAgreement, TopologyGraph,
     TrafficError, TransportEndpoint, UnwrappedPacket,
-    validate_path, wrap_packet_for_testing,
+    validate_path, wrap_packet_for_testing, wrap_packet_v1_for_testing,
 };
 
 // N2.4: Test helper that wraps wrap_packet_for_testing with the default flow_id,
@@ -1848,5 +1849,81 @@ fn end_to_end_expired_circuit_rejected() {
     assert!(
         matches!(result_b, Err(TrafficError::CircuitExpired { .. })),
         "expired relay B must reject, got {result_b:?}"
+    );
+}
+
+// ─── N2.3 frozen v1 protocol conformance (separate from v2) ───────────────
+
+/// V1 acceptance: a v1 packet traverses A→B→G using the frozen N2.3 protocol
+/// (v1 CircuitPacketV1, v1 AAD, v1 nonce — NO direction, NO flow_id, NO
+/// domain prefix). This proves the frozen v1 protocol is still executable.
+#[test]
+fn v1_forward_packet_traverses_a_b_g() {
+    let mut lc = live_circuit();
+    let plaintext = b"v1 frozen protocol test".to_vec();
+    let packet = wrap_packet_v1_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // B forwards.
+    let outcome_b = lc.table_b.forward_packet_v1(&packet, &lc.ts.source_id, now_unix()).unwrap();
+    let (forwarded, successor) = match outcome_b {
+        UnwrappedPacketV1::Forward { packet, successor } => (packet, successor),
+        _ => panic!("B must forward v1"),
+    };
+    assert_eq!(successor, lc.ts.gateway_id);
+    // G delivers.
+    let outcome_g = lc.table_g.forward_packet_v1(&forwarded, &lc.ts.relay_id, now_unix()).unwrap();
+    let recovered = match outcome_g {
+        UnwrappedPacketV1::Deliver { plaintext } => plaintext,
+        _ => panic!("G must deliver v1"),
+    };
+    assert_eq!(recovered, plaintext);
+}
+
+/// V1 wire format: encode → decode round-trip produces the same packet.
+#[test]
+fn v1_packet_wire_round_trip() {
+    let lc = live_circuit();
+    let packet = wrap_packet_v1_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        42, &lc.ts.gateway_id, b"v1 round trip",
+    ).unwrap();
+    let wire = packet.encode_to_cbor().unwrap();
+    let decoded = CircuitPacketV1::decode_from_cbor(&wire).unwrap();
+    assert_eq!(decoded, packet);
+}
+
+/// V1 and v2 are NOT wire-compatible: a v2 packet's CBOR (7 map entries)
+/// decoded as v1 will fail (extra keys or wrong entry count).
+/// Actually, v1 decode_from_cbor doesn't check entry count — it just looks
+/// up known keys and ignores extras. But the AAD and nonce are different,
+/// so a v1-wrapped packet forwarded by the v2 path will fail AEAD, and
+/// vice versa. This test proves v1 packets cannot be forwarded by v2.
+#[test]
+fn v1_packet_cannot_be_forwarded_by_v2_path() {
+    let mut lc = live_circuit();
+    let plaintext = b"v1 packet on v2 path".to_vec();
+    let v1_packet = wrap_packet_v1_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Convert v1 packet to v2 fields (direction=Forward, flow_id=DEFAULT).
+    let v2_packet = snp_node::node::CircuitPacket {
+        circuit_id: v1_packet.circuit_id,
+        direction: snp_node::node::TrafficDirection::Forward,
+        flow_id: snp_node::node::DEFAULT_FLOW_ID,
+        seq: v1_packet.seq,
+        ttl: v1_packet.ttl,
+        payload: v1_packet.payload,
+        final_dst: v1_packet.final_dst,
+    };
+    // V2 forward_packet will use v2 AAD (domain + direction + flow_id) and
+    // v2 nonce (direction XOR). The v1 packet was sealed with v1 AAD/nonce.
+    // AEAD must fail.
+    let result = lc.table_b.forward_packet(&v2_packet, &lc.ts.source_id, now_unix());
+    assert!(
+        matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
+        "v1 packet on v2 path must fail AEAD (different AAD/nonce), got {result:?}"
     );
 }

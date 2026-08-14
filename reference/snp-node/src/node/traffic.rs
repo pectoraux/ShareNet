@@ -1477,3 +1477,245 @@ mod tests {
         assert!(w.check(2).is_ok());
     }
 }
+
+// ─── N2.3 frozen v1 protocol profile (restored, separate from v2) ────────
+//
+// The frozen N2.3 protocol (commit 0efaaac) uses v1 CircuitPacket with NO
+// direction, NO flow_id, raw (non-domain-separated) AAD, and simple nonce
+// derivation. This type MUST remain frozen — N2.4 v2 development MUST NOT
+// modify it. It exists so the frozen v1 protocol has a live, executable
+// reference implementation + conformance path.
+
+/// A v1 circuit packet (frozen N2.3 protocol profile).
+///
+/// This is the EXACT frozen N2.3 packet format from commit `0efaaac`.
+/// It MUST NOT be modified by N2.4 development. The v2 packet
+/// ([`CircuitPacket`]) is a separate type with direction + flow_id +
+/// versioned AAD domain.
+///
+/// Wire fields (CBOR map, 5 entries — NOT the 7-entry v2 map):
+/// - `circuitId` — the circuit this packet belongs to.
+/// - `seq`       — per-circuit sequence number.
+/// - `ttl`       — hop budget, decremented per relay.
+/// - `payload`   — sealed (AEAD) bytes.
+/// - `finalDst`  — terminal destination NodeId.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitPacketV1 {
+    /// The circuit ID this packet travels on.
+    pub circuit_id: [u8; 32],
+    /// Per-circuit sequence number (monotonic from the source).
+    pub seq: u32,
+    /// Time-to-live in hops. Decremented per relay; dropped at 0.
+    pub ttl: u8,
+    /// Sealed payload bytes (one AEAD layer per remaining hop).
+    pub payload: Vec<u8>,
+    /// The terminal destination NodeId (gateway).
+    pub final_dst: [u8; 32],
+}
+
+/// v1 CBOR map keys (frozen, 5 entries).
+const V1_PKT_KEY_CIRCUIT_ID: &str = "circuitId";
+const V1_PKT_KEY_SEQ: &str = "seq";
+const V1_PKT_KEY_TTL: &str = "ttl";
+const V1_PKT_KEY_PAYLOAD: &str = "payload";
+const V1_PKT_KEY_FINAL_DST: &str = "finalDst";
+
+impl CircuitPacketV1 {
+    /// Encode this v1 packet to canonical CBOR wire bytes (5-entry map).
+    pub fn encode_to_cbor(&self) -> Result<Vec<u8>, TrafficError> {
+        let map = CborValue::Map(vec![
+            (CborValue::TextString(V1_PKT_KEY_CIRCUIT_ID.into()), CborValue::ByteString(self.circuit_id.to_vec())),
+            (CborValue::TextString(V1_PKT_KEY_SEQ.into()), CborValue::UnsignedInt(u64::from(self.seq))),
+            (CborValue::TextString(V1_PKT_KEY_TTL.into()), CborValue::UnsignedInt(u64::from(self.ttl))),
+            (CborValue::TextString(V1_PKT_KEY_PAYLOAD.into()), CborValue::ByteString(self.payload.clone())),
+            (CborValue::TextString(V1_PKT_KEY_FINAL_DST.into()), CborValue::ByteString(self.final_dst.to_vec())),
+        ]);
+        snp_cbor::encode(&map).map_err(|_| TrafficError::CborEncodingFailed)
+    }
+
+    /// Decode a v1 `CircuitPacketV1` from canonical CBOR wire bytes.
+    pub fn decode_from_cbor(bytes: &[u8]) -> Result<Self, TrafficError> {
+        let limits = CborLimits {
+            max_array_items: 4,
+            max_map_entries: 8,
+            max_byte_string_len: MAX_WIRE_PAYLOAD_BYTES as u64,
+            max_text_string_len: 16,
+            max_nesting_depth: 4,
+        };
+        let value = match decode_with_limits(bytes, &limits) {
+            Ok(v) => v,
+            Err(snp_cbor::CborError::LimitExceeded { kind, actual, max }) => {
+                return Err(TrafficError::WireDecodeFailed {
+                    reason: format!("CBOR {kind} limit exceeded: declared {actual}, max {max}"),
+                });
+            }
+            Err(e) => {
+                return Err(TrafficError::WireDecodeFailed { reason: e.to_string() });
+            }
+        };
+        let entries = match value {
+            CborValue::Map(e) => e,
+            _ => return Err(TrafficError::WireDecodeFailed {
+                reason: "expected top-level CBOR map".into(),
+            }),
+        };
+        let circuit_id = map_get_fixed(&entries, V1_PKT_KEY_CIRCUIT_ID)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "circuitId missing/invalid".into() })?;
+        let seq = map_get_u64(&entries, V1_PKT_KEY_SEQ)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "seq missing/invalid".into() })?;
+        let ttl = map_get_u8(&entries, V1_PKT_KEY_TTL)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "ttl missing/invalid".into() })?;
+        let final_dst = map_get_fixed(&entries, V1_PKT_KEY_FINAL_DST)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "finalDst missing/invalid".into() })?;
+        let payload = match map_get(&entries, V1_PKT_KEY_PAYLOAD) {
+            Some(CborValue::ByteString(b)) => b.clone(),
+            _ => return Err(TrafficError::WireDecodeFailed { reason: "payload missing/not a byte string".into() }),
+        };
+        if payload.len() > MAX_WIRE_PAYLOAD_BYTES {
+            return Err(TrafficError::PayloadTooLarge {
+                actual: payload.len(),
+                max: MAX_WIRE_PAYLOAD_BYTES,
+            });
+        }
+        let seq = u32::try_from(seq).map_err(|_| TrafficError::WireDecodeFailed {
+            reason: format!("seq {seq} out of u32 range"),
+        })?;
+        Ok(Self { circuit_id, seq, ttl, payload, final_dst })
+    }
+}
+
+/// v1 AEAD nonce: `circuit_id[0..8] ‖ seq(BE)` — NO direction XOR (frozen).
+fn v1_packet_nonce(circuit_id: &[u8; 32], seq: u32) -> snp_crypto::NonceBytes {
+    let mut fid = [0u8; 8];
+    fid.copy_from_slice(&circuit_id[..8]);
+    aead_nonce(&fid, seq)
+}
+
+/// v1 AEAD AAD: `circuit_id ‖ seq(BE) ‖ ttl ‖ final_dst` — NO domain prefix,
+/// NO direction, NO flow_id (frozen N2.3 protocol).
+fn v1_packet_aad(circuit_id: &[u8; 32], seq: u32, ttl: u8, final_dst: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(32 + 4 + 1 + 32);
+    aad.extend_from_slice(circuit_id);
+    aad.extend_from_slice(&seq.to_be_bytes());
+    aad.push(ttl);
+    aad.extend_from_slice(final_dst);
+    aad
+}
+
+/// v1 source-side wrap: create nested AEAD layers with v1 AAD + nonce.
+/// This is the EXACT frozen N2.3 `wrap_packet` logic, preserved for v1
+/// conformance.
+#[cfg(feature = "test-utils")]
+pub fn wrap_packet_v1_for_testing(
+    hops: &[crate::node::circuit_handshake::HopForwardingState],
+    circuit_id: &[u8; 32],
+    seq: u32,
+    final_dst: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<CircuitPacketV1, TrafficError> {
+    let relay_hops: Vec<_> = hops.iter().skip(1).collect();
+    if relay_hops.is_empty() {
+        return Err(TrafficError::EmptyCircuit);
+    }
+    let nonce = v1_packet_nonce(circuit_id, seq);
+    let mut payload = plaintext.to_vec();
+    let total_relay_hops = relay_hops.len();
+    for (rev_idx, hop) in relay_hops.iter().rev().enumerate() {
+        let hop_position = total_relay_hops - 1 - rev_idx;
+        let hop_ttl = PACKET_TTL_MAX.saturating_sub(hop_position as u8);
+        let hop_aad = v1_packet_aad(circuit_id, seq, hop_ttl, final_dst);
+        payload = aead_seal(&hop.forwarding_key, &nonce, &payload, &hop_aad);
+    }
+    Ok(CircuitPacketV1 {
+        circuit_id: *circuit_id,
+        seq,
+        ttl: PACKET_TTL_MAX,
+        payload,
+        final_dst: *final_dst,
+    })
+}
+
+/// v1 forward result (for v1 packets — separate from the v2 UnwrappedPacket).
+#[derive(Debug, Clone)]
+pub enum UnwrappedPacketV1 {
+    /// The v1 packet still has further hops. Forward to successor.
+    Forward {
+        /// The v1 packet to forward (one fewer AEAD layer, ttl decremented).
+        packet: CircuitPacketV1,
+        /// The successor NodeId to forward to (from the relay's state).
+        successor: [u8; 32],
+    },
+    /// The relay is the terminal gateway. The sealed layers are exhausted and
+    /// `plaintext` is the application payload for local delivery.
+    Deliver {
+        /// The decrypted application payload.
+        plaintext: Vec<u8>,
+    },
+}
+
+impl RelayForwardingTable {
+    /// v1 forward packet: the EXACT frozen N2.3 `forward_packet` logic,
+    /// preserved for v1 conformance. Uses v1 AAD (no domain, no direction,
+    /// no flow_id) and v1 nonce (no direction XOR).
+    ///
+    /// This is separate from the v2 `forward_packet` so the frozen v1
+    /// protocol remains executable and testable independently of N2.4
+    /// development.
+    pub fn forward_packet_v1(
+        &mut self,
+        packet: &CircuitPacketV1,
+        predecessor: &[u8; 32],
+        now: u64,
+    ) -> Result<UnwrappedPacketV1, TrafficError> {
+        if packet.ttl == 0 {
+            return Err(TrafficError::TtlExhausted {
+                circuit_id: packet.circuit_id,
+                ttl: 0,
+            });
+        }
+        let entry = self.entries.get_mut(&packet.circuit_id).ok_or(
+            TrafficError::UnknownCircuit { circuit_id: packet.circuit_id }
+        )?;
+        if now >= entry.state.expires_at {
+            return Err(TrafficError::CircuitExpired { circuit_id: packet.circuit_id });
+        }
+        if entry.state.circuit_id != packet.circuit_id {
+            return Err(TrafficError::CircuitIdMismatch {
+                expected: entry.state.circuit_id,
+                actual: packet.circuit_id,
+            });
+        }
+        if &entry.state.predecessor_node_id != predecessor {
+            return Err(TrafficError::PredecessorMismatch {
+                circuit_id: packet.circuit_id,
+                expected: entry.state.predecessor_node_id,
+                actual: *predecessor,
+            });
+        }
+        entry.replay.check(packet.seq).map_err(|e| match e {
+            TrafficError::PacketReplayOrStale { seq, .. } => {
+                TrafficError::PacketReplayOrStale { circuit_id: packet.circuit_id, seq }
+            }
+            other => other,
+        })?;
+        // v1 AEAD: v1 nonce + v1 AAD (no direction, no flow_id, no domain).
+        let nonce = v1_packet_nonce(&packet.circuit_id, packet.seq);
+        let aad = v1_packet_aad(&packet.circuit_id, packet.seq, packet.ttl, &packet.final_dst);
+        let inner = aead_open(&entry.state.forwarding_key, &nonce, &packet.payload, &aad)
+            .ok_or(TrafficError::PacketUnauthentic { circuit_id: packet.circuit_id })?;
+        entry.replay.commit(packet.seq);
+        match entry.state.successor_node_id {
+            None => Ok(UnwrappedPacketV1::Deliver { plaintext: inner }),
+            Some(successor) => {
+                let forwarded = CircuitPacketV1 {
+                    circuit_id: packet.circuit_id,
+                    seq: packet.seq,
+                    ttl: packet.ttl.saturating_sub(1),
+                    payload: inner,
+                    final_dst: packet.final_dst,
+                };
+                Ok(UnwrappedPacketV1::Forward { packet: forwarded, successor })
+            }
+        }
+    }
+}

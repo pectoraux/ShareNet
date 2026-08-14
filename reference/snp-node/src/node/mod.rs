@@ -170,8 +170,9 @@ pub use distributed_circuit::{
     authorization_in_root, verify_dh_proof, MAX_AUTHORIZATION_HASHES,
 };
 pub use traffic::{
-    CircuitPacket, CircuitSender, RelayForwardingTable, TrafficDirection, TrafficError,
-    UnwrappedPacket, unwrap_final,
+    CircuitPacket, CircuitPacketV1, CircuitSender, RelayForwardingTable,
+    TrafficDirection, TrafficError, UnwrappedPacket, UnwrappedPacketV1,
+    unwrap_final,
     MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
     REPLAY_WINDOW_SIZE, PACKET_TTL_MAX, FIRST_PACKET_SEQ, MAX_PACKET_SEQUENCE,
     DEFAULT_FLOW_ID,
@@ -181,6 +182,8 @@ pub use traffic::{
 // call it. Only compiled when the feature is enabled (integration tests).
 #[cfg(feature = "test-utils")]
 pub use traffic::wrap_packet_for_testing;
+#[cfg(feature = "test-utils")]
+pub use traffic::wrap_packet_v1_for_testing;
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,
