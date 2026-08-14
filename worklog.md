@@ -7194,3 +7194,50 @@ Stage Summary:
   - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
   - `cargo build -p snp-stack`: zero warnings, zero errors.
 - STOP condition met: no real ShareNet circuit integration, no HTTP/HTTPS proxy, no DNS integration, no application awareness. The deliverable is exactly "TCP flow bridge foundation — the packet-to-mesh adapter boundary is proven."
+
+---
+Task ID: N2.3.6
+Agent: Z.ai Code (main)
+Task: Implement async production Upstream backed by the real ShareNet circuit. Prove the full pipeline: smoltcp TCP → TcpFlowBridge → async ShareNetCircuitUpstream → real ShareNet circuit (A→B→C→G) → gateway HTTP fetch → response → client. No modification to frozen discovery/route/circuit protocols.
+
+Work Log:
+- Added `AsyncUpstream` trait to `snp-stack/src/bridge.rs` — async send/recv/close, matching the rest of ShareNet's async architecture. Documented why async is required (ShareNet circuit APIs are async; sync would require spawn_blocking/block_on).
+- Refactored `FlowEntry` from a struct to an enum: `FlowEntry::Sync(Box<dyn Upstream>)` | `FlowEntry::Async(Box<dyn AsyncUpstream + Send>)`. The bridge can hold both types.
+- Added `attach_async_upstream()` method to `TcpFlowBridge`.
+- Added `pump_async(&mut engine)` method — the async production pump. Reads from smoltcp socket → `upstream.send().await` → `upstream.recv().await` → injects into smoltcp socket. Only processes async flows; sync flows are skipped (and vice versa for `pump()`).
+- Added `circuit-upstream` Cargo feature to `snp-stack/Cargo.toml` (optional deps: snp-node, snp-gateway, snp-crypto, snp-link).
+- Created `ShareNetCircuitUpstream` (behind `circuit-upstream` feature):
+  - Implements `AsyncUpstream`.
+  - Holds: Node, Route, client X25519 keys, request_buffer, response_buffer, request_sent flag, closed flag.
+  - `send()`: buffers TCP write data from the application. When a complete HTTP request is detected (`\r\n\r\n`), extracts the URL from the HTTP request line + Host header, and calls `async_node::send_via_route_with_body()` — the REAL ShareNet circuit API. The gateway fetches the URL and returns the response body.
+  - `recv()`: returns the buffered HTTP response (reconstructed from TransitResponse + body).
+  - `close()`: marks as closed.
+  - Helper functions: `extract_url_from_http_request()` (parses HTTP request line + Host header → URL), `format_http_response()` (reconstructs HTTP response from TransitResponse + body).
+  - 4 unit tests for URL extraction.
+  - **Mode A limitation documented**: This is NOT a true transparent TCP byte stream. The current gateway is Mode A (HTTP fetch). The adapter buffers until a complete HTTP request is formed, then sends it as a gateway fetch. When Mode B (raw TCP stream) is designed, a streaming AsyncUpstream will replace this without changing the trait.
+- Added accessor methods to `TcpEngine`: `tcp_socket_mut()`, `tcp_socket()`, `sockets_mut()`, `remove_socket()` (with `SmolTcpSocket<'static>` lifetime fix).
+- Created `snp-stack/tests/circuit_bridge.rs` — THE ACCEPTANCE TEST:
+  - Brings up a full 4-node ShareNet mesh (A→B→C→G) with a local HTTP server.
+  - Starts the gateway with `serve_gateway_with_protocol_circuit_with_body` (body delivery — TransitEnvelope path).
+  - Starts two relays (A, B) with `serve_relay_via_route`.
+  - Creates a smoltcp TCP client → connects to TcpEngine (server at 10.0.0.1:443).
+  - Completes the TCP handshake (SYN → SYN-ACK → ACK → ESTABLISHED).
+  - Creates a `ShareNetCircuitUpstream` with the real route + client keys.
+  - Attaches it to the bridge via `attach_async_upstream()`.
+  - Client sends an HTTP GET request: `GET / HTTP/1.1\r\nHost: test.local:<port>\r\n...`.
+  - Bridge pumps async: reads the HTTP request → ShareNetCircuitUpstream extracts URL → sends via `send_via_route_with_body()` → circuit A→B→C→G → gateway fetches HTTP from local server → response body returns through circuit → bridge injects into smoltcp → client receives.
+  - Verifies: client receives HTTP 200 + known body "Hello from ShareNet gateway via real circuit!".
+  - Result: "Sent 61 bytes, received 129 bytes." — the full pipeline works.
+
+- Pushed to `origin/main` at commit `e9956b2`.
+
+Stage Summary:
+- N2.3.6 is complete: the async production `AsyncUpstream` trait + `ShareNetCircuitUpstream` implementation connects the TCP flow bridge to the REAL ShareNet circuit. The acceptance test proves the full pipeline: smoltcp TCP → bridge → async upstream → real circuit A→B→C→G → gateway → HTTP fetch → response → client.
+- The `AsyncUpstream` trait is the correct async seam — it matches ShareNet's async architecture. No `spawn_blocking` or `block_on` in the production path.
+- The frozen ShareNet stack (Identity, Discovery, Route, Circuit, Gateway, Internet) is UNTOUCHED. `ShareNetCircuitUpstream` calls the existing `send_via_route_with_body()` API — no protocol changes.
+- Mode A limitation is explicitly documented: the current adapter is HTTP-level (buffer → fetch → respond), not a true TCP byte stream. When Mode B is designed, the trait stays the same; only the implementation changes.
+- Test results:
+  - `cargo test -p snp-stack --features circuit-upstream`: 97 passed (58 unit + 1 circuit_bridge + 17 DNS + 9 flow + 7 bridge + 5 TCP), 0 failed, 0 ignored.
+  - `cargo test --workspace` (default features): 438 passed, 1 flaky (concurrent_upstream_through_mesh — passes in isolation), 3 ignored. The flaky test is pre-existing (N2.2.4 era) and unrelated to N2.3.6.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+- Repository: `origin/main` at `e9956b2`, verified to match local HEAD.
