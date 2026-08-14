@@ -894,3 +894,104 @@ fn three_hop_traversal_a_b_c_g() {
     };
     assert_eq!(recovered, plaintext, "G must recover the original plaintext");
 }
+
+// ─── P0: TTL must be authenticated ─────────────────────────────────────────
+
+/// P0: tampering with the packet's TTL must cause AEAD authentication failure.
+///
+/// The AAD now includes the hop-local TTL: `circuit_id ‖ seq ‖ ttl ‖ final_dst`.
+/// An on-path attacker cannot change `ttl` (e.g. from a low value to 255 to
+/// extend the packet's hop budget) without breaking AEAD — the relay's
+/// `aead_open` uses the TTL as it appears on the wire, which won't match the
+/// TTL the source bound into that layer's AAD.
+///
+/// This test uses the three-hop setup so the TTL is meaningfully per-hop:
+/// B sees ttl=T, C sees ttl=T-1, G sees ttl=T-2. Tampering with B's packet
+/// ttl (e.g. setting it to 255) makes B's AEAD fail.
+#[test]
+fn ttl_tampering_rejected() {
+    let ts = setup_three_hop();
+
+    let mut table_b = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_b, &mut acc_b, ts.relay_b_id,
+        &ts.relay_b_x25519_sk, &ts.relay_b_sk, &ts.relay_b_pk,
+    );
+
+    let plaintext = b"ttl-tamper test".to_vec();
+    let mut packet = wrap_packet(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        1, &ts.gateway_id, &plaintext,
+    ).unwrap();
+
+    // Sanity: the packet starts with the source's intended TTL.
+    let original_ttl = packet.ttl;
+    assert_eq!(original_ttl, snp_node::node::PACKET_TTL_MAX);
+
+    // An attacker bumps the TTL to 255 to extend the hop budget. The payload
+    // is NOT re-sealed, so the AEAD AAD (which includes the original ttl)
+    // won't match. B's forward_packet must reject with PacketUnauthentic.
+    packet.ttl = 255;
+    let result = table_b.forward_packet(&packet, &ts.source_id);
+    assert!(
+        matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
+        "tampered TTL must cause AEAD failure, got {result:?}"
+    );
+
+    // Restore the original TTL — the packet is authentic again (proves the
+    // failure was specifically due to the TTL mismatch, not the payload).
+    packet.ttl = original_ttl;
+    let outcome = table_b.forward_packet(&packet, &ts.source_id);
+    assert!(outcome.is_ok(), "restored TTL must authenticate successfully");
+}
+
+/// P0 (forwarded-packet TTL): a relay that tampers with the TTL of the
+/// forwarded packet (before handing it to the next relay) is detected by the
+/// next relay's AEAD. This proves the per-hop TTL authentication chain holds
+/// across the full A→B→C→G path, not just at the first hop.
+#[test]
+fn forwarded_ttl_tampering_rejected() {
+    let ts = setup_three_hop();
+
+    let mut table_b = RelayForwardingTable::new();
+    let mut table_c = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut acc_c = CircuitAcceptanceStore::new();
+    install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_b, &mut acc_b, ts.relay_b_id,
+        &ts.relay_b_x25519_sk, &ts.relay_b_sk, &ts.relay_b_pk,
+    );
+    install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_c, &mut acc_c, ts.relay_c_id,
+        &ts.relay_c_x25519_sk, &ts.relay_c_sk, &ts.relay_c_pk,
+    );
+
+    let plaintext = b"forwarded ttl-tamper".to_vec();
+    let packet = wrap_packet(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        1, &ts.gateway_id, &plaintext,
+    ).unwrap();
+
+    // B forwards honestly — peels its layer, decrements ttl.
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let mut forwarded = match outcome_b {
+        UnwrappedPacket::Forward { packet, .. } => packet,
+        _ => panic!("B must forward"),
+    };
+    // The forwarded packet's ttl is original_ttl - 1 (B decremented it).
+    let honest_forwarded_ttl = forwarded.ttl;
+
+    // An attacker (or a malicious B) bumps the forwarded packet's ttl before
+    // handing it to C. C's AEAD layer was sealed with the honest forwarded
+    // ttl, so the tampered ttl breaks the AAD → C rejects.
+    forwarded.ttl = honest_forwarded_ttl + 5;
+    let result = table_c.forward_packet(&forwarded, &ts.relay_b_id);
+    assert!(
+        matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
+        "tampered forwarded TTL must cause AEAD failure at C, got {result:?}"
+    );
+}

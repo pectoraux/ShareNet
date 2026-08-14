@@ -270,6 +270,10 @@ pub enum UnwrappedPacket {
 /// Per-circuit replay-protection state kept by a relay's forwarding table.
 #[derive(Debug, Clone)]
 struct CircuitReplayWindow {
+    /// Whether the window has been initialized by its first committed packet.
+    /// P1: replaces the old `max_seen == 0` sentinel, which conflated the
+    /// valid sequence number 0 with the uninitialized state.
+    initialized: bool,
     /// The highest sequence number seen so far on this circuit.
     max_seen: u32,
     /// A bit window of the last REPLAY_WINDOW_SIZE sequence numbers. `true` at
@@ -280,6 +284,7 @@ struct CircuitReplayWindow {
 impl CircuitReplayWindow {
     fn new() -> Self {
         Self {
+            initialized: false,
             max_seen: 0,
             seen: vec![false; REPLAY_WINDOW_SIZE as usize],
         }
@@ -296,8 +301,10 @@ impl CircuitReplayWindow {
     ///
     /// [`commit`]: CircuitReplayWindow::commit
     fn check(&self, seq: u32) -> Result<(), TrafficError> {
-        // First packet on this circuit (max_seen == 0): any seq is acceptable.
-        if self.max_seen == 0 {
+        // First packet on this circuit (initialized == false): any seq is
+        // acceptable. P1: uses an explicit `initialized` flag rather than
+        // `max_seen == 0`, so a first packet with seq=0 is handled correctly.
+        if !self.initialized {
             return Ok(());
         }
         // Future packet (seq > max_seen): always acceptable (will advance
@@ -334,7 +341,9 @@ impl CircuitReplayWindow {
     /// - If `seq <= max_seen` (within window): mark the slot (already checked
     ///   by `check`).
     fn commit(&mut self, seq: u32) {
-        if self.max_seen == 0 {
+        if !self.initialized {
+            // First authenticated packet. Initialize the window.
+            self.initialized = true;
             self.max_seen = seq;
             self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
             return;
@@ -492,11 +501,13 @@ impl RelayForwardingTable {
         })?;
 
         // 3, 6, 13. AEAD unwrap: peel one layer with the relay's forwarding_key.
-        // The AAD binds circuit_id ‖ seq ‖ final_dst, so a packet from a
-        // different circuit, a replayed seq, or a substituted destination
-        // fails authentication. THIS is the authentication gate.
+        // The AAD binds circuit_id ‖ seq ‖ ttl ‖ final_dst. P0: ttl is now
+        // authenticated per-hop — an attacker cannot modify ttl in transit
+        // without breaking AEAD. The ttl the relay sees is the ttl the source
+        // bound into this layer at construction time (each nested layer
+        // authenticates the hop-local TTL the opening relay will see).
         let nonce = packet_nonce(&packet.circuit_id, packet.seq);
-        let aad = packet_aad(&packet.circuit_id, packet.seq, &packet.final_dst);
+        let aad = packet_aad(&packet.circuit_id, packet.seq, packet.ttl, &packet.final_dst);
         let inner = aead_open(&entry.state.forwarding_key, &nonce, &packet.payload, &aad)
             .ok_or(TrafficError::PacketUnauthentic { circuit_id: packet.circuit_id })?;
 
@@ -591,15 +602,28 @@ pub fn wrap_packet(
     }
 
     let nonce = packet_nonce(circuit_id, seq);
-    let aad = packet_aad(circuit_id, seq, final_dst);
 
-    // Wrap in reverse order: innermost layer is the plaintext, outermost is
-    // for the first relay.
+    // P0: each nested AEAD layer authenticates the hop-local TTL the opening
+    // relay will see. The first relay sees ttl = PACKET_TTL_MAX; each
+    // subsequent relay sees one less (the predecessor decrements before
+    // forwarding). The source computes each hop's expected TTL at wrap time
+    // and binds it into that layer's AAD.
+    //
+    // Wrap in reverse order: innermost layer is the plaintext (for the last
+    // hop / gateway), outermost is for the first relay.
     let mut payload = plaintext.to_vec();
-    for hop in relay_hops.iter().rev() {
+    let total_relay_hops = relay_hops.len();
+    for (rev_idx, hop) in relay_hops.iter().rev().enumerate() {
+        // rev_idx == 0 → outermost layer (first relay, ttl = PACKET_TTL_MAX).
+        // rev_idx == 1 → next layer  (second relay, ttl = PACKET_TTL_MAX - 1).
+        // ... and so on. The hop at position `i` (0-indexed from the first
+        // relay) sees ttl = PACKET_TTL_MAX - i.
+        let hop_position = total_relay_hops - 1 - rev_idx; // 0 for first relay
+        let hop_ttl = PACKET_TTL_MAX.saturating_sub(hop_position as u8);
+        let hop_aad = packet_aad(circuit_id, seq, hop_ttl, final_dst);
         // The source's HopForwardingState.forwarding_key for this hop equals
         // the relay's RelayForwardingState.forwarding_key (same HKDF derivation).
-        payload = aead_seal(&hop.forwarding_key, &nonce, &payload, &aad);
+        payload = aead_seal(&hop.forwarding_key, &nonce, &payload, &hop_aad);
     }
 
     Ok(CircuitPacket {
@@ -730,14 +754,22 @@ fn packet_nonce(circuit_id: &[u8; 32], seq: u32) -> snp_crypto::NonceBytes {
     aead_nonce(&fid, seq)
 }
 
-/// Build the AEAD AAD for a circuit packet: `circuit_id ‖ seq(BE) ‖ final_dst`.
+/// Build the AEAD AAD for a circuit packet: `circuit_id ‖ seq(BE) ‖ ttl ‖
+/// final_dst`.
 ///
-/// This binds the packet to its circuit, sequence, and destination. A relay
-/// substituting any of these breaks the AEAD authentication (invariant #2, #6).
-fn packet_aad(circuit_id: &[u8; 32], seq: u32, final_dst: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(32 + 4 + 32);
+/// This binds the packet to its circuit, sequence, **hop-local TTL**, and
+/// destination. P0: `ttl` is now authenticated — an attacker cannot modify the
+/// TTL in transit without breaking AEAD. Each relay sees a different TTL (the
+/// predecessor decrements before forwarding), so the source binds each nested
+/// layer's AAD with the TTL that specific hop will see (see [`wrap_packet`]).
+///
+/// A relay substituting the circuit, seq, ttl, or destination breaks
+/// authentication (invariant #2, #6, #9).
+fn packet_aad(circuit_id: &[u8; 32], seq: u32, ttl: u8, final_dst: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(32 + 4 + 1 + 32);
     aad.extend_from_slice(circuit_id);
     aad.extend_from_slice(&seq.to_be_bytes());
+    aad.push(ttl);
     aad.extend_from_slice(final_dst);
     aad
 }
@@ -859,5 +891,36 @@ mod tests {
         assert!(w.check(2).is_ok());
         // And seq=1000 was NOT recorded, so it's still acceptable.
         assert!(w.check(1000).is_ok());
+    }
+
+    /// P1: a first packet with seq=0 must be tracked correctly. The old
+    /// `max_seen == 0` sentinel treated seq=0 as "uninitialized", so after
+    /// commit(0) the window was still treated as uninitialized — allowing a
+    /// replay of seq=0. The `initialized: bool` flag fixes this.
+    #[test]
+    fn first_packet_sequence_zero_is_tracked() {
+        let mut w = CircuitReplayWindow::new();
+        // First packet with seq=0 → accepted.
+        assert!(w.check(0).is_ok());
+        w.commit(0);
+        // The window is now initialized. A future seq is acceptable.
+        assert!(w.check(1).is_ok());
+    }
+
+    /// P1: after commit(0), replaying seq=0 must be rejected. Under the old
+    /// `max_seen == 0` sentinel, the window was still "uninitialized" after
+    /// commit(0), so a replay of seq=0 would be accepted (bypassing replay
+    /// detection). The `initialized` flag fixes this.
+    #[test]
+    fn sequence_zero_replay_is_rejected() {
+        let mut w = CircuitReplayWindow::new();
+        // First packet with seq=0 → accepted + committed.
+        assert!(w.check(0).is_ok());
+        w.commit(0);
+        // Replay of seq=0 → MUST be rejected (window is initialized, slot marked).
+        assert!(matches!(
+            w.check(0),
+            Err(TrafficError::PacketReplayOrStale { seq: 0, .. })
+        ));
     }
 }
