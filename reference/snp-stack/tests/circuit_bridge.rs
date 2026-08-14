@@ -2,7 +2,7 @@
 //!
 //! This test brings up a full 4-node ShareNet mesh (A→B→C→G) with a local
 //! HTTP server, connects a smoltcp TCP client through the TcpFlowBridge to
-//! a `ShareNetCircuitUpstream`, and verifies that the client receives the
+//! a `ShareNetCircuitUpstreamModeA`, and verifies that the client receives the
 //! HTTP response from the gateway.
 //!
 //! **This test requires the `circuit-upstream` feature.**
@@ -27,7 +27,7 @@ use snp_node::node::{
     TransportEndpoint, VerifiedNodeDescriptor,
 };
 use snp_stack::smol_device::TunSmolDevice;
-use snp_stack::{ShareNetCircuitUpstream, TcpEngine, TcpFlowBridge};
+use snp_stack::{ShareNetCircuitUpstreamModeA, TcpEngine, TcpFlowBridge};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -401,7 +401,7 @@ async fn real_circuit_backed_tcp_flow_bridge() {
     let established = exchange_until_established(&mut client, &mut server_engine, server_socket, 50);
     assert!(established, "TCP handshake must complete");
 
-    // 5. Create the ShareNetCircuitUpstream.
+    // 5. Create the ShareNetCircuitUpstreamModeA.
     let client_node = Node::new(
         client_idents.identity(),
         vec![Capability::Client],
@@ -409,7 +409,7 @@ async fn real_circuit_backed_tcp_flow_bridge() {
     );
     let client_x_sk = Arc::clone(&client_idents.x_sk);
     let client_x_pk = client_idents.x_pk;
-    let upstream = ShareNetCircuitUpstream::new(
+    let upstream = ShareNetCircuitUpstreamModeA::new(
         client_node,
         route,
         (*client_x_sk).clone(),
@@ -427,7 +427,7 @@ async fn real_circuit_backed_tcp_flow_bridge() {
     client.send_data(http_request.as_bytes());
 
     // 8. Pump the bridge (async) + exchange packets.
-    //    The bridge reads the HTTP request, the ShareNetCircuitUpstream::send
+    //    The bridge reads the HTTP request, the ShareNetCircuitUpstreamModeA::send
     //    extracts the URL and sends it via the real ShareNet circuit, the
     //    gateway fetches the HTTP response, and the response is injected
     //    back into the smoltcp socket.

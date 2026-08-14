@@ -124,7 +124,7 @@ pub trait Upstream: Send {
 /// raw TCP byte stream (that would be Mode B / SOCKS5, a future protocol
 /// extension).
 ///
-/// [`ShareNetCircuitUpstream`](crate::ShareNetCircuitUpstream) bridges this
+/// [`ShareNetCircuitUpstreamModeA`](crate::ShareNetCircuitUpstreamModeA) bridges this
 /// gap by buffering the application's TCP write data until a complete HTTP
 /// request is formed, then sending it as a single gateway HTTP fetch. The
 /// response body is returned and injected back into the smoltcp socket.
@@ -490,7 +490,7 @@ impl Upstream for MockUpstream {
     }
 }
 
-// ─── ShareNetCircuitUpstream (production, behind feature flag) ──────────────
+// ─── ShareNetCircuitUpstreamModeA (Mode A / HTTP-level, behind feature flag) ─
 
 #[cfg(feature = "circuit-upstream")]
 mod circuit_upstream {
@@ -499,38 +499,60 @@ mod circuit_upstream {
     use snp_node::node::async_node;
     use snp_node::node::{Node, Route};
 
-    /// **N2.3.6** — A production `AsyncUpstream` backed by a real ShareNet
-    /// circuit.
+    /// **N2.3.6 — Mode A / HTTP-level circuit adapter.**
     ///
-    /// This adapter connects the TCP flow bridge to the ShareNet mesh:
+    /// ## ⚠️ This is NOT transparent TCP
+    ///
+    /// This adapter is an **HTTP-level integration proof**, not a transparent
+    /// TCP byte stream. It works by:
+    ///
+    /// 1. Buffering the application's TCP write data.
+    /// 2. Waiting for a complete HTTP request (`\r\n\r\n`).
+    /// 3. Extracting the URL from the HTTP request line + Host header.
+    /// 4. Sending the URL via `send_via_route_with_body()` (Mode A — the
+    ///    gateway fetches the URL via HTTP).
+    /// 5. Returning the HTTP response body to the application.
+    ///
+    /// This means it **only works for HTTP traffic**. It cannot handle:
+    ///
+    /// - SSH (no HTTP request line to extract)
+    /// - WebSockets (no HTTP request line after the upgrade)
+    /// - Raw TLS (binary protocol, no text headers)
+    /// - Database protocols (binary)
+    /// - Any non-HTTP TCP protocol
+    ///
+    /// ## What this proves
+    ///
+    /// This adapter proves that the `AsyncUpstream` trait can be connected to
+    /// the real ShareNet circuit architecture without introducing a
+    /// synchronous boundary. The trait itself (`send`/`recv`/`close` as async
+    /// byte-stream operations) is the correct abstraction for a future Mode B
+    /// implementation.
+    ///
+    /// ## Future: Mode B
+    ///
+    /// When Mode B (raw TCP byte stream) is designed as a protocol extension
+    /// (N2.2.5), a `ShareNetCircuitUpstreamModeB` will replace this adapter
+    /// **without changing the `AsyncUpstream` trait or `TcpFlowBridge`**. The
+    /// bridge is Mode-agnostic — it doesn't care which upstream implementation
+    /// is attached.
+    ///
+    /// ## Architecture
     ///
     /// ```text
     /// TcpFlowBridge
     ///     ↓
-    /// ShareNetCircuitUpstream (this struct)
+    /// ShareNetCircuitUpstreamModeA (this struct — Mode A)
     ///     ↓
     /// send_via_route_with_body() (async)
     ///     ↓
     /// ShareNet circuit (A → B → C → G)
     ///     ↓
-    /// Gateway HTTP fetch
+    /// Gateway HTTP fetch (Mode A — fetches a URL)
     ///     ↓
-    /// Internet
+    /// Internet (HTTP only)
     /// ```
-    ///
-    /// ## Mode A limitation
-    ///
-    /// The current ShareNet gateway is Mode A (HTTP fetch). This adapter
-    /// buffers the application's TCP write data until it has a complete HTTP
-    /// request (detected by `\r\n\r\n`), then sends the URL from the HTTP
-    /// request line as a gateway fetch. The response body is returned via
-    /// `recv()`.
-    ///
-    /// This is NOT a true transparent TCP byte stream. It's an HTTP-level
-    /// adapter that proves the async circuit boundary. When Mode B (raw TCP
-    /// stream) is designed, a streaming `AsyncUpstream` will replace this
-    /// without changing the trait.
-    pub struct ShareNetCircuitUpstream {
+    pub struct ShareNetCircuitUpstreamModeA {
         /// The client node (identity + circuit keys).
         node: Node,
         /// The route to the gateway (A → B → C → G).
@@ -550,9 +572,9 @@ mod circuit_upstream {
         closed: bool,
     }
 
-    impl std::fmt::Debug for ShareNetCircuitUpstream {
+    impl std::fmt::Debug for ShareNetCircuitUpstreamModeA {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("ShareNetCircuitUpstream")
+            f.debug_struct("ShareNetCircuitUpstreamModeA")
                 .field("request_buffered", &self.request_buffer.len())
                 .field("response_buffered", &self.response_buffer.len())
                 .field("request_sent", &self.request_sent)
@@ -561,7 +583,7 @@ mod circuit_upstream {
         }
     }
 
-    impl ShareNetCircuitUpstream {
+    impl ShareNetCircuitUpstreamModeA {
         /// Create a new circuit-backed upstream.
         ///
         /// # Arguments
@@ -590,7 +612,7 @@ mod circuit_upstream {
     }
 
     #[async_trait::async_trait]
-    impl AsyncUpstream for ShareNetCircuitUpstream {
+    impl AsyncUpstream for ShareNetCircuitUpstreamModeA {
         async fn send(&mut self, data: &[u8]) -> Result<usize, BridgeError> {
             if self.closed {
                 return Err(BridgeError::Closed);
@@ -752,7 +774,7 @@ mod circuit_upstream {
 }
 
 #[cfg(feature = "circuit-upstream")]
-pub use circuit_upstream::ShareNetCircuitUpstream;
+pub use circuit_upstream::ShareNetCircuitUpstreamModeA;
 
 #[cfg(test)]
 mod tests {

@@ -104,7 +104,7 @@ pub use bridge::{
     AsyncUpstream, BridgeError, MockUpstream, TcpFlowBridge, Upstream,
 };
 #[cfg(feature = "circuit-upstream")]
-pub use bridge::ShareNetCircuitUpstream;
+pub use bridge::ShareNetCircuitUpstreamModeA;
 pub use dns::{
     intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,
