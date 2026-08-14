@@ -2127,3 +2127,38 @@ fn packet_version_tampering_rejected() {
         "unknown version 3 must be rejected, got {result:?}"
     );
 }
+
+/// P0: A v2 packet with the version field removed (simulating an old/fake
+/// packet) must be rejected — not accepted as V2.
+#[test]
+fn v2_missing_version_rejected() {
+    use snp_cbor::{CborLimits, CborValue, decode_with_limits};
+    // Construct a v2 packet CBOR WITHOUT the "v" field (7 entries instead of 8).
+    let lc = live_circuit();
+    let plaintext = b"no version field".to_vec();
+    let packet = wrap_test(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let wire = packet.encode_to_cbor().unwrap();
+    // Decode, remove the "v" entry, re-encode.
+    let limits = CborLimits::NONE;
+    let value = decode_with_limits(&wire, &limits).unwrap();
+    let mut entries = match value {
+        CborValue::Map(e) => e,
+        _ => panic!("expected map"),
+    };
+    entries.retain(|(k, _)| !matches!(k, CborValue::TextString(s) if s == "v"));
+    let no_version_wire = snp_cbor::encode(&CborValue::Map(entries)).unwrap();
+    // Decoding must fail — the "v" field is missing.
+    let result = snp_node::node::CircuitPacket::decode_from_cbor(&no_version_wire);
+    assert!(
+        result.is_err(),
+        "v2 packet without version field must be rejected, got {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, TrafficError::WireDecodeFailed { .. } | TrafficError::UnsupportedPacketVersion { .. }),
+        "missing version must fail with WireDecodeFailed or UnsupportedPacketVersion, got {err:?}"
+    );
+}
