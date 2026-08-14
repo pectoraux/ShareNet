@@ -51,7 +51,6 @@
 use std::net::IpAddr;
 
 use snp_cbor::CborValue;
-use snp_crypto::sha256;
 
 use crate::{GatewayError, GatewayResult};
 
@@ -320,6 +319,13 @@ pub const DEFAULT_RECEIVE_WINDOW: u64 = 64 * 1024;
 
 /// Maximum StreamData payload size (16 KiB).
 pub const MAX_STREAM_DATA_PAYLOAD: usize = 16 * 384;
+
+/// Maximum receive window a client or gateway can advertise (256 KiB).
+///
+/// A malicious client could request an enormous `initial_receive_window` to
+/// force the gateway to buffer unbounded data. This constant bounds the
+/// advertised window — values above this are clamped.
+pub const MAX_STREAM_WINDOW: u64 = 256 * 1024;
 
 /// Encode a [`StreamMessage`] to canonical CBOR bytes.
 ///
@@ -789,40 +795,12 @@ fn b(bytes: &[u8]) -> CborValue {
     CborValue::ByteString(bytes.to_vec())
 }
 
-/// Compute a stream-binding digest for a StreamData frame.
-///
-/// This binds the stream data to its (circuit, stream_id, direction, sequence)
-/// context, preventing replay across streams or circuits. The digest is
-/// computed over:
-///
-/// ```text
-/// SHA-256("ShareNet/0.1 stream-data" || stream_id || direction || sequence || data)
-/// ```
-///
-/// The circuit AEAD already provides confidentiality and integrity — this
-/// digest is an ADDITIONAL binding that the gateway can verify to reject
-/// misrouted or replayed frames even if the AEAD key were somehow compromised.
-///
-/// # Panics
-/// Never panics.
-#[must_use]
-pub fn stream_data_binding(
-    stream_id: StreamId,
-    direction: StreamDirection,
-    sequence: StreamSeq,
-    data: &[u8],
-) -> [u8; 32] {
-    let mut msg = Vec::with_capacity(32 + 8 + 1 + 8 + data.len());
-    msg.extend_from_slice(b"ShareNet/0.1 stream-data");
-    msg.extend_from_slice(&stream_id.to_be_bytes());
-    msg.push(match direction {
-        StreamDirection::ClientToGateway => 0,
-        StreamDirection::GatewayToClient => 1,
-    });
-    msg.extend_from_slice(&sequence.to_be_bytes());
-    msg.extend_from_slice(data);
-    sha256(&msg)
-}
+// Note: No separate stream_data_binding() function is needed. The circuit
+// AEAD (encrypt_circuit_payload / decrypt_circuit_payload) already
+// authenticates the ENTIRE StreamMessage CBOR — including stream_id,
+// direction, sequence, and data. A valid ciphertext cannot have any field
+// modified without failing AEAD authentication. The sequence number is a
+// protocol ordering/replay state variable, NOT a cryptographic authenticator.
 
 #[cfg(test)]
 mod tests {
@@ -946,48 +924,6 @@ mod tests {
         let bytes = encode_stream_message(&msg).unwrap();
         let decoded = decode_stream_message(&bytes).unwrap();
         assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn stream_data_binding_is_deterministic() {
-        let data = b"test payload";
-        let binding1 = stream_data_binding(
-            1,
-            StreamDirection::ClientToGateway,
-            0,
-            data,
-        );
-        let binding2 = stream_data_binding(
-            1,
-            StreamDirection::ClientToGateway,
-            0,
-            data,
-        );
-        assert_eq!(binding1, binding2, "same inputs → same binding");
-    }
-
-    #[test]
-    fn stream_data_binding_differs_by_stream_id() {
-        let data = b"test payload";
-        let b1 = stream_data_binding(1, StreamDirection::ClientToGateway, 0, data);
-        let b2 = stream_data_binding(2, StreamDirection::ClientToGateway, 0, data);
-        assert_ne!(b1, b2, "different stream_id → different binding");
-    }
-
-    #[test]
-    fn stream_data_binding_differs_by_direction() {
-        let data = b"test payload";
-        let b1 = stream_data_binding(1, StreamDirection::ClientToGateway, 0, data);
-        let b2 = stream_data_binding(1, StreamDirection::GatewayToClient, 0, data);
-        assert_ne!(b1, b2, "different direction → different binding");
-    }
-
-    #[test]
-    fn stream_data_binding_differs_by_sequence() {
-        let data = b"test payload";
-        let b1 = stream_data_binding(1, StreamDirection::ClientToGateway, 0, data);
-        let b2 = stream_data_binding(1, StreamDirection::ClientToGateway, 1, data);
-        assert_ne!(b1, b2, "different sequence → different binding");
     }
 
     #[test]
