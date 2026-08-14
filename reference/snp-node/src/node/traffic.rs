@@ -616,8 +616,18 @@ impl RelayForwardingTable {
 ///
 /// Returns [`TrafficError::EmptyCircuit`] if there are no non-source hops.
 /// Returns [`TrafficError::PayloadTooLarge`] if the plaintext exceeds
-/// [`MAX_PACKET_PAYLOAD_BYTES`].
-pub fn wrap_packet(
+/// [`MAX_PLAINTEXT_PAYLOAD_BYTES`].
+///
+/// # Visibility (P0: no arbitrary-sequence bypass)
+///
+/// This function is `pub(crate)`. Production callers MUST use
+/// [`CircuitSender::send_packet`], which owns per-circuit sequence allocation
+/// and prevents AEAD nonce reuse. Exposing `wrap_packet(.., seq: u32, ..)` as
+/// a normal public API would let callers bypass the circuit-owned allocator
+/// and reuse arbitrary sequence numbers under the same key.
+///
+/// Tests use [`wrap_packet_for_testing`], the public test-only alias.
+pub(crate) fn wrap_packet(
     hops: &[crate::node::circuit_handshake::HopForwardingState],
     circuit_id: &[u8; 32],
     seq: u32,
@@ -683,6 +693,28 @@ pub fn wrap_packet(
     })
 }
 
+/// Test-only public alias for [`wrap_packet`] (P0: no arbitrary-sequence
+/// bypass in production).
+///
+/// [`wrap_packet`] is `pub(crate)` so ordinary production callers cannot
+/// supply an arbitrary `u32` sequence number (which would bypass
+/// [`CircuitSender`] and risk AEAD nonce reuse). This alias exposes the same
+/// low-level construction to integration tests, which need to build packets
+/// with explicit sequence numbers to exercise adversarial scenarios (replay,
+/// stale, TTL tampering, etc.).
+///
+/// Forbidden in production source (enforced by the architectural guard
+/// script, same pattern as the topology graph's testing-only constructor).
+pub fn wrap_packet_for_testing(
+    hops: &[crate::node::circuit_handshake::HopForwardingState],
+    circuit_id: &[u8; 32],
+    seq: u32,
+    final_dst: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<CircuitPacket, TrafficError> {
+    wrap_packet(hops, circuit_id, seq, final_dst, plaintext)
+}
+
 // ─── Source-side: CircuitSender (circuit-owned sequence allocation) ───────
 
 /// Source-side circuit sender: owns per-circuit sequence allocation so that
@@ -696,10 +728,22 @@ pub fn wrap_packet(
 /// with [`TrafficError::SequenceExhausted`]. There is **no wraparound** —
 /// the circuit must be torn down and re-established before further traffic.
 ///
+/// # Uniqueness invariant (P0: no AEAD nonce reuse)
+///
+/// A `CircuitSender` is **NOT [`Clone`]**. There must be exactly ONE sender
+/// per circuit. Cloning would duplicate the sequence allocator, allowing two
+/// senders to independently emit the same `seq` under the same circuit_id +
+/// forwarding keys — reusing the AEAD nonce `(circuit_id, seq)`, which is
+/// catastrophic for ChaCha20-Poly1305.
+///
+/// If concurrent sending is eventually required, do NOT make this type
+/// clonable. Introduce an explicit shared sequence allocator (e.g. with a
+/// `Mutex`/atomic state) that hands out unique sequence numbers through
+/// controlled handles.
+///
 /// This is the production source-side API. The lower-level [`wrap_packet`]
-/// is retained for testing and explicit-sequence use cases, but production
-/// code SHOULD use `CircuitSender::send_packet` to guarantee the no-wrap
-/// lifecycle is enforced.
+/// is `pub(crate)` (not accessible to ordinary production callers); tests
+/// use [`wrap_packet_for_testing`].
 ///
 /// # Example
 ///
@@ -713,7 +757,7 @@ pub fn wrap_packet(
 /// // ...
 /// # Ok::<(), TrafficError>(())
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CircuitSender {
     circuit_id: [u8; 32],
     hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
@@ -761,6 +805,16 @@ impl CircuitSender {
     /// `CircuitPacket`. Fails closed with [`TrafficError::SequenceExhausted`]
     /// once `seq == u32::MAX` has been assigned — there is no wraparound.
     ///
+    /// # P1: sequence is committed only on success
+    ///
+    /// The sender's `next_seq`/`exhausted` state is advanced ONLY after
+    /// [`wrap_packet`] succeeds. A failed packet construction (e.g.
+    /// `PayloadTooLarge`, `EmptyCircuit`) does **not** consume a sequence
+    /// number — the same `seq` is offered to the next `send_packet` call.
+    /// In particular, if `seq == u32::MAX` and `wrap_packet` fails, the
+    /// circuit does NOT become exhausted until a packet using `u32::MAX` is
+    /// actually successfully constructed.
+    ///
     /// # Errors
     /// - [`TrafficError::SequenceExhausted`] — the circuit's sequence space
     ///   is exhausted; re-establish the circuit.
@@ -770,18 +824,23 @@ impl CircuitSender {
         if self.exhausted {
             return Err(TrafficError::SequenceExhausted { circuit_id: self.circuit_id });
         }
-        let seq = self.next_seq;
-        // Mark exhausted if this packet uses the last sequence number.
-        if seq == MAX_PACKET_SEQUENCE {
+        let candidate_seq = self.next_seq;
+        // P1: construct the packet FIRST. If this fails (PayloadTooLarge,
+        // EmptyCircuit, etc.), the sender state is NOT advanced — the same
+        // candidate_seq is offered again on the next call.
+        let packet = wrap_packet(
+            &self.hops, &self.circuit_id, candidate_seq, &self.final_dst, plaintext,
+        )?;
+        // P1: only NOW — after successful construction — commit the sequence
+        // allocation. The packet is real; the seq is consumed.
+        if candidate_seq == MAX_PACKET_SEQUENCE {
             self.exhausted = true;
         } else {
-            self.next_seq = seq.checked_add(1).ok_or(
+            self.next_seq = candidate_seq.checked_add(1).ok_or(
                 TrafficError::SequenceExhausted { circuit_id: self.circuit_id }
             )?;
         }
-        // Delegate to the low-level wrapper (which enforces payload limits +
-        // constructs the per-hop authenticated AEAD layers).
-        wrap_packet(&self.hops, &self.circuit_id, seq, &self.final_dst, plaintext)
+        Ok(packet)
     }
 
     /// Test-only constructor that starts the sender at a specific `next_seq`,

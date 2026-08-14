@@ -83,6 +83,21 @@ if [ -n "$matches" ]; then
     REPORT+=$'\n'"[VIOLATION] CircuitSender::new_at_seq_for_testing() in production source (testing-only):"$'\n'"$matches"$'\n'
 fi
 
+# N2.3: wrap_packet_for_testing() is the test-only public alias for the
+# pub(crate) wrap_packet(). It accepts an arbitrary u32 sequence number,
+# which would bypass CircuitSender and risk AEAD nonce reuse if called from
+# production. Forbidden in production source. Allow the definition file
+# (traffic.rs) and the re-export hub (mod.rs, which only re-exports the
+# symbol for test crates to import — it does not call it).
+matches=$(grep -rn "wrap_packet_for_testing" "$SRC_DIR" --include="*.rs" \
+    | grep -v "src/node/traffic.rs:" \
+    | grep -v "src/node/mod.rs:" \
+    || true)
+if [ -n "$matches" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT+=$'\n'"[VIOLATION] wrap_packet_for_testing() in production source (testing-only — production must use CircuitSender::send_packet):"$'\n'"$matches"$'\n'
+fi
+
 # ───────────────────────────────────────────────────────────────────────
 # N2.3 security gate: forbid unbounded snp_cbor::decode() in production
 # source.

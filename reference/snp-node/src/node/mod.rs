@@ -171,7 +171,7 @@ pub use distributed_circuit::{
 };
 pub use traffic::{
     CircuitPacket, CircuitSender, RelayForwardingTable, TrafficError, UnwrappedPacket,
-    wrap_packet, unwrap_final,
+    wrap_packet_for_testing, unwrap_final,
     MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
     REPLAY_WINDOW_SIZE, PACKET_TTL_MAX, FIRST_PACKET_SEQ, MAX_PACKET_SEQUENCE,
 };
