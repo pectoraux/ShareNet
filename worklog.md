@@ -7033,3 +7033,63 @@ Stage Summary:
   - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
   - `cargo build -p snp-stack`: zero warnings, zero errors.
 - STOP condition met: no TCP proxy, no smoltcp, no DNS, no circuit creation, no OS routing changes. The deliverable is exactly "packet flow classification — converting raw IP packets from the kernel into tracked ShareNet flows."
+
+---
+Task ID: N2.3.3
+Agent: Z.ai Code (main)
+Task: Integrate a userspace TCP/IP engine (smoltcp) behind the existing FlowClassifier/TUN boundary. Goal: TCP socket emulation through TUN — a synthetic TCP client can complete SYN/SYN-ACK/ACK through ShareNet userspace handling. Do NOT modify Route, Circuit, Gateway, or discovery protocols. Stop after the TCP/IP engine boundary is proven.
+
+Work Log:
+- Added Flow Ownership Invariant documentation to `snp-stack/src/lib.rs` — explicitly states that FlowKey/FlowTable are observational state only, MUST NOT generate/acknowledge/modify/terminate/route/circuit packets. Frozen APIs: FlowKey, PacketMetadata, IpPacket, PacketDevice trait.
+- Added `smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }` to workspace dependencies.
+- Added smoltcp dependency to `snp-stack/Cargo.toml`.
+- Created `snp-stack/src/smol_device.rs` — the smoltcp `Device` trait adapter:
+  - `TunSmolDevice` struct with `rx_queue` (VecDeque) and `tx_queue` (VecDeque) — bridges between ShareNet's async `PacketDevice` and smoltcp's synchronous `Device` trait.
+  - `push_rx()` — push incoming packets (from TUN) for smoltcp to consume.
+  - `pop_tx()` — pop outgoing packets (from smoltcp) to write to TUN.
+  - `TunRxToken` — owns the packet, implements `smoltcp::phy::RxToken` (consumes `&mut [u8]` — smoltcp 0.11 uses mutable slice).
+  - `TunTxToken<'a>` — holds `&mut VecDeque`, implements `smoltcp::phy::TxToken` (allocates a buffer, calls the closure, pushes to queue).
+  - `Device::receive(timestamp)` — pops from rx_queue, returns (RxToken, TxToken) pair. TxToken borrows `&mut self.tx_queue` (safe because RxToken owns its packet — no borrow conflict).
+  - `Device::transmit(timestamp)` — always returns a TxToken (smoltcp calls consume() only if it has a packet).
+  - `Device::capabilities()` — `Medium::Ip` (TUN is layer-3), configurable MTU.
+  - 4 unit tests: push_and_pop, transmit_pushes_to_tx_queue, capabilities, receive_returns_none_when_empty.
+
+- Created `snp-stack/src/tcp_engine.rs` — the TcpEngine wrapping smoltcp:
+  - `TcpEngine` struct: owns `TunSmolDevice`, `Interface`, `SocketSet<'static>`.
+  - `new(local_ip: Ipv4Address, mtu: usize)` — creates the device, configures the smoltcp interface with `HardwareAddress::Ip` (IP-level, not Ethernet), assigns the local IP with a /24 subnet.
+  - `process_incoming(packet: &[u8])` — pushes the packet into the device's rx_queue and polls the interface (advances TCP state machines).
+  - `drain_outgoing() -> Vec<Vec<u8>>` — polls and drains the device's tx_queue (returns packets to write to TUN).
+  - `poll()` — calls `interface.poll(now, &mut device, &mut sockets)` using destructuring borrow to get three mutable references from `&mut self`.
+  - `add_tcp_socket() -> SocketHandle` — creates a TcpSocket with 8 KiB RX/TX buffers.
+  - `listen(handle, port)` — puts a socket into LISTEN state.
+  - `tcp_state(handle) -> State` / `is_established(handle) -> bool` — query socket state.
+  - `interface()` / `interface_mut()` / `sockets()` — accessors for advanced configuration.
+  - `TcpEngineError` enum: SmolTcp(String), SocketNotFound(SocketHandle).
+  - 4 unit tests: creates_with_local_ip, add_tcp_socket_starts_closed, listen_transitions_to_listen_state, is_established_false_before_handshake.
+
+- Created `snp-stack/tests/tcp_handshake.rs` — 5 integration tests (THE ACCEPTANCE TESTS):
+  - `tcp_handshake_completes_through_engine` — THE KEY TEST. Creates a ClientStack (smoltcp interface at 10.0.0.2 with a TCP socket connecting to 10.0.0.1:443) and a TcpEngine server (listening on 10.0.0.1:443). Exchanges packets between them through the queue-based device. Verifies BOTH sides reach ESTABLISHED state — proving SYN → SYN-ACK → ACK completes through the userspace engine.
+  - `tcp_handshake_on_non_standard_port` — handshake on port 8080.
+  - `tcp_engine_rejects_unsolicited_syn_to_closed_port` — SYN to port 9999 (no listener) does NOT establish.
+  - `tcp_data_transfer_after_handshake` — after handshake, client sends "Hello, ShareNet!" via `socket.send_slice()`, verify connection stays established.
+  - `tcp_handshake_with_different_client_ip` — handshake from 10.0.0.100.
+
+- Fixed smoltcp 0.11 API differences during development:
+  1. `Device::receive/transmit` take a `timestamp: Instant` parameter (not zero args).
+  2. `RxToken::consume` takes `F: FnOnce(&mut [u8]) -> R` (mutable, not immutable).
+  3. `HardwareAddress` is in `smoltcp::wire`, not `smoltcp::phy`.
+  4. `Interface::new` takes 3 args: `(config, &mut device, now)`.
+  5. `SocketSet` doesn't have `len()` — removed `socket_count()` method.
+  6. `TcpSocket::connect` takes 3 args: `(cx, remote_endpoint, local_endpoint)` where `cx` is `&mut Context` obtained from `interface.context()`.
+
+Stage Summary:
+- N2.3.3 is complete: the userspace TCP/IP engine (smoltcp) is integrated behind the FlowClassifier/TUN boundary. A synthetic TCP client can complete a full TCP handshake (SYN → SYN-ACK → ACK) through ShareNet userspace handling.
+- The frozen ShareNet stack (Identity, Discovery, Route, Circuit, Gateway, Internet) is UNTOUCHED. `snp-stack` depends only on `snp-tun` and `smoltcp` — no dependency on any ShareNet crate.
+- The Flow Ownership Invariant is documented and frozen: FlowTable is observational state only, must not generate/acknowledge/modify/terminate/route/circuit packets.
+- smoltcp handles ALL TCP behavior (state machine, checksums, sequence numbers, retransmissions) — we did NOT write a half-TCP implementation. The `TcpEngine` is a thin wrapper that feeds packets into smoltcp and drains outgoing packets.
+- Test results:
+  - `cargo test -p snp-stack`: 39 passed (26 N2.3.2 unit + 4 smol_device + 4 tcp_engine unit + 5 tcp_handshake integration + 0 doc-tests [removed old example]), 0 failed, 0 ignored.
+  - `cargo test --workspace`: 543 passed (was 531; +12 net), 0 failed, 5 ignored.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+  - `cargo build -p snp-stack`: zero warnings, zero errors.
+- STOP condition met: no DNS, no HTTPS/HTTP proxy, no circuit creation, no gateway changes, no Internet forwarding. The deliverable is exactly "TCP socket emulation through TUN — the TCP/IP engine boundary is proven."

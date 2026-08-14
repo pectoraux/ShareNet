@@ -60,6 +60,8 @@ thiserror = "1"
 tracing = "0.1"
 # libc (for snp-tun Linux TUN device — raw syscall bindings)
 libc = "0.2"
+# smoltcp (userspace TCP/IP stack for snp-stack N2.3.3)
+smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
 # HTTP client (synchronous, simple — used by snp-gateway for Mode A fetches)
 ureq = "2"
 # URL parsing for the gateway egress policy

@@ -11,6 +11,7 @@ rust-version.workspace = true
 snp-tun.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+smoltcp.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
