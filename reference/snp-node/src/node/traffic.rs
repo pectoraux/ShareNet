@@ -776,7 +776,16 @@ pub fn wrap_packet_for_testing(
 /// (a borrowed handle) or [`ActiveCircuit::send_packet`]. The standalone
 /// [`CircuitSender::new`] constructor is `pub(crate)` (not in the public
 /// production API).
-#[derive(Debug, Clone)]
+///
+/// # P0: not `Clone` (no AEAD nonce reuse)
+///
+/// `CircuitSeqState` is **NOT `Clone`**. It owns the packet-sequence
+/// namespace for a circuit; cloning would duplicate the allocator, allowing
+/// two instances to independently emit the same `seq` under the same
+/// circuit_id + forwarding keys — reusing the AEAD nonce. The allocator is
+/// created exactly once, embedded in `ActiveCircuit`, and accessed only
+/// through `ActiveCircuit::sender()` (a borrowed handle).
+#[derive(Debug)]
 pub struct CircuitSeqState {
     /// The next sequence number to assign. Starts at FIRST_PACKET_SEQ (1).
     next_seq: u32,

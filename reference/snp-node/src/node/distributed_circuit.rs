@@ -811,7 +811,18 @@ impl RelayHandshakeResponse {
 ///
 /// `ActiveCircuit` can ONLY be constructed by `establish_distributed_circuit()`,
 /// which verifies ALL relay responses. Fields are private.
-#[derive(Debug, Clone)]
+///
+/// # P0: not `Clone` (no AEAD nonce reuse)
+///
+/// `ActiveCircuit` is **NOT `Clone`**. The circuit owns the packet-sequence
+/// namespace (`CircuitSeqState`); cloning would duplicate the allocator,
+/// allowing two circuit instances to independently emit the same `seq` under
+/// the same circuit_id + forwarding keys — reusing the AEAD nonce
+/// `(circuit_id, seq)`, catastrophic for ChaCha20-Poly1305.
+///
+/// If higher-level sharing is required, use an explicit synchronized handle
+/// such as `Arc<Mutex<ActiveCircuit>>`, not `Clone` of the circuit value.
+#[derive(Debug)]
 pub struct ActiveCircuit {
     /// Unique circuit identifier.
     circuit_id: [u8; 32],
