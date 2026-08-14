@@ -345,6 +345,15 @@ pub enum TrafficError {
     /// version/profile. The version/profile discriminator is checked BEFORE
     /// selecting the version-specific decoder — fail-closed.
     UnsupportedPacketVersion { version: u8 },
+    /// P0: the incoming packet's profile does not match the circuit's
+    /// established profile. A relay established as V2 received a V1 packet
+    /// (or vice versa). The profile is set at `accept_relay_handshake` time
+    /// and MUST match every forwarded packet — fail-closed.
+    ProfileMismatch {
+        circuit_id: [u8; 32],
+        expected: u8,
+        actual: u8,
+    },
 }
 
 impl std::fmt::Display for TrafficError {
@@ -395,6 +404,10 @@ impl std::fmt::Display for TrafficError {
             ),
             Self::UnsupportedPacketVersion { version } => write!(
                 f, "unsupported packet protocol version/profile {version} — fail-closed"
+            ),
+            Self::ProfileMismatch { circuit_id, expected, actual } => write!(
+                f, "circuit {} profile mismatch: expected {}, got {}",
+                hex_short(circuit_id), expected, actual
             ),
         }
     }
@@ -547,6 +560,22 @@ pub struct RelayForwardingTable {
     entries: std::collections::HashMap<[u8; 32], RelayTableEntry>,
 }
 
+/// Test-only: override a circuit's packet profile (test-utils feature).
+#[cfg(feature = "test-utils")]
+impl RelayForwardingTable {
+    /// Set the packet profile for an installed circuit (test-only).
+    /// Lets tests simulate V1 circuits without modifying accept_relay_handshake.
+    pub fn set_profile_for_testing(
+        &mut self,
+        circuit_id: &[u8; 32],
+        profile: PacketProfile,
+    ) {
+        if let Some(entry) = self.entries.get_mut(circuit_id) {
+            entry.state.profile = profile;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RelayTableEntry {
     /// The forwarding state installed by accept_relay_handshake.
@@ -645,6 +674,19 @@ impl RelayForwardingTable {
         if now >= entry.state.expires_at {
             return Err(TrafficError::CircuitExpired {
                 circuit_id: packet.circuit_id,
+            });
+        }
+
+        // P0: profile mismatch check. The circuit was established with a
+        // specific PacketProfile (set at accept_relay_handshake). A V2
+        // packet on a V1 circuit (or vice versa) is rejected BEFORE any
+        // cryptographic processing. This is the explicit version dispatch —
+        // NOT relying on AEAD failure to detect version mismatch.
+        if entry.state.profile != PacketProfile::V2 {
+            return Err(TrafficError::ProfileMismatch {
+                circuit_id: packet.circuit_id,
+                expected: entry.state.profile.as_byte(),
+                actual: PacketProfile::V2.as_byte(),
             });
         }
 
@@ -1727,6 +1769,15 @@ impl RelayForwardingTable {
         )?;
         if now >= entry.state.expires_at {
             return Err(TrafficError::CircuitExpired { circuit_id: packet.circuit_id });
+        }
+        // P0: profile mismatch check for v1. A V1 packet on a V2 circuit
+        // is rejected before any cryptographic processing.
+        if entry.state.profile != PacketProfile::V1 {
+            return Err(TrafficError::ProfileMismatch {
+                circuit_id: packet.circuit_id,
+                expected: entry.state.profile.as_byte(),
+                actual: PacketProfile::V1.as_byte(),
+            });
         }
         if entry.state.circuit_id != packet.circuit_id {
             return Err(TrafficError::CircuitIdMismatch {

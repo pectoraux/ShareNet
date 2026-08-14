@@ -255,10 +255,14 @@ fn install_relay_state_from(
         authorization: auth.clone(),
         authorization_hashes: hashes,
     };
-    let (_response, state) = accept_relay_handshake(
+    let (_response, mut state) = accept_relay_handshake(
         &request, relay_x25519_sk, relay_sk, relay_pk, acceptance_store,
     ).unwrap();
+    // The test setup uses V2 profile by default (set by accept_relay_handshake).
+    // For V1 tests, we override the profile after installation.
     table.install(state.clone());
+
+    // Return the state so callers can modify the profile if needed.
     state
 }
 
@@ -1857,6 +1861,9 @@ fn end_to_end_expired_circuit_rejected() {
 /// V1 acceptance: a v1 packet traverses A→B→G using the frozen N2.3 protocol
 /// (v1 CircuitPacketV1, v1 AAD, v1 nonce — NO direction, NO flow_id, NO
 /// domain prefix). This proves the frozen v1 protocol is still executable.
+///
+/// The relay state is established with V2 profile (by accept_relay_handshake),
+/// so we override it to V1 for this test — simulating a V1 circuit.
 #[test]
 fn v1_forward_packet_traverses_a_b_g() {
     let mut lc = live_circuit();
@@ -1865,6 +1872,16 @@ fn v1_forward_packet_traverses_a_b_g() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
+    // Override relay state to V1 profile for this test.
+    // (In production, V1 circuits would be established with V1 profile.)
+    lc.table_b.set_profile_for_testing(
+        &lc.ts.circuit_handshake.circuit_id,
+        snp_node::node::PacketProfile::V1,
+    );
+    lc.table_g.set_profile_for_testing(
+        &lc.ts.circuit_handshake.circuit_id,
+        snp_node::node::PacketProfile::V1,
+    );
     // B forwards.
     let outcome_b = lc.table_b.forward_packet_v1(&packet, &lc.ts.source_id, now_unix()).unwrap();
     let (forwarded, successor) = match outcome_b {
@@ -2010,22 +2027,43 @@ fn unknown_packet_version_rejected() {
 /// P0: V1 and V2 do not share the same dispatch path.
 #[test]
 fn v1_and_v2_do_not_share_dispatch_path() {
-    let mut lc = live_circuit();
+    let lc = live_circuit();
     let plaintext = b"dispatch test".to_vec();
+    // V2 packet on V2 circuit → succeeds.
+    let mut table_b_v2 = RelayForwardingTable::new();
+    let mut acc_b_v2 = CircuitAcceptanceStore::new();
+    install_relay_state(&lc.ts, &mut table_b_v2, &mut acc_b_v2, lc.ts.relay_id,
+        &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
     let v2_packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    assert!(lc.table_b.forward_packet(&v2_packet, &lc.ts.source_id, now_unix()).is_ok());
-    let mut table_b = RelayForwardingTable::new();
-    let mut acc_b = CircuitAcceptanceStore::new();
-    install_relay_state(&lc.ts, &mut table_b, &mut acc_b, lc.ts.relay_id,
+    assert!(table_b_v2.forward_packet(&v2_packet, &lc.ts.source_id, now_unix()).is_ok());
+
+    // V1 packet on V1 circuit → succeeds.
+    let mut table_b_v1 = RelayForwardingTable::new();
+    let mut acc_b_v1 = CircuitAcceptanceStore::new();
+    install_relay_state(&lc.ts, &mut table_b_v1, &mut acc_b_v1, lc.ts.relay_id,
         &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
+    table_b_v1.set_profile_for_testing(
+        &lc.ts.circuit_handshake.circuit_id,
+        snp_node::node::PacketProfile::V1,
+    );
     let v1_packet = wrap_packet_v1_for_testing(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    assert!(table_b.forward_packet_v1(&v1_packet, &lc.ts.source_id, now_unix()).is_ok());
+    assert!(table_b_v1.forward_packet_v1(&v1_packet, &lc.ts.source_id, now_unix()).is_ok());
+
+    // V1 packet on V2 circuit → ProfileMismatch (before AEAD).
+    let result = table_b_v2.forward_packet_v1(&v1_packet, &lc.ts.source_id, now_unix());
+    assert!(
+        matches!(result, Err(TrafficError::ProfileMismatch { .. })),
+        "V1 packet on V2 circuit must reject with ProfileMismatch, got {result:?}"
+    );
+
+    // V2 packet (converted from V1 fields) on V2 circuit → PacketUnauthentic
+    // (V1 AAD/nonce ≠ V2 AAD/nonce).
     let v2_from_v1 = snp_node::node::CircuitPacket {
         circuit_id: v1_packet.circuit_id,
         direction: snp_node::node::TrafficDirection::Forward,
@@ -2033,10 +2071,10 @@ fn v1_and_v2_do_not_share_dispatch_path() {
         seq: v1_packet.seq, ttl: v1_packet.ttl,
         payload: v1_packet.payload, final_dst: v1_packet.final_dst,
     };
-    let mut table_b2 = RelayForwardingTable::new();
-    let mut acc_b2 = CircuitAcceptanceStore::new();
-    install_relay_state(&lc.ts, &mut table_b2, &mut acc_b2, lc.ts.relay_id,
+    let mut table_b_v2b = RelayForwardingTable::new();
+    let mut acc_b_v2b = CircuitAcceptanceStore::new();
+    install_relay_state(&lc.ts, &mut table_b_v2b, &mut acc_b_v2b, lc.ts.relay_id,
         &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
-    let result = table_b2.forward_packet(&v2_from_v1, &lc.ts.source_id, now_unix());
+    let result = table_b_v2b.forward_packet(&v2_from_v1, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }
