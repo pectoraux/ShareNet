@@ -64,11 +64,43 @@ use crate::node::route_discovery::{RouteRole, ROUTE_MAX_HOPS};
 use snp_cbor::{CborLimits, CborValue, decode_with_limits};
 use snp_crypto::{aead_nonce, aead_open, aead_seal, sha256, SymmetricKey};
 
-/// Maximum payload (plaintext application bytes) a single packet may carry.
+/// Maximum **plaintext** (application) payload a single packet may carry,
+/// in bytes (P1: separated from the wire limit).
 ///
-/// Enforced at the source (wrap) and as a wire-level bound on the sealed
-/// payload field. Keeps per-packet allocation bounded (invariant #12).
-pub const MAX_PACKET_PAYLOAD_BYTES: usize = 65_536;
+/// Enforced at the source by [`wrap_packet`]. The sealed **wire** payload
+/// may be larger (each AEAD layer appends a 16-byte tag), bounded separately
+/// by [`MAX_WIRE_PAYLOAD_BYTES`].
+pub const MAX_PLAINTEXT_PAYLOAD_BYTES: usize = 65_536;
+
+/// Size of the ChaCha20-Poly1305 authentication tag appended by each AEAD
+/// layer (RFC 8439). Re-exported from `snp_crypto::Tag` (= `[u8; 16]`).
+pub const AEAD_TAG_BYTES: usize = 16;
+
+/// Maximum **wire** payload (sealed bytes) a `CircuitPacket.payload` may
+/// carry. Derived from the plaintext maximum plus the worst-case AEAD tag
+/// overhead across all non-source hops (P1).
+///
+/// Each non-source hop adds one 16-byte tag via `aead_seal`. The maximum
+/// number of non-source hops is `ROUTE_MAX_HOPS - 1` (15), so the worst-case
+/// wire overhead is `15 × 16 = 240` bytes. The wire bound is therefore:
+///
+/// ```text
+/// MAX_WIRE_PAYLOAD_BYTES = MAX_PLAINTEXT_PAYLOAD_BYTES
+///                        + AEAD_TAG_BYTES × (ROUTE_MAX_HOPS - 1)
+/// ```
+///
+/// Enforced by [`CircuitPacket::decode_from_cbor`] at the CBOR head, before
+/// any `Vec` allocation (invariant #12). The source's [`wrap_packet`] also
+/// rejects a plaintext that would produce a wire payload exceeding this.
+pub const MAX_WIRE_PAYLOAD_BYTES: usize =
+    MAX_PLAINTEXT_PAYLOAD_BYTES + AEAD_TAG_BYTES * (ROUTE_MAX_HOPS - 1);
+
+/// **Deprecated alias** for [`MAX_PLAINTEXT_PAYLOAD_BYTES`]. Retained for
+/// backward compatibility with code that predates the plaintext/wire split.
+/// New code should use `MAX_PLAINTEXT_PAYLOAD_BYTES` (source-side limit) or
+/// `MAX_WIRE_PAYLOAD_BYTES` (decoder-side limit) as appropriate.
+#[deprecated(note = "use MAX_PLAINTEXT_PAYLOAD_BYTES or MAX_WIRE_PAYLOAD_BYTES")]
+pub const MAX_PACKET_PAYLOAD_BYTES: usize = MAX_PLAINTEXT_PAYLOAD_BYTES;
 
 /// Default per-circuit replay window size (number of sequence numbers
 /// remembered for replay rejection). A packet whose seq is older than
@@ -253,29 +285,27 @@ impl CircuitReplayWindow {
         }
     }
 
-    /// Check + record a sequence number. Returns `Err` if the seq is a replay
-    /// or stale (behind the window). Saturating arithmetic on the window edge.
-    fn check_and_record(&mut self, seq: u32) -> Result<(), TrafficError> {
-        // First packet on this circuit: accept and record.
+    /// **Read-only** replay/sequence check. Returns `Ok(())` if `seq` would be
+    /// acceptable (not a replay, not stale); returns `Err` if it is a duplicate
+    /// or behind the window.
+    ///
+    /// This does NOT mutate the window. The caller MUST call [`commit`] after
+    /// the packet has passed AEAD authentication, otherwise an unauthenticated
+    /// attacker could poison the window (P0 #1: replay state must not mutate
+    /// before AEAD authentication).
+    ///
+    /// [`commit`]: CircuitReplayWindow::commit
+    fn check(&self, seq: u32) -> Result<(), TrafficError> {
+        // First packet on this circuit (max_seen == 0): any seq is acceptable.
         if self.max_seen == 0 {
-            self.max_seen = seq;
-            self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
             return Ok(());
         }
-        // Future packet: advance max_seen and mark.
+        // Future packet (seq > max_seen): always acceptable (will advance
+        // max_seen on commit).
         if seq > self.max_seen {
-            // Mark all newly-passed slots as unseen (they're now behind the window).
-            let mut s = self.max_seen.wrapping_add(1);
-            while s != seq.wrapping_add(1) {
-                self.seen[(s % REPLAY_WINDOW_SIZE) as usize] = false;
-                s = s.wrapping_add(1);
-            }
-            self.max_seen = seq;
-            self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
             return Ok(());
         }
         // Past or duplicate packet: check the window.
-        // Stale if older than max_seen - WINDOW (with wraparound awareness).
         let distance = self.max_seen.saturating_sub(seq);
         if distance >= REPLAY_WINDOW_SIZE {
             return Err(TrafficError::PacketReplayOrStale { circuit_id: [0u8; 32], seq });
@@ -284,8 +314,53 @@ impl CircuitReplayWindow {
         if self.seen[idx] {
             return Err(TrafficError::PacketReplayOrStale { circuit_id: [0u8; 32], seq });
         }
-        self.seen[idx] = true;
         Ok(())
+    }
+
+    /// Commit a sequence number into the replay window AFTER the packet has
+    /// passed AEAD authentication (P0 #1). This is the only method that
+    /// mutates the window.
+    ///
+    /// # Algorithm (O(WINDOW), never O(sequence delta) — P0 #2)
+    ///
+    /// - If `seq` is the first packet (`max_seen == 0`): set `max_seen = seq`,
+    ///   mark the slot.
+    /// - If `seq > max_seen` and the jump `delta = seq - max_seen` is `< WINDOW`:
+    ///   clear only the `delta` newly-exposed slots (O(delta) ≤ O(WINDOW)),
+    ///   set `max_seen = seq`, mark the slot.
+    /// - If `seq > max_seen` and `delta >= WINDOW`: the entire old window is
+    ///   now stale — clear it in O(WINDOW), set `max_seen = seq`, mark the slot.
+    ///   (Never iterate `max_seen..seq` — that was the P0 #2 DoS bug.)
+    /// - If `seq <= max_seen` (within window): mark the slot (already checked
+    ///   by `check`).
+    fn commit(&mut self, seq: u32) {
+        if self.max_seen == 0 {
+            self.max_seen = seq;
+            self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
+            return;
+        }
+        if seq > self.max_seen {
+            let delta = seq - self.max_seen;
+            if delta >= REPLAY_WINDOW_SIZE {
+                // The entire old window is now stale. Clear it in O(WINDOW),
+                // not O(delta). (P0 #2: the old code iterated max_seen..seq.)
+                for slot in self.seen.iter_mut() {
+                    *slot = false;
+                }
+            } else {
+                // Clear only the `delta` newly-exposed slots. O(delta) ≤ O(WINDOW).
+                for i in 1..=delta {
+                    let s = self.max_seen.wrapping_add(i);
+                    self.seen[(s % REPLAY_WINDOW_SIZE) as usize] = false;
+                }
+            }
+            self.max_seen = seq;
+            self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
+            return;
+        }
+        // seq <= max_seen, within window (check() already verified not a
+        // replay). Mark the slot.
+        self.seen[(seq % REPLAY_WINDOW_SIZE) as usize] = true;
     }
 }
 
@@ -405,8 +480,11 @@ impl RelayForwardingTable {
             });
         }
 
-        // 4, 5. Replay / sequence check.
-        entry.replay.check_and_record(packet.seq).map_err(|e| match e {
+        // 4, 5. Replay / sequence check — READ-ONLY at this stage (P0 #1).
+        // The window is NOT mutated here. An unauthenticated packet must not
+        // be able to advance max_seen or poison the window. The actual commit
+        // happens only after AEAD authentication succeeds (below).
+        entry.replay.check(packet.seq).map_err(|e| match e {
             TrafficError::PacketReplayOrStale { seq, .. } => {
                 TrafficError::PacketReplayOrStale { circuit_id: packet.circuit_id, seq }
             }
@@ -416,11 +494,18 @@ impl RelayForwardingTable {
         // 3, 6, 13. AEAD unwrap: peel one layer with the relay's forwarding_key.
         // The AAD binds circuit_id ‖ seq ‖ final_dst, so a packet from a
         // different circuit, a replayed seq, or a substituted destination
-        // fails authentication.
+        // fails authentication. THIS is the authentication gate.
         let nonce = packet_nonce(&packet.circuit_id, packet.seq);
         let aad = packet_aad(&packet.circuit_id, packet.seq, &packet.final_dst);
         let inner = aead_open(&entry.state.forwarding_key, &nonce, &packet.payload, &aad)
             .ok_or(TrafficError::PacketUnauthentic { circuit_id: packet.circuit_id })?;
+
+        // P0 #1: ONLY NOW — after AEAD authentication succeeded — commit the
+        // sequence number into the replay window. A packet that failed AEAD
+        // (PacketUnauthentic, returned above) never reaches this line, so it
+        // cannot mutate replay state. This is the architectural principle:
+        // failed security validation must not mutate security state.
+        entry.replay.commit(packet.seq);
 
         // 7. Determine: forward to successor, or deliver locally?
         match entry.state.successor_node_id {
@@ -480,10 +565,22 @@ pub fn wrap_packet(
     final_dst: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<CircuitPacket, TrafficError> {
-    if plaintext.len() > MAX_PACKET_PAYLOAD_BYTES {
+    // P1: the source rejects a plaintext that would produce a wire payload
+    // exceeding MAX_WIRE_PAYLOAD_BYTES. Each non-source hop adds one AEAD tag
+    // (16 bytes), so the worst-case sealed size is plaintext + 16×hops.
+    let relay_hops_count = hops.iter().skip(1).count();
+    let worst_case_wire = plaintext.len()
+        .saturating_add(AEAD_TAG_BYTES.saturating_mul(relay_hops_count));
+    if plaintext.len() > MAX_PLAINTEXT_PAYLOAD_BYTES {
         return Err(TrafficError::PayloadTooLarge {
             actual: plaintext.len(),
-            max: MAX_PACKET_PAYLOAD_BYTES,
+            max: MAX_PLAINTEXT_PAYLOAD_BYTES,
+        });
+    }
+    if worst_case_wire > MAX_WIRE_PAYLOAD_BYTES {
+        return Err(TrafficError::PayloadTooLarge {
+            actual: worst_case_wire,
+            max: MAX_WIRE_PAYLOAD_BYTES,
         });
     }
 
@@ -568,7 +665,9 @@ impl CircuitPacket {
         let limits = CborLimits {
             max_array_items: 4,
             max_map_entries: 8,
-            max_byte_string_len: MAX_PACKET_PAYLOAD_BYTES as u64,
+            // P1: the wire payload bound accounts for AEAD tag overhead
+            // across hops (MAX_WIRE_PAYLOAD_BYTES), not just the plaintext.
+            max_byte_string_len: MAX_WIRE_PAYLOAD_BYTES as u64,
             max_text_string_len: 16,
             max_nesting_depth: 4,
         };
@@ -601,12 +700,14 @@ impl CircuitPacket {
             Some(CborValue::ByteString(b)) => b.clone(),
             _ => return Err(TrafficError::WireDecodeFailed { reason: "payload missing/not a byte string".into() }),
         };
-        // Defense-in-depth: explicit payload-size check (the bounded decoder
-        // already enforced it at the head, but this yields a precise error).
-        if payload.len() > MAX_PACKET_PAYLOAD_BYTES {
+        // Defense-in-depth: explicit wire-payload-size check (the bounded
+        // decoder already enforced it at the head, but this yields a precise
+        // error). P1: the wire limit accounts for AEAD tag overhead across
+        // hops, so it is larger than the plaintext limit.
+        if payload.len() > MAX_WIRE_PAYLOAD_BYTES {
             return Err(TrafficError::PayloadTooLarge {
                 actual: payload.len(),
-                max: MAX_PACKET_PAYLOAD_BYTES,
+                max: MAX_WIRE_PAYLOAD_BYTES,
             });
         }
         let seq = u32::try_from(seq).map_err(|_| TrafficError::WireDecodeFailed {
@@ -683,18 +784,18 @@ mod tests {
     #[test]
     fn replay_window_accepts_monotonic() {
         let mut w = CircuitReplayWindow::new();
-        assert!(w.check_and_record(1).is_ok());
-        assert!(w.check_and_record(2).is_ok());
-        assert!(w.check_and_record(3).is_ok());
+        assert!(w.check(1).is_ok()); w.commit(1);
+        assert!(w.check(2).is_ok()); w.commit(2);
+        assert!(w.check(3).is_ok()); w.commit(3);
     }
 
     #[test]
     fn replay_window_rejects_duplicate() {
         let mut w = CircuitReplayWindow::new();
-        assert!(w.check_and_record(5).is_ok());
-        // Duplicate seq 5 → replay.
+        assert!(w.check(5).is_ok()); w.commit(5);
+        // Duplicate seq 5 → replay (check is read-only, returns Err).
         assert!(matches!(
-            w.check_and_record(5),
+            w.check(5),
             Err(TrafficError::PacketReplayOrStale { seq: 5, .. })
         ));
     }
@@ -703,11 +804,60 @@ mod tests {
     fn replay_window_rejects_stale() {
         let mut w = CircuitReplayWindow::new();
         // Advance well past the window.
-        assert!(w.check_and_record(REPLAY_WINDOW_SIZE + 10).is_ok());
+        assert!(w.check(REPLAY_WINDOW_SIZE + 10).is_ok());
+        w.commit(REPLAY_WINDOW_SIZE + 10);
         // A seq far behind → stale.
         assert!(matches!(
-            w.check_and_record(1),
+            w.check(1),
             Err(TrafficError::PacketReplayOrStale { .. })
         ));
+    }
+
+    /// P0 #2: a large sequence jump must be O(WINDOW), not O(delta).
+    /// Jumping from seq=1 to seq=u32::MAX must not loop ~4 billion times.
+    /// This test would hang/spin under the old implementation.
+    #[test]
+    fn large_sequence_jump_is_bounded() {
+        let mut w = CircuitReplayWindow::new();
+        assert!(w.check(1).is_ok()); w.commit(1);
+        // A huge jump — must complete instantly (O(WINDOW) clear, not O(delta)).
+        assert!(w.check(u32::MAX).is_ok());
+        w.commit(u32::MAX);
+        // The window is now centred on u32::MAX; a recent seq is stale.
+        assert!(matches!(
+            w.check(2),
+            Err(TrafficError::PacketReplayOrStale { .. })
+        ));
+    }
+
+    /// P0 #2: the u32::MAX boundary specifically must not cause unbounded work
+    /// or wraparound issues.
+    #[test]
+    fn sequence_max_boundary_is_bounded() {
+        let mut w = CircuitReplayWindow::new();
+        // First packet at the boundary.
+        assert!(w.check(u32::MAX).is_ok()); w.commit(u32::MAX);
+        // A seq slightly less is within the window (delta < WINDOW).
+        let near = u32::MAX - 5;
+        assert!(w.check(near).is_ok()); w.commit(near);
+        // Replaying near → rejected.
+        assert!(matches!(
+            w.check(near),
+            Err(TrafficError::PacketReplayOrStale { .. })
+        ));
+    }
+
+    /// P0 #1 (unit-level): check() is read-only — calling it on a huge seq
+    /// does NOT advance max_seen. Only commit() mutates.
+    #[test]
+    fn check_does_not_mutate_window() {
+        let mut w = CircuitReplayWindow::new();
+        assert!(w.check(1).is_ok()); w.commit(1);
+        // check(1000) returns Ok (future seq) but must NOT advance max_seen.
+        assert!(w.check(1000).is_ok());
+        // max_seen is still 1, so seq=2 is still acceptable (not stale).
+        assert!(w.check(2).is_ok());
+        // And seq=1000 was NOT recorded, so it's still acceptable.
+        assert!(w.check(1000).is_ok());
     }
 }

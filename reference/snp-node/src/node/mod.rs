@@ -172,7 +172,8 @@ pub use distributed_circuit::{
 pub use traffic::{
     CircuitPacket, RelayForwardingTable, TrafficError, UnwrappedPacket,
     wrap_packet, unwrap_final,
-    MAX_PACKET_PAYLOAD_BYTES, REPLAY_WINDOW_SIZE, PACKET_TTL_MAX,
+    MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
+    REPLAY_WINDOW_SIZE, PACKET_TTL_MAX,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

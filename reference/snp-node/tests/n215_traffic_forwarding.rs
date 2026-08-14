@@ -37,7 +37,7 @@ use snp_node::node::{
     accept_relay_handshake, Capability, CircuitAcceptanceStore,
     CircuitHandshake, CircuitSetup, CircuitTeardown, CommittedRoute,
     commit_route, derive_signed_hop_authorizations, discover_path,
-    Link as Link_, LinkKey, MAX_PACKET_PAYLOAD_BYTES,
+    Link as Link_, LinkKey, MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES,
     NodeAdvertisement, prepare_circuit_setup,
     RelayForwardingState, RelayForwardingTable,
     RelayHandshakeRequest, RouteAcceptance, RouteProposal, RouteRole,
@@ -203,8 +203,28 @@ fn install_relay_state(
     relay_sk: &[u8; 32],
     relay_pk: &[u8; 32],
 ) -> RelayForwardingState {
-    let authorizations = derive_signed_hop_authorizations(
+    install_relay_state_from(
         &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        table, acceptance_store, relay_node_id,
+        relay_x25519_sk, relay_sk, relay_pk,
+    )
+}
+
+/// Generic core: takes the three circuit fields directly, so it works with
+/// both TestSetup (2-hop) and ThreeHopSetup (3-hop).
+fn install_relay_state_from(
+    committed_route: &CommittedRoute,
+    circuit_handshake: &CircuitHandshake,
+    source_sk: &[u8; 32],
+    table: &mut RelayForwardingTable,
+    acceptance_store: &mut CircuitAcceptanceStore,
+    relay_node_id: [u8; 32],
+    relay_x25519_sk: &snp_crypto::X25519Secret,
+    relay_sk: &[u8; 32],
+    relay_pk: &[u8; 32],
+) -> RelayForwardingState {
+    let authorizations = derive_signed_hop_authorizations(
+        committed_route, circuit_handshake, source_sk,
     ).unwrap();
     let auth = authorizations.iter()
         .find(|a| a.relay_node_id == relay_node_id)
@@ -217,7 +237,7 @@ fn install_relay_state(
         hashes.push(sha256(&preimage));
     }
     let request = RelayHandshakeRequest {
-        handshake: ts.circuit_handshake.clone(),
+        handshake: circuit_handshake.clone(),
         authorization: auth.clone(),
         authorization_hashes: hashes,
     };
@@ -491,7 +511,7 @@ fn teardown_blocks_new_traffic() {
 #[test]
 fn oversized_payload_rejected() {
     let mut lc = live_circuit();
-    let big = vec![0u8; MAX_PACKET_PAYLOAD_BYTES + 1];
+    let big = vec![0u8; MAX_PLAINTEXT_PAYLOAD_BYTES + 1];
     let result = wrap_packet(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &big,
@@ -500,12 +520,14 @@ fn oversized_payload_rejected() {
 }
 
 /// Invariant #12/#13: wire decode rejects an oversized payload at the CBOR
-/// head, before allocation.
+/// head, before allocation. Uses the WIRE limit (P1: accounts for AEAD tag
+/// overhead across hops).
 #[test]
 fn wire_decode_rejects_oversized_payload() {
     use snp_cbor::{CborLimits, CborValue, decode_with_limits};
-    // Construct a CBOR map with an oversized payload byte string.
-    let big_payload = vec![0u8; MAX_PACKET_PAYLOAD_BYTES + 1];
+    // Construct a CBOR map with an oversized payload byte string (exceeds the
+    // WIRE limit, which is larger than the plaintext limit by AEAD tag overhead).
+    let big_payload = vec![0u8; MAX_WIRE_PAYLOAD_BYTES + 1];
     let map = CborValue::Map(vec![
         (CborValue::TextString("circuitId".into()), CborValue::ByteString(vec![0u8; 32])),
         (CborValue::TextString("seq".into()), CborValue::UnsignedInt(1)),
@@ -517,7 +539,7 @@ fn wire_decode_rejects_oversized_payload() {
     // decode_with_limits with the packet profile rejects at the head.
     let limits = CborLimits {
         max_array_items: 4, max_map_entries: 8,
-        max_byte_string_len: MAX_PACKET_PAYLOAD_BYTES as u64,
+        max_byte_string_len: MAX_WIRE_PAYLOAD_BYTES as u64,
         max_text_string_len: 16, max_nesting_depth: 4,
     };
     let err = decode_with_limits(&wire, &limits).unwrap_err();
@@ -633,4 +655,242 @@ fn multi_packet_sequence_traverses() {
         };
         assert_eq!(recovered, plaintext, "seq {seq} payload mismatch");
     }
+}
+
+// ─── P0 #1: replay window must not mutate before AEAD authentication ───────
+
+/// P0 #1: an unauthenticated/forged packet must NOT advance the replay window.
+///
+/// The previous implementation called `check_and_record(seq)` BEFORE AEAD,
+/// so a forged packet with a huge seq could advance `max_seen` and cause a
+/// subsequent legitimate packet (with a smaller seq) to be rejected as stale.
+///
+/// The fixed ordering is:
+///   circuit lookup → predecessor check → AEAD authentication → COMMIT replay
+///
+/// So a forged packet that fails AEAD produces `PacketUnauthentic` WITHOUT
+/// mutating the replay window. The subsequent legitimate packet is still
+/// accepted.
+#[test]
+fn invalid_packet_does_not_advance_replay_window() {
+    let mut lc = live_circuit();
+    let plaintext = b"legitimate payload".to_vec();
+
+    // 1. Valid seq=1 → accepted, replay window commits seq=1.
+    let p1 = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let outcome = lc.table_b.forward_packet(&p1, &lc.ts.source_id);
+    assert!(outcome.is_ok(), "valid seq=1 must be accepted");
+
+    // 2. Forged packet: seq=1000 (would advance max_seen under the old bug),
+    //    but with garbage payload → AEAD must fail → PacketUnauthentic.
+    //    Critically, the replay window must NOT advance.
+    let mut forged = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1000, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Corrupt the payload so AEAD fails.
+    forged.payload[0] ^= 0xff;
+    let forged_result = lc.table_b.forward_packet(&forged, &lc.ts.source_id);
+    assert!(
+        matches!(forged_result, Err(TrafficError::PacketUnauthentic { .. })),
+        "forged packet must fail AEAD, got {forged_result:?}"
+    );
+
+    // 3. Valid seq=2 → MUST still be accepted. Under the old bug, max_seen
+    //    would have advanced to 1000 (step 2), making seq=2 stale and rejected.
+    let p2 = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        2, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let outcome = lc.table_b.forward_packet(&p2, &lc.ts.source_id);
+    assert!(
+        outcome.is_ok(),
+        "valid seq=2 must still be accepted after a forged seq=1000 failed AEAD — \
+         replay window must not have advanced. Got: {outcome:?}"
+    );
+}
+
+// ─── P1: three-hop A → B → C → G traversal ─────────────────────────────────
+
+/// Build a 4-node topology: source A → relay B → relay C → gateway G.
+/// Returns the established circuit + key material for all four nodes.
+struct ThreeHopSetup {
+    source_id: [u8; 32],
+    source_sk: [u8; 32],
+    source_pk: [u8; 32],
+    relay_b_id: [u8; 32], relay_b_sk: [u8; 32], relay_b_pk: [u8; 32],
+    relay_b_x25519_sk: snp_crypto::X25519Secret, relay_b_x25519_pk: [u8; 32],
+    relay_c_id: [u8; 32], relay_c_sk: [u8; 32], relay_c_pk: [u8; 32],
+    relay_c_x25519_sk: snp_crypto::X25519Secret, relay_c_x25519_pk: [u8; 32],
+    gateway_id: [u8; 32], gateway_sk: [u8; 32], gateway_pk: [u8; 32],
+    gateway_x25519_sk: snp_crypto::X25519Secret, gateway_x25519_pk: [u8; 32],
+    committed_route: CommittedRoute,
+    circuit_setup: CircuitSetup,
+    circuit_handshake: CircuitHandshake,
+    ephemeral_secret: snp_crypto::X25519Secret,
+}
+
+fn setup_three_hop() -> ThreeHopSetup {
+    let mut graph = TopologyGraph::new_for_testing();
+    let (source_sk, source_pk) = fresh_keypair(b"n23-3hop-source");
+    let source_id = derive_node_id(&source_pk);
+    let source_advert = NodeAdvertisement::create_and_sign(
+        &source_sk, &source_pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:0")], None, 3600, 1,
+    );
+    graph.accept_advertisement(source_advert.verify_into_verified().unwrap()).unwrap();
+
+    let (rb_x25519_sk, rb_x25519_pk_pair) = x25519_static_keypair();
+    let rb_x25519_pk = rb_x25519_pk_pair.to_bytes();
+    let (rb_advert, relay_b_sk, relay_b_pk) = make_relay_advert(b"n23-3hop-relay-b", 1, &rb_x25519_pk);
+    let relay_b_id = derive_node_id(&relay_b_pk);
+    graph.accept_advertisement(rb_advert.verify_into_verified().unwrap()).unwrap();
+
+    let (rc_x25519_sk, rc_x25519_pk_pair) = x25519_static_keypair();
+    let rc_x25519_pk = rc_x25519_pk_pair.to_bytes();
+    let (rc_advert, relay_c_sk, relay_c_pk) = make_relay_advert(b"n23-3hop-relay-c", 1, &rc_x25519_pk);
+    let relay_c_id = derive_node_id(&relay_c_pk);
+    graph.accept_advertisement(rc_advert.verify_into_verified().unwrap()).unwrap();
+
+    let (gw_x25519_sk, gw_x25519_pk_pair) = x25519_static_keypair();
+    let gw_x25519_pk = gw_x25519_pk_pair.to_bytes();
+    let (gw_advert, gw_sk, gw_pk) = make_gateway_advert(b"n23-3hop-gateway", 1, &gw_x25519_pk);
+    let gateway_id = derive_node_id(&gw_pk);
+    graph.accept_advertisement(gw_advert.verify_into_verified().unwrap()).unwrap();
+
+    // Links: A→B, B→C, C→G
+    graph.add_link(Link_::new_up(
+        LinkKey::new(source_id, relay_b_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
+    ));
+    graph.add_link(Link_::new_up(
+        LinkKey::new(relay_b_id, relay_c_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
+    ));
+    graph.add_link(Link_::new_up(
+        LinkKey::new(relay_c_id, gateway_id, TransportEndpoint::tcp("127.0.0.1:3")), None,
+    ));
+
+    let exec = graph.snapshot_executable();
+    let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
+    let validated_path = validate_path(&exec, &discovered).unwrap();
+    let now = now_unix();
+    let proposal = RouteProposal::from_validated_path(
+        &validated_path, &source_sk, &source_pk,
+        ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        now + 3600,
+    ).unwrap();
+    let hash = proposal.proposal_hash().unwrap();
+    let rb_acc = RouteAcceptance::create_and_sign(
+        &relay_b_sk, &relay_b_pk, relay_b_id, hash, RouteRole::Relay, vec![], now + 3600,
+    ).unwrap();
+    let rc_acc = RouteAcceptance::create_and_sign(
+        &relay_c_sk, &relay_c_pk, relay_c_id, hash, RouteRole::Relay, vec![], now + 3600,
+    ).unwrap();
+    let gw_acc = RouteAcceptance::create_and_sign(
+        &gw_sk, &gw_pk, gateway_id, hash, RouteRole::Gateway, vec![], now + 3600,
+    ).unwrap();
+    let committed_route = commit_route(proposal, vec![rb_acc, rc_acc, gw_acc], &validated_path, now).unwrap();
+
+    let (ephemeral_secret, _) = x25519_ephemeral_keypair();
+    let auth_count = (committed_route.validated_hops().len() - 1) as u8;
+    let circuit_handshake = CircuitHandshake::create_and_sign(
+        &committed_route, &source_sk, &source_pk, &ephemeral_secret,
+        [0u8; 32], auth_count,
+    ).unwrap();
+    let (final_root, _) = snp_node::node::compute_authorization_root(
+        &committed_route, circuit_handshake.circuit_id,
+        circuit_handshake.commitment_hash, &source_sk,
+    ).unwrap();
+    let mut circuit_handshake = circuit_handshake;
+    circuit_handshake.authorization_root = final_root;
+    let preimage = circuit_handshake.preimage_bytes().unwrap();
+    circuit_handshake.source_signature = snp_crypto::ed25519_sign(&source_sk, &preimage);
+    let circuit_setup = prepare_circuit_setup(&committed_route, &circuit_handshake, &ephemeral_secret).unwrap();
+
+    ThreeHopSetup {
+        source_id, source_sk, source_pk,
+        relay_b_id, relay_b_sk, relay_b_pk, relay_b_x25519_sk: rb_x25519_sk, relay_b_x25519_pk: rb_x25519_pk,
+        relay_c_id, relay_c_sk, relay_c_pk, relay_c_x25519_sk: rc_x25519_sk, relay_c_x25519_pk: rc_x25519_pk,
+        gateway_id, gateway_sk: gw_sk, gateway_pk: gw_pk, gateway_x25519_sk: gw_x25519_sk, gateway_x25519_pk: gw_x25519_pk,
+        committed_route, circuit_setup, circuit_handshake, ephemeral_secret,
+    }
+}
+
+/// P1: three-hop A → B → C → G traversal with real RelayForwardingTable
+/// state at B, C, and G.
+///
+/// This exercises the full forwarding chain: peel layer B → forward → peel
+/// layer C → forward → peel layer G → deliver plaintext. A never talks
+/// directly to G (or to C).
+#[test]
+fn three_hop_traversal_a_b_c_g() {
+    let ts = setup_three_hop();
+
+    // Install forwarding state on B, C, and G.
+    let mut table_b = RelayForwardingTable::new();
+    let mut table_c = RelayForwardingTable::new();
+    let mut table_g = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut acc_c = CircuitAcceptanceStore::new();
+    let mut acc_g = CircuitAcceptanceStore::new();
+
+    let state_b = install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_b, &mut acc_b, ts.relay_b_id,
+        &ts.relay_b_x25519_sk, &ts.relay_b_sk, &ts.relay_b_pk,
+    );
+    assert_eq!(state_b.predecessor_node_id, ts.source_id);
+    assert_eq!(state_b.successor_node_id, Some(ts.relay_c_id));
+
+    let state_c = install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_c, &mut acc_c, ts.relay_c_id,
+        &ts.relay_c_x25519_sk, &ts.relay_c_sk, &ts.relay_c_pk,
+    );
+    assert_eq!(state_c.predecessor_node_id, ts.relay_b_id);
+    assert_eq!(state_c.successor_node_id, Some(ts.gateway_id));
+
+    let state_g = install_relay_state_from(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+        &mut table_g, &mut acc_g, ts.gateway_id,
+        &ts.gateway_x25519_sk, &ts.gateway_sk, &ts.gateway_pk,
+    );
+    assert_eq!(state_g.predecessor_node_id, ts.relay_c_id);
+    assert_eq!(state_g.successor_node_id, None); // terminal
+
+    // Source A wraps the plaintext into 3 nested AEAD layers (B, C, G).
+    let plaintext = b"three-hop secret payload".to_vec();
+    let packet = wrap_packet(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        1, &ts.gateway_id, &plaintext,
+    ).unwrap();
+    assert_eq!(packet.ttl, snp_node::node::PACKET_TTL_MAX);
+
+    // A → B: B peels its layer, forwards to C.
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let (packet_to_c, successor_b) = match outcome_b {
+        UnwrappedPacket::Forward { packet, successor } => (packet, successor),
+        _ => panic!("B must forward, not deliver"),
+    };
+    assert_eq!(successor_b, ts.relay_c_id, "B must forward to C");
+    assert_eq!(packet_to_c.ttl, packet.ttl - 1);
+
+    // B → C: C peels its layer, forwards to G.
+    let outcome_c = table_c.forward_packet(&packet_to_c, &ts.relay_b_id).unwrap();
+    let (packet_to_g, successor_c) = match outcome_c {
+        UnwrappedPacket::Forward { packet, successor } => (packet, successor),
+        _ => panic!("C must forward, not deliver"),
+    };
+    assert_eq!(successor_c, ts.gateway_id, "C must forward to G");
+    assert_eq!(packet_to_g.ttl, packet_to_c.ttl - 1);
+
+    // C → G: G peels the final layer, delivers the plaintext.
+    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_c_id).unwrap();
+    let recovered = match outcome_g {
+        UnwrappedPacket::Deliver { plaintext } => plaintext,
+        _ => panic!("G must deliver, not forward"),
+    };
+    assert_eq!(recovered, plaintext, "G must recover the original plaintext");
 }
