@@ -754,20 +754,30 @@ pub fn wrap_packet_for_testing(
 /// # Example
 ///
 /// ```no_run
-/// # use snp_node::node::{CircuitSender, CircuitSetup, HopForwardingState, TrafficError};
-/// # fn setup() -> (CircuitSetup, [u8;32], [u8;32]) { unimplemented!() }
-/// let (setup, circuit_id, gateway_id) = setup();
-/// let mut sender = CircuitSender::new(circuit_id, setup.hops().to_vec(), gateway_id);
+/// # use snp_node::node::{ActiveCircuit, TrafficError};
+/// # fn get_circuit() -> ActiveCircuit { unimplemented!() }
+/// let mut circuit = get_circuit();
+/// // The circuit owns its sequence allocator. Borrow a sender handle:
+/// let mut sender = circuit.sender();
 /// let packet1 = sender.send_packet(b"hello")?;      // seq = 1
 /// let packet2 = sender.send_packet(b"world")?;      // seq = 2
 /// // ...
 /// # Ok::<(), TrafficError>(())
 /// ```
-#[derive(Debug)]
-pub struct CircuitSender {
-    circuit_id: [u8; 32],
-    hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
-    final_dst: [u8; 32],
+/// Owned per-circuit sequence-allocation state, embedded in an `ActiveCircuit`.
+///
+/// This type exists so that the sequence allocator belongs to the **circuit
+/// instance** (the `ActiveCircuit`), not to an independently-constructible
+/// sender object. A caller cannot manufacture a second allocator merely by
+/// knowing the `circuit_id` + hops — the allocator is created exactly once,
+/// inside `ActiveCircuit`, at establishment time (P0: no AEAD nonce reuse).
+///
+/// Production code accesses the allocator through [`ActiveCircuit::sender`]
+/// (a borrowed handle) or [`ActiveCircuit::send_packet`]. The standalone
+/// [`CircuitSender::new`] constructor is `pub(crate)` (not in the public
+/// production API).
+#[derive(Debug, Clone)]
+pub struct CircuitSeqState {
     /// The next sequence number to assign. Starts at FIRST_PACKET_SEQ (1).
     next_seq: u32,
     /// Whether the sequence space is exhausted. Set to `true` after assigning
@@ -775,22 +785,11 @@ pub struct CircuitSender {
     exhausted: bool,
 }
 
-impl CircuitSender {
-    /// Construct a new sender for a circuit. Sequence allocation starts at
-    /// [`FIRST_PACKET_SEQ`] (= 1).
+impl CircuitSeqState {
+    /// Create a fresh allocator starting at [`FIRST_PACKET_SEQ`] (= 1).
     #[must_use]
-    pub fn new(
-        circuit_id: [u8; 32],
-        hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
-        final_dst: [u8; 32],
-    ) -> Self {
-        Self {
-            circuit_id,
-            hops,
-            final_dst,
-            next_seq: FIRST_PACKET_SEQ,
-            exhausted: false,
-        }
+    pub fn new() -> Self {
+        Self { next_seq: FIRST_PACKET_SEQ, exhausted: false }
     }
 
     /// The next sequence number that will be assigned (without sending).
@@ -800,8 +799,8 @@ impl CircuitSender {
         if self.exhausted { None } else { Some(self.next_seq) }
     }
 
-    /// Whether this sender's sequence space is exhausted (a circuit
-    /// re-establishment is required before further traffic).
+    /// Whether the sequence space is exhausted (a circuit re-establishment is
+    /// required before further traffic).
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
@@ -813,45 +812,203 @@ impl CircuitSender {
     ///
     /// # P1: sequence is committed only on success
     ///
-    /// The sender's `next_seq`/`exhausted` state is advanced ONLY after
+    /// The allocator's `next_seq`/`exhausted` state is advanced ONLY after
     /// [`wrap_packet`] succeeds. A failed packet construction (e.g.
     /// `PayloadTooLarge`, `EmptyCircuit`) does **not** consume a sequence
-    /// number — the same `seq` is offered to the next `send_packet` call.
-    /// In particular, if `seq == u32::MAX` and `wrap_packet` fails, the
-    /// circuit does NOT become exhausted until a packet using `u32::MAX` is
-    /// actually successfully constructed.
+    /// number — the same `seq` is offered to the next call.
     ///
     /// # Errors
-    /// - [`TrafficError::SequenceExhausted`] — the circuit's sequence space
-    ///   is exhausted; re-establish the circuit.
+    /// - [`TrafficError::SequenceExhausted`] — exhausted; re-establish.
     /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
     /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
-    pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
+    pub fn send_packet(
+        &mut self,
+        hops: &[crate::node::circuit_handshake::HopForwardingState],
+        circuit_id: &[u8; 32],
+        final_dst: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<CircuitPacket, TrafficError> {
         if self.exhausted {
-            return Err(TrafficError::SequenceExhausted { circuit_id: self.circuit_id });
+            return Err(TrafficError::SequenceExhausted { circuit_id: *circuit_id });
         }
         let candidate_seq = self.next_seq;
-        // P1: construct the packet FIRST. If this fails (PayloadTooLarge,
-        // EmptyCircuit, etc.), the sender state is NOT advanced — the same
-        // candidate_seq is offered again on the next call.
-        let packet = wrap_packet(
-            &self.hops, &self.circuit_id, candidate_seq, &self.final_dst, plaintext,
-        )?;
-        // P1: only NOW — after successful construction — commit the sequence
-        // allocation. The packet is real; the seq is consumed.
+        // P1: construct the packet FIRST. If this fails, the allocator state
+        // is NOT advanced — the same candidate_seq is offered again.
+        let packet = wrap_packet(hops, circuit_id, candidate_seq, final_dst, plaintext)?;
+        // P1: only NOW — after successful construction — commit the sequence.
         if candidate_seq == MAX_PACKET_SEQUENCE {
             self.exhausted = true;
         } else {
             self.next_seq = candidate_seq.checked_add(1).ok_or(
-                TrafficError::SequenceExhausted { circuit_id: self.circuit_id }
+                TrafficError::SequenceExhausted { circuit_id: *circuit_id }
             )?;
         }
         Ok(packet)
     }
 
-    /// Test-only constructor that starts the sender at a specific `next_seq`,
-    /// so tests can exercise the exhaustion boundary without sending ~4
-    /// billion packets.
+    /// Test-only: reset the allocator to a specific `next_seq`, so tests can
+    /// exercise the exhaustion boundary without ~4B sends. Feature-gated
+    /// behind `test-utils` (absent from production builds).
+    #[cfg(feature = "test-utils")]
+    pub fn reset_to_seq_for_testing(&mut self, next_seq: u32) {
+        self.next_seq = next_seq;
+        self.exhausted = false;
+    }
+}
+
+impl Default for CircuitSeqState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A borrowed handle to a circuit's sequence allocator (P0: the allocator is
+/// owned by the circuit, not independently constructible).
+///
+/// A `CircuitSender` borrows `&mut` the circuit's [`CircuitSeqState`] and `&`
+/// the circuit's hops/id/destination. Because the state is borrowed, two
+/// independent senders for the same circuit cannot coexist — the borrow
+/// checker enforces uniqueness. This structurally prevents the AEAD
+/// nonce-reuse attack where two senders both emit `seq = 1` under the same
+/// circuit keys.
+///
+/// # Uniqueness invariant
+///
+/// There must be exactly ONE sender handle per circuit at a time. The
+/// `&mut` borrow prevents a second `CircuitSender` from existing while one
+/// is live. The circuit itself owns the sequence namespace.
+///
+/// Production code obtains a handle via [`ActiveCircuit::sender`] or uses
+/// [`ActiveCircuit::send_packet`] directly. The standalone
+/// [`CircuitSender::new`] is `pub(crate)` (not in the public production API).
+#[derive(Debug)]
+pub struct CircuitSender<'a> {
+    /// Borrowed mutable reference to the circuit's sequence allocator.
+    seq_state: &'a mut CircuitSeqState,
+    /// Borrowed reference to the circuit's per-hop forwarding state.
+    hops: &'a [crate::node::circuit_handshake::HopForwardingState],
+    /// The circuit ID.
+    circuit_id: [u8; 32],
+    /// The terminal destination NodeId (the gateway).
+    final_dst: [u8; 32],
+}
+
+impl<'a> CircuitSender<'a> {
+    /// Construct a sender handle that borrows a circuit's sequence allocator
+    /// and forwarding state. `pub(crate)` — production callers use
+    /// [`ActiveCircuit::sender`] instead.
+    ///
+    /// This is `pub(crate)` so external crates cannot create an independent
+    /// sender for a circuit they don't own. The circuit's allocator is
+    /// accessed through the circuit's own `sender()` method, which borrows
+    /// the embedded `CircuitSeqState`.
+    pub(crate) fn new(
+        seq_state: &'a mut CircuitSeqState,
+        hops: &'a [crate::node::circuit_handshake::HopForwardingState],
+        circuit_id: [u8; 32],
+        final_dst: [u8; 32],
+    ) -> Self {
+        Self { seq_state, hops, circuit_id, final_dst }
+    }
+
+    /// The next sequence number that will be assigned (without sending).
+    /// Returns `None` if the sequence space is exhausted.
+    #[must_use]
+    pub fn peek_next_seq(&self) -> Option<u32> {
+        self.seq_state.peek_next_seq()
+    }
+
+    /// Whether this circuit's sequence space is exhausted.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.seq_state.is_exhausted()
+    }
+
+    /// Allocate the next sequence number and wrap a plaintext into a
+    /// `CircuitPacket`. Delegates to the borrowed [`CircuitSeqState`].
+    ///
+    /// # Errors
+    /// - [`TrafficError::SequenceExhausted`] — exhausted; re-establish.
+    /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
+    /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
+    pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
+        self.seq_state.send_packet(self.hops, &self.circuit_id, &self.final_dst, plaintext)
+    }
+}
+
+impl<'a> CircuitSender<'a> {
+    // (The main impl — new, peek_next_seq, is_exhausted, send_packet — is
+    // defined above with the struct. This block is retained for the
+    // test-only constructor below.)
+}
+
+impl<'a> CircuitSender<'a> {
+    /// Test-only standalone constructor that owns its own `CircuitSeqState`,
+    /// so integration tests can build a sender without a full `ActiveCircuit`.
+    /// Feature-gated behind `test-utils` (absent from production builds).
+    ///
+    /// Tests that need a sender but don't want to build the full
+    /// `ActiveCircuit` (e.g. adversarial replay-window tests) use this. The
+    /// allocator is freshly owned, starting at [`FIRST_PACKET_SEQ`].
+    #[cfg(feature = "test-utils")]
+    pub fn new_standalone_for_testing(
+        circuit_id: [u8; 32],
+        hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
+        final_dst: [u8; 32],
+    ) -> CircuitSenderOwnedForTesting {
+        CircuitSenderOwnedForTesting {
+            seq_state: CircuitSeqState::new(),
+            hops,
+            circuit_id,
+            final_dst,
+        }
+    }
+}
+
+/// Test-only owned sender (backs `CircuitSender::new_standalone_for_testing`).
+/// Feature-gated; absent from production builds. Holds its own
+/// `CircuitSeqState` + owned hops, so tests without an `ActiveCircuit` can
+/// still send packets. The allocator is unique per instance (not `Clone`).
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct CircuitSenderOwnedForTesting {
+    seq_state: CircuitSeqState,
+    hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
+    circuit_id: [u8; 32],
+    final_dst: [u8; 32],
+}
+
+#[cfg(feature = "test-utils")]
+impl CircuitSenderOwnedForTesting {
+    /// The next sequence number that will be assigned.
+    #[must_use]
+    pub fn peek_next_seq(&self) -> Option<u32> {
+        self.seq_state.peek_next_seq()
+    }
+
+    /// Whether the sequence space is exhausted.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.seq_state.is_exhausted()
+    }
+
+    /// Send a packet via the owned allocator.
+    pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
+        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.final_dst, plaintext)
+    }
+
+    /// Reset the allocator to a specific `next_seq` for exhaustion-boundary
+    /// tests.
+    pub fn reset_to_seq_for_testing(&mut self, next_seq: u32) {
+        self.seq_state.reset_to_seq_for_testing(next_seq);
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl<'a> CircuitSender<'a> {
+    /// Test-only constructor that starts a standalone owned sender at a
+    /// specific `next_seq`, so tests can exercise the exhaustion boundary
+    /// without sending ~4 billion packets.
     ///
     /// # Feature-gated (P0: structurally absent from production)
     ///
@@ -859,20 +1016,15 @@ impl CircuitSender {
     /// enabled. A normal production build does NOT expose it — an external
     /// crate cannot call `CircuitSender::new_at_seq_for_testing`. Integration
     /// tests enable the feature via `[dev-dependencies]`.
-    #[cfg(feature = "test-utils")]
     pub fn new_at_seq_for_testing(
         circuit_id: [u8; 32],
         hops: Vec<crate::node::circuit_handshake::HopForwardingState>,
         final_dst: [u8; 32],
         next_seq: u32,
-    ) -> Self {
-        Self {
-            circuit_id,
-            hops,
-            final_dst,
-            next_seq,
-            exhausted: false,
-        }
+    ) -> CircuitSenderOwnedForTesting {
+        let mut s = Self::new_standalone_for_testing(circuit_id, hops, final_dst);
+        s.reset_to_seq_for_testing(next_seq);
+        s
     }
 }
 

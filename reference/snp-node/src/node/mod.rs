@@ -170,8 +170,8 @@ pub use distributed_circuit::{
     authorization_in_root, verify_dh_proof, MAX_AUTHORIZATION_HASHES,
 };
 pub use traffic::{
-    CircuitPacket, CircuitSender, RelayForwardingTable, TrafficError, UnwrappedPacket,
-    unwrap_final,
+    CircuitPacket, CircuitSeqState, CircuitSender, RelayForwardingTable, TrafficError,
+    UnwrappedPacket, unwrap_final,
     MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
     REPLAY_WINDOW_SIZE, PACKET_TTL_MAX, FIRST_PACKET_SEQ, MAX_PACKET_SEQUENCE,
 };

@@ -829,6 +829,12 @@ pub struct ActiveCircuit {
     established_at: u64,
     /// When the circuit expires.
     expires_at: u64,
+    /// P0: the circuit's OWN sequence allocator. Owned by the circuit
+    /// instance, not independently constructible. This structurally prevents
+    /// two senders from existing for the same circuit (which would cause
+    /// AEAD nonce reuse). Accessed via [`ActiveCircuit::sender`] or
+    /// [`ActiveCircuit::send_packet`].
+    seq_state: crate::node::traffic::CircuitSeqState,
 }
 
 /// Error from `establish_distributed_circuit()`.
@@ -1156,6 +1162,7 @@ pub fn establish_distributed_circuit(
         hops: hops.to_vec(),
         established_at: now,
         expires_at: setup.expires_at(),
+        seq_state: crate::node::traffic::CircuitSeqState::new(),
     })
 }
 
@@ -1189,6 +1196,68 @@ impl ActiveCircuit {
     #[must_use]
     pub fn relay_acknowledged(&self, node_id: &[u8; 32]) -> bool {
         self.relay_response(node_id).is_some()
+    }
+
+    /// P0: borrow a sender handle for this circuit. The sequence allocator
+    /// is owned by the `ActiveCircuit`; this returns a borrowed handle that
+    /// cannot be duplicated (the `&mut` borrow prevents a second concurrent
+    /// sender). Two independent senders for the same circuit — which would
+    /// both emit `seq=1` and reuse the AEAD nonce — are structurally
+    /// impossible.
+    ///
+    /// The handle borrows the circuit, so it cannot outlive it. When the
+    /// handle is dropped, the borrow ends and a new one can be taken.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use snp_node::node::{ActiveCircuit, TrafficError};
+    /// # fn get_circuit() -> ActiveCircuit { unimplemented!() }
+    /// let mut circuit = get_circuit();
+    /// {
+    ///     let mut sender = circuit.sender();
+    ///     let p1 = sender.send_packet(b"hello")?;  // seq = 1
+    ///     let p2 = sender.send_packet(b"world")?;  // seq = 2
+    /// }
+    /// # Ok::<(), TrafficError>(())
+    /// ```
+    pub fn sender(&mut self) -> crate::node::traffic::CircuitSender<'_> {
+        crate::node::traffic::CircuitSender::new(
+            &mut self.seq_state,
+            &self.hops,
+            self.circuit_id,
+            self.destination,
+        )
+    }
+
+    /// P0: send a packet directly via the circuit's owned sequence allocator.
+    /// This is the production source-side API. The sequence number is
+    /// allocated from the circuit's own `CircuitSeqState`, which cannot be
+    /// duplicated — there is exactly one allocator per circuit instance.
+    ///
+    /// # Errors
+    /// - [`TrafficError::SequenceExhausted`] — the circuit's sequence space
+    ///   is exhausted; re-establish the circuit.
+    /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
+    /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
+    pub fn send_packet(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<crate::node::traffic::CircuitPacket, crate::node::traffic::TrafficError> {
+        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.destination, plaintext)
+    }
+
+    /// P0: the next sequence number the circuit's allocator will assign.
+    /// Returns `None` if the sequence space is exhausted.
+    #[must_use]
+    pub fn peek_next_seq(&self) -> Option<u32> {
+        self.seq_state.peek_next_seq()
+    }
+
+    /// P0: whether the circuit's sequence space is exhausted.
+    #[must_use]
+    pub fn is_seq_exhausted(&self) -> bool {
+        self.seq_state.is_exhausted()
     }
 }
 
