@@ -293,7 +293,7 @@ fn end_to_end_packet_traversal_a_b_g() {
     ).unwrap();
 
     // A sends the packet to B (the first relay). B's predecessor is A.
-    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id, now_unix()).unwrap();
     let (packet_to_g, successor) = match outcome_b {
         UnwrappedPacket::Forward { packet, successor } => (packet, successor),
         UnwrappedPacket::Deliver { .. } => panic!("B must forward, not deliver"),
@@ -302,7 +302,7 @@ fn end_to_end_packet_traversal_a_b_g() {
     assert_eq!(packet_to_g.ttl, packet.ttl - 1, "TTL decremented by B");
 
     // B sends the forwarded packet to G. G's predecessor is B.
-    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_id).unwrap();
+    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_id, now_unix()).unwrap();
     let recovered = match outcome_g {
         UnwrappedPacket::Deliver { plaintext } => plaintext,
         UnwrappedPacket::Forward { .. } => panic!("G must deliver, not forward"),
@@ -343,7 +343,7 @@ fn unknown_circuit_rejected() {
     ).unwrap();
     // Mutate the circuit_id to an unknown value.
     packet.circuit_id = [0xff; 32];
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
 }
 
@@ -361,7 +361,7 @@ fn predecessor_mismatch_rejected() {
     ).unwrap();
     // Claim the packet came from G (not A). B's predecessor is A.
     let impostor = lc.ts.gateway_id;
-    let result = lc.table_b.forward_packet(&packet, &impostor);
+    let result = lc.table_b.forward_packet(&packet, &impostor, now_unix());
     assert!(matches!(result, Err(TrafficError::PredecessorMismatch { .. })));
 }
 
@@ -376,9 +376,9 @@ fn packet_replay_rejected() {
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
     // First forwarding succeeds.
-    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix()).unwrap();
     // Replay the same seq → rejected.
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketReplayOrStale { .. })));
 }
 
@@ -394,13 +394,13 @@ fn stale_sequence_rejected() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         high_seq, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let _ = lc.table_b.forward_packet(&p_high, &lc.ts.source_id).unwrap();
+    let _ = lc.table_b.forward_packet(&p_high, &lc.ts.source_id, now_unix()).unwrap();
     // Now send seq=5 — far behind max_seen (distance >> window) → stale.
     let p_stale = wrap_packet_for_testing(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         5, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let result = lc.table_b.forward_packet(&p_stale, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&p_stale, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketReplayOrStale { .. })));
 }
 
@@ -415,7 +415,7 @@ fn ttl_exhausted_rejected() {
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
     packet.ttl = 0;
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::TtlExhausted { ttl: 0, .. })));
 }
 
@@ -436,7 +436,7 @@ fn cross_circuit_injection_rejected() {
     // Try to forward it on circuit 2's relay B. The circuit_id won't match
     // any state in lc2.table_b → UnknownCircuit. (Even if we crafted a packet
     // with lc2's circuit_id, the AEAD would fail because the keys differ.)
-    let result = lc2.table_b.forward_packet(&packet1, &lc.ts.source_id);
+    let result = lc2.table_b.forward_packet(&packet1, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
 }
 
@@ -452,7 +452,7 @@ fn tampered_payload_rejected() {
     ).unwrap();
     // Flip a byte in the sealed payload.
     packet.payload[0] ^= 0xff;
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }
 
@@ -469,7 +469,7 @@ fn destination_substitution_rejected() {
     ).unwrap();
     // Substitute the final_dst with a different node.
     packet.final_dst = [0xaa; 32];
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }
 
@@ -484,7 +484,7 @@ fn teardown_blocks_new_traffic() {
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
     // Before teardown: forwarding works.
-    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix()).unwrap();
 
     // Re-install B's state (the previous forward consumed the replay window).
     let mut acc_b = CircuitAcceptanceStore::new();
@@ -503,7 +503,7 @@ fn teardown_blocks_new_traffic() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         2, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let result = table_b.forward_packet(&packet2, &lc.ts.source_id);
+    let result = table_b.forward_packet(&packet2, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
 }
 
@@ -602,7 +602,7 @@ fn relay_does_not_inspect_payload() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix()).unwrap();
     let forwarded = match outcome {
         UnwrappedPacket::Forward { packet, .. } => packet,
         _ => panic!("expected Forward"),
@@ -627,7 +627,7 @@ fn hop_skip_rejected() {
     ).unwrap();
     // G's predecessor is B, so claim it came from B — but the packet still
     // has B's outer layer, which G's key cannot open.
-    let result = lc.table_g.forward_packet(&packet, &lc.ts.relay_id);
+    let result = lc.table_g.forward_packet(&packet, &lc.ts.relay_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }
 
@@ -643,13 +643,13 @@ fn multi_packet_sequence_traverses() {
             seq, &lc.ts.gateway_id, &plaintext,
         ).unwrap();
         // B forwards.
-        let outcome_b = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+        let outcome_b = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix()).unwrap();
         let forwarded = match outcome_b {
             UnwrappedPacket::Forward { packet, .. } => packet,
             _ => panic!("B must forward seq {seq}"),
         };
         // G delivers.
-        let outcome_g = lc.table_g.forward_packet(&forwarded, &lc.ts.relay_id).unwrap();
+        let outcome_g = lc.table_g.forward_packet(&forwarded, &lc.ts.relay_id, now_unix()).unwrap();
         let recovered = match outcome_g {
             UnwrappedPacket::Deliver { plaintext } => plaintext,
             _ => panic!("G must deliver seq {seq}"),
@@ -682,7 +682,7 @@ fn invalid_packet_does_not_advance_replay_window() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let outcome = lc.table_b.forward_packet(&p1, &lc.ts.source_id);
+    let outcome = lc.table_b.forward_packet(&p1, &lc.ts.source_id, now_unix());
     assert!(outcome.is_ok(), "valid seq=1 must be accepted");
 
     // 2. Forged packet: seq=1000 (would advance max_seen under the old bug),
@@ -694,7 +694,7 @@ fn invalid_packet_does_not_advance_replay_window() {
     ).unwrap();
     // Corrupt the payload so AEAD fails.
     forged.payload[0] ^= 0xff;
-    let forged_result = lc.table_b.forward_packet(&forged, &lc.ts.source_id);
+    let forged_result = lc.table_b.forward_packet(&forged, &lc.ts.source_id, now_unix());
     assert!(
         matches!(forged_result, Err(TrafficError::PacketUnauthentic { .. })),
         "forged packet must fail AEAD, got {forged_result:?}"
@@ -706,7 +706,7 @@ fn invalid_packet_does_not_advance_replay_window() {
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         2, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
-    let outcome = lc.table_b.forward_packet(&p2, &lc.ts.source_id);
+    let outcome = lc.table_b.forward_packet(&p2, &lc.ts.source_id, now_unix());
     assert!(
         outcome.is_ok(),
         "valid seq=2 must still be accepted after a forged seq=1000 failed AEAD — \
@@ -870,7 +870,7 @@ fn three_hop_traversal_a_b_c_g() {
     assert_eq!(packet.ttl, snp_node::node::PACKET_TTL_MAX);
 
     // A → B: B peels its layer, forwards to C.
-    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id, now_unix()).unwrap();
     let (packet_to_c, successor_b) = match outcome_b {
         UnwrappedPacket::Forward { packet, successor } => (packet, successor),
         _ => panic!("B must forward, not deliver"),
@@ -879,7 +879,7 @@ fn three_hop_traversal_a_b_c_g() {
     assert_eq!(packet_to_c.ttl, packet.ttl - 1);
 
     // B → C: C peels its layer, forwards to G.
-    let outcome_c = table_c.forward_packet(&packet_to_c, &ts.relay_b_id).unwrap();
+    let outcome_c = table_c.forward_packet(&packet_to_c, &ts.relay_b_id, now_unix()).unwrap();
     let (packet_to_g, successor_c) = match outcome_c {
         UnwrappedPacket::Forward { packet, successor } => (packet, successor),
         _ => panic!("C must forward, not deliver"),
@@ -888,7 +888,7 @@ fn three_hop_traversal_a_b_c_g() {
     assert_eq!(packet_to_g.ttl, packet_to_c.ttl - 1);
 
     // C → G: G peels the final layer, delivers the plaintext.
-    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_c_id).unwrap();
+    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_c_id, now_unix()).unwrap();
     let recovered = match outcome_g {
         UnwrappedPacket::Deliver { plaintext } => plaintext,
         _ => panic!("G must deliver, not forward"),
@@ -935,7 +935,7 @@ fn ttl_tampering_rejected() {
     // is NOT re-sealed, so the AEAD AAD (which includes the original ttl)
     // won't match. B's forward_packet must reject with PacketUnauthentic.
     packet.ttl = 255;
-    let result = table_b.forward_packet(&packet, &ts.source_id);
+    let result = table_b.forward_packet(&packet, &ts.source_id, now_unix());
     assert!(
         matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
         "tampered TTL must cause AEAD failure, got {result:?}"
@@ -944,7 +944,7 @@ fn ttl_tampering_rejected() {
     // Restore the original TTL — the packet is authentic again (proves the
     // failure was specifically due to the TTL mismatch, not the payload).
     packet.ttl = original_ttl;
-    let outcome = table_b.forward_packet(&packet, &ts.source_id);
+    let outcome = table_b.forward_packet(&packet, &ts.source_id, now_unix());
     assert!(outcome.is_ok(), "restored TTL must authenticate successfully");
 }
 
@@ -978,7 +978,7 @@ fn forwarded_ttl_tampering_rejected() {
     ).unwrap();
 
     // B forwards honestly — peels its layer, decrements ttl.
-    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id, now_unix()).unwrap();
     let mut forwarded = match outcome_b {
         UnwrappedPacket::Forward { packet, .. } => packet,
         _ => panic!("B must forward"),
@@ -990,7 +990,7 @@ fn forwarded_ttl_tampering_rejected() {
     // handing it to C. C's AEAD layer was sealed with the honest forwarded
     // ttl, so the tampered ttl breaks the AAD → C rejects.
     forwarded.ttl = honest_forwarded_ttl + 5;
-    let result = table_c.forward_packet(&forwarded, &ts.relay_b_id);
+    let result = table_c.forward_packet(&forwarded, &ts.relay_b_id, now_unix());
     assert!(
         matches!(result, Err(TrafficError::PacketUnauthentic { .. })),
         "tampered forwarded TTL must cause AEAD failure at C, got {result:?}"
@@ -1099,7 +1099,7 @@ fn sequence_zero_not_valid_after_exhaustion() {
     // so it returns SequenceZero (a more precise error) rather than
     // PacketUnauthentic.
     packet.seq = 0;
-    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix());
     assert!(
         matches!(result, Err(TrafficError::SequenceZero { .. })),
         "relay must reject seq=0 with SequenceZero, got {result:?}"
@@ -1119,7 +1119,7 @@ fn circuit_sender_packet_accepted_by_relay() {
     let packet = sender.send_packet(b"sender round-trip").unwrap();
     assert_eq!(packet.seq, 1);
     // B accepts and forwards.
-    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now_unix()).unwrap();
     assert!(matches!(outcome, UnwrappedPacket::Forward { .. }));
 }
 
@@ -1361,10 +1361,10 @@ fn active_circuit_owns_sequence_allocator() {
     ).expect("distributed circuit must establish");
 
     // The circuit owns its sequence allocator. First send → seq=1.
-    let p1 = active.send_packet(b"first").unwrap();
+    let p1 = active.send_packet(b"first", now_unix()).unwrap();
     assert_eq!(p1.seq, 1);
     // Second send → seq=2 (SAME allocator, not a new one).
-    let p2 = active.send_packet(b"second").unwrap();
+    let p2 = active.send_packet(b"second", now_unix()).unwrap();
     assert_eq!(p2.seq, 2);
     // The circuit's allocator is now at seq=3.
     assert_eq!(active.peek_next_seq(), Some(3));
@@ -1414,9 +1414,9 @@ fn active_circuit_sender_handle_is_unique() {
     // to `active` (the handle borrows it). The handle allocates seq 1, 2, 3.
     {
         let mut sender = active.sender();
-        let p1 = sender.send_packet(b"a").unwrap();
+        let p1 = sender.send_packet(b"a", now_unix()).unwrap();
         assert_eq!(p1.seq, 1);
-        let p2 = sender.send_packet(b"b").unwrap();
+        let p2 = sender.send_packet(b"b", now_unix()).unwrap();
         assert_eq!(p2.seq, 2);
         // The handle is dropped here; the borrow ends.
     }
@@ -1425,7 +1425,7 @@ fn active_circuit_sender_handle_is_unique() {
     // A new handle continues from seq=3.
     {
         let mut sender = active.sender();
-        let p3 = sender.send_packet(b"c").unwrap();
+        let p3 = sender.send_packet(b"c", now_unix()).unwrap();
         assert_eq!(p3.seq, 3);
     }
 }
@@ -1507,9 +1507,9 @@ fn active_circuit_is_not_cloneable() {
     // The circuit is NOT Clone — active.clone() would not compile here.
     // (If Clone were re-added, the external compile-fail check in the guard
     // would catch it. This test verifies the behavioral path still works.)
-    let p1 = active.send_packet(b"seq 1").unwrap();
+    let p1 = active.send_packet(b"seq 1", now_unix()).unwrap();
     assert_eq!(p1.seq, 1);
-    let p2 = active.send_packet(b"seq 2").unwrap();
+    let p2 = active.send_packet(b"seq 2", now_unix()).unwrap();
     assert_eq!(p2.seq, 2);
     // There is no way to produce a second circuit with seq_state.next_seq = 1
     // from this circuit — Clone is absent.
@@ -1558,7 +1558,7 @@ fn circuit_seq_state_is_not_cloneable() {
     // The embedded CircuitSeqState is NOT Clone. The circuit's allocator
     // advances correctly through a single instance.
     assert_eq!(active.peek_next_seq(), Some(1));
-    let _ = active.send_packet(b"first").unwrap();
+    let _ = active.send_packet(b"first", now_unix()).unwrap();
     assert_eq!(active.peek_next_seq(), Some(2));
     // There is no way to clone the CircuitSeqState to get a second allocator
     // at next_seq=2 — Clone is absent.
@@ -1619,6 +1619,222 @@ fn circuit_seq_state_is_not_publicly_constructible() {
 
     // The ONLY production path to send packets is ActiveCircuit::send_packet.
     // There is no standalone CircuitSeqState constructor accessible here.
-    let p1 = active.send_packet(b"only path").unwrap();
+    let p1 = active.send_packet(b"only path", now_unix()).unwrap();
     assert_eq!(p1.seq, 1);
+}
+
+// ─── P0: circuit expiration enforcement ───────────────────────────────────
+
+/// P0: an expired ActiveCircuit rejects send_packet with CircuitExpired.
+/// The circuit's expires_at is taken from the signed CircuitHandshake.expiry.
+/// After expiry, the source must establish a new circuit.
+#[test]
+fn expired_active_circuit_rejects_send() {
+    let ts = setup();
+    use std::cell::RefCell;
+    use std::collections::HashMap as StdMap;
+    struct MockRelay {
+        ed25519_sk: [u8; 32], ed25519_pk: [u8; 32],
+        x25519_sk: snp_crypto::X25519Secret, acceptance: CircuitAcceptanceStore,
+    }
+    struct MockTransport { relays: StdMap<[u8; 32], RefCell<MockRelay>> }
+    impl RelayHandshakeTransport for MockTransport {
+        fn send_handshake(&self, req: &RelayHandshakeRequest) -> Option<snp_node::node::RelayHandshakeResponse> {
+            let rid = req.authorization.relay_node_id;
+            let cell = self.relays.get(&rid)?;
+            let mut r = cell.borrow_mut();
+            let x = r.x25519_sk.clone(); let esk = r.ed25519_sk; let epk = r.ed25519_pk;
+            accept_relay_handshake(req, &x, &esk, &epk, &mut r.acceptance).ok().map(|(resp, _)| resp)
+        }
+    }
+    let mut relays = StdMap::new();
+    relays.insert(ts.relay_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.relay_sk, ed25519_pk: ts.relay_pk,
+        x25519_sk: ts.relay_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    relays.insert(ts.gateway_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.gateway_sk, ed25519_pk: ts.gateway_pk,
+        x25519_sk: ts.gateway_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    let transport = MockTransport { relays };
+    let mut active = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    ).unwrap();
+
+    // Before expiry: send succeeds.
+    let now = now_unix();
+    let p1 = active.send_packet(b"before expiry", now).unwrap();
+    assert_eq!(p1.seq, 1);
+
+    // After expiry: send rejects with CircuitExpired.
+    let expired_now = active.expires_at() + 1;
+    let result = active.send_packet(b"after expiry", expired_now);
+    assert!(
+        matches!(result, Err(TrafficError::CircuitExpired { .. })),
+        "expired circuit must reject send, got {result:?}"
+    );
+}
+
+/// P0: an expired sender handle rejects send_packet with CircuitExpired.
+/// The borrowed CircuitSender<'_> carries the circuit's expires_at and
+/// enforces the lifecycle boundary.
+#[test]
+fn expired_sender_handle_rejects_send() {
+    let ts = setup();
+    use std::cell::RefCell;
+    use std::collections::HashMap as StdMap;
+    struct MockRelay {
+        ed25519_sk: [u8; 32], ed25519_pk: [u8; 32],
+        x25519_sk: snp_crypto::X25519Secret, acceptance: CircuitAcceptanceStore,
+    }
+    struct MockTransport { relays: StdMap<[u8; 32], RefCell<MockRelay>> }
+    impl RelayHandshakeTransport for MockTransport {
+        fn send_handshake(&self, req: &RelayHandshakeRequest) -> Option<snp_node::node::RelayHandshakeResponse> {
+            let rid = req.authorization.relay_node_id;
+            let cell = self.relays.get(&rid)?;
+            let mut r = cell.borrow_mut();
+            let x = r.x25519_sk.clone(); let esk = r.ed25519_sk; let epk = r.ed25519_pk;
+            accept_relay_handshake(req, &x, &esk, &epk, &mut r.acceptance).ok().map(|(resp, _)| resp)
+        }
+    }
+    let mut relays = StdMap::new();
+    relays.insert(ts.relay_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.relay_sk, ed25519_pk: ts.relay_pk,
+        x25519_sk: ts.relay_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    relays.insert(ts.gateway_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.gateway_sk, ed25519_pk: ts.gateway_pk,
+        x25519_sk: ts.gateway_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    let transport = MockTransport { relays };
+    let mut active = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    ).unwrap();
+
+    let expires_at = active.expires_at();
+    let mut sender = active.sender();
+    // Before expiry: send succeeds.
+    let now = now_unix();
+    let p1 = sender.send_packet(b"before", now).unwrap();
+    assert_eq!(p1.seq, 1);
+    // After expiry: sender rejects.
+    let result = sender.send_packet(b"after", expires_at + 1);
+    assert!(
+        matches!(result, Err(TrafficError::CircuitExpired { .. })),
+        "expired sender handle must reject, got {result:?}"
+    );
+}
+
+/// P0: an expired RelayForwardingState rejects forward_packet with
+/// CircuitExpired. The relay's forwarding state carries expires_at (from the
+/// signed CircuitHandshake.expiry); after expiry, the relay refuses to
+/// process packets for the circuit.
+#[test]
+fn expired_relay_forwarding_state_rejects_packet() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let packet = wrap_packet_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+
+    // The circuit's expiry is in the future (set at handshake creation).
+    let expiry = lc.ts.circuit_handshake.expiry;
+
+    // Before expiry: forwarding succeeds.
+    let now = now_unix();
+    assert!(now < expiry, "test baseline: now must be before expiry");
+    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id, now);
+    assert!(outcome.is_ok(), "pre-expiry forward must succeed, got {outcome:?}");
+
+    // Re-install B's state (the previous forward consumed the replay window).
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut table_b = RelayForwardingTable::new();
+    install_relay_state(&lc.ts, &mut table_b, &mut acc_b, lc.ts.relay_id,
+        &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
+
+    // At/after expiry: forwarding rejects with CircuitExpired.
+    let packet2 = wrap_packet_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        2, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let result = table_b.forward_packet(&packet2, &lc.ts.source_id, expiry + 1);
+    assert!(
+        matches!(result, Err(TrafficError::CircuitExpired { .. })),
+        "expired relay state must reject forward, got {result:?}"
+    );
+}
+
+/// P0: a packet at exactly the expiry boundary (now == expires_at) is rejected.
+/// The boundary is `now >= expires_at → expired` (matches is_expired()).
+#[test]
+fn packet_at_expiry_is_rejected() {
+    let mut lc = live_circuit();
+    let expiry = lc.ts.circuit_handshake.expiry;
+    let plaintext = b"boundary".to_vec();
+    let packet = wrap_packet_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // now == expires_at → expired (>=).
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id, expiry);
+    assert!(
+        matches!(result, Err(TrafficError::CircuitExpired { .. })),
+        "packet at exactly expires_at must be rejected, got {result:?}"
+    );
+}
+
+/// P0 end-to-end: an expired circuit is rejected on both source and relay.
+/// A → B → G traversal works before expiry; after expiry, both the source
+/// (ActiveCircuit::send_packet) and the relay (forward_packet) reject with
+/// CircuitExpired.
+#[test]
+fn end_to_end_expired_circuit_rejected() {
+    let ts = setup();
+    // Install relay B + gateway G forwarding state.
+    let mut table_b = RelayForwardingTable::new();
+    let mut table_g = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut acc_g = CircuitAcceptanceStore::new();
+    install_relay_state(&ts, &mut table_b, &mut acc_b, ts.relay_id,
+        &ts.relay_x25519_sk, &ts.relay_sk, &ts.relay_pk);
+    install_relay_state(&ts, &mut table_g, &mut acc_g, ts.gateway_id,
+        &ts.gateway_x25519_sk, &ts.gateway_sk, &ts.gateway_pk);
+
+    let expiry = ts.circuit_handshake.expiry;
+    let now = now_unix();
+    assert!(now < expiry, "baseline: now before expiry");
+
+    // Before expiry: A → B → G traversal works.
+    let plaintext = b"pre-expiry payload".to_vec();
+    let packet = wrap_packet_for_testing(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        1, &ts.gateway_id, &plaintext,
+    ).unwrap();
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id, now).unwrap();
+    let forwarded = match outcome_b {
+        UnwrappedPacket::Forward { packet, .. } => packet,
+        _ => panic!("B must forward"),
+    };
+    let outcome_g = table_g.forward_packet(&forwarded, &ts.relay_id, now).unwrap();
+    match outcome_g {
+        UnwrappedPacket::Deliver { plaintext: recovered } => {
+            assert_eq!(recovered, plaintext);
+        }
+        _ => panic!("G must deliver"),
+    }
+
+    // After expiry: relay B rejects with CircuitExpired.
+    let expired_now = expiry + 1;
+    let packet2 = wrap_packet_for_testing(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        2, &ts.gateway_id, &plaintext,
+    ).unwrap();
+    let result_b = table_b.forward_packet(&packet2, &ts.source_id, expired_now);
+    assert!(
+        matches!(result_b, Err(TrafficError::CircuitExpired { .. })),
+        "expired relay B must reject, got {result_b:?}"
+    );
 }

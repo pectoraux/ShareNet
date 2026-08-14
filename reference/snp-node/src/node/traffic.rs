@@ -504,6 +504,7 @@ impl RelayForwardingTable {
         &mut self,
         packet: &CircuitPacket,
         predecessor: &[u8; 32],
+        now: u64,
     ) -> Result<UnwrappedPacket, TrafficError> {
         // 9. TTL check (before any crypto — cheap and fail-closed).
         if packet.ttl == 0 {
@@ -517,6 +518,18 @@ impl RelayForwardingTable {
         let entry = self.entries.get_mut(&packet.circuit_id).ok_or(
             TrafficError::UnknownCircuit { circuit_id: packet.circuit_id }
         )?;
+
+        // P0: circuit-expiration check. The relay's forwarding state carries
+        // `expires_at` (taken from the signed CircuitHandshake.expiry at
+        // accept_relay_handshake time). After expiry, the relay MUST reject
+        // further packets for this circuit — the circuit lifecycle boundary
+        // is enforced on both source and relay sides. This runs before AEAD
+        // (an expired circuit must not process packets at all).
+        if now >= entry.state.expires_at {
+            return Err(TrafficError::CircuitExpired {
+                circuit_id: packet.circuit_id,
+            });
+        }
 
         // 1. Circuit binding: the packet's circuit_id must match the state's.
         if entry.state.circuit_id != packet.circuit_id {
@@ -755,12 +768,12 @@ pub fn wrap_packet_for_testing(
 ///
 /// ```no_run
 /// # use snp_node::node::{ActiveCircuit, TrafficError};
-/// # fn get_circuit() -> ActiveCircuit { unimplemented!() }
-/// let mut circuit = get_circuit();
+/// # fn get_circuit() -> (ActiveCircuit, u64) { unimplemented!() }
+/// # let (mut circuit, now) = get_circuit();
 /// // The circuit owns its sequence allocator. Borrow a sender handle:
 /// let mut sender = circuit.sender();
-/// let packet1 = sender.send_packet(b"hello")?;      // seq = 1
-/// let packet2 = sender.send_packet(b"world")?;      // seq = 2
+/// let packet1 = sender.send_packet(b"hello", now)?;      // seq = 1
+/// let packet2 = sender.send_packet(b"world", now)?;      // seq = 2
 /// // ...
 /// # Ok::<(), TrafficError>(())
 /// ```
@@ -912,6 +925,8 @@ pub struct CircuitSender<'a> {
     circuit_id: [u8; 32],
     /// The terminal destination NodeId (the gateway).
     final_dst: [u8; 32],
+    /// P0: the circuit's expiry time (for lifecycle enforcement).
+    expires_at: u64,
 }
 
 impl<'a> CircuitSender<'a> {
@@ -928,8 +943,9 @@ impl<'a> CircuitSender<'a> {
         hops: &'a [crate::node::circuit_handshake::HopForwardingState],
         circuit_id: [u8; 32],
         final_dst: [u8; 32],
+        expires_at: u64,
     ) -> Self {
-        Self { seq_state, hops, circuit_id, final_dst }
+        Self { seq_state, hops, circuit_id, final_dst, expires_at }
     }
 
     /// The next sequence number that will be assigned (without sending).
@@ -948,11 +964,21 @@ impl<'a> CircuitSender<'a> {
     /// Allocate the next sequence number and wrap a plaintext into a
     /// `CircuitPacket`. Delegates to the borrowed [`CircuitSeqState`].
     ///
+    /// # P0: circuit-expiration enforcement
+    ///
+    /// If `now >= self.expires_at`, the circuit is expired and no further
+    /// packets may be created. Returns [`TrafficError::CircuitExpired`].
+    ///
     /// # Errors
+    /// - [`TrafficError::CircuitExpired`] — the circuit has expired.
     /// - [`TrafficError::SequenceExhausted`] — exhausted; re-establish.
     /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
     /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
-    pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
+    pub fn send_packet(&mut self, plaintext: &[u8], now: u64) -> Result<CircuitPacket, TrafficError> {
+        // P0: lifecycle check — an expired circuit must not produce packets.
+        if now >= self.expires_at {
+            return Err(TrafficError::CircuitExpired { circuit_id: self.circuit_id });
+        }
         self.seq_state.send_packet(self.hops, &self.circuit_id, &self.final_dst, plaintext)
     }
 }

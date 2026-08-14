@@ -1223,12 +1223,12 @@ impl ActiveCircuit {
     ///
     /// ```no_run
     /// # use snp_node::node::{ActiveCircuit, TrafficError};
-    /// # fn get_circuit() -> ActiveCircuit { unimplemented!() }
-    /// let mut circuit = get_circuit();
+    /// # fn get_circuit() -> (ActiveCircuit, u64) { unimplemented!() }
+    /// # let (mut circuit, now) = get_circuit();
     /// {
     ///     let mut sender = circuit.sender();
-    ///     let p1 = sender.send_packet(b"hello")?;  // seq = 1
-    ///     let p2 = sender.send_packet(b"world")?;  // seq = 2
+    ///     let p1 = sender.send_packet(b"hello", now)?;  // seq = 1
+    ///     let p2 = sender.send_packet(b"world", now)?;  // seq = 2
     /// }
     /// # Ok::<(), TrafficError>(())
     /// ```
@@ -1238,6 +1238,7 @@ impl ActiveCircuit {
             &self.hops,
             self.circuit_id,
             self.destination,
+            self.expires_at,
         )
     }
 
@@ -1246,7 +1247,14 @@ impl ActiveCircuit {
     /// allocated from the circuit's own `CircuitSeqState`, which cannot be
     /// duplicated — there is exactly one allocator per circuit instance.
     ///
+    /// # P0: circuit-expiration enforcement
+    ///
+    /// If `now >= self.expires_at`, the circuit is expired and no further
+    /// packets may be created. Returns [`TrafficError::CircuitExpired`].
+    /// The source must establish a new circuit before further traffic.
+    ///
     /// # Errors
+    /// - [`TrafficError::CircuitExpired`] — the circuit has expired.
     /// - [`TrafficError::SequenceExhausted`] — the circuit's sequence space
     ///   is exhausted; re-establish the circuit.
     /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
@@ -1254,7 +1262,16 @@ impl ActiveCircuit {
     pub fn send_packet(
         &mut self,
         plaintext: &[u8],
+        now: u64,
     ) -> Result<crate::node::traffic::CircuitPacket, crate::node::traffic::TrafficError> {
+        // P0: centralized lifecycle check. An expired circuit must not
+        // produce packets — its forwarding keys + sequence namespace are
+        // no longer valid.
+        if self.is_expired(now) {
+            return Err(crate::node::traffic::TrafficError::CircuitExpired {
+                circuit_id: self.circuit_id,
+            });
+        }
         self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.destination, plaintext)
     }
 
@@ -1343,6 +1360,7 @@ impl CircuitAcceptanceStore {
 /// - Who its predecessor is (who sends frames to it).
 /// - Who its successor is (who it forwards to).
 /// - What key to use for per-hop AEAD.
+/// - When the circuit expires (P0: relay-side lifetime enforcement).
 #[derive(Debug, Clone)]
 pub struct RelayForwardingState {
     /// The circuit ID this forwarding state belongs to.
@@ -1356,6 +1374,13 @@ pub struct RelayForwardingState {
     pub forwarding_key: snp_crypto::SymmetricKey,
     /// The relay's role.
     pub role: RouteRole,
+    /// P0: when this circuit's forwarding state expires (unix seconds).
+    /// Taken from the signed `CircuitHandshake.expiry`. After this time, the
+    /// relay MUST reject further packets for this circuit with
+    /// [`TrafficError::CircuitExpired`]. This enforces the circuit lifecycle
+    /// boundary on the relay side — a stale relay cannot continue accepting
+    /// traffic after the circuit has expired.
+    pub expires_at: u64,
 }
 
 /// Process a relay handshake request on the relay side.
@@ -1593,6 +1618,9 @@ pub fn accept_relay_handshake(
         successor_node_id: auth.successor_node_id,
         forwarding_key,
         role: auth.role,
+        // P0: the relay's forwarding state expires when the circuit's signed
+        // handshake expires. After this time, forward_packet rejects.
+        expires_at: handshake.expiry,
     };
 
     Ok((response, forwarding_state))
