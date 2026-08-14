@@ -515,6 +515,68 @@ pub async fn perform_snp_ik_handshake_async(
     })
 }
 
+/// **N2.2.1.** Perform the SNP-IK/0.1 handshake over an async TCP stream and
+/// return a [`VerifiedHandshake`] proof bound to the actual transport endpoint.
+///
+/// This is the canonical async variant of
+/// [`perform_snp_ik_handshake_verified`](crate::perform_snp_ik_handshake_verified).
+/// It is the unforgeable proof that:
+///
+/// 1. The SNP-IK/0.1 handshake actually completed (signatures verified,
+///    NodeId matches `SHA-256("SNP/0.1 node\0" || peer_pubKey)`, optional
+///    `expected_peer_node_id` pinning passed).
+/// 2. The handshake occurred over the specific TCP endpoint returned by
+///    `stream.peer_addr()` (the `TransportBinding` is bound to the proof at
+///    mint time and cannot be forged by external code).
+///
+/// The directional AEAD [`LinkKeys`] inside the proof are used by the caller
+/// to AEAD-encrypt subsequent frames on this connection.
+///
+/// # Parameters
+/// - `stream`: a connected `tokio::net::TcpStream`.
+/// - `is_initiator`: `true` for the side that opened the TCP connection.
+/// - `my_ed25519_secret`/`my_ed25519_public`: the node's Ed25519 identity keypair.
+/// - `my_x25519_secret`/`my_x25519_public`: the node's STATIC X25519 rendezvous keypair.
+/// - `expected_peer_node_id`: if `Some`, the handshake fails if the peer's
+///   authenticated NodeId does not match (the "I"-style pinning).
+///
+/// # Errors
+/// Returns [`AsyncLinkError::Handshake`] on signature/NodeId/CBOR failures,
+/// [`AsyncLinkError::Io`] on transport failure or if `peer_addr()` cannot be
+/// obtained (e.g. the stream was closed).
+pub async fn perform_snp_ik_handshake_verified_async(
+    stream: &mut tokio::net::TcpStream,
+    is_initiator: bool,
+    my_ed25519_secret: &[u8; 32],
+    my_ed25519_public: &[u8; 32],
+    my_x25519_secret: &snp_crypto::X25519Secret,
+    my_x25519_public: &snp_crypto::X25519PubKey,
+    expected_peer_node_id: Option<&[u8; 32]>,
+) -> Result<crate::VerifiedHandshake, AsyncLinkError> {
+    let result = perform_snp_ik_handshake_async(
+        stream,
+        is_initiator,
+        my_ed25519_secret,
+        my_ed25519_public,
+        my_x25519_secret,
+        my_x25519_public,
+        expected_peer_node_id,
+    )
+    .await?;
+    // N2.1.2.5: Extract the actual transport endpoint from the TcpStream.
+    // This binds the proof to the specific endpoint the handshake occurred over.
+    let peer_addr = stream
+        .peer_addr()
+        .map_err(|e| AsyncLinkError::Io(format!("peer_addr: {e}")))?;
+    let transport_binding = crate::TransportBinding::from_tcp_socket_addr(peer_addr);
+    // Mint the unforgeable proof from the internal HandshakeResult + transport binding.
+    // This conversion is pub(crate) — only callable from within snp-link.
+    Ok(crate::VerifiedHandshake::from_handshake_result(
+        &result,
+        transport_binding,
+    ))
+}
+
 /// Derive end-to-end circuit keys from a single X25519 DH output (async-context
 /// re-export of the sync `derive_circuit_keys_from_dh`).
 ///

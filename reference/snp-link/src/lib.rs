@@ -124,6 +124,11 @@ use thiserror::Error;
 // N2.0.6 — canonical async production transport.
 pub mod async_link;
 
+// N2.2.1 — re-export the async verified-handshake wrapper at the crate root
+// so callers can use `snp_link::perform_snp_ik_handshake_verified_async`
+// (mirroring the sync `snp_link::perform_snp_ik_handshake_verified`).
+pub use async_link::perform_snp_ik_handshake_verified_async;
+
 /// Errors from the L8 link layer.
 #[derive(Debug, Error)]
 pub enum LinkError {
@@ -584,12 +589,14 @@ impl VerifiedHandshake {
 
     /// Convert from a `HandshakeResult` (internal only).
     ///
-    /// This is private — only callable from within `snp-link`. It is used
-    /// by `perform_snp_ik_handshake_verified` to convert its internal
-    /// `HandshakeResult` into the unforgeable `VerifiedHandshake` proof,
-    /// binding it to the actual transport endpoint.
+    /// This is `pub(crate)` — only callable from within `snp-link` (including
+    /// the `async_link` submodule). It is used by
+    /// `perform_snp_ik_handshake_verified` (sync) and
+    /// `perform_snp_ik_handshake_verified_async` (async) to convert their
+    /// internal `HandshakeResult` into the unforgeable `VerifiedHandshake`
+    /// proof, binding it to the actual transport endpoint.
     #[must_use]
-    fn from_handshake_result(result: &HandshakeResult, transport_binding: TransportBinding) -> Self {
+    pub(crate) fn from_handshake_result(result: &HandshakeResult, transport_binding: TransportBinding) -> Self {
         Self::new(
             result.session_id,
             result.peer_node_id,

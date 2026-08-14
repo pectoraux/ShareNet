@@ -1,9 +1,10 @@
-//! N2.2.1 — Real TCP Next-Hop Transport tests.
+//! N2.2.1 — Async Tokio TCP Next-Hop Transport tests.
 //!
 //! These tests verify `TcpRecursiveTransport` and `TcpForwardingServer` —
 //! the production implementation of `RecursiveNextHopTransport` that uses
-//! real TCP sockets, SNP-IK/0.1 authentication, and canonical CBOR
-//! serialization.
+//! async Tokio TCP sockets, the SNP-IK/0.1 handshake, AEAD-encrypted
+//! canonical CBOR frames, identity binding, and server-side replay
+//! protection.
 //!
 //! ## North-star scenario
 //!
@@ -11,26 +12,29 @@
 //!   A ──TCP──> B ──TCP──> C ──TCP──> G
 //! ```
 //!
-//! - A, B, C, G each bind their own TCP listener on an ephemeral port.
+//! - A, B, C, G each bind their own async TCP listener on an ephemeral port.
 //! - A's `TcpRecursiveTransport` knows B's TCP address + Ed25519 public key.
 //! - B's `TcpRecursiveTransport` knows C's TCP address + Ed25519 public key.
 //! - C's `TcpRecursiveTransport` knows G's TCP address + Ed25519 public key.
 //! - Each `ForwardedQuery` crosses a real TCP boundary:
-//!   1. A encodes ForwardedQuery to canonical CBOR, sends over TCP to B.
-//!   2. B's TcpForwardingServer accepts the connection, performs SNP-IK
-//!      handshake as responder, decodes the query, calls
-//!      `ForwardingNode::handle_query`, which forwards a NEW query to C
-//!      over TCP, etc.
-//!   3. The response propagates back: G → C → B → A.
+//!   1. A AEAD-encrypts the ForwardedQuery (canonical CBOR) and sends it
+//!      to B over async TCP.
+//!   2. B's `TcpForwardingServer` accepts the connection, performs the
+//!      async SNP-IK handshake as responder, AEAD-decrypts the frame,
+//!      checks identity binding + replay cache, calls
+//!      `ForwardingNode::handle_query` (via `spawn_blocking`), which
+//!      forwards a NEW query to C over async TCP, etc.
+//!   3. The response propagates back: G → C → B → A (each hop
+//!      AEAD-encrypted).
 //!
 //! ## Constraints
 //!
 //! - NO `InMemoryRecursiveTransport` anywhere in this test.
 //! - NO direct A→C or A→G TCP connections.
 //! - Each node has its own TCP listener + Ed25519 keypair + X25519 keypair.
-//! - SNP-IK authentication on every connection.
-//! - ForwardedQuery crosses the actual TCP boundary (serialized → TCP →
-//!   deserialized → verified).
+//! - SNP-IK authentication + AEAD encryption on every connection.
+//! - ForwardedQuery crosses the actual TCP boundary (serialized → AEAD →
+//!   TCP → AEAD-decrypt → deserialized → verified).
 
 #![allow(clippy::pedantic)]
 
@@ -39,7 +43,7 @@ use std::sync::Arc;
 use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_static_keypair};
 use snp_node::node::{
     Capability, ForwardedQuery, ForwardingNode, InMemoryNextHopTransport, LinkKey, NextHopResolver,
-    NodeAdvertisement, RemoteNodeHint, Route, TcpForwardingServer, TcpRecursiveTransport,
+    NodeAdvertisement, RemoteNodeHint, TcpForwardingServer, TcpRecursiveTransport,
     TopologyGraph, TransportEndpoint, MAX_FRAME_SIZE,
 };
 use snp_node::test_support::test_authenticated_link;
@@ -110,13 +114,15 @@ impl TcpNode {
     }
 }
 
-/// The full A → B → C → G TCP test mesh.
+/// The full A → B → C → G async TCP test mesh.
 ///
 /// Each node has:
 /// - Its own Ed25519 + X25519 keypair.
-/// - Its own TcpRecursiveTransport (for forwarding to the next hop).
-/// - Its own TcpForwardingServer (listening for incoming queries).
-/// - Its own ForwardingNode (the protocol participant).
+/// - Its own `TcpRecursiveTransport` (for forwarding to the next hop).
+/// - Its own `TcpForwardingServer` (listening for incoming queries on an
+///   async `tokio::net::TcpListener`, running on a dedicated OS thread
+///   with its own multi-threaded Tokio runtime via `serve_in_background`).
+/// - Its own `ForwardingNode` (the protocol participant).
 struct TcpMesh {
     a: TcpNode,
     b: TcpNode,
@@ -125,8 +131,8 @@ struct TcpMesh {
     /// A's TCP transport (knows B's address). Stored in the mesh so the
     /// resolver can borrow it for the resolver's lifetime.
     a_transport: Arc<TcpRecursiveTransport>,
-    /// Keep the servers alive (they hold the listeners). Dropping this
-    /// kills the background threads.
+    /// Keep the servers alive (they hold the listeners + background
+    /// threads). Dropping this kills the background threads.
     _servers: Vec<Arc<TcpForwardingServer>>,
     /// A's topology (contains B's record + authenticated link A→B).
     topology: TopologyGraph,
@@ -138,6 +144,12 @@ impl TcpMesh {
     /// - G is a Gateway (has X25519 circuit key).
     /// - B, C are relays.
     /// - A is the local resolver (no server needed — A only initiates).
+    ///
+    /// Listeners are bound synchronously via `std::net::TcpListener` and
+    /// converted to `tokio::net::TcpListener` via `from_std`. This keeps
+    /// `TcpMesh::new` synchronous so the north-star test (which is
+    /// synchronous — it calls `resolver.resolve_route`) can construct the
+    /// mesh without an async context.
     fn new(label: &[u8]) -> Self {
         // G (gateway, destination). Created first so C can reference its advert.
         let (g_x_sk, g_x_pk) = x25519_static_keypair();
@@ -159,92 +171,13 @@ impl TcpMesh {
 
         // Create TcpRecursiveTransport for B, C, G (each forwards to the
         // next hop). A also gets one (to send the initial query to B).
-        // Each transport has its OWN keypair (the local node's keypair).
         let mut b_transport = TcpRecursiveTransport::new(b.ed25519_secret, b.ed25519_public);
         let mut c_transport = TcpRecursiveTransport::new(c.ed25519_secret, c.ed25519_public);
-        let mut g_transport = TcpRecursiveTransport::new(g.ed25519_secret, g.ed25519_public);
+        let g_transport = TcpRecursiveTransport::new(g.ed25519_secret, g.ed25519_public);
 
-        // Bind TcpForwardingServer for B, C, G. A does NOT need a server
-        // (it only initiates, never receives).
-        //
-        // The ForwardingNode needs the transport as `Arc<dyn RecursiveNextHopTransport + Send + Sync>`.
-        // We create the transport, wrap it in Arc, and pass it to the node.
-        // The node is then moved into the server. The transport Arc is
-        // cloned into the node AND held by the mesh (so we can add peers
-        // after the node is constructed).
-        //
-        // BUT: we need to add peers to the transport AFTER binding the
-        // servers (so we know the listen addresses). And the transport is
-        // moved into the ForwardingNode. So we use Arc<Mutex<...>>? No —
-        // TcpRecursiveTransport is Send + Sync, and the trait method takes
-        // &self, so we can share it via Arc.
-        //
-        // The problem: TcpRecursiveTransport::add_peer takes &mut self.
-        // We need interior mutability, OR we need to set up all peers
-        // BEFORE wrapping in Arc.
-        //
-        // Approach: bind the listeners FIRST (without ForwardingNode),
-        // collect the addresses, THEN add peers to the transports, THEN
-        // wrap in Arc and create the ForwardingNodes.
-        //
-        // But TcpForwardingServer requires a ForwardingNode at construction.
-        // So we need to:
-        //   1. Bind TcpListener for B, C, G (collect addresses).
-        //   2. Add peers to b_transport, c_transport, g_transport.
-        //   3. Wrap each transport in Arc<dyn ...>.
-        //   4. Create ForwardingNode for B, C, G (with the transport Arc).
-        //   5. Add neighbors (C's advert to B, G's advert to C).
-        //   6. Create TcpForwardingServer for B, C, G using the listeners.
-        //
-        // The issue: TcpForwardingServer::bind takes a `&str` addr and
-        // binds internally. We can't pass a pre-bound listener. So we
-        // need to either:
-        //   - Modify TcpForwardingServer to accept a pre-bound listener, OR
-        //   - Bind with `"127.0.0.1:0"` (ephemeral) and discover the addr
-        //     after binding.
-        //
-        // The latter is simpler. But then we need to bind the server
-        // BEFORE we know the address — which means the ForwardingNode must
-        // exist before the server. And the ForwardingNode needs the
-        // transport, which needs the peer addresses...
-        //
-        // Solution: use `"127.0.0.1:0"` and discover the address via
-        // `local_addr()`. The order is:
-        //   1. Bind listener for B (ephemeral), get addr_B.
-        //   2. Bind listener for C (ephemeral), get addr_C.
-        //   3. Bind listener for G (ephemeral), get addr_G.
-        //   4. Add peer (C, addr_C) to b_transport.
-        //   5. Add peer (G, addr_G) to c_transport.
-        //   6. Wrap transports in Arc<dyn ...>.
-        //   7. Create ForwardingNode for B, C, G.
-        //   8. Add neighbors.
-        //   9. Create TcpForwardingServer from the pre-bound listeners.
-        //
-        // But step 9 requires TcpForwardingServer to accept a pre-bound
-        // listener. Let me add a `from_listener` constructor.
-        //
-        // Actually, simpler: since TcpForwardingServer::bind takes a ForwardingNode,
-        // and the ForwardingNode needs the transport, and the transport
-        // needs the addresses — we have a chicken-and-egg problem.
-        //
-        // The cleanest solution: TcpRecursiveTransport uses interior
-        // mutability for the peers map (e.g. `RwLock<HashMap<...>>`).
-        // Then we can add peers after the transport is shared.
-        //
-        // But that complicates the trait impl. Alternatively, we use
-        // Arc<Mutex<TcpRecursiveTransport>> — but then the trait can't be
-        // implemented directly (we'd need a wrapper).
-        //
-        // Simplest for the test: bind the listeners with ephemeral ports
-        // FIRST, get the addresses, THEN construct the transports with
-        // peers pre-populated, THEN create the ForwardingNodes, THEN
-        // create the servers using a `from_listener` constructor.
-
-        // Actually, the test code is the only place that needs this
-        // ordering flexibility. Let me add a `from_listener` constructor
-        // to TcpForwardingServer.
-
-        // Bind listeners with ephemeral ports.
+        // Bind listeners with ephemeral ports (synchronously). The
+        // TcpForwardingServer stores the std listener and converts it to
+        // a tokio listener inside its own runtime when serve() is called.
         let b_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let c_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let g_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -297,12 +230,6 @@ impl TcpMesh {
         );
 
         // Add neighbors. B knows C; C knows G.
-        // We need C's advert and G's advert. The ForwardingNode constructs
-        // its own advert internally, but we created the advert separately
-        // above (in TcpNode::new). The ForwardingNode's internal advert
-        // has the SAME fields EXCEPT the endpoints (which we just set on
-        // the node). Let me use the ForwardingNode's own advert so the
-        // endpoints match.
         let c_advert = c_node.self_advert().clone();
         let g_advert = g_node.self_advert().clone();
         b_node.add_neighbor(c.node_id, c_advert);
@@ -315,7 +242,7 @@ impl TcpMesh {
         c.advert = c_node.self_advert().clone();
         g.advert = g_node.self_advert().clone();
 
-        // Create TcpForwardingServers from the pre-bound listeners.
+        // Create TcpForwardingServers from the pre-bound async listeners.
         let b_server = TcpForwardingServer::from_listener(
             Arc::new(b_node),
             b.ed25519_secret,
@@ -342,7 +269,8 @@ impl TcpMesh {
         let c_server = Arc::new(c_server);
         let g_server = Arc::new(g_server);
 
-        // Serve in background.
+        // Serve in background (each on its own OS thread + multi-threaded
+        // Tokio runtime). Returns immediately.
         b_server.clone().serve_in_background();
         c_server.clone().serve_in_background();
         g_server.clone().serve_in_background();
@@ -399,22 +327,29 @@ impl TcpMesh {
 // 1. tcp_recursive_a_b_c_gateway_success — THE NORTH-STAR TEST
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **North-star test:** A → B → C → G recursive resolution via real TCP.
+/// **North-star test:** A → B → C → G recursive resolution via real async TCP.
 ///
 /// Verifies the full N2.2.1 architecture:
-/// - A sends ONE ForwardedQuery to B over real TCP (canonical CBOR frame).
-/// - B's TcpForwardingServer accepts the connection, performs SNP-IK
-///   handshake as responder, decodes the query, calls
-///   `ForwardingNode::handle_query`, which forwards a NEW query to C
-///   over real TCP.
-/// - C repeats the process, forwarding to G over real TCP.
+/// - A sends ONE `ForwardedQuery` to B over real async TCP (AEAD-encrypted
+///   canonical CBOR frame).
+/// - B's `TcpForwardingServer` accepts the connection, performs the async
+///   SNP-IK handshake as responder, AEAD-decrypts the frame, checks
+///   identity binding + replay cache, calls `ForwardingNode::handle_query`
+///   (via `spawn_blocking`), which forwards a NEW query to C over real
+///   async TCP.
+/// - C repeats the process, forwarding to G over real async TCP.
 /// - G (the destination) responds.
-/// - The response propagates back over TCP: G → C → B → A.
+/// - The response propagates back over TCP (AEAD-encrypted): G → C → B → A.
 /// - A constructs a `DistributedRouteResolution` and verifies it.
 /// - The resolution converts to a `Route`.
 ///
 /// This test uses NO `InMemoryRecursiveTransport` — every hop crosses a
-/// real TCP boundary with SNP-IK authentication.
+/// real async TCP boundary with SNP-IK authentication + AEAD encryption.
+///
+/// This test is synchronous (`#[test]`) because the protocol layer
+/// (`NextHopResolver::resolve_route`) is synchronous. The transport's
+/// `forward_query` method bridges to async Tokio internally via a
+/// per-call current-thread runtime (see `TcpRecursiveTransport::forward_query`).
 #[test]
 fn tcp_recursive_a_b_c_gateway_success() {
     let mesh = TcpMesh::new(b"tcp-recursive");
@@ -491,7 +426,7 @@ fn tcp_recursive_a_b_c_gateway_success() {
     assert!(route.validate().is_ok());
 
     eprintln!(
-        "[test 1] PASS: TCP recursive A→B→C→G resolution succeeds via real TCP + SNP-IK + canonical CBOR"
+        "[test 1] PASS: async TCP recursive A→B→C→G resolution succeeds via real Tokio TCP + SNP-IK + AEAD + canonical CBOR"
     );
 }
 
@@ -594,31 +529,13 @@ fn tampered_serialized_field_rejected() {
     assert!(original.verify_all(), "original signatures verify");
 
     // Tamper case 1: flip a byte in the CBOR payload.
-    // We pick a byte that is part of the destination_node_id value (not a
-    // structural byte). The destination_node_id is a 32-byte bytestring;
-    // flipping any of its bytes changes the signed preimage → signature
-    // verification fails.
-    //
-    // The CBOR map is sorted by key. The keys are (in canonical order):
-    //   destinationNodeId, maxHops, parentQueryHash, parentQueryId,
-    //   parentResponderNodeId, parentSignature, queryId, signature,
-    //   sourceNodeId, sourcePublicKey, timestamp, visitedNodes
-    //
-    // We don't know the exact byte offset of destinationNodeId's value
-    // without parsing. Instead, we just flip a byte near the start (after
-    // the map header) and check that EITHER decoding fails OR signature
-    // verification fails.
     let mut tampered = original_bytes.clone();
-    // Find a byte in the middle of the payload to flip (avoid the very
-    // first byte which is the map header — flipping it would make the
-    // whole thing undecodable, which is also a valid rejection).
     let flip_pos = tampered.len() / 2;
     tampered[flip_pos] ^= 0xFF;
 
     // The tampered bytes must EITHER fail to decode OR fail signature
     // verification. Both are acceptable rejections.
-    let outcome = ForwardedQuery::decode_cbor(&tampered)
-        .map(|q| q.verify_all());
+    let outcome = ForwardedQuery::decode_cbor(&tampered).map(|q| q.verify_all());
     assert!(
         matches!(outcome, None | Some(false)),
         "tampered serialized field must be rejected (either decode fails or signature verification fails), got: {outcome:?}"
@@ -631,35 +548,36 @@ fn tampered_serialized_field_rejected() {
 // 4. malformed_frame_rejected
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **Adversarial test.** Send a truncated/garbled frame to a
+/// **Adversarial test.** Send a truncated AEAD frame to a
 /// `TcpForwardingServer` and verify it is rejected safely (the server does
 /// not crash, and the connection is closed without a response).
 ///
-/// "Truncated" means: declare a frame length of N but send fewer than N
-/// bytes. "Garbled" means: send a frame whose CBOR payload is not a valid
-/// `ForwardedQuery`.
+/// "Truncated" means: declare a sealed-body length of N but send fewer
+/// than N bytes. The server's `read_sealed_frame` reads the 4-byte length
+/// prefix and the 12-byte nonce, then blocks waiting for the remaining
+/// sealed-body bytes. On EOF (client closed), `read_exact` returns
+/// `UnexpectedEof`. The server closes the connection.
 ///
-/// This test completes the SNP-IK handshake first (so the frame layer is
-/// actually exercised), then sends a truncated frame.
-#[test]
-fn malformed_frame_rejected() {
-    use snp_link::perform_snp_ik_handshake_verified;
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
+/// This test completes the SNP-IK handshake first (so the AEAD frame layer
+/// is actually exercised), then sends a truncated frame.
+#[tokio::test]
+async fn malformed_frame_rejected() {
+    use snp_link::perform_snp_ik_handshake_verified_async;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     let mesh = TcpMesh::new(b"malformed-frame");
     let g_addr = mesh.g.listen_addr.clone();
 
-    let mut stream = TcpStream::connect(g_addr).expect("connect to G");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut stream = TcpStream::connect(g_addr)
+        .await
+        .expect("connect to G");
 
     // Use fresh keys for the initiator — G's server accepts any
     // authenticated peer (no expected_peer_node_id pinning on the responder).
     let (sk, pk) = fresh_keypair(b"malformed-initiator");
     let (x_sk, x_pk) = x25519_static_keypair();
-    perform_snp_ik_handshake_verified(
+    let verified = perform_snp_ik_handshake_verified_async(
         &mut stream,
         true, // initiator
         &sk,
@@ -668,289 +586,100 @@ fn malformed_frame_rejected() {
         &x_pk,
         Some(&mesh.g.node_id), // pin G's NodeId
     )
+    .await
     .expect("SNP-IK handshake with G must succeed");
 
-    // Now send a TRUNCATED frame: 4-byte length claiming 100 bytes, then
-    // only 3 bytes of payload.
-    stream.write_all(&100u32.to_be_bytes()).unwrap();
-    stream.write_all(b"abc").unwrap();
-    stream.flush().unwrap();
+    // Sanity: we have AEAD link keys (the handshake produced them).
+    let _keys = verified.link_keys();
 
-    // G's read_frame will block waiting for the remaining 97 bytes, then
-    // hit the read timeout (10s) and return an error. The server closes
-    // the connection. We should get EOF or an error on read.
-    // Use a shorter client timeout so the test doesn't take 10s.
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    // Now send a TRUNCATED frame: 4-byte length claiming 100 bytes of
+    // sealed body, then 12 bytes of nonce, then only 3 bytes of body.
+    stream.write_all(&100u32.to_be_bytes()).await.unwrap();
+    stream.write_all(&[0u8; 12]).await.unwrap(); // fake nonce
+    stream.write_all(b"abc").await.unwrap();
+    // Flush + shutdown write half so the server sees EOF on the read half.
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+
+    // G's read_sealed_frame will block waiting for the remaining 97 bytes,
+    // then hit EOF (because we shut down the write half) and return error.
+    // The server closes the connection. We should get EOF (read returns 0)
+    // or an error on read.
     let mut buf = [0u8; 16];
-    let result = stream.read(&mut buf);
+    let result = stream.read(&mut buf).await;
     assert!(
         matches!(result, Err(_) | Ok(0)),
         "truncated frame must be rejected with EOF or error, got: {result:?}"
     );
 
-    eprintln!("[test 4] PASS: malformed (truncated) frame rejected safely after handshake (server did not crash)");
+    eprintln!("[test 4] PASS: malformed (truncated) AEAD frame rejected safely after handshake (server did not crash)");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // 5. oversized_frame_rejected
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **Adversarial test.** Send a frame whose declared length exceeds
-/// `MAX_FRAME_SIZE` and verify it is rejected (the server closes the
-/// connection without allocating the buffer).
-#[test]
-fn oversized_frame_rejected() {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
+/// **Adversarial test.** Send a frame whose declared sealed-body length
+/// exceeds `MAX_FRAME_SIZE` and verify it is rejected (the server closes
+/// the connection without allocating the buffer).
+#[tokio::test]
+async fn oversized_frame_rejected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     let mesh = TcpMesh::new(b"oversized-frame");
     let g_addr = mesh.g.listen_addr.clone();
 
-    let mut stream = TcpStream::connect(g_addr).expect("connect to G");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut stream = TcpStream::connect(g_addr)
+        .await
+        .expect("connect to G");
 
     // Send a 4-byte length prefix claiming (MAX_FRAME_SIZE + 1) bytes.
+    // The server's read_sealed_frame reads the length, checks it against
+    // MAX_FRAME_SIZE, and rejects with InvalidData BEFORE allocating.
     let bogus_len = u32::try_from(MAX_FRAME_SIZE + 1).unwrap();
-    stream.write_all(&bogus_len.to_be_bytes()).unwrap();
-    stream.flush().unwrap();
+    stream.write_all(&bogus_len.to_be_bytes()).await.unwrap();
+    let _ = stream.flush().await;
 
-    // The server's read_frame will reject this with InvalidData. The server
+    // The server's read_sealed_frame returns InvalidData. The server
     // closes the connection. We should get EOF or an error on read.
     let mut buf = [0u8; 16];
-    let result = stream.read(&mut buf);
+    let result = stream.read(&mut buf).await;
     assert!(
         matches!(result, Err(_) | Ok(0)),
         "oversized frame must be rejected with EOF or error, got: {result:?}"
     );
 
-    eprintln!("[test 5] PASS: oversized frame rejected (MAX_FRAME_SIZE = {} bytes)", MAX_FRAME_SIZE);
+    eprintln!("[test 5] PASS: oversized AEAD frame rejected (MAX_FRAME_SIZE = {} bytes)", MAX_FRAME_SIZE);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // 6. replayed_serialized_message_rejected
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **Adversarial test.** Capture a serialized `ForwardedQuery` and replay
-/// it to the same destination. Verify the replay is rejected.
+/// **Adversarial test.** Construct a `ForwardedQuery` whose `visited_nodes`
+/// contains the receiver, AEAD-encrypt it, and send it to the receiver's
+/// `TcpForwardingServer`. Verify the server rejects it (closes the
+/// connection without a response).
 ///
-/// The `ForwardedQuery` carries:
-/// - `query_id`: a fresh 16-byte nonce per query. Replaying the same
-///   serialized query replays the same `query_id`.
-/// - `timestamp`: a freshness timestamp. The `ForwardingNode::handle_query`
-///   checks `query.verify_all()` which includes signature verification
-///   (covering `query_id` and `timestamp`). The signature is valid on
-///   replay (it's the same bytes). BUT the `visited_nodes` check catches
-///   the replay: a replayed query has the SAME `visited_nodes` as the
-///   original. If the original already visited B, the replay will be
-///   rejected as a loop (`has_visited(B) == true`).
+/// This exercises the recursive path's freshness check (loop prevention via
+/// `visited_nodes`): a query whose visited set contains the receiver is
+/// rejected as a loop by `ForwardingNode::handle_query`. The server closes
+/// the connection WITHOUT sending a response frame.
 ///
-/// In our A→B→C→G scenario:
-/// - A sends query Q1 to B (visited=[A]).
-/// - B forwards Q2 to C (visited=[A, B]).
-/// - C forwards Q3 to G (visited=[A, B, C]).
-/// - G responds.
-///
-/// If we capture Q1 (A→B) and replay it to B:
-/// - B receives Q1 again. visited=[A]. B is NOT in visited. So B does NOT
-///   reject it as a loop.
-/// - B verifies the signature (passes — same bytes).
-/// - B forwards a NEW query to C. C receives the new query, processes it,
-///   forwards to G. G responds. The full chain succeeds.
-///
-/// So replaying Q1 to B actually SUCCEEDS (it's a fresh query from A's
-/// perspective, with a fresh query_id — except it's the SAME query_id).
-///
-/// Wait — but A is the one that created Q1. If an attacker captures Q1
-/// and replays it to B, B sees a valid query from A and processes it.
-/// This is a valid protocol behavior (idempotent queries are not a
-/// vulnerability — the response is the same).
-///
-/// The REAL replay attack is: capture Q2 (B→C) and replay it to C from
-/// a DIFFERENT source. But Q2's source_node_id is B, and the SNP-IK
-/// handshake authenticates the connection initiator. So an attacker
-/// connecting to C would need to authenticate AS B to replay Q2.
-///
-/// For this test, let me focus on a simpler replay: capture a query,
-/// replay it immediately to the same destination. The query's `timestamp`
-/// provides a freshness window (MAX_ROUTE_QUERY_AGE_SECS = 60 seconds).
-/// Within the window, the replay succeeds (idempotent). After the window,
-/// the replay fails (stale timestamp).
-///
-/// Actually, looking at `ForwardingNode::handle_query` more carefully:
-/// it does NOT check `timestamp` freshness directly. It calls
-/// `query.verify_all()` which only checks signatures, not timestamps.
-/// The timestamp freshness is checked by `NextHopQuery::is_fresh()`,
-/// which is called by `NextHopResolver::resolve_step()` (the SINGLE-STEP
-/// path), NOT by `ForwardingNode::handle_query` (the RECURSIVE path).
-///
-/// So in the recursive path, a replayed query is NOT rejected by timestamp.
-/// It IS rejected by the `has_visited` check IF the visited set contains
-/// the receiving node. But for the FIRST hop (A→B), the visited set is
-/// [A], which does NOT contain B. So a replay of A's query to B succeeds.
-///
-/// For this test, let me test a DIFFERENT replay scenario: capture a
-/// query that has ALREADY been forwarded (so visited contains the
-/// receiver). For example, capture Q2 (B→C, visited=[A, B]) and replay
-/// it to B. B sees visited=[A, B] and B is in visited → loop detected →
-/// rejected.
-///
-/// But to replay Q2 to B, we'd need to connect to B's TCP server. The
-/// SNP-IK handshake authenticates the initiator. If we connect as A (using
-/// A's keys), B accepts the connection. Then we send Q2 (which has
-/// source_node_id = B, not A). The signature on Q2 is B's, so `verify_all`
-/// would verify B's signature. But the SNP-IK handshake authenticated the
-/// initiator as A. So there's a mismatch: the connection is from A, but
-/// the query claims to be from B.
-///
-/// `ForwardingNode::handle_query` does NOT check that the query's source
-/// matches the connection's authenticated identity. It only checks the
-/// query's signatures. So Q2 (signed by B) would be accepted by B's
-/// server even if the connection is from A.
-///
-/// This is actually a subtle issue. Let me not over-engineer this test.
-/// The simplest replay test: capture Q1 (A→B), replay it to B. B will
-/// process it again (idempotent). The query_id is the same, so B will
-/// forward a NEW query to C (with a fresh query_id). The full chain
-/// succeeds.
-///
-/// But the test description says "freshness check fails". The freshness
-/// check is on the TIMESTAMP. Let me re-read the task spec:
-///
-/// > `replayed_serialized_message_rejected` — capture a serialized
-/// > ForwardedQuery, replay it → freshness check fails
-///
-/// Hmm. So the spec expects a freshness check to fail. But
-/// `ForwardingNode::handle_query` doesn't check timestamp freshness.
-///
-/// Let me look at what checks ARE performed:
-/// 1. `verify_all()` — checks both signatures. Passes on replay (same bytes).
-/// 2. `has_visited(self.node_id)` — checks if the receiver is in visited.
-///    For the first hop (A→B, visited=[A]), this is false. Passes.
-/// 3. `max_hops == 0` — budget check. Passes.
-/// 4. Destination check — if receiver IS the destination, return terminal.
-/// 5. Find next hop — if no neighbor, return None.
-///
-/// So a replay of Q1 to B is NOT rejected by `handle_query`. It's
-/// processed again. The response is the same.
-///
-/// For the freshness check to fail, we'd need to either:
-/// - Wait 60 seconds for the timestamp to expire (too slow for a test).
-/// - Modify `ForwardingNode::handle_query` to check timestamp freshness.
-/// - Use a query with a future-dated timestamp (rejected by `is_fresh`).
-///
-/// Actually, looking at this more carefully, the test spec says
-/// "freshness check fails". The freshness check in the recursive path
-/// is the `has_visited` check (loop prevention) — a replayed query has
-/// the same visited set, and if the receiver is already in visited, it's
-/// a loop.
-///
-/// Let me reinterpret: "replayed serialized message" = a query that has
-/// ALREADY been processed by this node. When the node receives it again,
-/// the `has_visited` check catches it (if the node is in visited).
-///
-/// Scenario:
-/// - A sends Q1 to B (visited=[A]).
-/// - B forwards Q2 to C (visited=[A, B]).
-/// - We capture Q2 and replay it to B (the node that CREATED it).
-/// - B receives Q2. visited=[A, B]. B IS in visited → loop detected → rejected.
-///
-/// But Q2's source is B (B created it). The signature on Q2 is B's. B's
-/// server would verify B's signature. But the SNP-IK handshake on the
-/// connection — we'd need to connect AS someone (e.g. A). The connection
-/// is from A, but the query claims source=B.
-///
-/// `handle_query` doesn't check connection-source vs query-source. So it
-/// would process Q2 (verify B's signature passes), then check visited
-/// (B is in visited) → reject as loop.
-///
-/// This is the test! Let me implement it: connect to B as A, send Q2
-/// (captured during a prior resolution), verify B rejects it.
-///
-/// Actually wait — to capture Q2, I need to intercept B's outgoing query
-/// to C. That's hard without modifying the transport.
-///
-/// Simpler approach: construct Q2 manually (we know B's keys). Actually,
-/// the easiest test is: construct a ForwardedQuery with visited=[A, B]
-/// (where B is the target), sign it as A, send it to B. B sees visited
-/// contains B → rejects as loop.
-///
-/// Let me do that. This tests the replay/loop-prevention path.
-///
-/// Actually, let me re-read the task spec ONE more time:
-///
-/// > `replayed_serialized_message_rejected` — capture a serialized
-/// > ForwardedQuery, replay it → freshness check fails
-///
-/// OK so the spec wants a freshness check. The recursive path's freshness
-/// check is loop prevention (visited_nodes). A replayed query with the
-/// receiver in visited_nodes is rejected. Let me implement that.
-///
-/// Actually, I realize there's another freshness angle: the `timestamp`.
-/// If we capture a query and replay it AFTER 60 seconds, the timestamp
-/// is stale. But `ForwardingNode::handle_query` doesn't check the
-/// timestamp. The `NextHopResolver::resolve_route_with_budget` DOES
-/// check the timestamp indirectly (via the initial query's freshness —
-/// but that's on A's side, not on B's side).
-///
-/// Hmm. Let me look at what happens if we replay a query with a stale
-/// timestamp:
-/// - B's `handle_query` calls `query.verify_all()`. The signature covers
-///   the timestamp. If the timestamp is unchanged, the signature still
-///   verifies. So `verify_all()` passes.
-/// - B does NOT check `is_fresh()`. So a stale-timestamp query is NOT
-///   rejected by B.
-///
-/// So the freshness check is NOT enforced on the recursive path (only
-/// on the single-step path via `PendingRouteQuery`).
-///
-/// For this test, I'll implement the loop-prevention replay: capture a
-/// query, replay it to a node that is already in its visited set. The
-/// `has_visited` check rejects it.
-///
-/// Actually, let me re-read the spec more carefully:
-///
-/// > `replayed_serialized_message_rejected` — capture a serialized
-/// > ForwardedQuery, replay it → freshness check fails
-///
-/// OK I think the spec is describing the INTENT (replay should be
-/// rejected) and the MECHANISM is "freshness check" (which in the
-/// recursive path is the visited_nodes check). Let me implement the
-/// visited_nodes replay test.
-///
-/// Actually, there's an even simpler test: capture A's initial query Q1,
-/// replay it to B. B processes it (visited=[A], B not in visited, passes).
-/// B forwards a new query to C. The chain succeeds. Then capture Q1
-/// AGAIN and replay it to B a second time. B processes it again (same
-/// result). The chain succeeds again.
-///
-/// This is NOT a rejection. The query is idempotent within its freshness
-/// window. The only replay that gets rejected is one where the receiver
-/// is in visited.
-///
-/// Let me implement the visited-nodes replay: construct a query with
-/// visited=[A, B], send it to B. B rejects it as a loop.
-
-    // Actually, let me reconsider. The task spec lists 4 adversarial tests.
-    // For "replayed_serialized_message_rejected", the simplest interpretation
-    // that matches "freshness check fails" is: the query's timestamp is
-    // stale (older than MAX_ROUTE_QUERY_AGE_SECS). But the recursive path
-    // doesn't check timestamp freshness.
-    //
-    // I think the cleanest test is: replay a query whose visited_nodes
-    // contains the receiver. This is the recursive path's freshness
-    // mechanism (loop prevention). The test verifies that a replayed
-    // serialized query is rejected when the receiver is already in the
-    // visited set.
-    //
-    // Let me implement that.
-
-#[test]
-fn replayed_serialized_message_rejected() {
-    use snp_link::perform_snp_ik_handshake_verified;
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
+/// Note: the server-side replay cache would ALSO reject a duplicated
+/// `(source_node_id, query_id)` pair, but this test uses a FRESH query_id
+/// (generated by `ForwardedQuery::create_and_sign`) so the replay cache
+/// lets it through to `handle_query`, where the loop-prevention check
+/// rejects it. The replay cache is tested separately by the unit tests in
+/// `tcp_route_transport.rs` (`replay_cache_rejects_duplicate`,
+/// `replay_cache_evicts_when_full`, `replay_cache_purges_expired`).
+#[tokio::test]
+async fn replayed_serialized_message_rejected() {
+    use snp_crypto::aead_seal;
+    use snp_link::perform_snp_ik_handshake_verified_async;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     let mesh = TcpMesh::new(b"replay");
     let b_addr = mesh.b.listen_addr.clone();
@@ -970,17 +699,17 @@ fn replayed_serialized_message_rejected() {
         vec![mesh.a.node_id, mesh.b.node_id], // visited = [A, B]
     );
 
-    // Encode the query to canonical CBOR.
+    // Encode the query to canonical CBOR (the AEAD plaintext).
     let query_bytes = query.encode_cbor();
 
-    // Connect to B's server and perform the SNP-IK handshake as A.
-    let mut stream = TcpStream::connect(b_addr).expect("connect to B");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Connect to B's server and perform the async SNP-IK handshake as A.
+    let mut stream = TcpStream::connect(b_addr)
+        .await
+        .expect("connect to B");
 
-    // A's X25519 keypair for the handshake. We need a static keypair.
+    // A's X25519 keypair for the handshake.
     let (a_x_sk, a_x_pk) = x25519_static_keypair();
-    perform_snp_ik_handshake_verified(
+    let verified = perform_snp_ik_handshake_verified_async(
         &mut stream,
         true, // initiator
         &mesh.a.ed25519_secret,
@@ -989,23 +718,272 @@ fn replayed_serialized_message_rejected() {
         &a_x_pk,
         Some(&mesh.b.node_id), // pin B's NodeId
     )
+    .await
     .expect("SNP-IK handshake with B must succeed");
 
-    // Send the replayed query as a frame.
-    let len = u32::try_from(query_bytes.len()).unwrap();
-    stream.write_all(&len.to_be_bytes()).unwrap();
-    stream.write_all(&query_bytes).unwrap();
-    stream.flush().unwrap();
+    // The handshake authenticated us as A. The query's source_node_id is A.
+    // The server's identity-binding check (peer_node_id == source_node_id)
+    // passes. The replay cache check passes (fresh query_id). Then
+    // handle_query is called → has_visited(B) → true → None → server
+    // closes without a response.
+    let keys = verified.link_keys();
+
+    // AEAD-seal the query with the derived send_key + a fresh nonce.
+    let nonce = {
+        let mut n = [0u8; 12];
+        getrandom::getrandom(&mut n).expect("getrandom");
+        n
+    };
+    let sealed = aead_seal(&keys.send_key, &nonce, &query_bytes, &[]);
+
+    // Write the encrypted frame: [4-byte BE sealed_len][12-byte nonce][sealed].
+    let sealed_len = u32::try_from(sealed.len()).unwrap();
+    stream.write_all(&sealed_len.to_be_bytes()).await.unwrap();
+    stream.write_all(&nonce).await.unwrap();
+    stream.write_all(&sealed).await.unwrap();
+    let _ = stream.flush().await;
 
     // B's handle_query rejects the query (visited contains B → loop).
     // The server closes the connection WITHOUT sending a response frame.
     // We should get EOF (read returns 0) or an error.
     let mut buf = [0u8; 4];
-    let result = stream.read(&mut buf);
+    let result = stream.read(&mut buf).await;
     assert!(
         matches!(result, Err(_) | Ok(0)),
         "replayed serialized message (visited contains receiver) must be rejected with EOF or error, got: {result:?}"
     );
 
     eprintln!("[test 6] PASS: replayed serialized message rejected (loop prevention / freshness check)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 7. identity_binding_rejects_cross_channel_injection
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Adversarial test (N2.2.1 identity binding).** Connect to B's server
+/// as A (handshake authenticates as A), then send a `ForwardedQuery` whose
+/// `source_node_id` is C (a DIFFERENT identity). The server's
+/// identity-binding check (`peer_node_id == query.source_node_id`) must
+/// reject the query — a query signed by C cannot be injected over a
+/// connection authenticated as A.
+///
+/// Without this check, a malicious node that authenticated as A could
+/// inject queries signed by any other node, bypassing the SNP-IK
+/// authentication boundary. The identity-binding check closes this
+/// cross-channel injection vector.
+#[tokio::test]
+async fn identity_binding_rejects_cross_channel_injection() {
+    use snp_crypto::aead_seal;
+    use snp_link::perform_snp_ik_handshake_verified_async;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mesh = TcpMesh::new(b"identity-binding");
+    let b_addr = mesh.b.listen_addr.clone();
+
+    // Construct a query SIGNED BY C (source_node_id = C) but with a
+    // visited set that does NOT contain B (so the loop check would pass
+    // if the identity check didn't catch it first).
+    let query = ForwardedQuery::create_and_sign(
+        &mesh.c.ed25519_secret,
+        &mesh.c.ed25519_public,
+        mesh.c.node_id, // source = C (NOT A)
+        mesh.g.node_id, // destination
+        16,
+        [0u8; 16],
+        [0u8; 32],
+        [0u8; 32],
+        vec![mesh.c.node_id], // visited = [C] (B is NOT in visited)
+    );
+
+    let query_bytes = query.encode_cbor();
+
+    // Connect to B's server and perform the async SNP-IK handshake AS A
+    // (NOT as C). The handshake authenticates us as A.
+    let mut stream = TcpStream::connect(b_addr)
+        .await
+        .expect("connect to B");
+
+    let (a_x_sk, a_x_pk) = x25519_static_keypair();
+    let verified = perform_snp_ik_handshake_verified_async(
+        &mut stream,
+        true, // initiator
+        &mesh.a.ed25519_secret,
+        &mesh.a.ed25519_public,
+        &a_x_sk,
+        &a_x_pk,
+        Some(&mesh.b.node_id), // pin B's NodeId
+    )
+    .await
+    .expect("SNP-IK handshake with B must succeed (as A)");
+
+    // Sanity: the handshake authenticated us as A, NOT C.
+    assert_eq!(verified.peer_node_id(), mesh.b.node_id);
+
+    let keys = verified.link_keys();
+
+    // AEAD-seal the query (signed by C) with A's derived send_key.
+    let nonce = {
+        let mut n = [0u8; 12];
+        getrandom::getrandom(&mut n).expect("getrandom");
+        n
+    };
+    let sealed = aead_seal(&keys.send_key, &nonce, &query_bytes, &[]);
+
+    let sealed_len = u32::try_from(sealed.len()).unwrap();
+    stream.write_all(&sealed_len.to_be_bytes()).await.unwrap();
+    stream.write_all(&nonce).await.unwrap();
+    stream.write_all(&sealed).await.unwrap();
+    let _ = stream.flush().await;
+
+    // B's handle_connection reads the frame, decodes the query
+    // (source_node_id = C), then checks identity binding:
+    //   peer_node_id (A, from the handshake) != query.source_node_id (C)
+    // → REJECT. The server closes the connection WITHOUT sending a
+    // response. We should get EOF or an error.
+    let mut buf = [0u8; 4];
+    let result = stream.read(&mut buf).await;
+    assert!(
+        matches!(result, Err(_) | Ok(0)),
+        "cross-channel injection (query signed by C over connection authenticated as A) must be rejected with EOF or error, got: {result:?}"
+    );
+
+    eprintln!("[test 7] PASS: identity binding rejected cross-channel injection (query signed by C over A-authenticated connection)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8. replay_cache_rejects_duplicate_query_id
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Adversarial test (N2.2.1 server-side replay cache).** Send the SAME
+/// `ForwardedQuery` (same `source_node_id` AND same `query_id`) to B twice.
+/// The first send is processed (B forwards to C → G → response). The
+/// second send must be rejected by the server-side replay cache BEFORE
+/// reaching `ForwardingNode::handle_query`.
+///
+/// This test distinguishes the replay cache from the loop-prevention check:
+/// the query's `visited_nodes = [A]` does NOT contain B, so the loop check
+/// would pass. The replay cache is the ONLY thing that rejects the second
+/// send.
+#[tokio::test]
+async fn replay_cache_rejects_duplicate_query_id() {
+    use snp_crypto::aead_seal;
+    use snp_link::perform_snp_ik_handshake_verified_async;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mesh = TcpMesh::new(b"replay-cache");
+    let b_addr = mesh.b.listen_addr.clone();
+
+    // Construct a query from A with visited=[A] (B is NOT in visited, so
+    // the loop check would pass on the first send). destination = G
+    // (the full mesh is up, so the first send triggers B→C→G→response).
+    let query = ForwardedQuery::create_and_sign(
+        &mesh.a.ed25519_secret,
+        &mesh.a.ed25519_public,
+        mesh.a.node_id,
+        mesh.g.node_id, // destination
+        16,
+        [0u8; 16],
+        [0u8; 32],
+        [0u8; 32],
+        vec![mesh.a.node_id], // visited = [A]
+    );
+
+    let query_bytes = query.encode_cbor();
+
+    // ── First send: should succeed (B forwards to C → G → response). ──
+    let mut stream1 = TcpStream::connect(b_addr.clone())
+        .await
+        .expect("connect to B (first)");
+    let (a_x_sk, a_x_pk) = x25519_static_keypair();
+    let verified1 = perform_snp_ik_handshake_verified_async(
+        &mut stream1,
+        true,
+        &mesh.a.ed25519_secret,
+        &mesh.a.ed25519_public,
+        &a_x_sk,
+        &a_x_pk,
+        Some(&mesh.b.node_id),
+    )
+    .await
+    .expect("first handshake with B must succeed");
+    let keys1 = verified1.link_keys();
+
+    let nonce1 = {
+        let mut n = [0u8; 12];
+        getrandom::getrandom(&mut n).expect("getrandom");
+        n
+    };
+    let sealed1 = aead_seal(&keys1.send_key, &nonce1, &query_bytes, &[]);
+    let sealed_len1 = u32::try_from(sealed1.len()).unwrap();
+    stream1
+        .write_all(&sealed_len1.to_be_bytes())
+        .await
+        .unwrap();
+    stream1.write_all(&nonce1).await.unwrap();
+    stream1.write_all(&sealed1).await.unwrap();
+    let _ = stream1.flush().await;
+
+    // Read the response frame: [4-byte len][12-byte nonce][sealed].
+    let mut len_buf = [0u8; 4];
+    stream1.read_exact(&mut len_buf).await.expect("first send must get a response frame");
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+    assert!(
+        resp_len > 12 && resp_len <= MAX_FRAME_SIZE,
+        "first send response length must be valid, got {resp_len}"
+    );
+    let mut resp_buf = vec![0u8; resp_len];
+    stream1.read_exact(&mut resp_buf).await.expect("first send must complete response read");
+    // (We don't decode the response — we just verify a response WAS sent.)
+
+    eprintln!("[test 8] first send succeeded (B forwarded A→B→C→G and returned a response)");
+
+    // ── Second send: SAME (source_node_id, query_id) — must be rejected
+    // by the replay cache BEFORE reaching handle_query. ──
+    let mut stream2 = TcpStream::connect(b_addr)
+        .await
+        .expect("connect to B (second)");
+    // Reuse A's X25519 keypair (each connection gets its own ephemeral
+    // X25519 keypair inside the handshake, so the static keypair can be
+    // the same).
+    let verified2 = perform_snp_ik_handshake_verified_async(
+        &mut stream2,
+        true,
+        &mesh.a.ed25519_secret,
+        &mesh.a.ed25519_public,
+        &a_x_sk,
+        &a_x_pk,
+        Some(&mesh.b.node_id),
+    )
+    .await
+    .expect("second handshake with B must succeed");
+    let keys2 = verified2.link_keys();
+
+    let nonce2 = {
+        let mut n = [0u8; 12];
+        getrandom::getrandom(&mut n).expect("getrandom");
+        n
+    };
+    // SAME query_bytes → same (source_node_id, query_id).
+    let sealed2 = aead_seal(&keys2.send_key, &nonce2, &query_bytes, &[]);
+    let sealed_len2 = u32::try_from(sealed2.len()).unwrap();
+    stream2
+        .write_all(&sealed_len2.to_be_bytes())
+        .await
+        .unwrap();
+    stream2.write_all(&nonce2).await.unwrap();
+    stream2.write_all(&sealed2).await.unwrap();
+    let _ = stream2.flush().await;
+
+    // B's replay cache hits on (A, query_id) → rejects → closes without
+    // a response. We should get EOF or an error.
+    let mut buf = [0u8; 4];
+    let result = stream2.read(&mut buf).await;
+    assert!(
+        matches!(result, Err(_) | Ok(0)),
+        "replayed (source_node_id, query_id) must be rejected by the server-side replay cache (EOF or error), got: {result:?}"
+    );
+
+    eprintln!("[test 8] PASS: server-side replay cache rejected duplicated (source_node_id, query_id)");
 }

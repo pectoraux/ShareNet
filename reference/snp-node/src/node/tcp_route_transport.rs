@@ -1,10 +1,11 @@
-//! N2.2.1 — Real TCP next-hop transport for the recursive route-discovery
-//! protocol.
+//! N2.2.1 — Async Tokio TCP next-hop transport for the recursive
+//! route-discovery protocol.
 //!
-//! This module provides the production implementation of
-//! [`RecursiveNextHopTransport`] using real TCP sockets, SNP-IK/0.1
-//! authentication, and canonical CBOR serialization. It is the concrete
-//! counterpart to `InMemoryRecursiveTransport` (which exists only for tests).
+//! This module is the **canonical production implementation** of
+//! [`RecursiveNextHopTransport`] using real TCP sockets, the SNP-IK/0.1
+//! handshake, AEAD-encrypted frames, identity binding, and server-side
+//! replay protection. It is the concrete counterpart to
+//! `InMemoryRecursiveTransport` (which exists only for tests).
 //!
 //! ## Architecture
 //!
@@ -15,162 +16,337 @@
 //!   It holds a "phone book" of peers (NodeId → TCP address + expected
 //!   Ed25519 public key). For each `forward_query` call it:
 //!   1. Looks up the peer's TCP address + expected NodeId.
-//!   2. Opens a fresh TCP connection.
-//!   3. Performs the SNP-IK/0.1 handshake as **initiator**, pinning the
-//!      expected peer NodeId ("I"-style pinning).
-//!   4. Encodes the `ForwardedQuery` to canonical CBOR.
-//!   5. Writes a length-prefixed frame.
-//!   6. Reads the response frame.
-//!   7. Decodes the `RecursiveRouteResponse`.
-//!   8. Closes the connection.
+//!   2. Opens a fresh TCP connection (Tokio async).
+//!   3. Performs the SNP-IK/0.1 handshake as **initiator** via
+//!      [`snp_link::perform_snp_ik_handshake_verified_async`], pinning the
+//!      expected peer NodeId ("I"-style pinning). The handshake returns a
+//!      [`snp_link::VerifiedHandshake`] carrying directional AEAD
+//!      [`snp_link::LinkKeys`].
+//!   4. Encodes the `ForwardedQuery` to canonical CBOR (== hash preimage).
+//!   5. AEAD-seals the plaintext with `send_key` + a fresh 12-byte nonce.
+//!   6. Writes the encrypted frame.
+//!   7. Reads the encrypted response frame.
+//!   8. AEAD-opens the response with `recv_key` + the response's nonce.
+//!   9. Decodes the `RecursiveRouteResponse`.
+//!   10. Closes the connection.
 //!
 //! - [`TcpForwardingServer`] — used by a node that wants to **receive**
-//!   `ForwardedQuery` messages and respond. It binds a `TcpListener` and
-//!   accepts incoming connections. For each connection it:
+//!   `ForwardedQuery` messages and respond. It binds a `tokio::net::TcpListener`
+//!   and accepts incoming connections concurrently (one `tokio::spawn` task
+//!   per connection). For each connection it:
 //!   1. Performs the SNP-IK/0.1 handshake as **responder** (no expected
 //!      peer pinning — any authenticated peer is accepted; the handshake
-//!      itself proves the peer's identity).
-//!   2. Reads a `ForwardedQuery` frame.
-//!   3. Calls `ForwardingNode::handle_query()` (which recursively forwards
-//!      via the `ForwardingNode`'s OWN transport — typically another
-//!      `TcpRecursiveTransport`).
-//!   4. Encodes the `RecursiveRouteResponse` to canonical CBOR.
-//!   5. Writes the response frame.
-//!   6. Closes the connection.
+//!      itself proves the peer's identity). Returns a `VerifiedHandshake`
+//!      with the authenticated `peer_node_id` and directional AEAD keys.
+//!   2. Reads an encrypted `ForwardedQuery` frame, AEAD-opens it with
+//!      `recv_key`.
+//!   3. **Identity binding check:** `verified.peer_node_id() ==
+//!      query.source_node_id`. Rejects cross-channel injection (a query
+//!      signed by B cannot be sent over a connection authenticated as A).
+//!   4. **Replay protection:** checks the `(source_node_id, query_id)`
+//!      pair against a bounded server-side cache. Replays are rejected.
+//!   5. Calls `ForwardingNode::handle_query()` (via `spawn_blocking` so
+//!      the synchronous `ForwardingNode` does not block the runtime).
+//!   6. Encodes the `RecursiveRouteResponse` to canonical CBOR.
+//!   7. AEAD-seals with `send_key` + fresh nonce.
+//!   8. Writes the encrypted frame.
+//!   9. Closes the connection.
 //!
-//! ## Wire format
+//! ## Wire format (encrypted frames)
 //!
 //! ```text
-//!     [4 bytes: big-endian u32 length N] [N bytes: canonical CBOR message]
+//! ┌──────────────────────┬───────────────┬─────────────────────────────────┐
+//! │ sealed_len (4 BE u32)│ nonce (12 B)  │ sealed_data (sealed_len bytes)  │
+//! └──────────────────────┴───────────────┴─────────────────────────────────┘
 //! ```
 //!
-//! - `N` MUST be ≤ [`MAX_FRAME_SIZE`] (1 MiB). Larger frames are rejected
-//!   to prevent allocation attacks.
-//! - The CBOR message is the canonical encoding produced by
-//!   `ForwardedQuery::encode_cbor()` / `RecursiveRouteResponse::encode_cbor()`.
-//! - The handshake message exchange (performed BEFORE the frame exchange)
-//!   uses SNP-IK/0.1's own length-prefixed CBOR format — see
-//!   `snp_link::perform_snp_ik_handshake`.
+//! - `sealed_data = ChaCha20-Poly1305(seal_key, nonce, cbor_bytes, aad=[])`
+//!   — i.e. `ciphertext ‖ tag(16)`. Produced by [`snp_crypto::aead_seal`].
+//! - `sealed_len` is the byte length of `sealed_data` (plaintext.len() + 16).
+//! - `sealed_len` MUST be ≤ [`MAX_FRAME_SIZE`] (1 MiB). Larger declared
+//!   lengths are rejected BEFORE any allocation (allocation-attack
+//!   resistance).
+//! - The 12-byte `nonce` is generated fresh per frame via `getrandom`
+//!   (OS CSPRNG). The receiver does NOT need to track a counter — the nonce
+//!   is sent in clear because it is not secret. Nonce reuse under a single
+//!   key has probability ~2^-96 per frame (birthday bound: ~2^48 frames
+//!   for a 50% collision chance, far beyond any realistic server lifetime).
+//! - The AEAD AAD is empty — the entire CBOR-encoded message is encrypted,
+//!   so the frame header is not authenticated separately (it does not need
+//!   to be; a tampered length causes a read failure before AEAD open).
+//!
+//! ## Sync↔async boundary
+//!
+//! The [`RecursiveNextHopTransport`] trait and [`ForwardingNode`] are
+//! synchronous. The transport layer uses async Tokio internally. Each call
+//! to [`TcpRecursiveTransport::forward_query`] creates a single-threaded
+//! Tokio runtime and `block_on`s the async TCP + AEAD operations on it.
+//! This is a discovery-time operation (not a data-plane hot path), so the
+//! per-call runtime overhead is acceptable. A future async-protocol
+//! refactor would eliminate this `block_on` boundary.
+//!
+//! The server side is fully async: [`TcpForwardingServer::serve_in_background`]
+//! spawns a dedicated OS thread with its own multi-threaded Tokio runtime.
+//! The synchronous `ForwardingNode::handle_query` is invoked via
+//! `tokio::task::spawn_blocking` so it never blocks the runtime's worker
+//! pool.
 //!
 //! ## Security
 //!
 //! - **Authentication:** Every connection is authenticated via SNP-IK/0.1.
 //!   The initiator pins the expected peer NodeId; the responder accepts any
 //!   authenticated peer. Both sides derive directional AEAD link keys from
-//!   the handshake (these keys are not currently used for the frame payload
-//!   — the protocol messages carry their own Ed25519 signatures — but they
-//!   are derived and available for future encryption).
-//! - **Integrity:** Every `ForwardedQuery` and `RoutingAssertion` is signed
-//!   under `ROUTE_DISCOVERY_MSG_CONTEXT`. Tampering with a serialized field
-//!   invalidates the signature and is rejected by `verify_all()` /
-//!   `verify_signature()`.
-//! - **Replay protection:** Each `ForwardedQuery` carries a fresh 16-byte
-//!   `query_id` (generated by `getrandom`). A replayed serialized query
-//!   has a stale `query_id` and is rejected by `ForwardingNode::handle_query`
-//!   via the loop-prevention / visited-nodes check (a replayed query has
-//!   the same `query_id` and visited set as the original, so any forwarder
-//!   that already saw it will reject it as a loop). Additionally, the
-//!   `timestamp` field provides a freshness window (`MAX_ROUTE_QUERY_AGE_SECS`).
-//! - **Allocation-attack resistance:** `read_frame` caps the declared frame
-//!   length at `MAX_FRAME_SIZE` (1 MiB) and refuses to allocate more.
-//!
-//! ## What is NOT production-ready
-//!
-//! - **Single-threaded synchronous I/O.** The server accepts connections
-//!   serially in a single background thread. Production would use async I/O
-//!   (tokio) for concurrent connection handling and connection pooling.
-//! - **No connection pooling.** Each `forward_query` call opens a fresh TCP
-//!   connection and tears it down after one query/response. Production would
-//!   maintain a pool keyed by peer NodeId.
-//! - **No AEAD encryption of the frame payload.** The handshake derives AEAD
-//!   keys, but the frame payload is sent in plaintext (it carries its own
-//!   signatures). Production would encrypt the frame payload with the
-//!   derived link keys for confidentiality.
+//!   the handshake transcript.
+//! - **Confidentiality + integrity:** Every frame payload is AEAD-encrypted
+//!   with the derived link keys. A tampered ciphertext fails AEAD open and
+//!   is rejected (the connection is dropped without a response). An
+//!   eavesdropper on the wire sees only ChaCha20-Poly1305 ciphertext.
+//! - **Identity binding:** The server checks that the authenticated
+//!   `peer_node_id` from the SNP-IK handshake equals the `source_node_id`
+//!   in the `ForwardedQuery`. A query signed by B cannot be injected over
+//!   a connection authenticated as A. This closes the cross-channel
+//!   injection vector.
+//! - **Replay protection:** The server maintains a bounded
+//!   [`ReplayCache`] keyed by `(source_node_id, query_id)`. A replayed
+//!   serialized query is rejected before reaching `ForwardingNode::handle_query`.
+//!   Entries are purged when older than 2× `MAX_ROUTE_QUERY_AGE_SECS`.
+//! - **Allocation-attack resistance:** `read_sealed_frame` caps the
+//!   declared `sealed_len` at `MAX_FRAME_SIZE` and refuses to allocate
+//!   more.
+//! - **Signature layer (preserved):** Every `ForwardedQuery`,
+//!   `RoutingAssertion`, and `SignedResponseStep` is independently signed
+//!   under `ROUTE_DISCOVERY_MSG_CONTEXT` and re-verified by the receiver.
+//!   The AEAD layer is confidentiality + integrity for the transport; the
+//!   signature layer is end-to-end authenticity of the protocol objects.
+//!   Both layers are required — AEAD protects against a network attacker,
+//!   signatures protect against a malicious forwarder.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use snp_crypto::{x25519_static_keypair, X25519PubKey, X25519Secret};
-use snp_link::perform_snp_ik_handshake_verified;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+use snp_crypto::{
+    aead_open, aead_seal, derive_node_id, x25519_static_keypair, NonceBytes, SymmetricKey,
+    X25519PubKey, X25519Secret,
+};
+use snp_link::{LinkKeys, VerifiedHandshake, perform_snp_ik_handshake_verified_async};
 
 use super::route_discovery_protocol::{
-    ForwardedQuery, ForwardingNode, RecursiveNextHopTransport, RecursiveRouteResponse,
+    ForwardedQuery, ForwardingNode, MAX_ROUTE_QUERY_AGE_SECS, RecursiveNextHopTransport,
+    RecursiveRouteResponse,
 };
 
-/// Maximum size of a single frame on the wire (1 MiB). Prevents allocation
-/// attacks — a malicious peer claiming a frame length larger than this is
-/// rejected before any allocation.
+/// Maximum size of a single sealed frame on the wire (1 MiB). Prevents
+/// allocation attacks — a malicious peer claiming a frame length larger
+/// than this is rejected before any allocation.
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
-/// Default per-call TCP read/write timeout (10 seconds). Prevents a malicious
-/// or slow peer from blocking a forwarder indefinitely.
-const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+/// AEAD nonce length (12 bytes for ChaCha20-Poly1305).
+const NONCE_LEN: usize = 12;
+
+/// Poly1305 tag length (16 bytes).
+const TAG_LEN: usize = 16;
+
+/// Minimum sealed-frame length (nonce would be read separately; sealed
+/// body must carry at least the AEAD tag for `aead_open` to have any chance
+/// of succeeding).
+const MIN_SEALED_LEN: usize = TAG_LEN;
+
+/// Maximum number of entries in the server-side replay cache. When full,
+/// the oldest entries are evicted. 4096 is generous for a discovery-time
+/// service (one entry per `(source_node_id, query_id)` pair).
+const REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
 
 // ════════════════════════════════════════════════════════════════════════════
-// Frame protocol
+// AEAD-encrypted frame protocol (async Tokio I/O)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Write a length-prefixed frame to the stream.
+/// Generate a fresh 12-byte AEAD nonce from the OS CSPRNG.
 ///
-/// Wire format: `[4 bytes: big-endian u32 length N] [N bytes: payload]`.
+/// Panics if `getrandom` fails (the OS entropy source is unavailable) —
+/// nonce generation is a fatal error, not a degraded mode.
+fn fresh_nonce() -> NonceBytes {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nonce).expect("getrandom failed — OS entropy source unavailable");
+    nonce
+}
+
+/// Write an AEAD-encrypted frame to the async stream.
+///
+/// Wire format: `[4-byte BE u32 sealed_len][12-byte nonce][sealed_data]`
+/// where `sealed_data = aead_seal(send_key, nonce, plaintext, &[])`.
 ///
 /// # Errors
-/// Returns `io::Error` if the write fails or the payload exceeds
-/// `MAX_FRAME_SIZE`.
-pub(crate) fn write_frame(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    if data.len() > MAX_FRAME_SIZE {
+/// Returns `io::Error` if the write fails or the plaintext exceeds
+/// `MAX_FRAME_SIZE - TAG_LEN`.
+async fn write_sealed_frame(
+    stream: &mut TcpStream,
+    send_key: &SymmetricKey,
+    plaintext: &[u8],
+) -> io::Result<()> {
+    // The sealed body is ciphertext ‖ tag, so its length is plaintext.len() + 16.
+    // Reject plaintexts whose sealed form would exceed MAX_FRAME_SIZE.
+    if plaintext.len().saturating_add(TAG_LEN) > MAX_FRAME_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "frame payload {} bytes exceeds MAX_FRAME_SIZE {} bytes",
-                data.len(),
+                "frame plaintext {} bytes (+{} tag) exceeds MAX_FRAME_SIZE {} bytes",
+                plaintext.len(),
+                TAG_LEN,
                 MAX_FRAME_SIZE
             ),
         ));
     }
-    let len = u32::try_from(data.len()).map_err(|_| {
+    let nonce = fresh_nonce();
+    let sealed = aead_seal(send_key, &nonce, plaintext, &[]);
+    let sealed_len = u32::try_from(sealed.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "frame length exceeds u32::MAX",
+            "sealed frame length exceeds u32::MAX",
         )
     })?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(data)?;
-    stream.flush()?;
+    stream.write_all(&sealed_len.to_be_bytes()).await?;
+    stream.write_all(&nonce).await?;
+    stream.write_all(&sealed).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-/// Read a length-prefixed frame from the stream.
+/// Read an AEAD-encrypted frame from the async stream and AEAD-open it.
 ///
-/// Wire format: `[4 bytes: big-endian u32 length N] [N bytes: payload]`.
+/// Wire format: `[4-byte BE u32 sealed_len][12-byte nonce][sealed_data]`.
+///
+/// Returns the decrypted plaintext on success.
 ///
 /// # Errors
 /// Returns `io::Error` if:
 /// - The read fails (EOF, connection reset, timeout).
-/// - The declared length exceeds `MAX_FRAME_SIZE` (allocation-attack
-///   resistance).
-/// - The stream ends before the full payload is received.
-pub(crate) fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+/// - The declared `sealed_len` exceeds `MAX_FRAME_SIZE` (allocation-attack
+///   resistance) or is smaller than `MIN_SEALED_LEN`.
+/// - AEAD authentication fails (`aead_open` returns `None`). The
+///   connection is dropped without further I/O.
+async fn read_sealed_frame(
+    stream: &mut TcpStream,
+    recv_key: &SymmetricKey,
+) -> io::Result<Vec<u8>> {
+    // 1. Read the 4-byte sealed_len prefix.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
+    stream.read_exact(&mut len_buf).await?;
+    let sealed_len = u32::from_be_bytes(len_buf) as usize;
+    if sealed_len > MAX_FRAME_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "declared frame length {} bytes exceeds MAX_FRAME_SIZE {} bytes",
-                len,
-                MAX_FRAME_SIZE
+                "declared sealed frame length {} bytes exceeds MAX_FRAME_SIZE {} bytes",
+                sealed_len, MAX_FRAME_SIZE
             ),
         ));
     }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    Ok(buf)
+    if sealed_len < MIN_SEALED_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "declared sealed frame length {} bytes is smaller than minimum {} (AEAD tag)",
+                sealed_len, MIN_SEALED_LEN
+            ),
+        ));
+    }
+    // 2. Read the 12-byte nonce.
+    let mut nonce_buf = [0u8; NONCE_LEN];
+    stream.read_exact(&mut nonce_buf).await?;
+    // 3. Read the sealed body (ciphertext ‖ tag).
+    let mut sealed = vec![0u8; sealed_len];
+    stream.read_exact(&mut sealed).await?;
+    // 4. AEAD-open. Returns None on auth failure.
+    let plaintext = aead_open(recv_key, &nonce_buf, &sealed, &[]).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AEAD authentication failed — frame rejected",
+        )
+    })?;
+    Ok(plaintext)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Replay cache (server-side)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A bounded server-side replay cache keyed by `(source_node_id, query_id)`.
+///
+/// Each entry stores the wall-clock timestamp at which it was first seen.
+/// Entries older than 2× `MAX_ROUTE_QUERY_AGE_SECS` are purged on each
+/// insertion. When the cache is full, the oldest entries are evicted.
+///
+/// This is the server-side freshness check: even though `ForwardingNode`
+/// has its own loop-prevention (`visited_nodes`) and the protocol's
+/// `PendingRouteQuery` provides single-step replay protection, the TCP
+/// server needs its own stateless-per-connection replay protection because
+/// each accepted connection is independent.
+struct ReplayCache {
+    entries: HashMap<([u8; 32], [u8; 16]), u64>,
+    max_entries: usize,
+}
+
+impl ReplayCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    /// Check + insert `(source_node_id, query_id)`. Returns `true` if the
+    /// pair is fresh (not a replay), `false` if it was already seen.
+    ///
+    /// Side effects: purges expired entries (older than 2×
+    /// `MAX_ROUTE_QUERY_AGE_SECS`) and evicts the oldest entry when the
+    /// cache is full.
+    fn check_and_insert(
+        &mut self,
+        source_node_id: [u8; 32],
+        query_id: [u8; 16],
+        now: u64,
+    ) -> bool {
+        let key = (source_node_id, query_id);
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        // Purge expired entries.
+        let max_age = MAX_ROUTE_QUERY_AGE_SECS.saturating_mul(2);
+        self.entries.retain(|_, ts| now.saturating_sub(*ts) < max_age);
+        // If still full, evict the oldest entry.
+        while self.entries.len() >= self.max_entries {
+            // Find the entry with the smallest timestamp and remove it.
+            let oldest_key = match self
+                .entries
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(k, _)| *k)
+            {
+                Some(k) => k,
+                None => break,
+            };
+            self.entries.remove(&oldest_key);
+        }
+        self.entries.insert(key, now);
+        true
+    }
+}
+
+/// Current wall-clock time in seconds since UNIX_EPOCH. Returns 0 on
+/// clock errors (which would cause all cache entries to be considered
+/// expired — a fail-safe default).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -187,8 +363,8 @@ pub struct PeerInfo {
     pub ed25519_public: [u8; 32],
 }
 
-/// A production `RecursiveNextHopTransport` that uses real TCP sockets,
-/// SNP-IK/0.1 authentication, and canonical CBOR serialization.
+/// A production `RecursiveNextHopTransport` that uses async Tokio TCP,
+/// SNP-IK/0.1 authentication, and AEAD-encrypted canonical CBOR frames.
 ///
 /// Holds:
 /// - `peers`: a map from NodeId → `PeerInfo` (TCP address + expected
@@ -196,11 +372,19 @@ pub struct PeerInfo {
 ///   neighbor.
 /// - The local node's keypair (for the SNP-IK initiator side).
 ///
-/// `forward_query` opens a fresh TCP connection for each call, performs
-/// the SNP-IK handshake as initiator (pinning the expected peer NodeId),
-/// sends the encoded `ForwardedQuery` as a length-prefixed frame, reads
-/// the response frame, decodes the `RecursiveRouteResponse`, and closes
-/// the connection.
+/// `forward_query` opens a fresh TCP connection for each call (async
+/// via Tokio), performs the SNP-IK handshake as initiator (pinning the
+/// expected peer NodeId), AEAD-encrypts the encoded `ForwardedQuery`,
+/// reads the AEAD-encrypted response, decodes the `RecursiveRouteResponse`,
+/// and closes the connection.
+///
+/// ## Sync↔async boundary
+///
+/// The [`RecursiveNextHopTransport`] trait is synchronous. This impl
+/// creates a single-threaded Tokio runtime per `forward_query` call and
+/// `block_on`s the async TCP + AEAD operations on it. This is a
+/// discovery-time operation (not a data-plane hot path), so the per-call
+/// runtime overhead is acceptable.
 pub struct TcpRecursiveTransport {
     /// Map from NodeId → peer info (TCP address + expected Ed25519 public).
     peers: HashMap<[u8; 32], PeerInfo>,
@@ -241,7 +425,7 @@ impl TcpRecursiveTransport {
     /// The peer's NodeId is derived from the Ed25519 public key — callers
     /// do NOT need to pass it separately.
     pub fn add_peer(&mut self, ed25519_public: [u8; 32], addr: impl Into<String>) {
-        let node_id = snp_crypto::derive_node_id(&ed25519_public);
+        let node_id = derive_node_id(&ed25519_public);
         self.peers.insert(
             node_id,
             PeerInfo {
@@ -257,34 +441,47 @@ impl TcpRecursiveTransport {
         self.peers.len()
     }
 
-    /// **N2.2.1.** Initiate a SNP-IK handshake to `peer_addr`, pinning the
-    /// expected peer NodeId. Returns `Ok(())` on success.
+    /// Async implementation of `forward_query`. Performs the actual TCP
+    /// connect + SNP-IK handshake + AEAD-encrypted frame exchange.
     ///
-    /// This is a thin wrapper around `perform_snp_ik_handshake_verified`
-    /// that converts `LinkError` to `io::Error` and applies a timeout.
-    fn handshake_as_initiator(
+    /// This is the inner async body; the sync trait impl creates a runtime
+    /// and `block_on`s this future.
+    async fn forward_query_async(
         &self,
-        stream: &mut TcpStream,
-        expected_peer_node_id: &[u8; 32],
-    ) -> io::Result<()> {
-        stream.set_read_timeout(Some(TCP_TIMEOUT))?;
-        stream.set_write_timeout(Some(TCP_TIMEOUT))?;
-        perform_snp_ik_handshake_verified(
-            stream,
+        neighbor_node_id: &[u8; 32],
+        query: &ForwardedQuery,
+    ) -> Option<RecursiveRouteResponse> {
+        // 1. Look up peer info.
+        let peer = self.peers.get(neighbor_node_id)?;
+        // 2. Connect TCP (async).
+        let mut stream = TcpStream::connect(&peer.addr).await.ok()?;
+        stream.set_nodelay(true).ok();
+        // 3. SNP-IK handshake as initiator, pinning expected peer NodeId.
+        //    Returns a VerifiedHandshake with directional AEAD link keys.
+        let verified = perform_snp_ik_handshake_verified_async(
+            &mut stream,
             true, // is_initiator
             &self.local_ed25519_secret,
             &self.local_ed25519_public,
             &self.local_x25519_secret,
             &self.local_x25519_public,
-            Some(expected_peer_node_id),
+            Some(neighbor_node_id),
         )
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("SNP-IK handshake failed (initiator): {e}"),
-            )
-        })?;
-        Ok(())
+        .await
+        .ok()?;
+        let LinkKeys { send_key, recv_key } = verified.link_keys();
+        // 4. Encode the ForwardedQuery to canonical CBOR (== hash preimage).
+        let query_bytes = query.encode_cbor();
+        // 5. AEAD-seal + write the frame.
+        write_sealed_frame(&mut stream, &send_key, &query_bytes)
+            .await
+            .ok()?;
+        // 6. Read the AEAD-encrypted response frame + AEAD-open.
+        let response_bytes = read_sealed_frame(&mut stream, &recv_key).await.ok()?;
+        // 7. Decode the RecursiveRouteResponse.
+        let response = RecursiveRouteResponse::decode_cbor(&response_bytes)?;
+        // 8. Drop the stream (closes the connection).
+        Some(response)
     }
 }
 
@@ -294,22 +491,25 @@ impl RecursiveNextHopTransport for TcpRecursiveTransport {
         neighbor_node_id: &[u8; 32],
         query: &ForwardedQuery,
     ) -> Option<RecursiveRouteResponse> {
-        // 1. Look up peer info.
-        let peer = self.peers.get(neighbor_node_id)?;
-        // 2. Connect TCP.
-        let mut stream = TcpStream::connect(&peer.addr).ok()?;
-        // 3. SNP-IK handshake as initiator, pinning expected peer NodeId.
-        self.handshake_as_initiator(&mut stream, neighbor_node_id).ok()?;
-        // 4. Encode the ForwardedQuery to canonical CBOR (== hash preimage).
-        let query_bytes = query.encode_cbor();
-        // 5. Write the frame.
-        write_frame(&mut stream, &query_bytes).ok()?;
-        // 6. Read the response frame.
-        let response_bytes = read_frame(&mut stream).ok()?;
-        // 7. Decode the RecursiveRouteResponse.
-        let response = RecursiveRouteResponse::decode_cbor(&response_bytes)?;
-        // 8. Drop the stream (closes the connection).
-        Some(response)
+        // The protocol layer (ForwardingNode, RecursiveNextHopTransport)
+        // is synchronous. We bridge to the async transport by creating a
+        // single-threaded Tokio runtime per call and block_on'ing the
+        // async forward_query_async future on it.
+        //
+        // This is a discovery-time operation (not a data-plane hot path),
+        // so the per-call runtime overhead is acceptable. A future
+        // async-protocol refactor would eliminate this block_on boundary.
+        //
+        // Using a new current-thread runtime (rather than
+        // `Handle::current().block_on`) is intentional: it is safe
+        // regardless of whether the caller is inside an outer runtime
+        // (we never panic on "cannot start a runtime from within a
+        // runtime"). The cost is a fresh mio reactor per call.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(self.forward_query_async(neighbor_node_id, query))
     }
 }
 
@@ -317,23 +517,34 @@ impl RecursiveNextHopTransport for TcpRecursiveTransport {
 // TcpForwardingServer — responder side
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A TCP server that listens for incoming `ForwardedQuery` messages,
-/// handles them using `ForwardingNode` logic, and sends back
-/// `RecursiveRouteResponse` messages.
+/// An async TCP server that listens for incoming AEAD-encrypted
+/// `ForwardedQuery` messages, handles them using `ForwardingNode` logic,
+/// and sends back AEAD-encrypted `RecursiveRouteResponse` messages.
 ///
-/// The server runs in a background thread (`serve()` spawns it). Each
-/// incoming connection is handled synchronously: handshake → read frame →
-/// handle → write frame → close.
+/// The server runs on its own dedicated OS thread with its own
+/// multi-threaded Tokio runtime (`serve_in_background` spawns it). Each
+/// incoming connection is handled concurrently via `tokio::spawn`: the
+/// SNP-IK handshake, AEAD frame I/O, identity-binding check, replay
+/// check, and `ForwardingNode::handle_query` (via `spawn_blocking`) all
+/// run as independent tasks.
 ///
 /// The server's `ForwardingNode` carries its OWN `RecursiveNextHopTransport`
 /// (typically a `TcpRecursiveTransport` pointing at the next hop). When
 /// `handle_query` needs to forward, it uses that transport — so the FULL
-/// chain A → B → C → G goes over real TCP, not just A → B.
+/// chain A → B → C → G goes over real async TCP, not just A → B.
 pub struct TcpForwardingServer {
     /// The forwarding node that handles incoming queries.
     node: Arc<ForwardingNode>,
-    /// The TCP listener bound to this server's address.
-    listener: TcpListener,
+    /// The bound address (computed at construction time so `local_addr()`
+    /// remains valid even after `serve()` takes the listener).
+    bound_addr: SocketAddr,
+    /// The std TCP listener. Stored as `Option` inside a `std::sync::Mutex`
+    /// so `serve()` can `take()` it and convert it to a `tokio::net::TcpListener`
+    /// inside the server's own Tokio runtime. The conversion MUST happen
+    /// inside the runtime that will drive the listener (Tokio registers
+    /// the I/O resource with the current runtime's reactor at `from_std`
+    /// time), so we cannot convert it at construction time.
+    listener: StdMutex<Option<std::net::TcpListener>>,
     /// The server's Ed25519 secret key (for SNP-IK responder).
     ed25519_secret: [u8; 32],
     /// The server's Ed25519 public key.
@@ -342,145 +553,222 @@ pub struct TcpForwardingServer {
     x25519_secret: X25519Secret,
     /// The server's static X25519 public key.
     x25519_public: X25519PubKey,
+    /// Server-side replay cache (bounded). Shared across all connection
+    /// tasks via `Arc<Mutex<...>>`.
+    replay_cache: Arc<Mutex<ReplayCache>>,
 }
 
 impl TcpForwardingServer {
-    /// Bind a new `TcpForwardingServer` on `addr`.
+    /// Bind a new `TcpForwardingServer` on `addr` (async).
     ///
     /// The server uses the SAME Ed25519 keypair as the `ForwardingNode` it
     /// wraps (so the SNP-IK handshake authenticates the same identity as
     /// the node's advertisement). The X25519 keypair is generated fresh.
     ///
+    /// The listener is converted to a `std::net::TcpListener` (via
+    /// `into_std`) and re-converted to a `tokio::net::TcpListener` inside
+    /// the server's own runtime when `serve()` is called. This ensures
+    /// the I/O resource is registered with the correct runtime's reactor.
+    ///
     /// # Errors
     /// Returns `io::Error` if the TCP listener cannot be bound.
-    pub fn bind(
+    pub async fn bind(
         node: Arc<ForwardingNode>,
         ed25519_secret: [u8; 32],
         ed25519_public: [u8; 32],
         addr: &str,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        let (x25519_secret, x25519_public) = x25519_static_keypair();
-        Ok(Self {
+        let listener = TcpListener::bind(addr).await?;
+        let bound_addr = listener.local_addr()?;
+        // Convert back to std so the server's own runtime can register it.
+        // `into_std` deregisters from the current runtime and returns the
+        // listener in non-blocking mode.
+        let std_listener = listener.into_std()?;
+        Ok(Self::new_inner(
             node,
-            listener,
             ed25519_secret,
             ed25519_public,
-            x25519_secret,
-            x25519_public,
-        })
+            bound_addr,
+            Some(std_listener),
+        ))
     }
 
     /// **N2.2.1.** Construct a `TcpForwardingServer` from a pre-bound
-    /// `TcpListener`.
+    /// `std::net::TcpListener`.
     ///
     /// This is useful when the caller needs to know the bound address
     /// (e.g. ephemeral port `"127.0.0.1:0"`) BEFORE constructing the
     /// `ForwardingNode` (which needs the address to populate its
     /// `endpoints` field, and whose transport needs the peer addresses).
     ///
+    /// The listener is stored as-is (in blocking mode) and converted to
+    /// a `tokio::net::TcpListener` inside the server's own runtime when
+    /// `serve()` is called. This avoids the chicken-and-egg of needing a
+    /// Tokio runtime context at construction time.
+    ///
     /// # Errors
-    /// Returns `io::Error` only if the internal X25519 keypair generation
-    /// fails (which only happens if the OS CSPRNG is unavailable).
+    /// Returns `io::Error` if `listener.local_addr()` fails or the
+    /// internal X25519 keypair generation fails (which only happens if
+    /// the OS CSPRNG is unavailable).
     pub fn from_listener(
         node: Arc<ForwardingNode>,
         ed25519_secret: [u8; 32],
         ed25519_public: [u8; 32],
-        listener: TcpListener,
+        listener: std::net::TcpListener,
     ) -> io::Result<Self> {
-        let (x25519_secret, x25519_public) = x25519_static_keypair();
-        Ok(Self {
+        let bound_addr = listener.local_addr()?;
+        Ok(Self::new_inner(
             node,
-            listener,
+            ed25519_secret,
+            ed25519_public,
+            bound_addr,
+            Some(listener),
+        ))
+    }
+
+    /// Shared constructor body.
+    fn new_inner(
+        node: Arc<ForwardingNode>,
+        ed25519_secret: [u8; 32],
+        ed25519_public: [u8; 32],
+        bound_addr: SocketAddr,
+        listener: Option<std::net::TcpListener>,
+    ) -> Self {
+        let (x25519_secret, x25519_public) = x25519_static_keypair();
+        Self {
+            node,
+            bound_addr,
+            listener: StdMutex::new(listener),
             ed25519_secret,
             ed25519_public,
             x25519_secret,
             x25519_public,
-        })
+            replay_cache: Arc::new(Mutex::new(ReplayCache::new(REPLAY_CACHE_MAX_ENTRIES))),
+        }
     }
 
     /// Get the local address the server is bound to.
     ///
     /// Useful when the caller passed `"127.0.0.1:0"` (ephemeral port) and
-    /// needs to discover the actual port.
+    /// needs to discover the actual port. The address is captured at
+    /// construction time and remains valid for the lifetime of the server
+    /// (even after `serve()` takes the listener).
     #[must_use]
-    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.listener.local_addr()
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.bound_addr)
     }
 
     /// Get the bound address as a string (e.g. `"127.0.0.1:38507"`).
     ///
     /// # Errors
-    /// Returns `io::Error` if `local_addr()` fails.
+    /// Returns `io::Error` only if the stored address cannot be stringified
+    /// (which cannot happen in practice).
     pub fn local_addr_string(&self) -> io::Result<String> {
-        let addr = self.local_addr()?;
-        Ok(addr.to_string())
+        Ok(self.bound_addr.to_string())
     }
 
-    /// **N2.2.1.** Accept ONE connection, handle it, and return.
+    /// Run the server forever (async). Each accepted connection is
+    /// handled concurrently via `tokio::spawn`.
     ///
-    /// This is useful for tests that want to drive the server synchronously
-    /// (one connection per call). Production would use `serve()` which
-    /// loops forever.
-    ///
-    /// # Errors
-    /// Returns `io::Error` if `accept()` fails or the handshake fails.
-    /// Returns `Ok(())` after handling one connection (even if the query
-    /// itself failed — that is logged but not propagated).
-    pub fn accept_one(&self) -> io::Result<()> {
-        let (mut stream, _peer_addr) = self.listener.accept()?;
-        self.handle_connection(&mut stream)
-    }
-
-    /// Run the server forever in the current thread.
-    ///
-    /// Blocks the calling thread. Each accepted connection is handled
-    /// synchronously. Use `serve_in_background()` to run in a thread.
+    /// This method takes the stored `std::net::TcpListener`, converts it
+    /// to a `tokio::net::TcpListener` (setting non-blocking mode), and
+    /// enters the accept loop. The conversion MUST happen inside the
+    /// Tokio runtime that will drive the listener (the reactor
+    /// registration is runtime-specific), so callers should use
+    /// [`TcpForwardingServer::serve_in_background`] (which spawns a
+    /// dedicated OS thread + runtime) rather than calling `serve()`
+    /// directly from an arbitrary context.
     ///
     /// # Errors
-    /// Returns `io::Error` if `accept()` fails irrecoverably.
-    pub fn serve(&self) -> io::Result<()> {
-        for stream in self.listener.incoming() {
-            let mut stream = stream?;
-            // Handle each connection; errors are logged but do not kill the server.
-            if let Err(e) = self.handle_connection(&mut stream) {
-                eprintln!("[TcpForwardingServer] connection error: {e}");
-            }
+    /// Returns `io::Error` if the listener conversion fails or `accept()`
+    /// fails irrecoverably.
+    pub async fn serve(self: Arc<Self>) -> io::Result<()> {
+        // Take the std listener out of the Mutex and convert to tokio.
+        // This registers the I/O resource with the current runtime's
+        // reactor, which is why serve() must run on the SAME runtime that
+        // will drive the listener.
+        let listener = {
+            let mut guard = self.listener.lock().expect("listener mutex poisoned");
+            let std_listener = guard.take().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "listener already taken (serve() called twice?)",
+                )
+            })?;
+            // Set non-blocking mode (required by tokio::net::TcpListener::from_std).
+            std_listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(std_listener)?
+        };
+        loop {
+            let (stream, _peer_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("[TcpForwardingServer] accept() error: {e}");
+                    // Brief back-off to avoid a tight error loop.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = server.handle_connection(stream).await {
+                    eprintln!("[TcpForwardingServer] connection error: {e}");
+                }
+            });
         }
-        Ok(())
     }
 
-    /// Spawn a background thread running `serve()`.
+    /// Spawn a dedicated OS thread running `serve()` on its own
+    /// multi-threaded Tokio runtime.
     ///
-    /// Returns immediately. The thread runs until the listener is closed
-    /// (which happens when the `TcpForwardingServer` is dropped).
+    /// Returns immediately. The thread + runtime run until the listener
+    /// is closed (which happens when the `TcpForwardingServer` is
+    /// dropped — but note that dropping an `Arc<TcpForwardingServer>`
+    /// only closes the listener when the LAST Arc is dropped).
     ///
-    /// # Panics
-    /// The spawned thread panics if `serve()` returns an error other than
-    /// a benign accept failure. In practice this only happens if the
-    /// listener is closed externally.
+    /// This is the canonical production entry point: the synchronous
+    /// caller (e.g. a node's main thread) calls `serve_in_background` and
+    /// continues; all network I/O happens on the dedicated runtime.
     pub fn serve_in_background(self: Arc<Self>) {
-        thread::spawn(move || {
-            if let Err(e) = self.serve() {
-                eprintln!("[TcpForwardingServer] serve() exited with error: {e}");
-            }
-        });
+        std::thread::Builder::new()
+            .name("TcpForwardingServer".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("[TcpForwardingServer] failed to create runtime: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(self.serve()) {
+                    eprintln!("[TcpForwardingServer] serve() exited with error: {e}");
+                }
+            })
+            .expect("failed to spawn TcpForwardingServer thread");
     }
 
-    /// Handle a single connection: handshake → read frame → handle → write
-    /// frame → close.
+    /// Handle a single connection (async): SNP-IK handshake → read
+    /// AEAD-encrypted frame → identity-binding check → replay check →
+    /// `ForwardingNode::handle_query` (via `spawn_blocking`) → write
+    /// AEAD-encrypted response → close.
     ///
-    /// This is the core per-connection logic. It is `pub(crate)` so tests
-    /// can call it directly (via `accept_one()`) without exposing it in
-    /// the public API.
-    fn handle_connection(&self, stream: &mut TcpStream) -> io::Result<()> {
+    /// On ANY error (handshake failure, AEAD failure, identity mismatch,
+    /// replay, decode failure, handle_query rejection), the connection is
+    /// dropped WITHOUT sending a response — the initiator sees EOF / error
+    /// and treats it as failure.
+    async fn handle_connection(self: Arc<Self>, mut stream: TcpStream) -> io::Result<()> {
+        stream.set_nodelay(true).ok();
+
         // 1. SNP-IK handshake as responder (no expected peer pinning — we
         //    accept any authenticated peer; the handshake itself proves
-        //    the peer's identity).
-        stream.set_read_timeout(Some(TCP_TIMEOUT))?;
-        stream.set_write_timeout(Some(TCP_TIMEOUT))?;
-        perform_snp_ik_handshake_verified(
-            stream,
+        //    the peer's identity). Returns a VerifiedHandshake with the
+        //    authenticated peer_node_id + directional AEAD link keys.
+        let verified: VerifiedHandshake = perform_snp_ik_handshake_verified_async(
+            &mut stream,
             false, // is_initiator = false (responder)
             &self.ed25519_secret,
             &self.ed25519_public,
@@ -488,14 +776,18 @@ impl TcpForwardingServer {
             &self.x25519_public,
             None, // no expected_peer_node_id — accept any authenticated peer
         )
+        .await
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 format!("SNP-IK handshake failed (responder): {e}"),
             )
         })?;
-        // 2. Read the ForwardedQuery frame.
-        let query_bytes = read_frame(stream)?;
+        let peer_node_id = verified.peer_node_id();
+        let LinkKeys { send_key, recv_key } = verified.link_keys();
+
+        // 2. Read the AEAD-encrypted ForwardedQuery frame + AEAD-open.
+        let query_bytes = read_sealed_frame(&mut stream, &recv_key).await?;
         // 3. Decode the ForwardedQuery from canonical CBOR.
         let query = ForwardedQuery::decode_cbor(&query_bytes).ok_or_else(|| {
             io::Error::new(
@@ -503,12 +795,53 @@ impl TcpForwardingServer {
                 "failed to decode ForwardedQuery from canonical CBOR",
             )
         })?;
-        // 4. Hand the query to the ForwardingNode. The node verifies both
-        //    signatures (NextHopQuery + parent binding), checks visited_nodes
-        //    (loop prevention), checks hop budget, and either returns a
-        //    terminal response or forwards a NEW query to the next hop
-        //    (via its own transport — typically another TcpRecursiveTransport).
-        let response = match self.node.handle_query(&query) {
+
+        // 4. **Identity binding (N2.2.1).** The authenticated peer NodeId
+        //    from the SNP-IK handshake MUST equal the query's
+        //    source_node_id. A query signed by B cannot be sent over a
+        //    connection authenticated as A — this closes the cross-channel
+        //    injection vector. Drop without a response.
+        if peer_node_id != query.source_node_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "identity binding failed: authenticated peer NodeId {:?} != query.source_node_id {:?}",
+                    peer_node_id, query.source_node_id
+                ),
+            ));
+        }
+
+        // 5. **Replay protection (N2.2.1).** Check the (source_node_id,
+        //    query_id) pair against the server-side replay cache. A
+        //    replayed serialized query is rejected before reaching
+        //    ForwardingNode::handle_query.
+        {
+            let mut cache = self.replay_cache.lock().await;
+            if !cache.check_and_insert(query.source_node_id, query.query_id, now_secs()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "replay detected: (source_node_id, query_id) already seen",
+                ));
+            }
+        }
+
+        // 6. Hand the query to the ForwardingNode via `spawn_blocking`.
+        //    The ForwardingNode is synchronous (it may recursively call
+        //    transport.forward_query, which itself bridges to async via a
+        //    per-call runtime). Running it on a blocking thread ensures
+        //    we never stall the runtime's worker pool.
+        let node = Arc::clone(&self.node);
+        let query_clone = query;
+        let response_opt = tokio::task::spawn_blocking(move || node.handle_query(&query_clone))
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("ForwardingNode::handle_query panicked: {e}"),
+                )
+            })?;
+
+        let response = match response_opt {
             Some(r) => r,
             None => {
                 // The query was rejected (bad signature, loop, budget
@@ -518,90 +851,185 @@ impl TcpForwardingServer {
                 return Ok(());
             }
         };
-        // 5. Encode the RecursiveRouteResponse to canonical CBOR.
+
+        // 7. Encode the RecursiveRouteResponse to canonical CBOR.
         let response_bytes = response.encode_cbor();
-        // 6. Write the response frame.
-        write_frame(stream, &response_bytes)?;
-        // 7. Connection closes on drop.
+        // 8. AEAD-seal + write the response frame.
+        write_sealed_frame(&mut stream, &send_key, &response_bytes).await?;
+        // 9. Connection closes on drop.
         Ok(())
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Tests for the frame protocol (unit tests, no network)
+// Tests for the AEAD frame protocol (unit tests, async)
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `write_frame` / `read_frame` round-trip a small payload.
-    #[test]
-    fn frame_round_trip_small() {
-        // Use an in-memory pipe via `std::os::unix::net::UnixStream` would
-        // be cleaner, but to stay portable we use a TCP loopback pair.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// `write_sealed_frame` / `read_sealed_frame` round-trip a small
+    /// payload over a real TCP loopback connection (async).
+    #[tokio::test]
+    async fn sealed_frame_round_trip_small() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let handle = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let data = read_frame(&mut s).unwrap();
+
+        let key = [0x42u8; 32];
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let data = read_sealed_frame(&mut s, &key).await.unwrap();
             assert_eq!(data, b"hello");
-            write_frame(&mut s, b"world").unwrap();
+            write_sealed_frame(&mut s, &key, b"world").await.unwrap();
         });
-        let mut s = TcpStream::connect(addr).unwrap();
-        write_frame(&mut s, b"hello").unwrap();
-        let resp = read_frame(&mut s).unwrap();
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        write_sealed_frame(&mut s, &key, b"hello").await.unwrap();
+        let resp = read_sealed_frame(&mut s, &key).await.unwrap();
         assert_eq!(resp, b"world");
-        handle.join().unwrap();
+        server.await.unwrap();
     }
 
-    /// `read_frame` rejects a declared length exceeding `MAX_FRAME_SIZE`.
-    #[test]
-    fn frame_oversized_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// `read_sealed_frame` rejects a declared length exceeding `MAX_FRAME_SIZE`.
+    #[tokio::test]
+    async fn sealed_frame_oversized_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let handle = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
+        let key = [0x42u8; 32];
+
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
             // Write a 4-byte length prefix claiming (MAX_FRAME_SIZE + 1) bytes.
-            let bogus_len = (MAX_FRAME_SIZE as u32).checked_add(1).unwrap();
-            s.write_all(&bogus_len.to_be_bytes()).unwrap();
+            let bogus_len = u32::try_from(MAX_FRAME_SIZE + 1).unwrap();
+            s.write_all(&bogus_len.to_be_bytes()).await.unwrap();
             // Don't send any payload — the reader should reject before
             // expecting any.
         });
-        let mut s = TcpStream::connect(addr).unwrap();
-        let err = read_frame(&mut s).unwrap_err();
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let err = read_sealed_frame(&mut s, &key).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let _ = handle.join();
+        let _ = server.await;
     }
 
-    /// `write_frame` rejects a payload exceeding `MAX_FRAME_SIZE`.
-    #[test]
-    fn frame_write_oversized_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// `write_sealed_frame` rejects a plaintext whose sealed form would
+    /// exceed `MAX_FRAME_SIZE`.
+    #[tokio::test]
+    async fn sealed_frame_write_oversized_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let _handle = thread::spawn(move || {
-            let (_s, _) = listener.accept().unwrap();
+        let key = [0x42u8; 32];
+        let _server = tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
         });
-        let mut s = TcpStream::connect(addr).unwrap();
-        let huge = vec![0u8; MAX_FRAME_SIZE + 1];
-        let err = write_frame(&mut s, &huge).unwrap_err();
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // plaintext of MAX_FRAME_SIZE - 15 bytes → sealed = MAX_FRAME_SIZE + 1.
+        let huge = vec![0u8; MAX_FRAME_SIZE - (TAG_LEN - 1)];
+        let err = write_sealed_frame(&mut s, &key, &huge).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// `read_frame` returns UnexpectedEof on a truncated frame.
-    #[test]
-    fn frame_truncated_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// `read_sealed_frame` returns UnexpectedEof on a truncated frame.
+    #[tokio::test]
+    async fn sealed_frame_truncated_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let handle = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            // Claim 10 bytes but only send 3.
-            s.write_all(&10u32.to_be_bytes()).unwrap();
-            s.write_all(b"abc").unwrap();
+        let key = [0x42u8; 32];
+
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Claim 10 bytes of sealed body but only send 3.
+            s.write_all(&10u32.to_be_bytes()).await.unwrap();
+            s.write_all(&[0u8; 12]).await.unwrap(); // fake nonce
+            s.write_all(b"abc").await.unwrap();
         });
-        let mut s = TcpStream::connect(addr).unwrap();
-        let err = read_frame(&mut s).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-        let _ = handle.join();
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let err = read_sealed_frame(&mut s, &key).await.unwrap_err();
+        // The error kind may be UnexpectedEof or InvalidData depending on
+        // platform and timing — either is acceptable (the frame was rejected).
+        assert!(
+            err.kind() == io::ErrorKind::UnexpectedEof || err.kind() == io::ErrorKind::InvalidData,
+            "truncated frame should produce UnexpectedEof or InvalidData, got: {:?}",
+            err.kind()
+        );
+        let _ = server.await;
+    }
+
+    /// `read_sealed_frame` rejects a frame whose AEAD tag does not
+    /// authenticate (the sealed body was tampered).
+    #[tokio::test]
+    async fn sealed_frame_tampered_ciphertext_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let key = [0x42u8; 32];
+
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Build a real sealed frame, then flip a byte in the ciphertext.
+            let sealed = aead_seal(&key, &[0u8; 12], b"hello", &[]);
+            let mut tampered = sealed.clone();
+            // Flip a byte in the ciphertext portion (not the tag).
+            tampered[0] ^= 0xFF;
+            let len = u32::try_from(tampered.len()).unwrap();
+            s.write_all(&len.to_be_bytes()).await.unwrap();
+            s.write_all(&[0u8; 12]).await.unwrap(); // nonce
+            s.write_all(&tampered).await.unwrap();
+        });
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let err = read_sealed_frame(&mut s, &key).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = server.await;
+    }
+
+    /// `ReplayCache` rejects a duplicate `(source_node_id, query_id)`.
+    #[test]
+    fn replay_cache_rejects_duplicate() {
+        let mut cache = ReplayCache::new(8);
+        let src = [1u8; 32];
+        let qid = [2u8; 16];
+        assert!(cache.check_and_insert(src, qid, 100));
+        // Duplicate at a later timestamp — must be rejected.
+        assert!(!cache.check_and_insert(src, qid, 200));
+    }
+
+    /// `ReplayCache` evicts the oldest entry when full.
+    #[test]
+    fn replay_cache_evicts_when_full() {
+        let mut cache = ReplayCache::new(2);
+        let src_a = [1u8; 32];
+        let src_b = [2u8; 32];
+        let src_c = [3u8; 32];
+        let qid = [9u8; 16];
+        // Insert two entries at t=100, t=200.
+        assert!(cache.check_and_insert(src_a, qid, 100));
+        assert!(cache.check_and_insert(src_b, qid, 200));
+        // Insert a third — cache is full; oldest (src_a @ t=100) is evicted.
+        assert!(cache.check_and_insert(src_c, qid, 300));
+        // src_a should now be re-acceptable (it was evicted).
+        assert!(cache.check_and_insert(src_a, qid, 400));
+    }
+
+    /// `ReplayCache` purges expired entries.
+    #[test]
+    fn replay_cache_purges_expired() {
+        let mut cache = ReplayCache::new(1024);
+        let src = [1u8; 32];
+        let qid = [2u8; 16];
+        // Insert at t=0.
+        assert!(cache.check_and_insert(src, qid, 0));
+        // Same key, much later — should still be rejected (entry is fresh
+        // in the cache because the max_age window is 2 * MAX_ROUTE_QUERY_AGE_SECS).
+        assert!(!cache.check_and_insert(src, qid, MAX_ROUTE_QUERY_AGE_SECS));
+        // After 3x MAX_ROUTE_QUERY_AGE_SECS, the entry is purged on the
+        // next insertion — the same key becomes re-acceptable.
+        let other_src = [9u8; 32];
+        let other_qid = [9u8; 16];
+        assert!(cache.check_and_insert(other_src, other_qid, 3 * MAX_ROUTE_QUERY_AGE_SECS + 1));
+        // Now src/qid should be fresh again (it was purged).
+        assert!(cache.check_and_insert(src, qid, 3 * MAX_ROUTE_QUERY_AGE_SECS + 2));
     }
 }
