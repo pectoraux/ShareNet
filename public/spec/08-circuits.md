@@ -388,11 +388,30 @@ Each AEAD layer appends a 16-byte tag, so a multi-hop packet's wire payload exce
 
 ## N2.4 — Bidirectional Circuit Traffic & Flow Lifecycle
 
-**Status: SPECIFICATION (frozen before implementation per spec-first rule)**
+**Status: PROPOSED / ARCHITECTURE REVIEW (not yet frozen)**
 
 N2.4 makes an `ActiveCircuit` a genuinely bidirectional authenticated transport channel. N2.3 proved forward traffic (A→B→C→G); N2.4 proves reverse traffic (G→C→B→A) over the same circuit, with independent sequence namespaces, replay windows, and per-hop authentication for each direction.
 
 The objective is NOT Internet access. The objective is to establish a bidirectional secure transport primitive suitable for a future Internet gateway.
+
+### Protocol version boundary (P0: N2.3 frozen ≠ N2.4)
+
+N2.3 is frozen at commit `0efaaac` with **circuit packet profile v1**. N2.4 proposes **profile v2**. These are distinct protocol versions — v2 is NOT wire-compatible with v1.
+
+| | v1 (N2.3, frozen) | v2 (N2.4, proposed) |
+|---|---|---|
+| Packet fields | circuit_id, seq, ttl, payload, final_dst | circuit_id, **direction**, **flow_id**, seq, ttl, payload, final_dst |
+| AAD domain | (none — raw fields) | `"SNP/0.1/circuit/packet/v2"` |
+| AAD fields | circuit_id ‖ seq ‖ ttl ‖ final_dst | domain ‖ circuit_id ‖ direction ‖ flow_id ‖ seq ‖ ttl ‖ final_dst |
+| Nonce | `circuit_id[0..8] ‖ seq` | `(circuit_id[0..8] ⊕ direction) ‖ seq` |
+| Direction | Forward only | Forward + Reverse |
+| flow_id | (absent) | 8 bytes, bound in AAD |
+
+**v1 packets are NOT valid v2 packets** (different AAD domain, nonce derivation, wire format). A v1 implementation and a v2 implementation produce cryptographically non-equivalent packets. The N2.3 frozen spec describes v1; the N2.4 spec below describes v2.
+
+The reference implementation at `44285be` has migrated to the v2 packet format. The N2.3 tests in `n215_traffic_forwarding.rs` now exercise v2 forward-only traffic (with `direction=Forward`, `flow_id=DEFAULT_FLOW_ID`). They are NOT v1 compatibility tests — they are v2-forward tests. The frozen v1 protocol is described by the N2.3 spec section above; a future conformance harness should verify v1 independently if v1 backward compatibility is required.
+
+N2.4 MUST be formally frozen (spec + ADR + packet profile + golden vectors + conformance tests aligned) before reverse traffic implementation begins.
 
 ### Traffic direction
 
@@ -419,16 +438,16 @@ CircuitPacket = {
 }
 ```
 
-### AEAD AAD (normative)
+### AEAD AAD (normative for v2)
 
 The AAD for each hop's AEAD layer is:
 
 ```text
-AAD = "SNP/0.1/circuit/packet" ‖ circuit_id ‖ direction ‖ flow_id ‖ seq(BE) ‖ ttl ‖ final_dst
+AAD = "SNP/0.1/circuit/packet/v2" ‖ circuit_id ‖ direction ‖ flow_id ‖ seq(BE) ‖ ttl ‖ final_dst
 ```
 
 where:
-- `"SNP/0.1/circuit/packet"` is a domain-separation prefix preventing cross-protocol confusion.
+- `"SNP/0.1/circuit/packet/v2"` is the **versioned** domain-separation prefix (v2). This is distinct from the N2.3 frozen v1 prefix (which was absent — raw fields only). The version in the domain prevents cross-version confusion.
 - `direction` is a single byte (0 or 1) — cryptographically binds the packet to its direction.
 - `flow_id` is 8 bytes — binds the packet to a logical flow.
 - `ttl` is the hop-local TTL for the relay processing this layer.
@@ -479,6 +498,42 @@ Reverse:  G allocates seq 1, 2, 3, ...   (gateway-owned)
 - `u32::MAX` = exhaustion, no wrap (same as N2.3).
 - Forward seq and reverse seq are **completely independent** — forward seq=1 does not affect reverse seq=1.
 - Each direction's allocator is circuit-owned and non-Clone (same ownership model as N2.3).
+
+### Reverse sequence ownership (normative)
+
+The `ActiveCircuit` MUST own both sequence allocators:
+
+```text
+ActiveCircuit
+    ├── forward_seq_state    (source-owned, for A → G traffic)
+    └── reverse_seq_state    (gateway-owned, for G → A traffic)
+```
+
+The gateway MUST obtain its reverse sequence allocator from the `ActiveCircuit` (or an equivalent circuit-owned handle). No independent production allocator may be constructible from `circuit_id + hops` alone — the same P0 no-nonce-reuse invariant from N2.3 applies to both directions.
+
+The API should be:
+
+```text
+ActiveCircuit::send_packet(plaintext, now)         → forward packet (source path)
+ActiveCircuit::sender() → CircuitSender<'_>          → forward borrowed handle
+ActiveCircuit::send_reverse_packet(plaintext, now)  → reverse packet (gateway path)
+ActiveCircuit::reverse_sender() → CircuitSender<'_> → reverse borrowed handle
+```
+
+Both allocators are `pub(crate)`, `!Clone`, and owned by the `ActiveCircuit` instance (which is itself `!Clone`).
+
+### Reverse key semantics (normative)
+
+Forward and reverse traffic use the **SAME** per-hop `forwarding_key` (derived from X25519 DH + HKDF during circuit establishment). The direction is separated cryptographically by the direction-bound AAD and the direction-aware nonce derivation — NOT by separate keys.
+
+```text
+Forward:  relay uses its forwarding_key to DECRYPT (peel) its incoming layer.
+Reverse:  relay uses the SAME forwarding_key to ENCRYPT (add) its outgoing layer.
+```
+
+No second DH exchange is required for reverse traffic. No separate reverse key is derived. The direction byte in the AAD and the direction-XOR in the nonce derivation ensure forward and reverse AEAD operations under the same key produce different (circuit_id, direction, seq) triples — preventing nonce reuse.
+
+This is a frozen architectural decision: a future agent MUST NOT invent a second key exchange or derive a different reverse key. The direction binding in the AAD/nonce is the sole mechanism separating forward and reverse traffic under the same key.
 
 ### Replay protection
 

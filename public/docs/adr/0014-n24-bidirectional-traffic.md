@@ -11,6 +11,10 @@ N2.3 (frozen at `0efaaac`) proves forward-only traffic: A → B → C → G. The
 
 ## Decision
 
+### 0. Protocol version boundary (P0)
+
+N2.3 is frozen with **circuit packet profile v1**. N2.4 introduces **profile v2** — a new, non-backward-compatible packet format. The v2 AAD domain includes a versioned prefix: `"SNP/0.1/circuit/packet/v2"` (v1 had no domain prefix). v1 and v2 packets are cryptographically non-equivalent. The reference implementation has migrated to v2; N2.3 tests now exercise v2-forward traffic, not v1.
+
 ### 1. Reverse traffic uses the Tor add-layer model
 
 Forward traffic (N2.3): the source creates nested AEAD layers; each relay **peels** (decrypts) one layer.
@@ -21,6 +25,14 @@ Reverse traffic (N2.4): each relay **adds** (encrypts) one AEAD layer as the pac
 
 This is the proven Tor reverse model. It avoids the complexity of a second key exchange or pre-sharing reverse keys during establishment.
 
+### 1a. Same key for both directions (normative)
+
+Forward and reverse traffic use the **SAME** per-hop `forwarding_key`. No second DH exchange, no separate reverse key. The direction is separated by:
+- Direction byte in the AAD (Forward=0, Reverse=1).
+- Direction XOR in the nonce derivation (`fid[0] ^= direction`).
+
+This is a frozen decision: a future agent MUST NOT invent a second key exchange or derive a different reverse key.
+
 ### 2. Traffic direction is cryptographically bound
 
 A `TrafficDirection` field (Forward=0, Reverse=1) is included in the packet and bound into the AEAD AAD. A forward packet cannot be replayed as a reverse packet, and vice versa.
@@ -29,6 +41,10 @@ A `TrafficDirection` field (Forward=0, Reverse=1) is included in the packet and 
 
 Forward and reverse each have their own sequence allocator, starting at `FIRST_PACKET_SEQ=1`. Forward seq=1 and reverse seq=1 are both valid because the direction is cryptographically bound. This preserves the AEAD nonce-safety property: the nonce is derived from `(circuit_id, direction, seq)`, so forward seq=1 and reverse seq=1 produce different nonces.
 
+### 3a. Reverse sequence ownership (normative)
+
+`ActiveCircuit` MUST own both `forward_seq_state` and `reverse_seq_state`. Both are `pub(crate)`, `!Clone`. The gateway obtains its reverse allocator from the circuit — no independent production allocator may be constructible from `circuit_id + hops` alone. This preserves the N2.3 no-nonce-reuse invariant for both directions.
+
 ### 4. Independent replay windows per direction
 
 Each relay maintains separate forward and reverse replay windows. A forward packet's seq does not mutate the reverse replay window, and vice versa.
@@ -36,6 +52,14 @@ Each relay maintains separate forward and reverse replay windows. A forward pack
 ### 5. Flow identity (`flow_id`)
 
 An 8-byte `flow_id` is introduced to distinguish logical traffic flows on one circuit. A circuit is not synonymous with one application connection. For N2.4, `flow_id` is cryptographically bound in the AAD and validated by the relay, but TCP stream multiplexing is deferred.
+
+### 6. Domain-separated AAD
+
+The AAD includes a versioned domain-separation prefix `"SNP/0.1/circuit/packet/v2"` to prevent cross-protocol and cross-version confusion. The full AAD is:
+
+```text
+"SNP/0.1/circuit/packet/v2" ‖ circuit_id ‖ direction ‖ flow_id ‖ seq ‖ ttl ‖ final_dst
+```
 
 ### 6. Relay state refactored to directional
 

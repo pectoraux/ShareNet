@@ -1287,8 +1287,9 @@ fn packet_nonce(circuit_id: &[u8; 32], direction: TrafficDirection, seq: u32) ->
     aead_nonce(&fid, seq)
 }
 
-/// N2.4: Domain-separation prefix for the AEAD AAD.
-const AAD_DOMAIN: &[u8] = b"SNP/0.1/circuit/packet";
+/// N2.4: Versioned domain-separation prefix for the AEAD AAD (v2).
+/// Distinct from the N2.3 frozen v1 (which had no domain prefix).
+const AAD_DOMAIN: &[u8] = b"SNP/0.1/circuit/packet/v2";
 
 /// Build the AEAD AAD for a circuit packet (N2.4: domain-separated +
 /// direction + flow_id bound).
