@@ -935,6 +935,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "snp-stack"
+version = "0.1.0"
+dependencies = [
+ "snp-tun",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "snp-sync"
 version = "0.1.0"
 dependencies = [

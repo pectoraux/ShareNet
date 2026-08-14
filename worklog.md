@@ -6970,3 +6970,66 @@ Stage Summary:
   - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
   - `cargo build -p snp-tun`: zero warnings, zero errors.
 - STOP condition met: no TCP interception, no transparent HTTPS, no DNS, no smoltcp, no OS routing changes. The deliverable is exactly "a safe Linux kernel packet entry/exit boundary, ready for the later transparent networking pipeline."
+
+---
+Task ID: N2.3.2
+Agent: Z.ai Code (main)
+Task: Implement packet flow classification — convert raw IP packets from the TUN boundary into tracked ShareNet flows. Scope: TCP/UDP header parsing, FlowKey (5-tuple) extraction, FlowTable with TCP state machine (SynSent → Established → Closing → Closed) and idle expiration. NO TCP proxy, smoltcp, DNS, or circuit creation.
+
+Work Log:
+- N2.3.1 audit pass completed first (4 verification points):
+  1. TUN lifecycle: `AsyncFd<OwnedFd>` closes fd on drop → kernel destroys interface. Panic-safe (dev: unwind runs Drop; release: abort → process exit closes all fds).
+  2. AsyncFd correctness: fd opened with O_NONBLOCK. `try_io()` handles WouldBlock + readiness clearing. No spin — `Err(_would_block) => continue` loops back to `readable().await`.
+  3. Packet validation: all 4 rejection cases present (IPv4 total_length < header_len, IPv4 bytes < total_length, IPv6 payload_length exceeds buffer, IPv4 IHL < 5).
+  4. IPv6 extension headers: documented the limitation in `Ipv6Packet::next_header()` — "This is the FIRST next-header value. Extension header traversal deferred to N2.3.2. Callers MUST NOT assume next_header == 6 means TCP."
+
+- Added `snp-stack` crate to workspace members and `snp-tun` to workspace internal dependencies.
+
+- Created `snp-stack/src/transport.rs`:
+  - `TcpFlags` struct (fin, syn, rst, psh, ack, urg) with `from_byte()`, `is_syn()`, `is_syn_ack()`, `is_teardown()`.
+  - `TcpHeader` (src_port, dst_port, seq, ack, flags, header_len).
+  - `UdpHeader` (src_port, dst_port, length).
+  - `TransportHeader` enum (Tcp/Udp).
+  - `FlowKey` (src_ip, dst_ip, src_port, dst_port, protocol) — the 5-tuple. `reverse()` swaps src↔dst for finding the return direction.
+  - `parse_transport(packet) -> Result<Option<TransportHeader>, TransportError>` — dispatches on protocol (6→TCP, 17→UDP, other→None). Validates: TCP min 20 bytes + data_offset, UDP min 8 bytes.
+  - `flow_key(packet, transport) -> Result<FlowKey>` — extracts the 5-tuple.
+  - `TransportError` enum (NoTransportPayload, TruncatedTcp, TruncatedUdp, InvalidTcpDataOffset).
+  - 14 unit tests: TCP SYN/SYN-ACK/FIN/RST parsing, UDP parsing, IPv6 TCP/UDP, ICMP returns None, flow key extraction, reverse, truncated headers, all flag combinations.
+
+- Created `snp-stack/src/flow_table.rs`:
+  - `TcpState` enum: SynSent, Established, Closing, Closed.
+  - `UdpState` enum: New, Established.
+  - `FlowState` enum: Tcp(TcpState), Udp(UdpState).
+  - `FlowEntry` struct: key, state, created_at, last_seen, packet_count, byte_count. `on_packet()` advances the TCP state machine (RST always → Closed; SYN-ACK in SynSent → Established; non-SYN in SynSent → Established (handshake completed in reverse); FIN in Established → Closing; FIN in Closing → Closed). `is_closed()` for eviction.
+  - `FlowTable` struct: `Arc<tokio::sync::Mutex<HashMap<FlowKey, FlowEntry>>>` — thread-safe, cloneable (shares state).
+  - `process_packet(key, tcp_flags, now, packet_len)` — looks up or creates a flow. For new TCP flows, determines the initial state from the first packet's flags (SYN → SynSent, SYN-ACK → Established, other → Established for mid-flow traffic). For new UDP flows, starts in New. For existing flows, calls `on_packet()` to advance the state.
+  - `sweep_idle(now, max_age)` — evicts flows where `last_seen` is older than `max_age`, AND flows in Closed state (regardless of age).
+  - `get()`, `remove()`, `clear()`, `len()`, `is_empty()`.
+  - 12 unit tests: TCP SYN creates flow, SYN-ACK establishes, FIN→Closing, RST→Closed, UDP lifecycle, idle eviction, active flow not evicted, closed flow evicted immediately, lookup, remove, concurrent flows (10 tasks, no cross-contamination), byte count accumulation.
+
+- Created `snp-stack/src/lib.rs` — module declarations, public re-exports, rustdoc with architecture diagram + usage example.
+
+- Created `snp-stack/tests/flow_classification.rs` — 9 integration tests:
+  - `tcp_syn_creates_flow_in_synsent_state` — SYN → SynSent.
+  - `tcp_full_handshake_lifecycle` — SYN → SYN-ACK → ACK → FIN → FIN-ACK → RST → Closed → evicted. Full state machine exercise.
+  - `tcp_rst_immediately_closes_flow` — RST in Established → Closed.
+  - `udp_flow_starts_as_new_then_established` — first packet → New, second → Established.
+  - `udp_ipv6_flow_classification` — IPv6 UDP flow key extraction.
+  - `idle_tcp_flow_evicted_after_timeout` — flow evicted after max_age, not before.
+  - `active_flow_refreshes_idle_timer` — traffic resets the idle timer.
+  - `concurrent_flows_no_cross_contamination` — 20 concurrent TCP connections (multi_thread runtime), 40 flows total (20 fwd + 20 rev), each tracked independently.
+  - `end_to_end_packet_to_flow_through_mock_device` — full pipeline: MockPacketDevice → read_packet → parse_transport → flow_key → FlowTable.process_packet.
+
+- Fixed two bugs found during testing:
+  1. RST in Established went to Closing instead of Closed (because `is_teardown()` matches both FIN and RST). Fixed by checking RST first — RST always → Closed, regardless of current state.
+  2. New flows created via `process_packet` didn't process the first packet's flags (a SYN-ACK as the first packet of a reverse flow stayed in SynSent instead of transitioning to Established). Fixed by determining the initial state from the first packet's flags at creation time.
+
+Stage Summary:
+- N2.3.2 is complete: raw IP packets from the TUN boundary are now classified into tracked flows with TCP state machine + idle expiration. The frozen ShareNet stack is UNTOUCHED.
+- Dependency direction: `snp-stack` → `snp-tun` (IpPacket only). No dependency on Identity, Discovery, Route, Circuit, or Gateway.
+- Test results:
+  - `cargo test -p snp-stack`: 36 passed (26 unit + 9 integration + 1 doc-test), 0 failed, 0 ignored.
+  - `cargo test --workspace`: 531 passed (was 495; +36 new), 0 failed, 5 ignored.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+  - `cargo build -p snp-stack`: zero warnings, zero errors.
+- STOP condition met: no TCP proxy, no smoltcp, no DNS, no circuit creation, no OS routing changes. The deliverable is exactly "packet flow classification — converting raw IP packets from the kernel into tracked ShareNet flows."

@@ -26,6 +26,7 @@ members = [
     "snp-node",
     "snp-conformance",
     "snp-tun",
+    "snp-stack",
 ]
 
 [workspace.package]
@@ -87,6 +88,7 @@ snp-routing = { path = "snp-routing" }
 snp-circuit = { path = "snp-circuit" }
 snp-gateway = { path = "snp-gateway" }
 snp-civic = { path = "snp-civic" }
+snp-tun = { path = "snp-tun" }
 
 [profile.release]
 opt-level = 3

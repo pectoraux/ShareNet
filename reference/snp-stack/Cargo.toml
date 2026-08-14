@@ -1,0 +1,20 @@
+[package]
+name = "snp-stack"
+description = "ShareNet transparent networking stack — packet flow classification (N2.3.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+snp-tun.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lib]
+name = "snp_stack"
+path = "src/lib.rs"

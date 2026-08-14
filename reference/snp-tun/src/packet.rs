@@ -317,6 +317,14 @@ impl Ipv6Packet {
     }
 
     /// Returns the IPv6 next-header field (e.g. 6 = TCP, 17 = UDP, 58 = ICMPv6).
+    ///
+    /// **N2.3.1 limitation:** This is the FIRST next-header value from the
+    /// fixed 40-byte IPv6 header. If the packet has extension headers
+    /// (Hop-by-Hop=0, Routing=43, Fragment=44, Destination Options=60, etc.),
+    /// this field is the extension header type, NOT the transport protocol.
+    /// Extension header traversal is deferred to N2.3.2. Callers MUST NOT
+    /// assume `next_header() == 6` means TCP without first checking for
+    /// extension headers.
     #[must_use]
     pub fn next_header(&self) -> u8 {
         self.metadata.protocol
