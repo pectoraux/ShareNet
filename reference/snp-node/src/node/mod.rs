@@ -171,10 +171,15 @@ pub use distributed_circuit::{
 };
 pub use traffic::{
     CircuitPacket, CircuitSender, RelayForwardingTable, TrafficError, UnwrappedPacket,
-    wrap_packet_for_testing, unwrap_final,
+    unwrap_final,
     MAX_PLAINTEXT_PAYLOAD_BYTES, MAX_WIRE_PAYLOAD_BYTES, AEAD_TAG_BYTES,
     REPLAY_WINDOW_SIZE, PACKET_TTL_MAX, FIRST_PACKET_SEQ, MAX_PACKET_SEQUENCE,
 };
+// N2.3 P0: wrap_packet_for_testing is feature-gated behind `test-utils`. It is
+// physically absent from normal production builds — an external crate cannot
+// call it. Only compiled when the feature is enabled (integration tests).
+#[cfg(feature = "test-utils")]
+pub use traffic::wrap_packet_for_testing;
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
     GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,

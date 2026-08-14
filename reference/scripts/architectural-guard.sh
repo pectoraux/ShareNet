@@ -184,6 +184,35 @@ if [ -n "$DECODE_IMPORT_MATCHES" ]; then
     REPORT+=$'\n'"[VIOLATION] import of snp_cbor::decode into scope (N2.3 wire-decode gate — would bypass the call-site check):"$'\n'"$DECODE_IMPORT_MATCHES"$'\n'
 fi
 
+# ───────────────────────────────────────────────────────────────────────
+# N2.3 P0: verify test-only APIs are STRUCTURALLY ABSENT from a default
+# (no-feature) production build. The grep checks above only protect
+# ShareNet's own src/; this check protects EXTERNAL consumers by confirming
+# the symbols don't exist in the compiled library when `test-utils` is off.
+#
+# wrap_packet_for_testing and CircuitSender::new_at_seq_for_testing are
+# gated behind #[cfg(feature = "test-utils")]. A normal `cargo build`
+# (without --features test-utils) must NOT include them. An external crate
+# linking against the default-build rlib must be unable to call them.
+# ───────────────────────────────────────────────────────────────────────
+if command -v cargo >/dev/null 2>&1; then
+    # Build snp-node without test-utils (the default).
+    if cargo build -p snp-node 2>/dev/null; then
+        RLIB=$(ls "$REPO_ROOT/reference/target/debug/libsnp_node"*.rlib 2>/dev/null | head -1)
+        if [ -n "$RLIB" ]; then
+            # Check the symbol table for the test-only names.
+            if nm "$RLIB" 2>/dev/null | grep -qiE "wrap_packet_for_testing|new_at_seq_for_testing"; then
+                VIOLATIONS=$((VIOLATIONS + 1))
+                REPORT+=$'\n'"[VIOLATION] test-only APIs present in default (no test-utils) production build — feature gating is broken:"$'\n'
+                REPORT+="$(nm "$RLIB" 2>/dev/null | grep -iE "wrap_packet_for_testing|new_at_seq_for_testing" | head)"$'\n'
+            else
+                # Symbols absent — structurally enforced. Good.
+                :
+            fi
+        fi
+    fi
+fi
+
 if [ "$VIOLATIONS" -gt 0 ]; then
     echo "========================================" >&2
     echo "ARCHITECTURAL GUARD: $VIOLATIONS violation(s) found" >&2

@@ -21,6 +21,15 @@ legacy-demo = []
 # does NOT enable this feature — the old APIs are physically absent from
 # the production binary.
 legacy-circuit-keys = []
+# N2.3: Expose test-only APIs that bypass the circuit-owned sequence
+# allocator (wrap_packet_for_testing, CircuitSender::new_at_seq_for_testing).
+# These are physically ABSENT from normal production builds (`cargo build`)
+# — an external crate cannot call them. Integration tests enable this via
+# the [dev-dependencies] self-reference below, which always turns the
+# feature on for `cargo test`. The PRODUCTION BINARY MUST NOT enable this
+# feature; the architectural guard verifies the symbols are absent from a
+# default-feature build.
+test-utils = []
 
 [[bin]]
 name = "snp-node"
@@ -44,6 +53,10 @@ tokio.workspace = true
 getrandom = "0.2"
 
 [dev-dependencies]
+# Self-reference so integration tests (tests/*.rs) always compile against
+# the test-utils feature. This does NOT affect downstream crates that depend
+# on snp-node — they only get test-utils if they explicitly request it.
+snp-node = { path = ".", features = ["test-utils"] }
 serde_json.workspace = true
 url.workspace = true
 

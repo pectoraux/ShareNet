@@ -703,8 +703,14 @@ pub(crate) fn wrap_packet(
 /// with explicit sequence numbers to exercise adversarial scenarios (replay,
 /// stale, TTL tampering, etc.).
 ///
-/// Forbidden in production source (enforced by the architectural guard
-/// script, same pattern as the topology graph's testing-only constructor).
+/// # Feature-gated (P0: structurally absent from production)
+///
+/// This function is ONLY compiled when the `test-utils` Cargo feature is
+/// enabled. A normal production build (`cargo build`) does NOT enable
+/// `test-utils`, so this symbol is physically absent from the production
+/// binary — an external crate cannot call it. Integration tests enable the
+/// feature via the `[dev-dependencies]` self-reference in `Cargo.toml`.
+#[cfg(feature = "test-utils")]
 pub fn wrap_packet_for_testing(
     hops: &[crate::node::circuit_handshake::HopForwardingState],
     circuit_id: &[u8; 32],
@@ -845,9 +851,15 @@ impl CircuitSender {
 
     /// Test-only constructor that starts the sender at a specific `next_seq`,
     /// so tests can exercise the exhaustion boundary without sending ~4
-    /// billion packets. Forbidden in production source (enforced by the
-    /// architectural guard script, same pattern as the topology graph's
-    /// testing-only constructor).
+    /// billion packets.
+    ///
+    /// # Feature-gated (P0: structurally absent from production)
+    ///
+    /// This function is ONLY compiled when the `test-utils` Cargo feature is
+    /// enabled. A normal production build does NOT expose it — an external
+    /// crate cannot call `CircuitSender::new_at_seq_for_testing`. Integration
+    /// tests enable the feature via `[dev-dependencies]`.
+    #[cfg(feature = "test-utils")]
     pub fn new_at_seq_for_testing(
         circuit_id: [u8; 32],
         hops: Vec<crate::node::circuit_handshake::HopForwardingState>,

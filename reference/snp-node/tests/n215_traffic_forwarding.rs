@@ -1266,3 +1266,35 @@ fn failed_max_sequence_send_does_not_exhaust_circuit() {
     assert!(sender.is_exhausted(), "circuit is exhausted only after a successful u32::MAX packet");
     assert_eq!(sender.peek_next_seq(), None);
 }
+
+// ─── P0: test-only APIs are structurally absent from production builds ────
+
+/// P0: `wrap_packet_for_testing` and `CircuitSender::new_at_seq_for_testing`
+/// are feature-gated behind `test-utils`. They are physically absent from a
+/// normal production build (`cargo build` without `--features test-utils`),
+/// so an external crate cannot call them to bypass `CircuitSender` and reuse
+/// AEAD nonces.
+///
+/// This test verifies the symbols EXIST when `test-utils` is enabled (which
+/// it is for `cargo test` via the `[dev-dependencies]` self-reference). The
+/// complementary check — that the symbols are ABSENT without the feature — is
+/// performed by the architectural guard script, which builds snp-node without
+/// `test-utils` and greps the symbol table for the test-only names.
+#[test]
+fn test_only_apis_exist_under_test_utils_feature() {
+    // These compile only because test-utils is enabled for tests.
+    let ts = setup();
+    let _ = wrap_packet_for_testing(
+        ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
+        1, &ts.gateway_id, b"feature-gated",
+    ).unwrap();
+    let _sender = CircuitSender::new_at_seq_for_testing(
+        ts.circuit_handshake.circuit_id,
+        ts.circuit_setup.hops().to_vec(),
+        ts.gateway_id,
+        1,
+    );
+    // If this test compiles, the test-utils feature is correctly enabled for
+    // the test crate. The architectural guard verifies the symbols are absent
+    // from a default (no-feature) production build.
+}
