@@ -93,11 +93,16 @@
 #![warn(clippy::all)]
 #![allow(clippy::pedantic)]
 
+pub mod dns;
 pub mod flow_table;
 pub mod smol_device;
 pub mod tcp_engine;
 pub mod transport;
 
+pub use dns::{
+    intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
+    DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,
+};
 pub use flow_table::{FlowEntry, FlowState, FlowTable, TcpState, UdpState};
 pub use tcp_engine::{TcpEngine, TcpEngineError};
 pub use transport::{

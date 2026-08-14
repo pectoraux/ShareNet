@@ -7093,3 +7093,58 @@ Stage Summary:
   - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
   - `cargo build -p snp-stack`: zero warnings, zero errors.
 - STOP condition met: no DNS, no HTTPS/HTTP proxy, no circuit creation, no gateway changes, no Internet forwarding. The deliverable is exactly "TCP socket emulation through TUN — the TCP/IP engine boundary is proven."
+
+---
+Task ID: N2.3.4
+Agent: Z.ai Code (main)
+Task: Implement DNS interception foundation — parse DNS queries (transaction ID, QNAME, QTYPE, QCLASS), generate synthetic responses (A, AAAA, NXDOMAIN), intercept UDP/53 packets and return synthetic responses. No gateway DNS forwarding, DoH, DoT, caching, or DNSSEC.
+
+Work Log:
+- Created `snp-stack/src/dns.rs` — DNS parsing, response generation, and interception:
+  - `DnsQtype` enum (A=1, Aaaa=28, Cname=5, Mx=15, Txt=16, Ns=2, Soa=6, Ptr=12, Srv=33, Any=255) with `from_u16()`.
+  - `DnsQclass` enum (IN=1, CH=3, HS=4, Any=255) with `from_u16()`.
+  - `DnsQuestion` struct (qname, qtype, qclass).
+  - `DnsQuery` struct (transaction_id, flags, questions) with `is_query()`, `recursion_desired()`, `first_question()`.
+  - `parse_dns_query(data) -> Result<DnsQuery, DnsError>` — parses the 12-byte header (transaction ID, flags, QDCOUNT), then parses each question (QNAME + QTYPE + QCLASS). Validates: min 12 bytes, QNAME label lengths, no compression pointers in QNAME.
+  - `parse_qname(data, offset) -> Result<(String, usize), DnsError>` — parses label-length-prefixed QNAME, returns domain string + offset past QNAME.
+  - `encode_qname(name) -> Vec<u8>` — encodes a domain name into wire format (for tests + response building).
+  - `DnsResponse` struct with `build_a_response()`, `build_aaaa_response()`, `build_nxdomain_response()` — generate full DNS response packets with correct header (QR=1, RD copied, RCODE), question section (copied from query via pointer 0xC00C), and answer section (TYPE, CLASS, TTL=300s, RDLENGTH, RDATA).
+  - `DnsResolver` struct — holds `HashMap<String, IpAddr>` (case-insensitive). `add_mapping()`, `resolve()`, `resolve_query()`, `with_mappings()`, `mapping_count()`. resolve_query dispatches on QTYPE: A→IPv4 response, AAAA→IPv6 response, A with only IPv6→NXDOMAIN, AAAA with only IPv4→NXDOMAIN, unmapped→NXDOMAIN, unsupported QTYPE→NXDOMAIN.
+  - `is_dns_query(packet) -> Result<bool, TransportError>` — quick detection (UDP, dst_port==53).
+  - `extract_dns_payload(packet) -> Option<&[u8]>` — extracts the UDP payload (after the 8-byte UDP header) from a DNS query packet.
+  - `extract_question_bytes(dns_payload) -> Result<Vec<u8>, DnsError>` — extracts the raw question section bytes (for copying into the response).
+  - `intercept_dns_query(packet, resolver) -> Result<Option<Vec<u8>>, DnsError>` — THE KEY FUNCTION. Extracts DNS payload, parses the query, resolves via the resolver, generates a synthetic response, and builds a complete IP+UDP response packet (swapped src/dst IP, swapped src/dst port, DNS response as UDP payload). Returns `None` for non-DNS packets.
+  - `build_udp_response_packet()`, `build_ipv4_udp_packet()`, `build_ipv6_udp_packet()` — internal helpers for constructing the response IP packet.
+  - `DnsError` enum: TooShort, MalformedQname, TruncatedQuestions, UnknownTypeClass.
+  - 15 unit tests: parse A/AAAA queries, too-short packet, empty QNAME, multi-label QNAME, A response, AAAA response, NXDOMAIN, A-with-only-IPv6→NXDOMAIN, case-insensitive, is_dns_query detection (port 53 vs 80), intercept returns response packet, intercept returns None for non-DNS, intercept IPv6, response payload extraction.
+
+- Updated `snp-stack/src/lib.rs`:
+  - Added DNS Ownership Invariant documentation (extends Flow Ownership Invariant): "TCP flows: smoltcp owns transport behavior. UDP DNS flows: DNS subsystem (DnsResolver) owns resolution behavior. FlowTable: observes only — never resolves, never generates DNS responses."
+  - Added `pub mod dns;` and re-exports for `intercept_dns_query`, `is_dns_query`, `parse_dns_query`, `DnsError`, `DnsQclass`, `DnsQuestion`, `DnsQuery`, `DnsQtype`, `DnsResolver`, `DnsResponse`, `DNS_PORT`.
+
+- Created `snp-stack/tests/dns_interception.rs` — 17 integration tests:
+  - `parse_dns_query_a_record`, `parse_dns_query_aaaa_record`, `parse_dns_query_multi_label` — query parsing.
+  - `is_dns_query_detects_udp_53`, `is_dns_query_rejects_non_53_port` — detection.
+  - `dns_a_response_has_correct_ip` — A query → response with correct IPv4 in RDATA.
+  - `dns_aaaa_response_has_correct_ipv6` — AAAA query → response with correct IPv6.
+  - `dns_nxdomain_for_unmapped_domain` — unmapped → RCODE=3, 0 answers.
+  - `dns_a_query_with_only_ipv6_mapping_returns_nxdomain` — A query, only IPv6 mapping → NXDOMAIN.
+  - `dns_response_transaction_id_matches_query` — transaction ID echoed.
+  - `dns_response_swaps_src_dst_ports` — response src_port=53, dst_port=client's source.
+  - `dns_intercept_ipv6_query` — full IPv6 DNS interception (swapped IPv6 addresses, AAAA response).
+  - `dns_resolution_is_case_insensitive` — "Example.COM" mapping resolves "example.com".
+  - `dns_resolver_multiple_mappings` — 3 mappings (2×IPv4, 1×IPv6), all resolve correctly.
+  - `intercept_returns_none_for_non_dns_packet` — port 80 UDP → None.
+  - `intercept_returns_none_for_tcp_packet` — TCP → None.
+  - `end_to_end_dns_interception_pipeline` — THE ACCEPTANCE TEST: build DNS query IP packet → intercept → get response IP packet → parse → verify swapped addresses, correct transaction ID, QR=1, RCODE=0, 1 answer, RDATA=10.0.0.100.
+
+Stage Summary:
+- N2.3.4 is complete: DNS interception foundation is implemented. DNS queries (UDP/53) are parsed, resolved via a configurable DnsResolver, and synthetic responses (A/AAAA/NXDOMAIN) are generated as complete IP packets ready to write back to the TUN.
+- The DNS Ownership Invariant is documented and frozen: FlowTable is observational only, DNS resolution belongs to the DnsResolver subsystem.
+- The frozen ShareNet stack (Identity, Discovery, Route, Circuit, Gateway, Internet) is UNTOUCHED. `snp-stack` depends only on `snp-tun` and `smoltcp`.
+- Test results:
+  - `cargo test -p snp-stack`: 80 passed (49 unit [26 N2.3.2 + 4 smol_device + 4 tcp_engine + 15 DNS] + 17 DNS integration + 9 flow classification + 5 TCP handshake), 0 failed, 0 ignored.
+  - `cargo test --workspace`: 575 passed (was 543; +32 new), 0 failed, 5 ignored.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+  - `cargo build -p snp-stack`: zero warnings, zero errors.
+- STOP condition met: no gateway DNS forwarding, no DoH/DoT, no caching, no DNSSEC, no recursive resolution. The deliverable is exactly "DNS interception foundation — parse DNS queries, generate synthetic responses, intercept UDP/53 packets."
