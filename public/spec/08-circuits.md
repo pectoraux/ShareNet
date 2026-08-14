@@ -383,3 +383,240 @@ Each AEAD layer appends a 16-byte tag, so a multi-hop packet's wire payload exce
 - TCP connection migration / route recovery (N2.1.4+, spec §39).
 - Flow control / congestion (transport layer).
 - Android VPN, TUN, Civic Points, crypto services.
+
+---
+
+## N2.4 — Bidirectional Circuit Traffic & Flow Lifecycle
+
+**Status: SPECIFICATION (frozen before implementation per spec-first rule)**
+
+N2.4 makes an `ActiveCircuit` a genuinely bidirectional authenticated transport channel. N2.3 proved forward traffic (A→B→C→G); N2.4 proves reverse traffic (G→C→B→A) over the same circuit, with independent sequence namespaces, replay windows, and per-hop authentication for each direction.
+
+The objective is NOT Internet access. The objective is to establish a bidirectional secure transport primitive suitable for a future Internet gateway.
+
+### Traffic direction
+
+Traffic direction is cryptographically explicit in the packet and bound into the AEAD AAD. A forward packet MUST NOT be valid as a reverse packet, and vice versa.
+
+```text
+TrafficDirection = Forward | Reverse
+```
+
+- **Forward**: A → B → C → G (source to gateway). The source creates nested AEAD layers (onion-wrap); each relay peels one layer (decrypt).
+- **Reverse**: G → C → B → A (gateway to source). Each relay **adds** one AEAD layer (encrypt) as the packet passes through; the source peels all layers (decrypt) to recover plaintext. This is the Tor reverse model — relays do not need to know each other's keys.
+
+### Packet model
+
+```text
+CircuitPacket = {
+  circuitId : bstr .size 32,   ; the circuit this packet belongs to
+  direction : uint,             ; 0 = Forward, 1 = Reverse
+  flowId    : bstr .size 8,     ; logical traffic flow identifier
+  seq       : uint,             ; per-circuit-per-direction sequence (starts at 1)
+  ttl       : uint,              ; hop budget, decremented per relay, drop at 0
+  payload   : bstr,              ; sealed (AEAD) bytes
+  finalDst  : bstr .size 32,    ; terminal destination (gateway for forward, source for reverse)
+}
+```
+
+### AEAD AAD (normative)
+
+The AAD for each hop's AEAD layer is:
+
+```text
+AAD = "SNP/0.1/circuit/packet" ‖ circuit_id ‖ direction ‖ flow_id ‖ seq(BE) ‖ ttl ‖ final_dst
+```
+
+where:
+- `"SNP/0.1/circuit/packet"` is a domain-separation prefix preventing cross-protocol confusion.
+- `direction` is a single byte (0 or 1) — cryptographically binds the packet to its direction.
+- `flow_id` is 8 bytes — binds the packet to a logical flow.
+- `ttl` is the hop-local TTL for the relay processing this layer.
+- `final_dst` is the terminal destination.
+
+An attacker who modifies `direction`, `flow_id`, `circuit_id`, `seq`, `ttl`, or `final_dst` in transit breaks AEAD.
+
+### Forward direction (A → B → C → G)
+
+Unchanged from N2.3. The source creates nested AEAD layers, one per non-source hop (including the terminal gateway), in reverse traversal order. Each relay peels one layer.
+
+### Reverse direction (G → C → B → A)
+
+The gateway (G) originates reverse traffic. The relay model is **add-layer** (Tor reverse): each relay encrypts the packet with its own key as it passes through, adding one AEAD layer. The source (A) peels all layers to recover the plaintext.
+
+```text
+G sends:
+  inner = plaintext (for A)
+  packet = { circuit_id, direction=Reverse, flow_id, seq, ttl=PACKET_TTL_MAX, payload=inner, final_dst=A }
+
+G → C:  C ADDS a layer: payload = AEAD_seal(key_C, nonce, packet.payload, aad)
+         ttl decremented
+         forwards to B
+
+C → B:  B ADDS a layer: payload = AEAD_seal(key_B, nonce, packet.payload, aad)
+         ttl decremented
+         forwards to A
+
+A receives:
+  peels key_B: AEAD_open(key_B, nonce, payload, aad) → inner_B
+  peels key_C: AEAD_open(key_C, nonce, inner_B, aad) → plaintext
+  delivers locally
+```
+
+**General invariant:** In reverse, each relay ADDS one AEAD layer (encrypt). The source PEELS all layers (decrypt). The relay does NOT need to know other relays' keys — it only uses its own `forwarding_key`.
+
+### Sequence model
+
+Each direction has an **independent** sequence namespace:
+
+```text
+Forward:  A allocates seq 1, 2, 3, ...   (source-owned)
+Reverse:  G allocates seq 1, 2, 3, ...   (gateway-owned)
+```
+
+- `FIRST_PACKET_SEQ = 1` (same as N2.3).
+- `seq = 0` is invalid (same as N2.3).
+- `u32::MAX` = exhaustion, no wrap (same as N2.3).
+- Forward seq and reverse seq are **completely independent** — forward seq=1 does not affect reverse seq=1.
+- Each direction's allocator is circuit-owned and non-Clone (same ownership model as N2.3).
+
+### Replay protection
+
+Each direction has an **independent** replay window:
+
+```text
+Forward replay window:  per relay, for forward packets
+Reverse replay window:  per relay, for reverse packets
+```
+
+- A forward seq MUST NOT mutate the reverse replay window.
+- A reverse seq MUST NOT mutate the forward replay window.
+- The check-before-AEAD / commit-after-AEAD ordering is preserved for both directions.
+- The O(WINDOW) update algorithm is preserved for both directions.
+
+### Relay state model
+
+The relay's forwarding state is refactored to support both directions:
+
+```text
+CircuitDirectionState {
+    ingress_peer   : [u8; 32]     ; who sends to this relay (in this direction)
+    egress_peer    : Option<[u8;32]> ; who this relay forwards to (None = terminal)
+    forwarding_key : SymmetricKey   ; the DH-derived AEAD key (same for both directions)
+    replay_window  : CircuitReplayWindow ; independent per direction
+}
+
+RelayForwardingState {
+    circuit_id     : [u8; 32]
+    forward_state  : CircuitDirectionState  ; ingress=predecessor, egress=successor
+    reverse_state  : CircuitDirectionState  ; ingress=successor, egress=predecessor
+    role           : RouteRole               ; Relay or Gateway
+    expires_at     : u64                     ; from signed handshake.expiry
+}
+```
+
+For forward traffic:
+- `ingress = predecessor`, `egress = successor`
+- Relay peels one AEAD layer (decrypt).
+
+For reverse traffic:
+- `ingress = successor`, `egress = predecessor`
+- Relay adds one AEAD layer (encrypt).
+
+The `forwarding_key` is the SAME for both directions (one DH-derived key per relay). The direction is bound via the AAD, not via separate keys.
+
+### Flow identity
+
+A `flow_id` (8 bytes) distinguishes logical traffic flows on one circuit. A circuit is NOT synonymous with one application connection.
+
+For N2.4:
+- `flow_id` is cryptographically bound in the AAD.
+- A relay validates that the `flow_id` matches a known flow on the circuit.
+- Flow multiplexing (multiple simultaneous streams) is deferred — N2.4 only requires one default flow.
+- Do NOT implement TCP stream multiplexing or application protocols.
+
+### Flow lifecycle
+
+```text
+Flow states:
+    OPEN      — flow initiated, not yet active
+    ACTIVE    — flow is carrying traffic
+    CLOSING   — flow is shutting down (graceful)
+    CLOSED    — flow is terminated
+
+Circuit states (unchanged from N2.3):
+    ACTIVE    — circuit is established
+    EXPIRED   — circuit has passed expires_at
+    TORN_DOWN — teardown received
+```
+
+Circuit lifecycle and flow lifecycle are NOT conflated. A circuit can carry multiple flows over its lifetime. When a circuit is torn down, all flows are implicitly closed.
+
+### TTL semantics
+
+Reverse traffic gets its own per-hop TTL authentication. For G → C → B → A:
+- G sends with `ttl = PACKET_TTL_MAX`.
+- C sees `ttl = PACKET_TTL_MAX`, decrements to `PACKET_TTL_MAX - 1` before forwarding.
+- B sees `ttl = PACKET_TTL_MAX - 1`, decrements to `PACKET_TTL_MAX - 2` before forwarding.
+- Each layer authenticates the hop-local TTL the relay sees.
+
+The TTL is authenticated per-hop in the AAD (same model as N2.3, applied to both directions).
+
+### Circuit expiration
+
+Both directions enforce circuit expiration:
+- Forward: `ActiveCircuit::send_packet(plaintext, now)` checks `is_expired(now)`.
+- Reverse: the relay's `forward_packet` checks `now >= state.expires_at` for both directions.
+- Boundary: `now >= expires_at → CircuitExpired` (same as N2.3).
+
+### Teardown
+
+Teardown removes the circuit's forwarding state from the relay table. After teardown, packets for that circuit are rejected in BOTH directions.
+
+### N2.4 acceptance tests
+
+```text
+1.  forward_packet_traverses_A_B_C_G
+2.  reverse_packet_traverses_G_C_B_A
+3.  bidirectional_circuit_supports_simultaneous_forward_reverse
+4.  forward_packet_cannot_be_used_as_reverse_packet
+5.  reverse_packet_cannot_be_used_as_forward_packet
+6.  forward_replay_state_does_not_affect_reverse
+7.  reverse_replay_state_does_not_affect_forward
+8.  reverse_sequence_starts_at_one
+9.  reverse_sequence_exhaustion_fails_closed
+10. reverse_ttl_tampering_rejected
+11. reverse_predecessor_mismatch_rejected
+12. reverse_successor_is_authoritative
+13. reverse_packet_wrong_circuit_rejected
+14. reverse_packet_wrong_flow_rejected
+15. expired_circuit_rejects_both_directions
+16. teardown_blocks_both_directions
+17. malformed_reverse_packet_fails_closed
+18. oversized_reverse_packet_rejected_before_allocation
+19. A_B_C_G_bidirectional_round_trip
+20. three_hop_bidirectional_round_trip
+```
+
+#### Critical integration test
+
+Using the same `ActiveCircuit`:
+
+```text
+A sends "hello"  →  B → C → G  →  G receives "hello"
+G sends "world"  →  C → B → A  →  A receives "world"
+```
+
+No direct A↔G connection. No special reverse channel. No application modification.
+
+### NOT in N2.4 (deferred)
+
+- Internet gateway egress (N2.6).
+- SOCKS / HTTP proxy (N2.7).
+- TUN/VPN (N2.8).
+- Android VPNService (N2.9).
+- TCP connection migration (N2.5).
+- Route recovery (N2.5).
+- Congestion control / flow control (transport layer).
+- Civic Points, cryptocurrency, content transfer, UI.
+- TCP stream multiplexing (flow_id is cryptographic binding only in N2.4).

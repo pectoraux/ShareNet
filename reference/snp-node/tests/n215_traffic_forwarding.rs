@@ -47,6 +47,18 @@ use snp_node::node::{
     validate_path, wrap_packet_for_testing,
 };
 
+// N2.4: Test helper that wraps wrap_packet_for_testing with the default flow_id,
+// so existing N2.3 tests don't need to change their call signature.
+fn wrap_test(
+    hops: &[snp_node::node::HopForwardingState],
+    circuit_id: &[u8; 32],
+    seq: u32,
+    final_dst: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<snp_node::node::CircuitPacket, TrafficError> {
+    wrap_packet_for_testing(hops, circuit_id, seq, final_dst, &snp_node::node::DEFAULT_FLOW_ID, plaintext)
+}
+
 // ─── Test helpers (mirrors n214's setup, adapted for N2.3 traffic) ─────────
 
 fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
@@ -172,7 +184,7 @@ fn setup() -> TestSetup {
     let circuit_setup = prepare_circuit_setup(&committed_route, &circuit_handshake, &ephemeral_secret).unwrap();
 
     // NOTE: N2.3 traffic forwarding does not require a live ActiveCircuit
-    // object on the source side. wrap_packet_for_testing() uses circuit_setup.hops()
+    // object on the source side. wrap_test() uses circuit_setup.hops()
     // (the per-hop forwarding keys), which is identical to
     // active_circuit.hops(). The relay-side state is installed by
     // install_relay_state() in each test, which calls accept_relay_handshake
@@ -284,7 +296,7 @@ fn end_to_end_packet_traversal_a_b_g() {
 
     // Source A wraps the plaintext. The hops include A (hop 0, no key), B, G.
     let plaintext = b"hello gateway, this is the secret app payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         ts.circuit_setup.hops(),
         &ts.circuit_handshake.circuit_id,
         1, // seq
@@ -337,7 +349,7 @@ fn live_circuit() -> LiveCircuit {
 fn unknown_circuit_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -355,7 +367,7 @@ fn unknown_circuit_rejected() {
 fn predecessor_mismatch_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -371,7 +383,7 @@ fn predecessor_mismatch_rejected() {
 fn packet_replay_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -390,13 +402,13 @@ fn stale_sequence_rejected() {
     let plaintext = b"payload".to_vec();
     // Send a high seq first (advances max_seen well past the window).
     let high_seq = snp_node::node::REPLAY_WINDOW_SIZE + 20;
-    let p_high = wrap_packet_for_testing(
+    let p_high = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         high_seq, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
     let _ = lc.table_b.forward_packet(&p_high, &lc.ts.source_id, now_unix()).unwrap();
     // Now send seq=5 — far behind max_seen (distance >> window) → stale.
-    let p_stale = wrap_packet_for_testing(
+    let p_stale = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         5, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -410,7 +422,7 @@ fn stale_sequence_rejected() {
 fn ttl_exhausted_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -429,7 +441,7 @@ fn cross_circuit_injection_rejected() {
     let mut lc2 = live_circuit();
     let plaintext = b"secret for circuit 1".to_vec();
     // Wrap a packet for circuit 1.
-    let packet1 = wrap_packet_for_testing(
+    let packet1 = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -446,7 +458,7 @@ fn cross_circuit_injection_rejected() {
 fn tampered_payload_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -463,7 +475,7 @@ fn tampered_payload_rejected() {
 fn destination_substitution_rejected() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -479,7 +491,7 @@ fn destination_substitution_rejected() {
 fn teardown_blocks_new_traffic() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -499,7 +511,7 @@ fn teardown_blocks_new_traffic() {
     assert!(!table_b.has_circuit(&lc.ts.circuit_handshake.circuit_id));
 
     // A fresh packet (new seq, to avoid replay) is now rejected.
-    let packet2 = wrap_packet_for_testing(
+    let packet2 = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         2, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -513,7 +525,7 @@ fn teardown_blocks_new_traffic() {
 fn oversized_payload_rejected() {
     let mut lc = live_circuit();
     let big = vec![0u8; MAX_PLAINTEXT_PAYLOAD_BYTES + 1];
-    let result = wrap_packet_for_testing(
+    let result = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &big,
     );
@@ -565,7 +577,7 @@ fn malformed_wire_rejected() {
 fn packet_wire_round_trip() {
     let mut lc = live_circuit();
     let plaintext = b"round trip payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         42, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -598,7 +610,7 @@ fn forwarding_state_cleanup_deterministic() {
 fn relay_does_not_inspect_payload() {
     let mut lc = live_circuit();
     let plaintext = b"plaintext that B must not see".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -621,7 +633,7 @@ fn hop_skip_rejected() {
     let plaintext = b"trying to skip B".to_vec();
     // Wrap a packet with BOTH layers (B and G). Send it DIRECTLY to G,
     // skipping B. G tries to peel with G's key, but the outer layer is B's.
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -638,7 +650,7 @@ fn multi_packet_sequence_traverses() {
     let mut lc = live_circuit();
     for seq in 1..=3u32 {
         let plaintext = format!("packet {seq}").into_bytes();
-        let packet = wrap_packet_for_testing(
+        let packet = wrap_test(
             lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
             seq, &lc.ts.gateway_id, &plaintext,
         ).unwrap();
@@ -678,7 +690,7 @@ fn invalid_packet_does_not_advance_replay_window() {
     let plaintext = b"legitimate payload".to_vec();
 
     // 1. Valid seq=1 → accepted, replay window commits seq=1.
-    let p1 = wrap_packet_for_testing(
+    let p1 = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -688,7 +700,7 @@ fn invalid_packet_does_not_advance_replay_window() {
     // 2. Forged packet: seq=1000 (would advance max_seen under the old bug),
     //    but with garbage payload → AEAD must fail → PacketUnauthentic.
     //    Critically, the replay window must NOT advance.
-    let mut forged = wrap_packet_for_testing(
+    let mut forged = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1000, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -702,7 +714,7 @@ fn invalid_packet_does_not_advance_replay_window() {
 
     // 3. Valid seq=2 → MUST still be accepted. Under the old bug, max_seen
     //    would have advanced to 1000 (step 2), making seq=2 stale and rejected.
-    let p2 = wrap_packet_for_testing(
+    let p2 = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         2, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -863,7 +875,7 @@ fn three_hop_traversal_a_b_c_g() {
 
     // Source A wraps the plaintext into 3 nested AEAD layers (B, C, G).
     let plaintext = b"three-hop secret payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         1, &ts.gateway_id, &plaintext,
     ).unwrap();
@@ -922,7 +934,7 @@ fn ttl_tampering_rejected() {
     );
 
     let plaintext = b"ttl-tamper test".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         1, &ts.gateway_id, &plaintext,
     ).unwrap();
@@ -972,7 +984,7 @@ fn forwarded_ttl_tampering_rejected() {
     );
 
     let plaintext = b"forwarded ttl-tamper".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         1, &ts.gateway_id, &plaintext,
     ).unwrap();
@@ -1090,7 +1102,7 @@ fn sequence_zero_not_valid_after_exhaustion() {
     // Construct a packet with seq=0 (the source's CircuitSender would never
     // do this, but an attacker might try). The relay must reject it.
     let plaintext = b"seq-zero attack".to_vec();
-    let mut packet = wrap_packet_for_testing(
+    let mut packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,  // legitimate seq=1 first
     ).unwrap();
@@ -1185,7 +1197,7 @@ fn circuit_sender_is_not_cloneable() {
 fn arbitrary_sequence_wrap_api_not_public() {
     // The public test-only alias is available.
     let ts = setup();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         42, &ts.gateway_id, b"test-only",
     ).unwrap();
@@ -1285,7 +1297,7 @@ fn failed_max_sequence_send_does_not_exhaust_circuit() {
 fn test_only_apis_exist_under_test_utils_feature() {
     // These compile only because test-utils is enabled for tests.
     let ts = setup();
-    let _ = wrap_packet_for_testing(
+    let _ = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         1, &ts.gateway_id, b"feature-gated",
     ).unwrap();
@@ -1735,7 +1747,7 @@ fn expired_sender_handle_rejects_send() {
 fn expired_relay_forwarding_state_rejects_packet() {
     let mut lc = live_circuit();
     let plaintext = b"payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -1756,7 +1768,7 @@ fn expired_relay_forwarding_state_rejects_packet() {
         &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
 
     // At/after expiry: forwarding rejects with CircuitExpired.
-    let packet2 = wrap_packet_for_testing(
+    let packet2 = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         2, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -1774,7 +1786,7 @@ fn packet_at_expiry_is_rejected() {
     let mut lc = live_circuit();
     let expiry = lc.ts.circuit_handshake.expiry;
     let plaintext = b"boundary".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
         1, &lc.ts.gateway_id, &plaintext,
     ).unwrap();
@@ -1809,7 +1821,7 @@ fn end_to_end_expired_circuit_rejected() {
 
     // Before expiry: A → B → G traversal works.
     let plaintext = b"pre-expiry payload".to_vec();
-    let packet = wrap_packet_for_testing(
+    let packet = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         1, &ts.gateway_id, &plaintext,
     ).unwrap();
@@ -1828,7 +1840,7 @@ fn end_to_end_expired_circuit_rejected() {
 
     // After expiry: relay B rejects with CircuitExpired.
     let expired_now = expiry + 1;
-    let packet2 = wrap_packet_for_testing(
+    let packet2 = wrap_test(
         ts.circuit_setup.hops(), &ts.circuit_handshake.circuit_id,
         2, &ts.gateway_id, &plaintext,
     ).unwrap();

@@ -1272,7 +1272,8 @@ impl ActiveCircuit {
                 circuit_id: self.circuit_id,
             });
         }
-        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.destination, plaintext)
+        // N2.4: use DEFAULT_FLOW_ID (flow multiplexing is deferred).
+        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.destination, &crate::node::traffic::DEFAULT_FLOW_ID, plaintext)
     }
 
     /// P0: the next sequence number the circuit's allocator will assign.

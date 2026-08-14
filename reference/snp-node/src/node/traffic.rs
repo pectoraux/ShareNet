@@ -166,31 +166,68 @@ pub const FIRST_PACKET_SEQ: u32 = 1;
 /// lifetime.
 pub const MAX_PACKET_SEQUENCE: u32 = u32::MAX;
 
-/// A forwarded packet on an established circuit.
+/// Default flow ID for the primary flow on a circuit (N2.4).
+/// All-zeros is the default flow when no explicit flow is opened.
+pub const DEFAULT_FLOW_ID: [u8; 8] = [0u8; 8];
+
+/// N2.4: Traffic direction — cryptographically bound in the packet + AAD.
+/// A forward packet MUST NOT be valid as a reverse packet, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrafficDirection {
+    /// Forward: source → gateway (A → B → C → G). Relay peels one AEAD layer.
+    Forward = 0,
+    /// Reverse: gateway → source (G → C → B → A). Relay adds one AEAD layer.
+    Reverse = 1,
+}
+
+impl TrafficDirection {
+    /// Encode as a single byte for the wire + AAD.
+    #[must_use]
+    pub fn as_byte(&self) -> u8 {
+        match self {
+            Self::Forward => 0,
+            Self::Reverse => 1,
+        }
+    }
+
+    /// Decode from a wire byte.
+    #[must_use]
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Forward),
+            1 => Some(Self::Reverse),
+            _ => None,
+        }
+    }
+}
+
+/// A forwarded packet on an established circuit (N2.4: bidirectional).
 ///
 /// Wire fields (CBOR map):
 /// - `circuitId` — the circuit this packet belongs to (invariant #1, #10).
-/// - `seq`       — per-circuit sequence number (invariant #4, #5).
+/// - `direction` — Forward (0) or Reverse (1) (N2.4: direction binding).
+/// - `flowId`    — 8-byte logical flow identifier (N2.4: flow binding).
+/// - `seq`       — per-circuit-per-direction sequence number (invariant #4, #5).
 /// - `ttl`       — hop budget, decremented per relay (invariant #9).
-/// - `payload`   — sealed (AEAD) bytes. For a relay, this is ONE AEAD layer
-///                 it must peel with its `forwarding_key`. For the
-///                 destination, this is the plaintext (all layers peeled).
-/// - `finalDst`  — the terminal destination NodeId (the gateway). Carried in
-///                 the clear so the last relay knows where to deliver; bound
-///                 into every AEAD layer's AAD so it cannot be substituted
-///                 (invariant #2).
+/// - `payload`   — sealed (AEAD) bytes. For forward: one layer to peel.
+///                 For reverse: payload grows as each relay adds a layer.
+/// - `finalDst`  — the terminal destination NodeId. For forward: the gateway.
+///                 For reverse: the source. Bound into every AEAD layer's AAD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitPacket {
     /// The circuit ID this packet travels on.
     pub circuit_id: [u8; 32],
-    /// Per-circuit sequence number (monotonic from the source).
+    /// N2.4: Traffic direction (Forward or Reverse).
+    pub direction: TrafficDirection,
+    /// N2.4: Logical flow identifier (8 bytes).
+    pub flow_id: [u8; 8],
+    /// Per-circuit-per-direction sequence number (monotonic from the sender).
     pub seq: u32,
     /// Time-to-live in hops. Decremented per relay; dropped at 0.
     pub ttl: u8,
-    /// Sealed payload bytes (one AEAD layer per remaining hop).
+    /// Sealed payload bytes (AEAD layers).
     pub payload: Vec<u8>,
-    /// The terminal destination NodeId (gateway). In the clear on the wire;
-    /// bound into every AEAD layer's AAD.
+    /// The terminal destination NodeId. Forward: gateway. Reverse: source.
     pub final_dst: [u8; 32],
 }
 
@@ -593,13 +630,12 @@ impl RelayForwardingTable {
         })?;
 
         // 3, 6, 13. AEAD unwrap: peel one layer with the relay's forwarding_key.
-        // The AAD binds circuit_id ‖ seq ‖ ttl ‖ final_dst. P0: ttl is now
-        // authenticated per-hop — an attacker cannot modify ttl in transit
-        // without breaking AEAD. The ttl the relay sees is the ttl the source
-        // bound into this layer at construction time (each nested layer
-        // authenticates the hop-local TTL the opening relay will see).
-        let nonce = packet_nonce(&packet.circuit_id, packet.seq);
-        let aad = packet_aad(&packet.circuit_id, packet.seq, packet.ttl, &packet.final_dst);
+        // N2.4: the AAD now binds circuit_id ‖ direction ‖ flow_id ‖ seq ‖ ttl ‖ final_dst.
+        let nonce = packet_nonce(&packet.circuit_id, packet.direction, packet.seq);
+        let aad = packet_aad(
+            &packet.circuit_id, packet.direction, &packet.flow_id,
+            packet.seq, packet.ttl, &packet.final_dst,
+        );
         let inner = aead_open(&entry.state.forwarding_key, &nonce, &packet.payload, &aad)
             .ok_or(TrafficError::PacketUnauthentic { circuit_id: packet.circuit_id })?;
 
@@ -626,6 +662,8 @@ impl RelayForwardingTable {
                 // same seq, ttl-1, payload=inner, same final_dst.
                 let forwarded = CircuitPacket {
                     circuit_id: packet.circuit_id,
+                    direction: packet.direction,
+                    flow_id: packet.flow_id,
                     seq: packet.seq,
                     ttl: packet.ttl.saturating_sub(1),
                     payload: inner,
@@ -680,6 +718,7 @@ pub(crate) fn wrap_packet(
     circuit_id: &[u8; 32],
     seq: u32,
     final_dst: &[u8; 32],
+    flow_id: &[u8; 8],
     plaintext: &[u8],
 ) -> Result<CircuitPacket, TrafficError> {
     // P1: the source rejects a plaintext that would produce a wire payload
@@ -707,7 +746,7 @@ pub(crate) fn wrap_packet(
         return Err(TrafficError::EmptyCircuit);
     }
 
-    let nonce = packet_nonce(circuit_id, seq);
+    let nonce = packet_nonce(circuit_id, TrafficDirection::Forward, seq);
 
     // P0: each nested AEAD layer authenticates the hop-local TTL the opening
     // relay will see. The first relay sees ttl = PACKET_TTL_MAX; each
@@ -715,25 +754,26 @@ pub(crate) fn wrap_packet(
     // forwarding). The source computes each hop's expected TTL at wrap time
     // and binds it into that layer's AAD.
     //
+    // N2.4: the AAD now also binds direction (Forward) and flow_id.
+    //
     // Wrap in reverse order: innermost layer is the plaintext (for the last
     // hop / gateway), outermost is for the first relay.
     let mut payload = plaintext.to_vec();
     let total_relay_hops = relay_hops.len();
     for (rev_idx, hop) in relay_hops.iter().rev().enumerate() {
-        // rev_idx == 0 → outermost layer (first relay, ttl = PACKET_TTL_MAX).
-        // rev_idx == 1 → next layer  (second relay, ttl = PACKET_TTL_MAX - 1).
-        // ... and so on. The hop at position `i` (0-indexed from the first
-        // relay) sees ttl = PACKET_TTL_MAX - i.
         let hop_position = total_relay_hops - 1 - rev_idx; // 0 for first relay
         let hop_ttl = PACKET_TTL_MAX.saturating_sub(hop_position as u8);
-        let hop_aad = packet_aad(circuit_id, seq, hop_ttl, final_dst);
-        // The source's HopForwardingState.forwarding_key for this hop equals
-        // the relay's RelayForwardingState.forwarding_key (same HKDF derivation).
+        let hop_aad = packet_aad(
+            circuit_id, TrafficDirection::Forward, flow_id,
+            seq, hop_ttl, final_dst,
+        );
         payload = aead_seal(&hop.forwarding_key, &nonce, &payload, &hop_aad);
     }
 
     Ok(CircuitPacket {
         circuit_id: *circuit_id,
+        direction: TrafficDirection::Forward,
+        flow_id: *flow_id,
         seq,
         ttl: PACKET_TTL_MAX,
         payload,
@@ -764,9 +804,10 @@ pub fn wrap_packet_for_testing(
     circuit_id: &[u8; 32],
     seq: u32,
     final_dst: &[u8; 32],
+    flow_id: &[u8; 8],
     plaintext: &[u8],
 ) -> Result<CircuitPacket, TrafficError> {
-    wrap_packet(hops, circuit_id, seq, final_dst, plaintext)
+    wrap_packet(hops, circuit_id, seq, final_dst, flow_id, plaintext)
 }
 
 // ─── Source-side: CircuitSender (circuit-owned sequence allocation) ───────
@@ -895,6 +936,7 @@ impl CircuitSeqState {
         hops: &[crate::node::circuit_handshake::HopForwardingState],
         circuit_id: &[u8; 32],
         final_dst: &[u8; 32],
+        flow_id: &[u8; 8],
         plaintext: &[u8],
     ) -> Result<CircuitPacket, TrafficError> {
         if self.exhausted {
@@ -903,7 +945,7 @@ impl CircuitSeqState {
         let candidate_seq = self.next_seq;
         // P1: construct the packet FIRST. If this fails, the allocator state
         // is NOT advanced — the same candidate_seq is offered again.
-        let packet = wrap_packet(hops, circuit_id, candidate_seq, final_dst, plaintext)?;
+        let packet = wrap_packet(hops, circuit_id, candidate_seq, final_dst, flow_id, plaintext)?;
         // P1: only NOW — after successful construction — commit the sequence.
         if candidate_seq == MAX_PACKET_SEQUENCE {
             self.exhausted = true;
@@ -1014,7 +1056,8 @@ impl<'a> CircuitSender<'a> {
         if now >= self.expires_at {
             return Err(TrafficError::CircuitExpired { circuit_id: self.circuit_id });
         }
-        self.seq_state.send_packet(self.hops, &self.circuit_id, &self.final_dst, plaintext)
+        // N2.4: use DEFAULT_FLOW_ID (flow multiplexing is deferred).
+        self.seq_state.send_packet(self.hops, &self.circuit_id, &self.final_dst, &DEFAULT_FLOW_ID, plaintext)
     }
 }
 
@@ -1076,7 +1119,7 @@ impl CircuitSenderOwnedForTesting {
 
     /// Send a packet via the owned allocator.
     pub fn send_packet(&mut self, plaintext: &[u8]) -> Result<CircuitPacket, TrafficError> {
-        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.final_dst, plaintext)
+        self.seq_state.send_packet(&self.hops, &self.circuit_id, &self.final_dst, &DEFAULT_FLOW_ID, plaintext)
     }
 
     /// Reset the allocator to a specific `next_seq` for exhaustion-boundary
@@ -1131,6 +1174,8 @@ pub fn unwrap_final(plaintext: &[u8]) -> Vec<u8> {
 
 /// CBOR map keys for CircuitPacket (canonical sort by encoded bytes).
 const PKT_KEY_CIRCUIT_ID: &str = "circuitId";
+const PKT_KEY_DIRECTION: &str = "direction";
+const PKT_KEY_FLOW_ID: &str = "flowId";
 const PKT_KEY_SEQ: &str = "seq";
 const PKT_KEY_TTL: &str = "ttl";
 const PKT_KEY_PAYLOAD: &str = "payload";
@@ -1144,6 +1189,8 @@ impl CircuitPacket {
     pub fn encode_to_cbor(&self) -> Result<Vec<u8>, TrafficError> {
         let map = CborValue::Map(vec![
             (CborValue::TextString(PKT_KEY_CIRCUIT_ID.into()), CborValue::ByteString(self.circuit_id.to_vec())),
+            (CborValue::TextString(PKT_KEY_DIRECTION.into()), CborValue::UnsignedInt(u64::from(self.direction.as_byte()))),
+            (CborValue::TextString(PKT_KEY_FLOW_ID.into()), CborValue::ByteString(self.flow_id.to_vec())),
             (CborValue::TextString(PKT_KEY_SEQ.into()), CborValue::UnsignedInt(u64::from(self.seq))),
             (CborValue::TextString(PKT_KEY_TTL.into()), CborValue::UnsignedInt(u64::from(self.ttl))),
             (CborValue::TextString(PKT_KEY_PAYLOAD.into()), CborValue::ByteString(self.payload.clone())),
@@ -1189,6 +1236,12 @@ impl CircuitPacket {
         };
         let circuit_id = map_get_fixed(&entries, PKT_KEY_CIRCUIT_ID)
             .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "circuitId missing/invalid".into() })?;
+        let direction_byte = map_get_u8(&entries, PKT_KEY_DIRECTION)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "direction missing/invalid".into() })?;
+        let direction = TrafficDirection::from_byte(direction_byte)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: format!("invalid direction byte {direction_byte}") })?;
+        let flow_id = map_get_fixed(&entries, PKT_KEY_FLOW_ID)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "flowId missing/invalid".into() })?;
         let seq = map_get_u64(&entries, PKT_KEY_SEQ)
             .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "seq missing/invalid".into() })?;
         let ttl = map_get_u8(&entries, PKT_KEY_TTL)
@@ -1212,7 +1265,7 @@ impl CircuitPacket {
         let seq = u32::try_from(seq).map_err(|_| TrafficError::WireDecodeFailed {
             reason: format!("seq {seq} out of u32 range"),
         })?;
-        Ok(Self { circuit_id, seq, ttl, payload, final_dst })
+        Ok(Self { circuit_id, direction, flow_id, seq, ttl, payload, final_dst })
     }
 }
 
@@ -1221,28 +1274,50 @@ impl CircuitPacket {
 /// Build the 12-byte AEAD nonce for a circuit packet: `circuit_id[0..8] ‖ seq(BE)`.
 ///
 /// This mirrors `snp_crypto::aead_nonce` (fid‖seq) but derives the 8-byte fid
-/// from the circuit_id's first 8 bytes, so each (circuit, seq) pair has a
-/// unique nonce. The nonce is NOT secret — it must only be unique per key.
-fn packet_nonce(circuit_id: &[u8; 32], seq: u32) -> snp_crypto::NonceBytes {
+/// from the circuit_id's first 8 bytes XORed with the direction byte, so
+/// each (circuit, direction, seq) triple has a unique nonce. The nonce is NOT
+/// secret — it must only be unique per key. Including direction in the nonce
+/// derivation ensures forward seq=1 and reverse seq=1 produce different nonces
+/// under the same key.
+fn packet_nonce(circuit_id: &[u8; 32], direction: TrafficDirection, seq: u32) -> snp_crypto::NonceBytes {
     let mut fid = [0u8; 8];
     fid.copy_from_slice(&circuit_id[..8]);
+    // XOR the direction byte into the fid so forward and reverse nonces differ.
+    fid[0] ^= direction.as_byte();
     aead_nonce(&fid, seq)
 }
 
-/// Build the AEAD AAD for a circuit packet: `circuit_id ‖ seq(BE) ‖ ttl ‖
-/// final_dst`.
+/// N2.4: Domain-separation prefix for the AEAD AAD.
+const AAD_DOMAIN: &[u8] = b"SNP/0.1/circuit/packet";
+
+/// Build the AEAD AAD for a circuit packet (N2.4: domain-separated +
+/// direction + flow_id bound).
 ///
-/// This binds the packet to its circuit, sequence, **hop-local TTL**, and
-/// destination. P0: `ttl` is now authenticated — an attacker cannot modify the
-/// TTL in transit without breaking AEAD. Each relay sees a different TTL (the
-/// predecessor decrements before forwarding), so the source binds each nested
-/// layer's AAD with the TTL that specific hop will see (see [`wrap_packet`]).
+/// ```text
+/// AAD = "SNP/0.1/circuit/packet" ‖ circuit_id ‖ direction ‖ flow_id ‖ seq(BE) ‖ ttl ‖ final_dst
+/// ```
 ///
-/// A relay substituting the circuit, seq, ttl, or destination breaks
-/// authentication (invariant #2, #6, #9).
-fn packet_aad(circuit_id: &[u8; 32], seq: u32, ttl: u8, final_dst: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(32 + 4 + 1 + 32);
+/// This binds the packet to its circuit, direction, flow, sequence,
+/// **hop-local TTL**, and destination. An attacker who modifies any of these
+/// in transit breaks AEAD.
+///
+/// N2.4 additions over N2.3:
+/// - Domain-separation prefix prevents cross-protocol confusion.
+/// - `direction` byte: a forward packet cannot be replayed as reverse.
+/// - `flow_id`: binds the packet to a logical flow.
+fn packet_aad(
+    circuit_id: &[u8; 32],
+    direction: TrafficDirection,
+    flow_id: &[u8; 8],
+    seq: u32,
+    ttl: u8,
+    final_dst: &[u8; 32],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(AAD_DOMAIN.len() + 32 + 1 + 8 + 4 + 1 + 32);
+    aad.extend_from_slice(AAD_DOMAIN);
     aad.extend_from_slice(circuit_id);
+    aad.push(direction.as_byte());
+    aad.extend_from_slice(flow_id);
     aad.extend_from_slice(&seq.to_be_bytes());
     aad.push(ttl);
     aad.extend_from_slice(final_dst);
