@@ -210,7 +210,35 @@ if command -v cargo >/dev/null 2>&1; then
                 :
             fi
         fi
+
+        # N2.3 P0: verify CircuitSeqState is NOT in the public API. An
+        # external crate must not be able to construct a second sequence
+        # allocator for an existing circuit. We attempt an external compile
+        # that imports the type — it must fail.
+        if [ -n "$RLIB" ]; then
+            cat > /tmp/check_seq_state_absent.rs <<'RUSTEOF'
+use snp_node::node::CircuitSeqState;
+fn main() { let _ = CircuitSeqState::new(); }
+RUSTEOF
+            if rustc --edition 2021 --extern snp_node="$RLIB" -L "$REPO_ROOT/reference/target/debug/deps" /tmp/check_seq_state_absent.rs -o /tmp/check_seq_state_absent 2>/dev/null; then
+                VIOLATIONS=$((VIOLATIONS + 1))
+                REPORT+=$'\n'"[VIOLATION] CircuitSeqState is publicly accessible — an external crate can construct a second sequence allocator (P0 nonce-reuse escape hatch):"$'\n'
+            else
+                # Good — the external compile failed (type is pub(crate)).
+                :
+            fi
+            rm -f /tmp/check_seq_state_absent.rs /tmp/check_seq_state_absent 2>/dev/null
+        fi
     fi
+fi
+
+# N2.3 P0: grep guard — CircuitSeqState must NOT be re-exported from mod.rs
+# (it's pub(crate); re-exporting it would make it public).
+matches=$(grep -rn "pub use.*CircuitSeqState\|CircuitSeqState," "$SRC_DIR/node/mod.rs" --include="*.rs" \
+    || true)
+if [ -n "$matches" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT+=$'\n'"[VIOLATION] CircuitSeqState re-exported from mod.rs (must be pub(crate) only):"$'\n'"$matches"$'\n'
 fi
 
 if [ "$VIOLATIONS" -gt 0 ]; then

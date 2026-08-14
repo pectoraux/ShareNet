@@ -1563,3 +1563,62 @@ fn circuit_seq_state_is_not_cloneable() {
     // There is no way to clone the CircuitSeqState to get a second allocator
     // at next_seq=2 — Clone is absent.
 }
+
+// ─── P0: CircuitSeqState is not a public production type ──────────────────
+
+/// P0: `CircuitSeqState` is `pub(crate)` — not accessible to external crates.
+/// An external caller cannot construct a second allocator for an existing
+/// circuit (which would cause AEAD nonce reuse). This test documents the
+/// invariant: the only production sequence-allocation path is
+/// `ActiveCircuit::send_packet()` / `ActiveCircuit::sender()`.
+///
+/// The complementary compile-time check — that `use snp_node::node::CircuitSeqState`
+/// fails in an external crate — is verified by the architectural guard's
+/// structural external-build check. This test confirms the production path
+/// (ActiveCircuit-owned allocator) works correctly.
+#[test]
+fn circuit_seq_state_is_not_publicly_constructible() {
+    // This test does NOT import CircuitSeqState — it's pub(crate), so the
+    // test crate (which links against snp-node as an external crate) cannot
+    // name the type. The only way to send packets is via ActiveCircuit.
+    //
+    // (If CircuitSeqState were ever re-exported from node/mod.rs, this test
+    // file would still compile, but the architectural guard's external
+    // compile-fail check would catch it. The test name documents the invariant.)
+    let ts = setup();
+    use std::cell::RefCell;
+    use std::collections::HashMap as StdMap;
+    struct MockRelay {
+        ed25519_sk: [u8; 32], ed25519_pk: [u8; 32],
+        x25519_sk: snp_crypto::X25519Secret, acceptance: CircuitAcceptanceStore,
+    }
+    struct MockTransport { relays: StdMap<[u8; 32], RefCell<MockRelay>> }
+    impl RelayHandshakeTransport for MockTransport {
+        fn send_handshake(&self, req: &RelayHandshakeRequest) -> Option<snp_node::node::RelayHandshakeResponse> {
+            let rid = req.authorization.relay_node_id;
+            let cell = self.relays.get(&rid)?;
+            let mut r = cell.borrow_mut();
+            let x = r.x25519_sk.clone(); let esk = r.ed25519_sk; let epk = r.ed25519_pk;
+            accept_relay_handshake(req, &x, &esk, &epk, &mut r.acceptance).ok().map(|(resp, _)| resp)
+        }
+    }
+    let mut relays = StdMap::new();
+    relays.insert(ts.relay_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.relay_sk, ed25519_pk: ts.relay_pk,
+        x25519_sk: ts.relay_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    relays.insert(ts.gateway_id, RefCell::new(MockRelay {
+        ed25519_sk: ts.gateway_sk, ed25519_pk: ts.gateway_pk,
+        x25519_sk: ts.gateway_x25519_sk.clone(), acceptance: CircuitAcceptanceStore::new(),
+    }));
+    let transport = MockTransport { relays };
+    let mut active = establish_distributed_circuit(
+        &ts.circuit_setup, &ts.circuit_handshake, &ts.committed_route,
+        &transport, &ts.ephemeral_secret, &ts.source_sk,
+    ).unwrap();
+
+    // The ONLY production path to send packets is ActiveCircuit::send_packet.
+    // There is no standalone CircuitSeqState constructor accessible here.
+    let p1 = active.send_packet(b"only path").unwrap();
+    assert_eq!(p1.seq, 1);
+}

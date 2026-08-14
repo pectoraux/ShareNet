@@ -785,8 +785,17 @@ pub fn wrap_packet_for_testing(
 /// circuit_id + forwarding keys — reusing the AEAD nonce. The allocator is
 /// created exactly once, embedded in `ActiveCircuit`, and accessed only
 /// through `ActiveCircuit::sender()` (a borrowed handle).
+///
+/// # P0: `pub(crate)` — not a public production type
+///
+/// `CircuitSeqState` is `pub(crate)` so external crates cannot construct a
+/// second allocator for an existing circuit (which would cause AEAD nonce
+/// reuse). It is NOT re-exported from `node/mod.rs`. The only production path
+/// to allocate packet sequences is `ActiveCircuit::send_packet()` or
+/// `ActiveCircuit::sender()` (a borrowed handle into the circuit-owned
+/// allocator).
 #[derive(Debug)]
-pub struct CircuitSeqState {
+pub(crate) struct CircuitSeqState {
     /// The next sequence number to assign. Starts at FIRST_PACKET_SEQ (1).
     next_seq: u32,
     /// Whether the sequence space is exhausted. Set to `true` after assigning
@@ -796,28 +805,31 @@ pub struct CircuitSeqState {
 
 impl CircuitSeqState {
     /// Create a fresh allocator starting at [`FIRST_PACKET_SEQ`] (= 1).
+    /// `pub(crate)` — only `ActiveCircuit` (in `distributed_circuit.rs`)
+    /// constructs this, at circuit establishment time.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next_seq: FIRST_PACKET_SEQ, exhausted: false }
     }
 
     /// The next sequence number that will be assigned (without sending).
-    /// Returns `None` if the sequence space is exhausted.
+    /// `pub(crate)` — accessed via `ActiveCircuit::peek_next_seq()`.
     #[must_use]
-    pub fn peek_next_seq(&self) -> Option<u32> {
+    pub(crate) fn peek_next_seq(&self) -> Option<u32> {
         if self.exhausted { None } else { Some(self.next_seq) }
     }
 
-    /// Whether the sequence space is exhausted (a circuit re-establishment is
-    /// required before further traffic).
+    /// Whether the sequence space is exhausted.
+    /// `pub(crate)` — accessed via `ActiveCircuit::is_seq_exhausted()`.
     #[must_use]
-    pub fn is_exhausted(&self) -> bool {
+    pub(crate) fn is_exhausted(&self) -> bool {
         self.exhausted
     }
 
     /// Allocate the next sequence number and wrap a plaintext into a
     /// `CircuitPacket`. Fails closed with [`TrafficError::SequenceExhausted`]
     /// once `seq == u32::MAX` has been assigned — there is no wraparound.
+    /// `pub(crate)` — accessed via `ActiveCircuit::send_packet()`.
     ///
     /// # P1: sequence is committed only on success
     ///
@@ -830,7 +842,7 @@ impl CircuitSeqState {
     /// - [`TrafficError::SequenceExhausted`] — exhausted; re-establish.
     /// - [`TrafficError::EmptyCircuit`] — no non-source hops.
     /// - [`TrafficError::PayloadTooLarge`] — plaintext exceeds the limit.
-    pub fn send_packet(
+    pub(crate) fn send_packet(
         &mut self,
         hops: &[crate::node::circuit_handshake::HopForwardingState],
         circuit_id: &[u8; 32],
