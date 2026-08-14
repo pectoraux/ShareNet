@@ -1267,6 +1267,7 @@ pub fn unwrap_final(plaintext: &[u8]) -> Vec<u8> {
 const PKT_KEY_CIRCUIT_ID: &str = "circuitId";
 const PKT_KEY_DIRECTION: &str = "direction";
 const PKT_KEY_FLOW_ID: &str = "flowId";
+const PKT_KEY_VERSION: &str = "v";
 const PKT_KEY_SEQ: &str = "seq";
 const PKT_KEY_TTL: &str = "ttl";
 const PKT_KEY_PAYLOAD: &str = "payload";
@@ -1282,6 +1283,7 @@ impl CircuitPacket {
             (CborValue::TextString(PKT_KEY_CIRCUIT_ID.into()), CborValue::ByteString(self.circuit_id.to_vec())),
             (CborValue::TextString(PKT_KEY_DIRECTION.into()), CborValue::UnsignedInt(u64::from(self.direction.as_byte()))),
             (CborValue::TextString(PKT_KEY_FLOW_ID.into()), CborValue::ByteString(self.flow_id.to_vec())),
+            (CborValue::TextString(PKT_KEY_VERSION.into()), CborValue::UnsignedInt(u64::from(PacketProfile::V2.as_byte()))),
             (CborValue::TextString(PKT_KEY_SEQ.into()), CborValue::UnsignedInt(u64::from(self.seq))),
             (CborValue::TextString(PKT_KEY_TTL.into()), CborValue::UnsignedInt(u64::from(self.ttl))),
             (CborValue::TextString(PKT_KEY_PAYLOAD.into()), CborValue::ByteString(self.payload.clone())),
@@ -1333,6 +1335,20 @@ impl CircuitPacket {
             .ok_or_else(|| TrafficError::WireDecodeFailed { reason: format!("invalid direction byte {direction_byte}") })?;
         let flow_id = map_get_fixed(&entries, PKT_KEY_FLOW_ID)
             .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "flowId missing/invalid".into() })?;
+        // P0: read the wire version field. This is the explicit packet-level
+        // version discriminator — a relay can determine the profile from the
+        // wire bytes, without needing circuit state first.
+        let wire_version = map_get_u8(&entries, PKT_KEY_VERSION)
+            .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "v (version) missing/invalid".into() })?;
+        // The version MUST be V2 for v2 packets. V1 packets don't have this
+        // field (they have a 5-entry map; v2 has 8). If a v1 packet is
+        // mistakenly parsed by the v2 decoder, the "v" field is absent →
+        // WireDecodeFailed. If the version byte is unknown → fail-closed.
+        let wire_profile = PacketProfile::from_byte(wire_version)
+            .ok_or_else(|| TrafficError::UnsupportedPacketVersion { version: wire_version })?;
+        if wire_profile != PacketProfile::V2 {
+            return Err(TrafficError::UnsupportedPacketVersion { version: wire_version });
+        }
         let seq = map_get_u64(&entries, PKT_KEY_SEQ)
             .ok_or_else(|| TrafficError::WireDecodeFailed { reason: "seq missing/invalid".into() })?;
         let ttl = map_get_u8(&entries, PKT_KEY_TTL)

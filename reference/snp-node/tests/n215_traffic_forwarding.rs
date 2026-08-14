@@ -2078,3 +2078,52 @@ fn v1_and_v2_do_not_share_dispatch_path() {
     let result = table_b_v2b.forward_packet(&v2_from_v1, &lc.ts.source_id, now_unix());
     assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }
+
+/// P0: The v2 packet wire format carries an explicit "v": 2 version field.
+/// A relay can determine the profile from the wire bytes alone — without
+/// circuit state. This test verifies the version field is present in the
+/// encoded CBOR and that tampering with it causes decode failure.
+#[test]
+fn packet_version_tampering_rejected() {
+    let lc = live_circuit();
+    let plaintext = b"version test".to_vec();
+    let packet = wrap_test(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Encode → decode round-trip succeeds (version=2 is present).
+    let wire = packet.encode_to_cbor().unwrap();
+    let decoded = snp_node::node::CircuitPacket::decode_from_cbor(&wire).unwrap();
+    assert_eq!(decoded, packet);
+
+    // Tamper with the version byte: change "v":2 to "v":1 in the CBOR.
+    let mut tampered = wire.clone();
+    let mut found = false;
+    for i in 0..tampered.len().saturating_sub(2) {
+        if tampered[i] == 0x61 && tampered[i+1] == 0x76 && tampered[i+2] == 0x02 {
+            tampered[i+2] = 0x01;
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "version field must be present in the wire bytes");
+    let result = snp_node::node::CircuitPacket::decode_from_cbor(&tampered);
+    assert!(
+        matches!(result, Err(TrafficError::UnsupportedPacketVersion { version: 1 })),
+        "tampered version (2->1) must be rejected, got {result:?}"
+    );
+
+    // Also verify version=3 (unknown) is rejected.
+    let mut tampered3 = wire.clone();
+    for i in 0..tampered3.len().saturating_sub(2) {
+        if tampered3[i] == 0x61 && tampered3[i+1] == 0x76 && tampered3[i+2] == 0x02 {
+            tampered3[i+2] = 0x03;
+            break;
+        }
+    }
+    let result = snp_node::node::CircuitPacket::decode_from_cbor(&tampered3);
+    assert!(
+        matches!(result, Err(TrafficError::UnsupportedPacketVersion { version: 3 })),
+        "unknown version 3 must be rejected, got {result:?}"
+    );
+}
