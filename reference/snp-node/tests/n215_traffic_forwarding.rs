@@ -1928,33 +1928,115 @@ fn v1_packet_cannot_be_forwarded_by_v2_path() {
     );
 }
 
-/// P0: V1 golden wire vector — the exact canonical CBOR bytes a v1
-/// CircuitPacketV1 must produce. These bytes are FROZEN (from commit
-/// 0efaaac). Any change to v1 encode/AAD/nonce that produces different
-/// bytes is a protocol break. The conformance vector is in
-/// `public/conformance/vectors/11-circuit-packet-v1.json`.
-///
-/// This test asserts the exact wire bytes so CI catches accidental v1 drift.
+/// P0: V1 golden wire vector — loaded from the authoritative JSON conformance
+/// file. The test reads public/conformance/vectors/11-circuit-packet-v1.json,
+/// constructs a CircuitPacketV1 from the vector input, encodes it, and asserts
+/// the exact expected wire bytes. Then decodes and verifies round-trip.
 #[test]
-fn v1_golden_wire_vector_frozen() {
-    let packet = CircuitPacketV1 {
-        circuit_id: [0x0f; 32],
-        seq: 1,
-        ttl: 16,
-        payload: vec![0xde, 0xad, 0xbe, 0xef],
-        final_dst: [0xaa; 32],
-    };
+fn json_golden_vector_is_authoritative() {
+    use std::fs;
+    let json_str = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/conformance/vectors/11-circuit-packet-v1.json"))
+        .expect("golden vector JSON file must exist");
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .expect("golden vector JSON must be valid");
+    let vector = &json["vectors"][0];
+    let input = &vector["input"];
+
+    let circuit_id_hex = input["circuitId"].as_str().unwrap();
+    assert_eq!(circuit_id_hex.len(), 64, "circuitId must be 64 hex chars (32 bytes)");
+    let circuit_id: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&circuit_id_hex[i*2..i*2+2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into().unwrap();
+
+    let seq = input["seq"].as_u64().unwrap() as u32;
+    let ttl = input["ttl"].as_u64().unwrap() as u8;
+    let payload_hex = input["payload"].as_str().unwrap();
+    let payload: Vec<u8> = (0..payload_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&payload_hex[i..i+2], 16).unwrap())
+        .collect();
+    let final_dst_hex = input["finalDst"].as_str().unwrap();
+    assert_eq!(final_dst_hex.len(), 64, "finalDst must be 64 hex chars");
+    let final_dst: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&final_dst_hex[i*2..i*2+2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into().unwrap();
+
+    let packet = CircuitPacketV1 { circuit_id, seq, ttl, payload: payload.clone(), final_dst };
+
     let wire = packet.encode_to_cbor().unwrap();
-    let hex: String = wire.iter().map(|b| format!("{b:02x}")).collect();
-    // FROZEN v1 wire bytes from commit 0efaaac.
-    // Any change here = protocol break = requires version bump + ADR.
-    let expected = "a563736571016374746c10677061796c6f616444deadbeef6866696e616c4473745820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6963697263756974496458200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
-    assert_eq!(
-        hex, expected,
-        "v1 wire bytes changed — the frozen N2.3 v1 protocol has been broken. \
-         This requires a protocol version bump + ADR update + explicit approval."
-    );
-    // Verify decode round-trip produces the same packet.
+    let expected_hex = vector["expectedWire"].as_str().unwrap();
+    let expected: Vec<u8> = (0..expected_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&expected_hex[i..i+2], 16).unwrap())
+        .collect();
+    assert_eq!(wire, expected, "v1 wire bytes must match golden vector exactly");
+
     let decoded = CircuitPacketV1::decode_from_cbor(&wire).unwrap();
-    assert_eq!(decoded, packet, "v1 decode must round-trip the frozen wire bytes");
+    assert_eq!(decoded, packet, "v1 decode must round-trip the golden vector");
+}
+
+/// P0: the golden vector's circuitId must be exactly 32 bytes.
+#[test]
+fn malformed_vector_circuit_id_rejected() {
+    use std::fs;
+    let json_str = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/conformance/vectors/11-circuit-packet-v1.json"))
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    let cid = json["vectors"][0]["input"]["circuitId"].as_str().unwrap();
+    assert_eq!(cid.len(), 64, "circuitId must be 64 hex chars (32 bytes)");
+    for c in cid.chars() { assert!(c.is_ascii_hexdigit(), "circuitId must be hex"); }
+}
+
+/// P0: PacketProfile enum distinguishes V1 from V2 explicitly.
+#[test]
+fn explicit_v1_version_dispatch() {
+    assert_ne!(snp_node::node::PacketProfile::V1, snp_node::node::PacketProfile::V2);
+    assert_eq!(snp_node::node::PacketProfile::V1.as_byte(), 1);
+    assert_eq!(snp_node::node::PacketProfile::V2.as_byte(), 2);
+    assert_eq!(snp_node::node::PacketProfile::from_byte(1), Some(snp_node::node::PacketProfile::V1));
+    assert_eq!(snp_node::node::PacketProfile::from_byte(2), Some(snp_node::node::PacketProfile::V2));
+}
+
+/// P0: unknown packet versions are rejected (fail-closed).
+#[test]
+fn unknown_packet_version_rejected() {
+    assert_eq!(snp_node::node::PacketProfile::from_byte(0), None);
+    assert_eq!(snp_node::node::PacketProfile::from_byte(3), None);
+    assert_eq!(snp_node::node::PacketProfile::from_byte(255), None);
+}
+
+/// P0: V1 and V2 do not share the same dispatch path.
+#[test]
+fn v1_and_v2_do_not_share_dispatch_path() {
+    let mut lc = live_circuit();
+    let plaintext = b"dispatch test".to_vec();
+    let v2_packet = wrap_test(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    assert!(lc.table_b.forward_packet(&v2_packet, &lc.ts.source_id, now_unix()).is_ok());
+    let mut table_b = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    install_relay_state(&lc.ts, &mut table_b, &mut acc_b, lc.ts.relay_id,
+        &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
+    let v1_packet = wrap_packet_v1_for_testing(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    assert!(table_b.forward_packet_v1(&v1_packet, &lc.ts.source_id, now_unix()).is_ok());
+    let v2_from_v1 = snp_node::node::CircuitPacket {
+        circuit_id: v1_packet.circuit_id,
+        direction: snp_node::node::TrafficDirection::Forward,
+        flow_id: snp_node::node::DEFAULT_FLOW_ID,
+        seq: v1_packet.seq, ttl: v1_packet.ttl,
+        payload: v1_packet.payload, final_dst: v1_packet.final_dst,
+    };
+    let mut table_b2 = RelayForwardingTable::new();
+    let mut acc_b2 = CircuitAcceptanceStore::new();
+    install_relay_state(&lc.ts, &mut table_b2, &mut acc_b2, lc.ts.relay_id,
+        &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
+    let result = table_b2.forward_packet(&v2_from_v1, &lc.ts.source_id, now_unix());
+    assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
 }

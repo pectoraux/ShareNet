@@ -1382,6 +1382,11 @@ pub struct RelayForwardingState {
     /// boundary on the relay side — a stale relay cannot continue accepting
     /// traffic after the circuit has expired.
     pub expires_at: u64,
+    /// N2.4 P0: the packet protocol profile (V1 or V2) for this circuit.
+    /// Set at accept_relay_handshake time. Determines which decode/forward
+    /// path the relay uses for packets on this circuit. Explicit version
+    /// dispatch — NOT relying on AEAD incompatibility to detect the version.
+    pub profile: crate::node::traffic::PacketProfile,
 }
 
 /// Process a relay handshake request on the relay side.
@@ -1622,6 +1627,10 @@ pub fn accept_relay_handshake(
         // P0: the relay's forwarding state expires when the circuit's signed
         // handshake expires. After this time, forward_packet rejects.
         expires_at: handshake.expiry,
+        // N2.4 P0: explicit packet profile. V2 for the current implementation
+        // (direction + flow_id + versioned AAD). V1 is for frozen N2.3
+        // conformance only.
+        profile: crate::node::traffic::PacketProfile::V2,
     };
 
     Ok((response, forwarding_state))

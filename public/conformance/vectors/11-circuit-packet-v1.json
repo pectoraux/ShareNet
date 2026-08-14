@@ -1,22 +1,22 @@
 {
   "suite": "circuit-packet-v1",
   "specSection": "N2.3 frozen (commit 0efaaac)",
-  "description": "Frozen N2.3 v1 CircuitPacketV1 wire format. These vectors are IMMUTABLE \u2014 any change to v1 encode/decode/AAD/nonce that produces different bytes is a protocol break and MUST require a version bump + ADR update + explicit approval. The conformance test in n215_traffic_forwarding.rs asserts against these exact hex bytes.",
+  "description": "Frozen N2.3 v1 CircuitPacketV1 wire format. IMMUTABLE. The conformance test reads this JSON and asserts exact bytes.",
   "frozenAt": "0efaaac",
   "vectors": [
     {
       "id": "v1-packet-encode-roundtrip",
-      "description": "Encode a known v1 CircuitPacketV1 and verify the exact canonical CBOR bytes. Then decode back and verify equality.",
+      "description": "Encode a known v1 CircuitPacketV1 and verify exact CBOR bytes.",
       "input": {
-        "circuitId": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "circuitId": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
         "seq": 1,
         "ttl": 16,
         "payload": "deadbeef",
         "finalDst": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
-      "expectedWire": "a563736571016374746c10677061796c6f616444deadbeef6866696e616c4473745820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6963697263756974496458200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "expectedWire": "a563736571016374746c10677061796c6f616444deadbeef6866696e616c4473745820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6963697263756974496458200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
       "expectedMapEntries": 5,
-      "notes": "5-entry CBOR map. Keys sorted by canonical encoded bytes: seq, ttl, payload, finalDst, circuitId. NO direction field, NO flowId field \u2014 these are v2-only."
+      "notes": "circuitId is 32 bytes. finalDst is 32 bytes."
     }
   ]
 }

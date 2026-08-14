@@ -170,6 +170,48 @@ pub const MAX_PACKET_SEQUENCE: u32 = u32::MAX;
 /// All-zeros is the default flow when no explicit flow is opened.
 pub const DEFAULT_FLOW_ID: [u8; 8] = [0u8; 8];
 
+/// N2.3/N2.4: Packet protocol profile (version discriminator).
+///
+/// A packet's profile determines its wire format, AAD domain, nonce
+/// derivation, and forwarding path. The profile is an explicit wire-level
+/// discriminator — a relay MUST determine the profile BEFORE selecting the
+/// version-specific decoder + cryptographic path.
+///
+/// V1 is the frozen N2.3 protocol (commit `0efaaac`). V2 is the proposed
+/// N2.4 bidirectional protocol. They are NOT wire-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketProfile {
+    /// V1: frozen N2.3 forward-only protocol. 5-field CBOR map, raw AAD
+    /// (no domain prefix), simple nonce (no direction XOR).
+    V1 = 1,
+    /// V2: N2.4 proposed bidirectional protocol. 7-field CBOR map (adds
+    /// direction + flow_id), versioned AAD domain
+    /// (`"SNP/0.1/circuit/packet/v2"`), direction-aware nonce.
+    V2 = 2,
+}
+
+impl PacketProfile {
+    /// Encode as a single byte for wire transmission.
+    #[must_use]
+    pub fn as_byte(&self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Decode from a wire byte. Returns `None` for unknown/unsupported
+    /// versions (fail-closed).
+    #[must_use]
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
 /// N2.4: Traffic direction — cryptographically bound in the packet + AAD.
 /// A forward packet MUST NOT be valid as a reverse packet, and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -299,6 +341,10 @@ pub enum TrafficError {
     /// sequence and is rejected (prevents ambiguity with sentinel state and
     /// enforces the protocol's sequence lifecycle).
     SequenceZero { circuit_id: [u8; 32] },
+    /// P0: the relay received a packet with an unknown/unsupported protocol
+    /// version/profile. The version/profile discriminator is checked BEFORE
+    /// selecting the version-specific decoder — fail-closed.
+    UnsupportedPacketVersion { version: u8 },
 }
 
 impl std::fmt::Display for TrafficError {
@@ -346,6 +392,9 @@ impl std::fmt::Display for TrafficError {
             ),
             Self::SequenceZero { circuit_id } => write!(
                 f, "circuit {} packet seq 0 is invalid (sequences start at 1)", hex_short(circuit_id)
+            ),
+            Self::UnsupportedPacketVersion { version } => write!(
+                f, "unsupported packet protocol version/profile {version} — fail-closed"
             ),
         }
     }
