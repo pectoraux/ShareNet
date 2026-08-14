@@ -110,6 +110,7 @@ pub mod async_transport;
 pub mod async_node;
 pub mod identity;
 pub mod gateway;
+pub mod gateway_stream;
 pub mod circuit;
 pub mod session;
 pub mod descriptor;
