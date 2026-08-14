@@ -6916,3 +6916,57 @@ Stage Summary:
   - SHARENET_EXTERNAL_NET_TESTS=1 cargo test -p snp-node --test n224_real_internet_egress -- --ignored: 2 passed — the streaming read (fetch_with_limit) works against real HTTPS (example.com, status 200, signature verified, Content-Type text/html).
 
 - The gateway is now a proper security appliance boundary: bounded concurrency, bounded read-time response memory, and proven end-to-end body delivery. Ready for N2.3 (desktop TUN) / N2.4 (Android VPN) — the gateway can no longer be turned into an unbounded remotely-controllable HTTP client.
+
+---
+Task ID: N2.3.1
+Agent: Z.ai Code (main)
+Task: Implement the Linux TUN Packet Boundary Foundation — a new `snp-tun` crate that provides the kernel packet entry/exit boundary for ShareNet transparent networking. Scope: Linux `/dev/net/tun` only, async read/write IP packets, IPv4/IPv6 header parsing, trait seam for testability. NO TCP proxying, DNS, smoltcp, macOS/Windows/Android, or OS routing changes.
+
+Work Log:
+- Added `snp-tun` to the workspace members and `libc = "0.2"` to workspace.dependencies in `/home/z/my-project/reference/Cargo.toml`.
+- Created `snp-tun/Cargo.toml` with dependencies: thiserror, async-trait, tokio (all platforms), libc (Linux-only via `target.'cfg(target_os = "linux")'`).
+- Created `snp-tun/src/error.rs` — `TunError` enum with 8 variants: PermissionDenied, DeviceNotFound, InvalidPacket, NameTooLong, PartialWrite, Closed, UnsupportedPlatform, Io. Added `TunError::from_io()` that maps EPERM(1)→PermissionDenied, EACCES(13)→PermissionDenied, ENOENT(2)→DeviceNotFound, preserving other errors as Io. 4 unit tests for error mapping.
+- Created `snp-tun/src/packet.rs` — IP packet abstraction:
+  - `PacketMetadata { source: IpAddr, destination: IpAddr, protocol: u8, length: usize }` — the metadata a router needs without transport-layer parsing.
+  - `IpPacket` enum (IPv4/IPv6) with `parse(&[u8]) -> Result<IpPacket, TunError>` — dispatches on version nibble (byte 0 >> 4: 4→IPv4, 6→IPv6, else→InvalidPacket).
+  - `Ipv4Packet` — parses version, IHL, total_length, protocol, source, destination. Validates: min 20 bytes, IHL ≥ 5, total_length ≤ buffer length. Caches metadata + owns bytes (truncated to declared total_length).
+  - `Ipv6Packet` — parses version, payload_length, next_header, source, destination. Validates: min 40 bytes, 40 + payload_length ≤ buffer length. Caches metadata + owns bytes.
+  - 14 unit tests: valid IPv4/IPv6 parsing, metadata extraction, malformed random bytes, empty packet, too-short headers, wrong version nibble, truncated-by-total-length, bad IHL, trailing padding stripping, byte preservation.
+  - `build_test_ipv4_packet()` and `build_test_ipv6_packet()` — public test helpers for constructing minimal valid IP packets.
+- Created `snp-tun/src/device.rs` — the trait seam:
+  - `PacketDevice` trait (async_trait): `read_packet(&mut self) -> Result<IpPacket, TunError>` + `write_packet(&mut self, IpPacket) -> Result<(), TunError>`. Send-required. This is the integration point between the TUN kernel boundary and the future ShareNet stack.
+  - `LinuxTunDevice` (#[cfg(target_os = "linux")]):
+    - `create(name: &str) -> Result<Self, TunError>` — validates name length (< 16 bytes), opens `/dev/net/tun` with O_RDWR|O_NONBLOCK|O_CLOEXEC, calls `ioctl(TUNSETIFF)` with IFF_TUN|IFF_NO_PI (layer-3 TUN, no packet-info prefix), reads back the actual interface name, wraps the fd in `tokio::io::unix::AsyncFd<OwnedFd>` for epoll-based async readiness.
+    - `read_packet` — uses `AsyncFd::readable().await` + `guard.try_io(|inner| libc::read(...))` to read one packet (max 65535 bytes) non-blocking, then `IpPacket::parse()`. Loops on WouldBlock.
+    - `write_packet` — uses `AsyncFd::writable().await` + `guard.try_io(|inner| libc::write(...))` to write the packet non-blocking. Verifies full write (no partial writes for TUN). Loops on WouldBlock.
+    - Drop: `AsyncFd<OwnedFd>` drops → `OwnedFd` drops → fd closed → kernel destroys the TUN interface automatically.
+  - `MockPacketDevice` (all platforms):
+    - In-memory `PacketDevice` backed by `Arc<tokio::sync::Mutex<MockState>>` where `MockState { pending: VecDeque<IpPacket>, written: Vec<IpPacket> }`.
+    - Cloneable (shares state via Arc) — enables concurrent access from multiple async tasks on separate clones.
+    - `with_packets(vec)` — pre-loads packets for `read_packet` to return (FIFO).
+    - `written_packets()` — returns clones of packets received via `write_packet`.
+    - `read_packet` returns `TunError::Closed` when the pending queue is empty.
+  - 5 unit tests for mock device: read/write roundtrip, closed-when-empty, concurrent reads (no corruption), concurrent writes (no corruption), IPv6 roundtrip.
+- Created `snp-tun/src/lib.rs` — module declarations + public re-exports (PacketDevice, MockPacketDevice, LinuxTunDevice (Linux-only), TunError, IpPacket, Ipv4Packet, Ipv6Packet, PacketMetadata, MAX_PACKET_SIZE, build_test_ipv4_packet, build_test_ipv6_packet). Extensive rustdoc with architecture diagram, scope, and usage example.
+- Created `snp-tun/tests/packet_device.rs` — 9 integration tests:
+  - `privilege_failure_returns_error_not_panic` — creates a TUN device, verifies it returns PermissionDenied/DeviceNotFound (not panic) in unprivileged environments. Handles all three cases: Ok (privileged), PermissionDenied, DeviceNotFound, other error — all pass without panic.
+  - `name_too_long_returns_error_not_panic` — 16-byte name → NameTooLong (deterministic, fires before opening device). 15-byte name passes the length check.
+  - `empty_name_is_accepted_by_length_check` — empty name passes the length check (kernel auto-assigns).
+  - `mock_device_packet_roundtrip_ipv4` — pre-load IPv4 packet, read back, verify metadata.
+  - `mock_device_packet_roundtrip_ipv6` — pre-load IPv6 packet, read back, verify metadata.
+  - `mock_device_write_and_inspect` — write two packets, verify written_packets() returns them in order.
+  - `concurrent_packet_handling_no_corruption` — 20 packets, 10 concurrent readers (multi_thread runtime), verify all 20 read exactly once (no duplication, no loss, no corruption).
+  - `mock_device_closed_when_empty` — read from empty mock → Closed.
+  - `ip_packet_through_mock_device_full_roundtrip` — parse → pre-load → read → verify metadata + bytes → write → inspect written.
+
+Stage Summary:
+- N2.3.1 is complete: the Linux TUN packet boundary is implemented as a clean adapter crate (`snp-tun`) with zero dependencies on the existing ShareNet stack. The frozen architecture (Identity, Discovery, Route, Circuit, Gateway, Internet) is UNTOUCHED.
+- The `PacketDevice` trait seam allows future CI to test packet flow without root privileges (via `MockPacketDevice`), while production uses `LinuxTunDevice` with real `/dev/net/tun`.
+- Async: fully Tokio-compatible via `AsyncFd` (epoll-based readiness, NOT threadpool). No `std::thread`, no `block_on()`, no `Runtime::new()`.
+- Security: privilege failures return `PermissionDenied` (not panic), malformed packets return `InvalidPacket` (not crash), name-length validation is deterministic.
+- Test results:
+  - `cargo test -p snp-tun`: 34 passed (24 unit + 9 integration + 1 doc-test), 0 failed, 0 ignored.
+  - `cargo test --workspace`: 495 passed (was 461; +34 new), 0 failed, 5 ignored.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+  - `cargo build -p snp-tun`: zero warnings, zero errors.
+- STOP condition met: no TCP interception, no transparent HTTPS, no DNS, no smoltcp, no OS routing changes. The deliverable is exactly "a safe Linux kernel packet entry/exit boundary, ready for the later transparent networking pipeline."

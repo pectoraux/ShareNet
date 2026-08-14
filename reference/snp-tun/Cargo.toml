@@ -1,0 +1,23 @@
+[package]
+name = "snp-tun"
+description = "Linux TUN packet boundary for ShareNet transparent networking (N2.3.1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lib]
+name = "snp_tun"
+path = "src/lib.rs"

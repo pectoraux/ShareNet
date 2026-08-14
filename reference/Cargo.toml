@@ -25,6 +25,7 @@ members = [
     "snp-civic",
     "snp-node",
     "snp-conformance",
+    "snp-tun",
 ]
 
 [workspace.package]
@@ -56,6 +57,8 @@ serde_json = "1"
 thiserror = "1"
 # Logging
 tracing = "0.1"
+# libc (for snp-tun Linux TUN device — raw syscall bindings)
+libc = "0.2"
 # HTTP client (synchronous, simple — used by snp-gateway for Mode A fetches)
 ureq = "2"
 # URL parsing for the gateway egress policy
