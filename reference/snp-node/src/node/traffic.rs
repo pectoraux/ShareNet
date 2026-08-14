@@ -23,30 +23,38 @@
 //!
 //! ```text
 //! source constructs:
-//!   inner = plaintext (for G)
-//!   layer_C = AEAD_seal(key_C, nonce, inner,   aad = circuit_id ‖ seq ‖ G)
-//!   layer_B = AEAD_seal(key_B, nonce, layer_C, aad = circuit_id ‖ seq ‖ C)
+//!   inner   = plaintext (for G)
+//!   layer_C = AEAD_seal(key_C, nonce, inner,   aad = circuit_id ‖ seq ‖ ttl_C ‖ final_dst)
+//!   layer_B = AEAD_seal(key_B, nonce, layer_C, aad = circuit_id ‖ seq ‖ ttl_B ‖ final_dst)
 //!   packet  = { circuit_id, seq, ttl, payload = layer_B, final_dst = G }
+//!
+//! where ttl_B is the TTL the first relay sees (PACKET_TTL_MAX),
+//!       ttl_C = ttl_B - 1, etc. Each layer authenticates the hop-local TTL.
 //!
 //! B: lookup state[circuit_id] → unwrap layer_B with key_B → reveals layer_C + successor C
 //! C: lookup state[circuit_id] → unwrap layer_C with key_C → reveals plaintext + successor G (terminal)
 //! G: receives plaintext
 //! ```
 //!
+//! The AEAD AAD is `circuit_id ‖ seq ‖ ttl ‖ final_dst`, where `ttl` is the
+//! hop-local TTL the opening relay sees. An attacker who modifies `ttl`,
+//! `circuit_id`, `seq`, or `final_dst` in transit breaks AEAD. Each nested
+//! layer authenticates its own hop-local TTL (not a single end-to-end value).
+//!
 //! ## The 15 N2.3 invariants
 //!
 //!  1. Packet bound to exactly one circuit         — `circuit_id` in packet + state lookup
-//!  2. Relay cannot substitute circuit/destination — state keyed by circuit_id; successor in sealed inner
+//!  2. Relay cannot substitute circuit/destination — state keyed by circuit_id; final_dst in AAD
 //!  3. Relay cannot decrypt beyond its layer        — AEAD: only the hop's key opens its layer
-//!  4. Packet replay rejected                       — per-circuit seq window in RelayForwardingTable
-//!  5. Sequence/order bounded                       — seq is u32, monotonic, max-seen enforced
+//!  4. Packet replay rejected                       — check-before-AEAD, commit-after-AEAD
+//!  5. Sequence/order bounded                       — seq is u32, monotonic, stale rejected
 //!  6. Cannot inject into another circuit           — AAD binds circuit_id; wrong-circuit key fails AEAD
 //!  7. Cannot skip a designated hop                 — each layer reveals only the next successor
 //!  8. Relay cannot change predecessor/successor    — state's predecessor check + AEAD AAD binds next-hop
-//!  9. TTL prevents forwarding loops                — ttl decremented per hop, drop at 0
+//!  9. TTL prevents forwarding loops                — ttl decremented per hop, drop at 0, AUTHENTICATED per-hop
 //! 10. Unknown circuit IDs rejected                 — state lookup miss → UnknownCircuit
 //! 11. Teardown immediately blocks new traffic      — table.remove_circuit() drops state
-//! 12. Oversized packets rejected before allocation — bounded CBOR decode + MAX_PACKET_PAYLOAD_BYTES
+//! 12. Oversized packets rejected before allocation — bounded CBOR decode + MAX_PLAINTEXT/WIRE_PAYLOAD_BYTES
 //! 13. Malformed forwarding messages fail closed    — AEAD failure → PacketUnauthentic, no partial state
 //! 14. Forwarding state cleaned up deterministically — explicit remove_circuit + drop on teardown
 //! 15. Path operates without inspecting app payload  — relays see only ciphertext + successor NodeId
