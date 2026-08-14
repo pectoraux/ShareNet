@@ -181,10 +181,14 @@ N2.3 proves that an encrypted packet genuinely traverses the installed relay for
 ### Acceptance test
 
 ```text
-A ──sealed packet──> B ──sealed packet──> C ──plaintext──> G
+A ──sealed packet──> B ──sealed packet──> C ──sealed packet──> G
+
+B unwraps layer_B → reveals layer_C → forwards to C
+C unwraps layer_C → reveals layer_G → forwards to G
+G unwraps layer_G → recovers plaintext → delivers locally
 ```
 
-where B and C consult their installed `RelayForwardingState` (from N2.2's `accept_relay_handshake`), unwrap one AEAD layer, and forward. A never talks directly to G. A three-hop (A→B→C→G) traversal MUST be proven.
+where B, C, and G each unwrap exactly one AEAD layer. There is ONE AEAD LAYER PER NON-SOURCE HOP, INCLUDING THE TERMINAL GATEWAY. A never talks directly to G. A three-hop (A→B→C→G) traversal MUST be proven.
 
 ### CircuitPacket wire format
 

@@ -8,12 +8,16 @@
 //! relay forwarding state from source to destination:
 //!
 //! ```text
-//! A ──sealed packet──> B ──sealed packet──> C ──plaintext──> G
+//! A ──sealed packet──> B ──sealed packet──> C ──sealed packet──> G
+//!
+//! B unwraps layer_B → reveals layer_C → forwards to C
+//! C unwraps layer_C → reveals layer_G → forwards to G
+//! G unwraps layer_G → recovers plaintext → delivers locally
 //! ```
 //!
-//! B and C consult their installed [`RelayForwardingState`] (from N2.2's
-//! `accept_relay_handshake`), unwrap one AEAD layer, and forward. A never
-//! talks directly to G.
+//! B, C, and G each unwrap exactly one AEAD layer. There is ONE AEAD LAYER
+//! PER NON-SOURCE HOP, INCLUDING THE TERMINAL GATEWAY. A never talks directly
+//! to G.
 //!
 //! ## Per-hop onion AEAD
 //!
