@@ -6353,3 +6353,492 @@ Work Log:
 >    ensures the tests don't hang indefinitely on a misbehaving peer."
 
 - Ready for the next task.
+
+---
+Task ID: N2.2.4
+Agent: Z.ai (subagent — real Internet egress hardening + tests)
+Task: Implement N2.2.4 — Real Internet Egress for ShareNet. Harden the
+PinnedConnector SSRF defences (decimal/octal/hex IP alternative encodings,
+broadcast address, port policy, URL length limit), add resource-limit
+constants, and add the deterministic security tests + concurrent upstream
+test + upstream failure propagation tests + opt-in external Internet
+egress test.
+
+Work Log:
+- Read worklog tail (last 200 lines) for context on N2.2.1 through N2.2.3
+  (async recursive transport with SNP-IK + AEAD, protocol-driven circuit
+  establishment with fresh ephemeral X25519, recursive discovery → circuit
+  → gateway egress). Read the production gateway code in
+  `snp-gateway/src/lib.rs` (1524 lines — TransitRequest/Response CBOR,
+  sign/verify, is_private_ipv4/ipv6/destination, parse_ipv4/ipv6,
+  PinnedConnector::new/fetch/fetch_https, parse_http_response,
+  handle_transit_request[_with_connector]). Read the production async
+  runtime in `snp-node/src/node/async_node.rs` (1908 lines —
+  serve_gateway_with_protocol_circuit,
+  serve_one_gateway_request_protocol_circuit, serve_relay_via_route,
+  send_via_route). Read the existing test infrastructure in
+  `snp-node/tests/n222_circuit_establishment.rs` (3150 lines — NodeIdents,
+  Mesh, send_via_route, test_connector_factory) and
+  `snp-node/tests/n223_discovery_to_circuit.rs` (1368 lines —
+  DiscoveryMesh with both discovery plane and circuit plane). Read the
+  conformance test runner in `snp-conformance/src/main.rs` for the
+  is_private_destination vector handling. Read the existing n19_security
+  test (the ignored `test_9_real_https_through_pinned_ip` pattern).
+
+### 1. Harden PinnedConnector SSRF defences (snp-gateway/src/lib.rs)
+
+**a) Decimal/octal/hex IP alternative encodings:**
+
+Added `pub fn parse_ipv4_alternative(s: &str) -> Option<[u8; 4]>` that
+parses SINGLE-INTEGER IPv4 representations (no dots):
+- Decimal: `"2130706433"` → `[127, 0, 0, 1]`
+- Hex with `0x`/`0X` prefix: `"0x7f000001"` → `[127, 0, 0, 1]`
+- Octal with leading `0` + digits 0-7: `"017700000001"` → `[127, 0, 0, 1]`
+
+The function returns `None` for inputs with dots (dotted-octal forms like
+`0177.0.0.1` are handled by a separate suspicious-component check in
+`is_private_destination`), empty strings, invalid chars for the detected
+radix, or values that overflow `u32`.
+
+Modified `is_private_destination` to call `parse_ipv4_alternative` after
+`parse_ipv4` fails. Also added a dotted-octal/hex suspicious-component
+detector: if the host has 4 dotted parts and ANY part has a leading zero
+with all-octal digits (e.g. `0177`) OR starts with `0x`/`0X` (e.g.
+`0x7f`), the host is rejected as a suspicious alternative IP encoding
+(`is_private_destination` returns `true`). This catches `0177.0.0.1`,
+`0x7f.0.0.1`, and similar mixed-form encodings that bypass the standard
+`parse_ipv4` (which rejects leading zeros but doesn't actively flag them
+as private).
+
+**b) Broadcast address:**
+
+Added an explicit `255.255.255.255` check to `is_private_ipv4` (before
+the `b[0] >= 240` reserved-range check). The broadcast address was
+already rejected via the `240.0.0.0/4` reserved check, but the explicit
+check documents the intent and makes the broadcast defence visible in
+the code.
+
+**c) Port policy:**
+
+Added `pub fn validate_port(scheme: &str, port: u16) -> GatewayResult<()>`:
+- HTTPS: port 443 allowed (other ports → `EgressBlocked`).
+- HTTP: port 80 allowed (other ports → `EgressBlocked`).
+- Other schemes: `MalformedUrl` (defensive — should have been caught
+  earlier in `PinnedConnector::new`).
+
+Called `validate_port(scheme, port)` in `PinnedConnector::new` after
+parsing the URL and getting the port, BEFORE the DNS resolution step.
+This blocks SSRF pivots that use non-standard ports (e.g.
+`https://internal.svc:8443/`, `http://attacker.com:22/`).
+
+**d) URL length limit:**
+
+Added `pub const MAX_URL_LENGTH: usize = 8192`. Added a length check at
+the very start of `PinnedConnector::new` (BEFORE URL parsing) that
+returns `MalformedUrl` if the URL exceeds 8192 chars. This bounds the
+memory cost of accepting an untrusted URL.
+
+### 2. Resource limit constants (snp-gateway/src/lib.rs)
+
+Added the following public constants:
+- `MAX_URL_LENGTH: usize = 8192` — maximum URL length (8 KiB).
+- `MAX_RESPONSE_BYTES_DEFAULT: u64 = 10 * 1024 * 1024` — 10 MiB default
+  response body cap.
+- `MAX_CONCURRENT_UPSTREAM: usize = 64` — reserved for the production
+  semaphore that bounds `spawn_blocking` queue depth (not yet enforced).
+- `CONNECT_TIMEOUT_SECS: u64 = 15` — matches the existing
+  `TcpStream::connect_timeout` in `PinnedConnector::fetch`.
+- `READ_TIMEOUT_SECS: u64 = 30` — matches the existing `set_read_timeout`
+  in `PinnedConnector::fetch`.
+- `MAX_REDIRECTS: u8 = 5` — reserved for the future same-host
+  redirect-following feature (currently redirects are NOT followed —
+  3xx returned verbatim as an SSRF defence).
+
+### 3. New gateway unit tests (snp-gateway/src/lib.rs `tests` module)
+
+Added 5 new unit tests (total now 12, was 7):
+- `private_ipv4_broadcast_explicit` — verifies `255.255.255.255` and
+  other broadcast-ish addresses in `240.0.0.0/4` are rejected.
+- `parse_ipv4_alternative_decimal_hex_octal` — verifies the new
+  `parse_ipv4_alternative` function handles decimal, hex (with `0x`/`0X`),
+  and octal forms, and rejects invalid inputs (empty, dotted, overflow,
+  non-numeric, non-hex-after-0x, octal-with-9).
+- `private_destination_alternative_encodings` — verifies
+  `is_private_destination` catches `2130706433` (decimal), `0x7f000001`
+  (hex), `017700000001` (octal), `0177.0.0.1` (dotted-octal),
+  `0x7f.0.0.1` (dotted-hex), and `255.255.255.255` (broadcast), AND does
+  NOT flag public alternative encodings (`134744072` decimal = 8.8.8.8,
+  `0x08080808` hex = 8.8.8.8).
+- `validate_port_policy` — verifies HTTPS:443 OK, HTTPS:22/8443/80
+  blocked, HTTP:80 OK, HTTP:8080/443 blocked, ftp/ws → MalformedUrl.
+- `pinned_connector_rejects_oversized_url` — verifies a URL of exactly
+  `MAX_URL_LENGTH` chars does NOT trigger the length check (boundary),
+  and a URL one char longer is rejected with `MalformedUrl`.
+
+### 4. New test file: snp-node/tests/n224_gateway_security.rs (18 tests)
+
+Created the deterministic, network-isolated test suite for N2.2.4:
+
+**SSRF rejection tests (13, all pure — no network access):**
+1. `localhost_url_rejected` — `http://localhost/` → `EgressBlocked`.
+2. `loopback_ip_rejected` — `http://127.0.0.1/` → `EgressBlocked`.
+3. `private_ip_rejected` — `http://10.0.0.1/` → `EgressBlocked`.
+4. `ipv6_loopback_rejected` — `http://[::1]/` → `EgressBlocked`.
+5. `link_local_rejected` — `http://169.254.169.254/` → `EgressBlocked`.
+6. `metadata_endpoint_rejected` — `http://metadata.google.internal/` →
+   `EgressBlocked`.
+7. `decimal_ip_rejected` — `http://2130706433/` (= 127.0.0.1) →
+   `EgressBlocked`.
+8. `octal_ip_rejected` — `http://0177.0.0.1/` (= 127.0.0.1) →
+   `EgressBlocked`.
+9. `hex_ip_rejected` — `http://0x7f000001/` (= 127.0.0.1) →
+   `EgressBlocked`.
+10. `disallowed_port_rejected` — `https://example.com:22/` →
+    `EgressBlocked` (port policy).
+11. `oversized_url_rejected` — URL > 8192 chars → `MalformedUrl`.
+12. `unsupported_scheme_rejected` — `ftp://example.com/` → `MalformedUrl`.
+13. `broadcast_address_rejected` — `http://255.255.255.255/` →
+    `EgressBlocked`.
+
+All 13 tests call `PinnedConnector::new(url)` directly and verify the
+error type via `matches!(result, Err(GatewayError::EgressBlocked(_)))` or
+`Err(GatewayError::MalformedUrl(_)))`. The SSRF check fires at
+construction time, BEFORE any DNS resolution or TCP connection, so the
+tests are deterministic and require NO network access.
+
+**Concurrent upstream test (1):**
+
+14. `concurrent_upstream_through_mesh` — Brings up 3 INDEPENDENT 4-node
+    meshes (A→B→C→G) concurrently via `tokio::join!(Mesh::start_with_body(
+    "concurrent-upstream-mesh-1"), ...)`. Each mesh has its own HTTP
+    server returning a distinct body. Runs 3 `send_via_route` calls
+    concurrently via `tokio::join!`. Verifies:
+    - All 3 responses are HTTP 200.
+    - Each response's `object_id` matches `SHA-256` of its own mesh's body
+      (no cross-contamination — if mesh 1's response had mesh 2's body,
+      this assert fails).
+    - The 3 `object_id`s are DISTINCT (proving 3 distinct bodies).
+    - Each response is signed by its OWN gateway (no cross-signing).
+    - Each response's `gateway_id` matches its own gateway's NodeId.
+    - The 3 `req_id`s are DISTINCT (proving fresh per-call req_id
+      generation — no reuse across concurrent calls).
+
+    The production gateway serves ONE request per
+    `serve_gateway_with_protocol_circuit` call (it `break`s after one
+    request — see `async_node.rs`). To test concurrency without modifying
+    the FROZEN production gateway, the test uses 3 INDEPENDENT meshes,
+    each with its own gateway, relays, and HTTP server. This proves the
+    protocol layer has no shared-state issues across independent circuits
+    AND that the upstream fetch layer correctly attributes each response
+    to the correct circuit.
+
+**Upstream failure propagation tests (4):**
+
+15. `upstream_connection_refused` — Allocates an ephemeral port via
+    `ephemeral_port()` (binds TcpListener, gets port, drops listener).
+    Constructs a `PinnedConnector::from_parts(127.0.0.1, port)` and calls
+    `fetch("GET", &[])`. The TCP connect fails with ECONNREFUSED. The
+    test wraps the fetch in `spawn_blocking` and verifies the result is
+    `Err(GatewayError::Upstream(_))`.
+
+16. `upstream_timeout` — Constructs a `PinnedConnector::from_parts(
+    192.0.2.1, 80)` (TEST-NET-1, RFC 5737 — black-hole address). Calls
+    `fetch("GET", &[])`. The TCP connect either fails immediately with
+    ENETUNREACH (sandboxed environments with no route) or times out after
+    the 15s `connect_timeout` (routed environments). Either way, the
+    result is `Err(GatewayError::Upstream(_))`. The test wraps the
+    `spawn_blocking` in a 20s `tokio::time::timeout` (15s connect_timeout
+    + 5s margin) to bound the worst case. NOTE: in the sandboxed test
+    environment, this test takes ~15s because the environment has a
+    default route to 192.0.2.1 but no response — the connect_timeout
+    fires.
+
+17. `upstream_http_500` — Starts a local HTTP server that returns 500.
+    Constructs a `PinnedConnector::from_parts(127.0.0.1, port)` and calls
+    `fetch("GET", &[])`. Verifies the response `status == 500` and the
+    body matches the expected error text.
+
+18. `upstream_http_404` — Starts a local HTTP server that returns 404.
+    Constructs a `PinnedConnector::from_parts(127.0.0.1, port)` and calls
+    `fetch("GET", &[])`. Verifies the response `status == 404` and the
+    body matches.
+
+Tests 15-18 use `PinnedConnector::from_parts()` (test-only SSRF bypass)
+because they need to connect to 127.0.0.1 (which `PinnedConnector::new`
+would reject). The bypass is intentional and documented — production
+gateways use `PinnedConnector::new` (which enforces SSRF), but tests need
+to connect to controlled local upstreams.
+
+### 5. New test file: snp-node/tests/n224_real_internet_egress.rs (2 tests, both #[ignore]'d)
+
+Created the opt-in external Internet egress test suite:
+
+**`ProdConnectorMesh`** — A variant of `DiscoveryMesh` (from n223) that
+uses the PRODUCTION `PinnedConnector::new(url)` connector factory
+(NOT `from_parts`). The gateway's connector factory closure is:
+```rust
+|url| PinnedConnector::new(url).map_err(snp_node::legacy::NodeError::Gateway)
+```
+This enforces the full SSRF defence + port policy + URL length limit +
+DNS pinning + TLS certificate validation. The mesh brings up:
+- Discovery plane: B, C, G each have a `TcpForwardingServer` + a
+  `TcpRecursiveTransport` peer map.
+- Circuit plane: B, C run `serve_relay_via_route`; G runs
+  `serve_gateway_with_protocol_circuit` with the production connector.
+- A's topology + `TcpRecursiveTransport` (peer = B at B's discovery_addr).
+
+**Test 1: `real_internet_egress_through_production_connector`** — The
+N2.2.4 north-star external test. Marked `#[ignore]` and self-skips
+unless `SHARENET_EXTERNAL_NET_TESTS=1`. Steps:
+1. Bring up the full 4-node mesh with the PRODUCTION connector.
+2. A discovers a route to G via recursive TCP discovery (A→B→C→G).
+3. `resolution.verify()` — all signatures + chain coherence OK.
+4. `resolution.into_route()` — produces a validated Route.
+5. `send_via_route(&route, "https://example.com/")` — sends a real HTTPS
+   request through the discovered route.
+6. The gateway calls `PinnedConnector::new("https://example.com/")`:
+   - URL parse OK.
+   - SSRF literal-host check OK (example.com is public).
+   - Port validation OK (443 for HTTPS).
+   - DNS resolution → Cloudflare anycast IP (e.g. 104.20.23.154).
+   - Per-IP SSRF check OK (public IP).
+   - IP pin → 104.20.23.154:443.
+   - TCP connect + rustls TLS handshake (SNI=example.com, cert validated
+     against Mozilla CA bundle).
+   - HTTP/1.1 GET request → 200 OK response.
+   - Body capped, object_id = SHA-256(body), response signed.
+7. The response propagates back: G → C → B → A. A decrypts with the
+   circuit recv_key, verifies the gateway's Ed25519 signature.
+8. Test verifies: `status == 200`, `verify_transit_response(...) == true`,
+   `gateway_id == G's NodeId`, `object_id != [0; 32]` (non-empty body),
+   `Content-Type: text/html` header present (proves it's a real HTTP
+   response from a web server).
+
+   NOTE: The test uses `https://example.com/` instead of
+   `https://httpbin.org/get` (which the task description mentions as an
+   example) because httpbin.org is hosted behind an AWS ELB that
+   frequently returns 503 under load. example.com is Cloudflare-fronted
+   and returns a stable 200. The test asserts `status == 200`, so a
+   reliable upstream is required.
+
+   The test was verified to PASS in the sandboxed environment (with
+   network access) — both tests pass in 0.23s.
+
+**Test 2: `production_connector_accepts_public_https_url`** — A lighter
+sanity check that verifies `PinnedConnector::new("https://example.com/")`
+succeeds (URL parse + SSRF + port + DNS + per-IP SSRF + IP pin). Does
+NOT do TCP connect / TLS / HTTP — just construction. Also `#[ignore]`'d
+and self-skips without the env var.
+
+**Running the external tests:**
+```bash
+# Default (skipped due to #[ignore]):
+cargo test -p snp-node --test n224_real_internet_egress
+
+# With --ignored but no env var (tests self-skip):
+cargo test -p snp-node --test n224_real_internet_egress -- --ignored
+
+# Full run (requires network access to example.com):
+SHARENET_EXTERNAL_NET_TESTS=1 cargo test -p snp-node --test n224_real_internet_egress -- --ignored
+```
+
+### Key design decisions
+
+- **SSRF check at construction time.** All 13 SSRF rejection tests verify
+  that `PinnedConnector::new(url)` rejects the URL BEFORE any DNS
+  resolution or TCP connection. The SSRF check fires at construction
+  time, so the tests are deterministic and require NO network access.
+  This is the correct design — SSRF defence must be fail-closed at the
+  earliest possible stage.
+
+- **Alternative IP encodings: parse + reject.** `parse_ipv4_alternative`
+  handles decimal/hex/octal single-integer forms (returns `Some(ip)` for
+  valid encodings). `is_private_destination` then checks the parsed IP
+  via `is_private_ipv4`. For dotted-octal/hex forms (`0177.0.0.1`,
+  `0x7f.0.0.1`), a separate suspicious-component detector rejects them
+  outright (returns `true` for "private") without trying to compute the
+  actual IP — because we don't care which private IP it would resolve to,
+  we reject anything that LOOKS like an alternative IP encoding.
+
+- **Defense in depth.** The URL crate (Rust) normalizes alternative IP
+  encodings to standard decimal form BEFORE we see the host string (e.g.
+  `http://0x7f000001/` → host = `"127.0.0.1"`). So the
+  `parse_ipv4_alternative` function is not strictly necessary for the
+  URL-based path — the normalized form is caught by `parse_ipv4` +
+  `is_private_ipv4`. However, `parse_ipv4_alternative` is a defense in
+  depth for callers that pass host strings directly (e.g. if someone uses
+  `is_private_destination` on a raw host string from elsewhere). The
+  dotted-octal suspicious check IS necessary because the URL crate's
+  IPv4 parser accepts `0177.0.0.1` and normalizes it to `127.0.0.1`, but
+  we want to reject it explicitly at the literal-host stage (rather than
+  relying on the URL crate's normalization, which could change).
+
+- **Port policy is fail-closed.** Only 80 (http) and 443 (https) are
+  allowed by default. Non-standard ports require explicit per-port
+  policy, which is not configured by default. This blocks SSRF pivots
+  that use non-standard ports to reach internal services.
+
+- **URL length limit is checked first.** The `MAX_URL_LENGTH` check
+  happens BEFORE URL parsing (which itself can be expensive on
+  pathological inputs). This bounds the memory cost of accepting an
+  untrusted URL.
+
+- **Resource limit constants are reserved.** `MAX_CONCURRENT_UPSTREAM`
+  and `MAX_REDIRECTS` are defined as named constants but NOT yet
+  enforced by the gateway. They are reserved for the production
+  semaphore (bounds `spawn_blocking` queue depth) and the future
+  same-host redirect-following feature. `CONNECT_TIMEOUT_SECS` and
+  `READ_TIMEOUT_SECS` are already used by `PinnedConnector::fetch` (via
+  `Duration::from_secs(15)` and `Duration::from_secs(30)`) — publishing
+  them as named constants makes the policy explicit and tunable.
+
+- **External test uses example.com, not httpbin.org.** The task
+  description suggests `https://httpbin.org/get`, but httpbin.org is
+  hosted behind an AWS ELB that returns 503 under load (verified during
+  development — direct `PinnedConnector::new("https://httpbin.org/get")
+  .fetch()` returned 503 from `awselb/2.0`). example.com is
+  Cloudflare-fronted and returns a stable 200. The test asserts
+  `status == 200`, so a reliable upstream is required. The test verifies
+  the same properties that httpbin would have verified (status 200, real
+  HTTP response, gateway signature, Content-Type header) — just with a
+  more reliable upstream.
+
+- **External test is `#[ignore]` + env-var gated.** The test is marked
+  `#[ignore]` so it does not run by default. It also self-skips unless
+  `SHARENET_EXTERNAL_NET_TESTS=1` is set, even if `--ignored` is passed.
+  This is a belt-and-suspenders check that prevents accidental network
+  access in CI. The test was verified to PASS in the sandboxed
+  environment (with network access).
+
+- **No production code changes outside snp-gateway/src/lib.rs.** All
+  changes are in the gateway crate. The async runtime
+  (`snp-node/src/node/async_node.rs`), route (`snp-node/src/node/route.rs`),
+  link (`snp-link/src/lib.rs`), and crypto (`snp-crypto/src/lib.rs`) are
+  UNTOUCHED. The FROZEN architecture (ForwardedQuery, SignedResponseStep,
+  RecursiveRouteResponse, DistributedRouteResolution, Route,
+  RouteCommitment, RecursiveNextHopTransport, TcpRecursiveTransport,
+  send_via_route, serve_relay_via_route, Circuit cryptography) is
+  preserved.
+
+### Test results
+
+- `cargo build -p snp-node`:
+  - Success (105 pre-existing warnings, no new warnings from N2.2.4
+    changes — verified the new test files compile cleanly with
+    `#[allow(dead_code)]` on the Mesh struct fields that are kept alive
+    implicitly).
+
+- `cargo test -p snp-gateway --lib`:
+  - 12 passed, 0 failed, 0 ignored (was 7; +5 new —
+    `private_ipv4_broadcast_explicit`,
+    `parse_ipv4_alternative_decimal_hex_octal`,
+    `private_destination_alternative_encodings`, `validate_port_policy`,
+    `pinned_connector_rejects_oversized_url`).
+
+- `cargo test -p snp-node --test n224_gateway_security`:
+  - 18 passed, 0 failed, 0 ignored (ran 3× in a row, no flakiness; ~15s
+    per run — the 15s is dominated by `upstream_timeout` which waits
+    for the 15s connect_timeout to 192.0.2.1).
+
+- `cargo test -p snp-node --test n224_real_internet_egress`:
+  - 0 passed, 0 failed, 2 ignored (both tests are `#[ignore]`'d).
+
+- `SHARENET_EXTERNAL_NET_TESTS=1 cargo test -p snp-node --test
+  n224_real_internet_egress -- --ignored`:
+  - 2 passed, 0 failed, 0 ignored (verified in the sandboxed environment
+    with network access; ~0.23s total). Both tests pass:
+    - `production_connector_accepts_public_https_url` — verifies
+      `PinnedConnector::new("https://example.com/")` succeeds (DNS
+      resolves to a public Cloudflare IP, no SSRF block).
+    - `real_internet_egress_through_production_connector` — full
+      end-to-end through the 4-node mesh with the PRODUCTION connector;
+      status=200, signature verifies, Content-Type: text/html present,
+      object_id non-zero.
+
+- `cargo test --workspace`:
+  - Total: 453 passed, 0 failed, 5 ignored (was 430 passed, 3 ignored;
+    +23 new passing tests [18 from n224_gateway_security + 5 gateway
+    unit tests], +2 new ignored tests [n224_real_internet_egress]).
+
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+  - The `is_private_destination` hardening (alternative IP encodings,
+    broadcast, dotted-octal/hex suspicious check) does NOT break any
+    existing conformance vector — the public vectors
+    (`example.com`, `1.1.1.1`, `8.8.8.8`, `2606:4700:4700::1111`) still
+    return `false` (not private), and the private vectors (`10.0.0.1`,
+    `127.0.0.1`, `169.254.1.1`, `224.0.0.1`, `localhost`,
+    `internal.local`, `::1`, `fe80::1`, `fc00::1`, `ff02::1`) still
+    return `true`.
+
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (105 pre-existing warnings).
+
+### Security invariant (N2.2.4)
+
+> "The N2.2.4 hardening closes every SSRF bypass vector that was
+> identified in the task description:
+>
+> 1. **Alternative IP encodings** — `parse_ipv4_alternative` catches
+>    decimal (`2130706433`), hex (`0x7f000001`), and octal
+>    (`017700000001`) single-integer forms at the literal-host check
+>    stage. Dotted-octal (`0177.0.0.1`) and dotted-hex (`0x7f.0.0.1`)
+>    forms are caught by a suspicious-component detector that rejects
+>    any 4-part dotted host with a leading-zero-octal or `0x`-prefixed
+>    component. These encodings are SSRF bypass vectors because some
+>    HTTP stacks interpret them as `127.0.0.1`, bypassing naive
+>    string-based checks for `127.`.
+>
+> 2. **Broadcast address** — `255.255.255.255` is explicitly rejected
+>    by `is_private_ipv4` (was already caught by the `240.0.0.0/4`
+>    reserved-range check, but the explicit check documents the intent).
+>
+> 3. **Port policy** — `validate_port` enforces that HTTPS uses port 443
+>    and HTTP uses port 80 by default. Non-standard ports are rejected
+>    with `EgressBlocked`. This blocks SSRF pivots that use non-standard
+>    ports to reach internal services (e.g. `https://internal.svc:8443/`,
+>    `http://attacker.com:22/`).
+>
+> 4. **URL length limit** — `MAX_URL_LENGTH = 8192` rejects URLs longer
+>    than 8 KiB at construction time, before URL parsing. This bounds
+>    the memory cost of accepting an untrusted URL.
+>
+> 5. **Resource limits** — `MAX_RESPONSE_BYTES_DEFAULT` (10 MiB),
+>    `MAX_CONCURRENT_UPSTREAM` (64), `CONNECT_TIMEOUT_SECS` (15),
+>    `READ_TIMEOUT_SECS` (30), `MAX_REDIRECTS` (5) are published as
+>    named constants. The timeouts are already enforced by
+>    `PinnedConnector::fetch`; the concurrent-upstream limit and
+>    redirect-following are reserved for future production features.
+>
+> The hardening is defense-in-depth: even though the URL crate (Rust)
+> normalizes alternative IP encodings to standard decimal form before
+> we see the host string, the `parse_ipv4_alternative` function and the
+> dotted-octal suspicious check catch any caller that passes a raw host
+> string (e.g. if someone uses `is_private_destination` on a host from a
+> non-URL source). The port policy and URL length limit are NEW
+> fail-closed checks that were NOT present in N1.9 (N1.9 implicitly
+> allowed any port and any URL length).
+>
+> The 13 deterministic SSRF rejection tests prove that every bypass
+> vector is caught at construction time, BEFORE any DNS resolution or
+> TCP connection. The 1 concurrent upstream test proves that 3
+> independent circuits through 3 independent meshes do not
+> cross-contaminate (each response's `object_id` matches its own mesh's
+> body, each response is signed by its own gateway, each response has a
+> distinct `req_id`). The 4 upstream failure propagation tests prove
+> that TCP connection refused, TCP timeout, HTTP 500, and HTTP 404 are
+> all handled gracefully (the client gets a clear error or status code,
+> no panic, no hang).
+>
+> The opt-in external Internet egress test (2 tests, both `#[ignore]`'d)
+> proves the PRODUCTION `PinnedConnector::new` path works end-to-end
+> through the full A→B→C→G mesh: URL parse → SSRF literal-host check →
+> port validation → DNS resolution → per-IP SSRF check → IP pin → TCP
+> connect → TLS handshake (rustls + webpki-roots) → HTTP/1.1 request →
+> response parse → sign → encrypt → return. The test was verified to
+> PASS in the sandboxed environment with network access (status=200,
+> signature verifies, Content-Type: text/html present)."
+
+- Ready for the next task.
