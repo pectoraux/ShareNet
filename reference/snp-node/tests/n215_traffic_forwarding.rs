@@ -1927,3 +1927,34 @@ fn v1_packet_cannot_be_forwarded_by_v2_path() {
         "v1 packet on v2 path must fail AEAD (different AAD/nonce), got {result:?}"
     );
 }
+
+/// P0: V1 golden wire vector — the exact canonical CBOR bytes a v1
+/// CircuitPacketV1 must produce. These bytes are FROZEN (from commit
+/// 0efaaac). Any change to v1 encode/AAD/nonce that produces different
+/// bytes is a protocol break. The conformance vector is in
+/// `public/conformance/vectors/11-circuit-packet-v1.json`.
+///
+/// This test asserts the exact wire bytes so CI catches accidental v1 drift.
+#[test]
+fn v1_golden_wire_vector_frozen() {
+    let packet = CircuitPacketV1 {
+        circuit_id: [0x0f; 32],
+        seq: 1,
+        ttl: 16,
+        payload: vec![0xde, 0xad, 0xbe, 0xef],
+        final_dst: [0xaa; 32],
+    };
+    let wire = packet.encode_to_cbor().unwrap();
+    let hex: String = wire.iter().map(|b| format!("{b:02x}")).collect();
+    // FROZEN v1 wire bytes from commit 0efaaac.
+    // Any change here = protocol break = requires version bump + ADR.
+    let expected = "a563736571016374746c10677061796c6f616444deadbeef6866696e616c4473745820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6963697263756974496458200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
+    assert_eq!(
+        hex, expected,
+        "v1 wire bytes changed — the frozen N2.3 v1 protocol has been broken. \
+         This requires a protocol version bump + ADR update + explicit approval."
+    );
+    // Verify decode round-trip produces the same packet.
+    let decoded = CircuitPacketV1::decode_from_cbor(&wire).unwrap();
+    assert_eq!(decoded, packet, "v1 decode must round-trip the frozen wire bytes");
+}
