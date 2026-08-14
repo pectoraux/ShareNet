@@ -7148,3 +7148,49 @@ Stage Summary:
   - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
   - `cargo build -p snp-stack`: zero warnings, zero errors.
 - STOP condition met: no gateway DNS forwarding, no DoH/DoT, no caching, no DNSSEC, no recursive resolution. The deliverable is exactly "DNS interception foundation — parse DNS queries, generate synthetic responses, intercept UDP/53 packets."
+
+---
+Task ID: N2.3.5
+Agent: Z.ai Code (main)
+Task: Implement TCP Flow Bridge Foundation — prove the packet-to-mesh adapter boundary. A TCP SYN received from TUN → smoltcp creates socket → outbound bytes extracted → wrapped into transit-like message → upstream returns bytes → injected back into smoltcp → application receives data. No real ShareNet circuit yet (MockUpstream is the seam).
+
+Work Log:
+- Added accessor methods to `TcpEngine` (tcp_engine.rs):
+  - `sockets_mut()` — mutable access to the SocketSet.
+  - `tcp_socket_mut(handle) -> &mut SmolTcpSocket<'static>` — mutable access to a specific socket (for the bridge's recv_slice/send_slice). Fixed lifetime issue by specifying `SmolTcpSocket<'static>` explicitly.
+  - `tcp_socket(handle) -> &SmolTcpSocket<'static>` — shared access (for can_recv/can_send checks).
+  - `remove_socket(handle)` — for connection teardown.
+
+- Created `snp-stack/src/bridge.rs` — the TCP flow bridge:
+  - `Upstream` trait (Send): `send(&mut self, data: &[u8]) -> Result<usize, BridgeError>`, `recv(&mut self) -> Result<Option<Vec<u8>>, BridgeError>`, `close(&mut self)`. This is the SEAM between the TCP flow bridge and the ShareNet circuit. Production plugs in a circuit-backed implementation; tests use MockUpstream.
+  - `BridgeError` enum: Closed, BufferFull, SmolTcp(String), UnknownSocket(SocketHandle).
+  - `FlowEntry` struct: maps a SocketHandle to a `Box<dyn Upstream>`.
+  - `TcpFlowBridge` struct: holds `HashMap<SocketHandle, FlowEntry>`. API:
+    - `attach_upstream(socket_handle, upstream)` — link a smoltcp socket to an upstream.
+    - `detach_upstream(socket_handle)` — close the upstream + remove the flow.
+    - `has_upstream(socket_handle)`, `flow_count()`.
+    - `pump(&mut engine) -> (usize, usize)` — THE CORE FUNCTION. For each tracked flow: (1) reads bytes from the smoltcp socket via `socket.recv_slice()`, (2) forwards them to the upstream via `upstream.send()`, (3) receives bytes from the upstream via `upstream.recv()`, (4) injects them into the smoltcp socket via `socket.send_slice()`. Returns (bytes_sent_to_upstream, bytes_injected_to_app). Handles closed upstreams by closing the smoltcp socket.
+  - `MockUpstream` struct: in-memory queues for testing. `load_receive_data()` pre-loads bytes the bridge will receive. `sent_bytes()` returns what the bridge sent. `is_closed()`, `has_receive_data()`.
+  - 5 unit tests: bridge_starts_empty, bridge_attach_and_detach, mock_upstream_send_and_recv, mock_upstream_closed_returns_error, bridge_pump_no_flows_is_noop.
+
+- Created `snp-stack/tests/tcp_flow_bridge.rs` — 7 integration tests:
+  - `tcp_flow_bridge_end_to_end_data_transfer` — THE ACCEPTANCE TEST. Full pipeline: client smoltcp → SYN → server TcpEngine handshake → attach MockUpstream → client sends "GET / HTTP/1.1..." → bridge pumps request to upstream → upstream has pre-loaded "Hello from gateway!" → bridge pumps response into smoltcp → exchange packets → client receives "Hello from gateway!". Verifies both directions: total_sent > 0 (app→upstream) AND total_recv > 0 (upstream→app).
+  - `tcp_flow_bridge_bidirectional_transfer` — similar but with HTTP-like request/response, larger payload.
+  - `bridge_attaches_after_handshake` — verify the bridge can attach AFTER establishment.
+  - `bridge_detaches_and_closes_upstream` — verify detach closes the upstream.
+  - `bridge_pump_no_flows_is_noop` — pump with no flows returns (0, 0).
+  - `mock_upstream_tracks_sent_bytes` — verify sent_bytes() accumulation.
+  - `mock_upstream_load_and_receive` — verify load/receive lifecycle.
+
+- Updated `snp-stack/src/lib.rs` — added `pub mod bridge;` and re-exports for `BridgeError`, `MockUpstream`, `TcpFlowBridge`, `Upstream`.
+
+Stage Summary:
+- N2.3.5 is complete: the TCP flow bridge proves the packet-to-mesh adapter boundary. A TCP SYN from the TUN → smoltcp handshake → bridge pumps bytes to an upstream → upstream returns bytes → bridge injects into smoltcp → application receives data. The `Upstream` trait is the seam — production plugs in a ShareNet circuit adapter, tests use MockUpstream.
+- The frozen ShareNet stack (Identity, Discovery, Route, Circuit, Gateway, Internet) is UNTOUCHED. `snp-stack` depends only on `snp-tun` and `smoltcp`.
+- The Flow Ownership Invariant is preserved: the bridge does NOT do routing, gateway selection, or circuit creation — it only transfers bytes between smoltcp sockets and the upstream seam.
+- Test results:
+  - `cargo test -p snp-stack`: 92 passed (54 unit + 17 DNS + 9 flow + 7 bridge + 5 TCP handshake), 0 failed, 0 ignored.
+  - `cargo test --workspace`: 587 passed (was 575; +12 new), 0 failed, 5 ignored.
+  - `cargo run -p snp-conformance`: 138/138 (100.0%) — no regressions.
+  - `cargo build -p snp-stack`: zero warnings, zero errors.
+- STOP condition met: no real ShareNet circuit integration, no HTTP/HTTPS proxy, no DNS integration, no application awareness. The deliverable is exactly "TCP flow bridge foundation — the packet-to-mesh adapter boundary is proven."

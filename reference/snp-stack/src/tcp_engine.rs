@@ -198,6 +198,32 @@ impl TcpEngine {
     pub fn interface_mut(&mut self) -> &mut Interface {
         &mut self.interface
     }
+
+    /// Returns a mutable reference to the underlying socket set (for advanced
+    /// socket manipulation — e.g. the bridge's `recv_slice`/`send_slice`).
+    #[must_use]
+    pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {
+        &mut self.sockets
+    }
+
+    /// Returns a mutable reference to a specific TCP socket (for the bridge
+    /// to call `recv_slice`/`send_slice`).
+    #[must_use]
+    pub fn tcp_socket_mut(&mut self, handle: SocketHandle) -> &mut SmolTcpSocket<'static> {
+        self.sockets.get_mut::<SmolTcpSocket<'static>>(handle)
+    }
+
+    /// Returns a shared reference to a specific TCP socket (for the bridge
+    /// to check `can_recv`/`can_send`).
+    #[must_use]
+    pub fn tcp_socket(&self, handle: SocketHandle) -> &SmolTcpSocket<'static> {
+        self.sockets.get::<SmolTcpSocket<'static>>(handle)
+    }
+
+    /// Remove a socket from the socket set (for connection teardown).
+    pub fn remove_socket(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
+    }
 }
 
 #[cfg(test)]
@@ -207,7 +233,7 @@ mod tests {
 
     #[test]
     fn engine_creates_with_local_ip() {
-        let engine = TcpEngine::new(Ipv4Address::new(10, 0, 0, 1), 1500);
+        let _engine = TcpEngine::new(Ipv4Address::new(10, 0, 0, 1), 1500);
         // No sockets yet.
     }
 

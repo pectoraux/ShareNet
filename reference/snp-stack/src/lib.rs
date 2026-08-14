@@ -93,12 +93,14 @@
 #![warn(clippy::all)]
 #![allow(clippy::pedantic)]
 
+pub mod bridge;
 pub mod dns;
 pub mod flow_table;
 pub mod smol_device;
 pub mod tcp_engine;
 pub mod transport;
 
+pub use bridge::{BridgeError, MockUpstream, TcpFlowBridge, Upstream};
 pub use dns::{
     intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,
