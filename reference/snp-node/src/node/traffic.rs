@@ -17,24 +17,43 @@
 //!
 //! ## Per-hop onion AEAD
 //!
-//! The source wraps the payload in nested ChaCha20-Poly1305 layers, one per
-//! non-source hop, in reverse traversal order. Each relay peels exactly one
-//! layer with its installed `forwarding_key`:
+//! The source wraps the payload in nested ChaCha20-Poly1305 layers, **one per
+//! non-source hop, including the terminal gateway**, in reverse traversal
+//! order. Each relay peels exactly one layer with its `forwarding_key`. The
+//! terminal gateway peels the final layer to recover the plaintext.
+//!
+//! **General invariant:** ONE AEAD LAYER PER NON-SOURCE HOP, INCLUDING THE
+//! TERMINAL GATEWAY. For a route A → B → C → G, there are three non-source
+//! hops (B, C, G), so the source creates three nested AEAD layers.
 //!
 //! ```text
 //! source constructs:
 //!   inner   = plaintext (for G)
-//!   layer_C = AEAD_seal(key_C, nonce, inner,   aad = circuit_id ‖ seq ‖ ttl_C ‖ final_dst)
-//!   layer_B = AEAD_seal(key_B, nonce, layer_C, aad = circuit_id ‖ seq ‖ ttl_B ‖ final_dst)
+//!
+//!   layer_G = AEAD_seal(key_G, nonce, inner,
+//!                       aad = circuit_id ‖ seq ‖ ttl_G ‖ final_dst)
+//!
+//!   layer_C = AEAD_seal(key_C, nonce, layer_G,
+//!                       aad = circuit_id ‖ seq ‖ ttl_C ‖ final_dst)
+//!
+//!   layer_B = AEAD_seal(key_B, nonce, layer_C,
+//!                       aad = circuit_id ‖ seq ‖ ttl_B ‖ final_dst)
+//!
 //!   packet  = { circuit_id, seq, ttl, payload = layer_B, final_dst = G }
 //!
 //! where ttl_B is the TTL the first relay sees (PACKET_TTL_MAX),
-//!       ttl_C = ttl_B - 1, etc. Each layer authenticates the hop-local TTL.
+//!       ttl_C = ttl_B - 1, ttl_G = ttl_B - 2. Each layer authenticates
+//!       the hop-local TTL for the relay that opens it.
 //!
-//! B: lookup state[circuit_id] → unwrap layer_B with key_B → reveals layer_C + successor C
-//! C: lookup state[circuit_id] → unwrap layer_C with key_C → reveals plaintext + successor G (terminal)
-//! G: receives plaintext
+//! Forwarding:
+//!   A → B:  B unwraps layer_B → reveals layer_C  → forwards to C
+//!   B → C:  C unwraps layer_C → reveals layer_G  → forwards to G
+//!   C → G:  G unwraps layer_G → reveals plaintext → delivers locally
 //! ```
+//!
+//! A non-terminal relay always treats the decrypted inner bytes as the
+//! **next AEAD layer** (for its successor). Only the terminal gateway
+//! (successor = `None`) treats the inner bytes as the plaintext to deliver.
 //!
 //! The AEAD AAD is `circuit_id ‖ seq ‖ ttl ‖ final_dst`, where `ttl` is the
 //! hop-local TTL the opening relay sees. An attacker who modifies `ttl`,
@@ -619,9 +638,13 @@ impl RelayForwardingTable {
 /// Source-side: wrap an application payload into a `CircuitPacket` ready to
 /// send to the first relay.
 ///
-/// The source constructs nested AEAD layers, one per non-source hop, in
-/// reverse traversal order. Each layer's AAD binds `circuit_id ‖ seq ‖
-/// final_dst`, so the destination and circuit cannot be substituted.
+/// The source constructs nested AEAD layers, **one per non-source hop
+/// (including the terminal gateway)**, in reverse traversal order. Each
+/// layer's AAD binds `circuit_id ‖ seq ‖ ttl ‖ final_dst`, where `ttl` is
+/// the hop-local TTL the opening relay is expected to see. An attacker who
+/// modifies the circuit, sequence, TTL, or destination in transit breaks the
+/// AEAD authentication. Each layer authenticates its own hop-local TTL (not
+/// a single end-to-end value).
 ///
 /// # Parameters
 ///
