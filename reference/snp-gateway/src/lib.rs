@@ -125,6 +125,52 @@ pub type ReqId = [u8; 16];
 /// 32-byte NodeId / ObjectId / RendezvousIdentity (I3, I4).
 pub type NodeIdBytes = [u8; 32];
 
+// ─── Resource limits (N2.2.4 — Real Internet Egress) ────────────────────────
+
+/// Maximum URL length accepted by [`PinnedConnector::new`] (8 KiB).
+///
+/// URLs longer than this are rejected with [`GatewayError::MalformedUrl`] at
+/// construction time, before any DNS resolution or TCP connection is attempted.
+/// This bounds the memory cost of accepting an untrusted URL.
+pub const MAX_URL_LENGTH: usize = 8192;
+
+/// Default maximum response body size (10 MiB).
+///
+/// The gateway caps the response body at `req.max_response_bytes`; this
+/// constant is the default the client SHOULD use if it has no specific
+/// preference. Production deployments may lower this to fit their egress
+/// budget.
+pub const MAX_RESPONSE_BYTES_DEFAULT: u64 = 10 * 1024 * 1024;
+
+/// Maximum number of concurrent upstream fetches per gateway process.
+///
+/// Beyond this limit, new requests must wait (or be rejected). NOT yet
+/// enforced by the gateway — the constant is reserved for the production
+/// semaphore that bounds the `spawn_blocking` queue depth (N2.2.4 reserves
+/// the constant so production code can refer to it without magic numbers).
+pub const MAX_CONCURRENT_UPSTREAM: usize = 64;
+
+/// Connect timeout for the upstream TCP connection (seconds).
+///
+/// Matches the 15-second timeout already used by [`PinnedConnector::fetch`].
+/// Publishing it as a named constant makes the policy explicit and
+/// tunable.
+pub const CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// Read timeout for the upstream HTTP response (seconds).
+///
+/// Matches the 30-second timeout already used by [`PinnedConnector::fetch`].
+pub const READ_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum number of HTTP 3xx redirects the gateway would follow.
+///
+/// The current gateway does NOT follow redirects (3xx responses are returned
+/// to the client verbatim — a deliberate SSRF defence against redirect-based
+/// private-IP pivots). This constant is reserved for the future same-host
+/// redirect-following feature, which would re-run the SSRF check on each
+/// `Location` header.
+pub const MAX_REDIRECTS: u8 = 5;
+
 /// A Mode A "please fetch this URL for me" bundle, signed by the client.
 ///
 /// CDDL (02-PROTOCOL-SPEC.md §8.2), simplified for N1.8 (empty headers, null
@@ -492,6 +538,7 @@ pub fn verify_transit_response(resp: &TransitResponse, gateway_public_key: &[u8;
 /// - `192.168.0.0/16` — RFC 1918 private
 /// - `224.0.0.0/4` — multicast
 /// - `240.0.0.0/4` — reserved
+/// - `255.255.255.255` — broadcast (N2.2.4 explicit check)
 #[must_use]
 pub fn is_private_ipv4(b: &[u8; 4]) -> bool {
     // 0.0.0.0/8 — "this network" / unspecified
@@ -526,7 +573,12 @@ pub fn is_private_ipv4(b: &[u8; 4]) -> bool {
     if (224..=239).contains(&b[0]) {
         return true;
     }
-    // 240.0.0.0/4 — reserved
+    // 240.0.0.0/4 — reserved (includes 255.255.255.255 broadcast, which is
+    // also caught by the explicit broadcast check below — listed separately
+    // for self-documentation).
+    if b[0] == 255 && b[1] == 255 && b[2] == 255 && b[3] == 255 {
+        return true;
+    }
     if b[0] >= 240 {
         return true;
     }
@@ -574,6 +626,11 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     for (i, p) in parts.iter().enumerate() {
         // Reject empty / leading-zero (e.g. "0177") / non-numeric.
+        // The leading-zero rejection is the SSRF defence against octal-encoded
+        // dotted IPs like "0177.0.0.1" (= 127.0.0.1). It also incidentally
+        // rejects hex-form dotted components like "0x7f.0.0.1" (the `0x` is
+        // non-numeric). Dotted-octal/hex forms are additionally caught by the
+        // suspicious-component check in [`is_private_destination`].
         if p.is_empty() || (p.len() > 1 && p.starts_with('0')) {
             return None;
         }
@@ -586,6 +643,53 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     Some(out)
 }
 
+/// Parse a SINGLE-INTEGER IPv4 representation in decimal, hex, or octal form.
+///
+/// These alternative encodings are SSRF bypass vectors: a URL like
+/// `http://2130706433/` is interpreted by some HTTP stacks as
+/// `http://127.0.0.1/`, bypassing naive string-based checks for `127.`.
+/// This parser lets [`is_private_destination`] catch them at the literal-host
+/// check stage.
+///
+/// Accepted forms (single integer, no dots):
+/// - Decimal: `2130706433` → `[127, 0, 0, 1]`
+/// - Hex: `0x7f000001` → `[127, 0, 0, 1]`
+/// - Octal: `017700000001` → `[127, 0, 0, 1]`
+///
+/// Dotted-octal forms (`0177.0.0.1`) and dotted-hex forms (`0x7f.0.0.1`) are
+/// NOT parsed here — they are rejected as suspicious alternative encodings
+/// by the dotted-component check in [`is_private_destination`].
+///
+/// Returns `None` if the input contains a dot, is empty, has invalid chars
+/// for the detected radix, or overflows `u32`.
+#[must_use]
+pub fn parse_ipv4_alternative(s: &str) -> Option<[u8; 4]> {
+    let s = s.trim();
+    if s.is_empty() || s.contains('.') {
+        return None;
+    }
+    let n: u32 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        // Hex: 0x7f000001
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(hex, 16).ok()?
+    } else if s.len() > 1 && s.starts_with('0') {
+        // Octal: 017700000001 (leading zero + more digits, all 0-7)
+        if !s.chars().all(|c| ('0'..='7').contains(&c)) {
+            return None;
+        }
+        u32::from_str_radix(s, 8).ok()?
+    } else {
+        // Decimal: 2130706433
+        if !s.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<u32>().ok()?
+    };
+    Some(n.to_be_bytes())
+}
+
 /// Determine whether a destination host is private/restricted and MUST be
 /// rejected by a gateway egress (invariant I18, threat T9 — SSRF defence).
 ///
@@ -593,6 +697,14 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// resolves to `127.0.0.1` (DNS rebinding) is NOT caught here — callers MUST
 /// re-check the resolved IP via [`is_private_ip`] immediately before
 /// connecting. [`handle_transit_request`] does this two-step check.
+///
+/// **N2.2.4 hardening:** This function additionally catches the alternative
+/// IP encodings that bypass naive string checks:
+/// - Decimal single-integer: `2130706433` (= 127.0.0.1)
+/// - Hex single-integer: `0x7f000001` (= 127.0.0.1)
+/// - Octal single-integer: `017700000001` (= 127.0.0.1)
+/// - Dotted-octal: `0177.0.0.1` (= 127.0.0.1) — rejected as suspicious
+/// - Dotted-hex: `0x7f.0.0.1` (= 127.0.0.1) — rejected as suspicious
 #[must_use]
 pub fn is_private_destination(host: &str) -> bool {
     let h = host.to_lowercase();
@@ -610,9 +722,38 @@ pub fn is_private_destination(host: &str) -> bool {
     if h == "metadata.google.internal" || h == "metadata" {
         return true;
     }
-    // IPv4 literal
+    // IPv4 dotted-quad literal (standard form: no leading zeros, decimal only)
     if let Some(v4) = parse_ipv4(h) {
         return is_private_ipv4(&v4);
+    }
+    // IPv4 alternative encodings (decimal/hex/octal single-integer forms).
+    // SSRF bypass vector: `http://2130706433/` and `http://0x7f000001/` are
+    // interpreted by some HTTP stacks as `http://127.0.0.1/`.
+    if let Some(v4) = parse_ipv4_alternative(h) {
+        return is_private_ipv4(&v4);
+    }
+    // Dotted-octal/hex alternative encodings (e.g. `0177.0.0.1`, `0x7f.0.0.1`).
+    // The standard `parse_ipv4` rejects these (leading-zero / hex chars), so
+    // they would otherwise fall through as "public hostname" and rely on the
+    // DNS-rebinding check (which is implementation-dependent and not
+    // deterministic). Reject them explicitly at the literal-host stage for
+    // deterministic defence.
+    if h.contains('.') {
+        let parts: Vec<&str> = h.split('.').collect();
+        if parts.len() == 4 && parts.iter().all(|p| !p.is_empty()) {
+            let suspicious = parts.iter().any(|p| {
+                // Octal: leading zero + more digits, all 0-7
+                p.len() > 1
+                    && p.starts_with('0')
+                    && p.chars().all(|c| ('0'..='7').contains(&c))
+                // Hex: 0x prefix
+                || p.starts_with("0x")
+                || p.starts_with("0X")
+            });
+            if suspicious {
+                return true;
+            }
+        }
     }
     // IPv6 literal — strip brackets if present
     let bare = h.trim_start_matches('[').trim_end_matches(']');
@@ -715,6 +856,53 @@ pub fn is_private_ip_str(ip: &str) -> bool {
     false
 }
 
+/// Validate that the port is allowed for the given scheme (N2.2.4 egress-port
+/// policy).
+///
+/// - HTTPS: port 443 allowed (other ports require explicit per-port policy,
+///   which is not configured by default — reject by default).
+/// - HTTP: port 80 allowed (other ports require explicit per-port policy,
+///   which is not configured by default — reject by default).
+///
+/// The N1.9 implementation implicitly allowed any port (the URL scheme
+/// determined the port); N2.2.4 makes the policy explicit and fail-closed
+/// for non-standard ports. This blocks SSRF pivots that use non-standard
+/// ports to reach internal services (e.g. `http://attacker.com:22/` to
+/// probe SSH, or `https://internal.svc:8443/` to reach a private API).
+///
+/// # Errors
+/// Returns [`GatewayError::EgressBlocked`] if the port is not in the
+/// default-allow set for the scheme. Returns [`GatewayError::MalformedUrl`]
+/// if the scheme is not `http` or `https` (should have been caught earlier
+/// in `PinnedConnector::new`, but `validate_port` is also defensive).
+pub fn validate_port(scheme: &str, port: u16) -> GatewayResult<()> {
+    match scheme {
+        "https" => {
+            if port == 443 {
+                Ok(())
+            } else {
+                Err(GatewayError::EgressBlocked(format!(
+                    "HTTPS port {port} not allowed by default (only 443); \
+                     per-port egress policy not configured (N2.2.4)"
+                )))
+            }
+        }
+        "http" => {
+            if port == 80 {
+                Ok(())
+            } else {
+                Err(GatewayError::EgressBlocked(format!(
+                    "HTTP port {port} not allowed by default (only 80); \
+                     per-port egress policy not configured (N2.2.4)"
+                )))
+            }
+        }
+        other => Err(GatewayError::MalformedUrl(format!(
+            "unsupported scheme \"{other}\" in port validation (only http/https)"
+        ))),
+    }
+}
+
 // ─── PinnedConnector (N1.9: DNS pinning — close the N1.8 TOCTOU gap) ─────────
 
 /// An HTTP response returned by [`PinnedConnector::fetch`].
@@ -776,13 +964,23 @@ impl PinnedConnector {
     /// first public IP.
     ///
     /// # Errors
-    /// - [`GatewayError::MalformedUrl`] if the URL is malformed or uses an
-    ///   unsupported scheme.
+    /// - [`GatewayError::MalformedUrl`] if the URL is malformed, uses an
+    ///   unsupported scheme, or exceeds [`MAX_URL_LENGTH`] characters.
     /// - [`GatewayError::EgressBlocked`] if the literal host or ANY resolved
-    ///   IP is private/restricted (I18 SSRF defence).
+    ///   IP is private/restricted (I18 SSRF defence), or if the port is not
+    ///   in the default-allow set for the scheme (N2.2.4 egress-port policy).
     /// - [`GatewayError::DnsEmpty`] if DNS resolution returns no addresses.
     /// - [`GatewayError::Upstream`] if DNS resolution itself fails.
     pub fn new(url: &str) -> GatewayResult<Self> {
+        // N2.2.4: URL length limit — reject oversized URLs early to prevent
+        // memory exhaustion via giant URLs. This happens BEFORE URL parsing
+        // (which itself can be expensive on pathological inputs).
+        if url.len() > MAX_URL_LENGTH {
+            return Err(GatewayError::MalformedUrl(format!(
+                "URL length {} exceeds MAX_URL_LENGTH={MAX_URL_LENGTH} (N2.2.4)",
+                url.len()
+            )));
+        }
         let parsed = url::Url::parse(url)
             .map_err(|e| GatewayError::MalformedUrl(format!("URL parse: {e}")))?;
         let scheme = parsed.scheme();
@@ -806,7 +1004,11 @@ impl PinnedConnector {
         let port = parsed.port_or_known_default().ok_or_else(|| {
             GatewayError::MalformedUrl(format!("URL has no default port for scheme \"{scheme}\""))
         })?;
-        // Step 2: SSRF defence — resolve DNS ONCE, check EVERY resolved IP.
+        // Step 2 (N2.2.4): Egress-port policy — only 80 (http) / 443 (https)
+        // by default. Non-standard ports require explicit per-port policy,
+        // which is not configured by default — fail-closed.
+        validate_port(scheme, port)?;
+        // Step 3: SSRF defence — resolve DNS ONCE, check EVERY resolved IP.
         // We collect all addresses and reject if ANY are private — this is
         // the DNS-rebinding defence. The first PUBLIC IP becomes the pin.
         let host_port = format!("{host}:{port}");
@@ -1425,6 +1627,103 @@ mod tests {
         assert!(!is_private_destination("example.com"));
         assert!(!is_private_destination("93.184.216.34"));
         assert!(!is_private_destination("[2606:2800:220:1:248:1893:25c8:1946]"));
+    }
+
+    #[test]
+    fn private_ipv4_broadcast_explicit() {
+        // N2.2.4: 255.255.255.255 broadcast is explicitly rejected.
+        assert!(is_private_ipv4(&[255, 255, 255, 255]));
+        // Other broadcast-ish addresses in 240.0.0.0/4 are still rejected
+        // via the reserved-range check, but the explicit broadcast check
+        // documents the intent.
+        assert!(is_private_ipv4(&[255, 255, 255, 254]));
+        assert!(is_private_ipv4(&[255, 0, 0, 0]));
+        assert!(is_private_ipv4(&[243, 0, 0, 1]));
+    }
+
+    #[test]
+    fn parse_ipv4_alternative_decimal_hex_octal() {
+        // Decimal single-integer forms
+        assert_eq!(parse_ipv4_alternative("2130706433"), Some([127, 0, 0, 1]));
+        assert_eq!(parse_ipv4_alternative("167772161"), Some([10, 0, 0, 1]));
+        assert_eq!(parse_ipv4_alternative("16909060"), Some([1, 2, 3, 4]));
+        // Hex single-integer forms (0x prefix)
+        assert_eq!(parse_ipv4_alternative("0x7f000001"), Some([127, 0, 0, 1]));
+        assert_eq!(parse_ipv4_alternative("0X7F000001"), Some([127, 0, 0, 1]));
+        assert_eq!(parse_ipv4_alternative("0x0a000001"), Some([10, 0, 0, 1]));
+        // Octal single-integer forms (leading zero + digits 0-7)
+        assert_eq!(parse_ipv4_alternative("017700000001"), Some([127, 0, 0, 1]));
+        // 0o1200000001 = 167772161 = 0x0a000001 = 10.0.0.1
+        assert_eq!(parse_ipv4_alternative("01200000001"), Some([10, 0, 0, 1]));
+        // Edge cases: rejected
+        assert_eq!(parse_ipv4_alternative(""), None);
+        assert_eq!(parse_ipv4_alternative("127.0.0.1"), None, "dotted forms not handled here");
+        assert_eq!(parse_ipv4_alternative("0x"), None, "empty hex");
+        assert_eq!(parse_ipv4_alternative("0xZZ"), None, "non-hex chars after 0x");
+        assert_eq!(parse_ipv4_alternative("017700000009"), None, "octal with invalid digit 9");
+        assert_eq!(parse_ipv4_alternative("99999999999999999999"), None, "decimal overflow");
+        assert_eq!(parse_ipv4_alternative("0xFFFFFFFFF"), None, "hex overflow (9 hex digits)");
+        assert_eq!(parse_ipv4_alternative("example.com"), None, "non-numeric");
+    }
+
+    #[test]
+    fn private_destination_alternative_encodings() {
+        // N2.2.4: alternative IP encodings are caught at the literal-host stage.
+        // Decimal single-integer
+        assert!(is_private_destination("2130706433"), "decimal 127.0.0.1");
+        assert!(is_private_destination("167772161"), "decimal 10.0.0.1");
+        // Hex single-integer
+        assert!(is_private_destination("0x7f000001"), "hex 127.0.0.1");
+        assert!(is_private_destination("0X7F000001"), "hex (uppercase) 127.0.0.1");
+        // Octal single-integer
+        assert!(is_private_destination("017700000001"), "octal 127.0.0.1");
+        // Dotted-octal (rejected as suspicious — leading zero + octal digits)
+        assert!(is_private_destination("0177.0.0.1"), "dotted-octal 127.0.0.1");
+        // Dotted-hex (rejected as suspicious — 0x prefix)
+        assert!(is_private_destination("0x7f.0.0.1"), "dotted-hex 127.0.0.1");
+        // Broadcast
+        assert!(is_private_destination("255.255.255.255"), "broadcast");
+        // Public alternative encodings should NOT be flagged
+        // 134744072 (decimal) = 8.8.8.8 (Google DNS) — public
+        assert!(!is_private_destination("134744072"), "decimal 8.8.8.8 is public");
+        // 0x08080808 (hex) = 8.8.8.8 — public
+        assert!(!is_private_destination("0x08080808"), "hex 8.8.8.8 is public");
+    }
+
+    #[test]
+    fn validate_port_policy() {
+        // HTTPS: only 443
+        assert!(validate_port("https", 443).is_ok());
+        assert!(matches!(validate_port("https", 22), Err(GatewayError::EgressBlocked(_))));
+        assert!(matches!(validate_port("https", 8443), Err(GatewayError::EgressBlocked(_))));
+        assert!(matches!(validate_port("https", 80), Err(GatewayError::EgressBlocked(_))));
+        // HTTP: only 80
+        assert!(validate_port("http", 80).is_ok());
+        assert!(matches!(validate_port("http", 8080), Err(GatewayError::EgressBlocked(_))));
+        assert!(matches!(validate_port("http", 443), Err(GatewayError::EgressBlocked(_))));
+        // Other schemes: MalformedUrl
+        assert!(matches!(validate_port("ftp", 21), Err(GatewayError::MalformedUrl(_))));
+        assert!(matches!(validate_port("ws", 80), Err(GatewayError::MalformedUrl(_))));
+    }
+
+    #[test]
+    fn pinned_connector_rejects_oversized_url() {
+        // URL of exactly MAX_URL_LENGTH chars should be accepted (boundary).
+        let url_ok = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH - "https://example.com/".len()));
+        assert_eq!(url_ok.len(), MAX_URL_LENGTH);
+        // We can't easily test that this DOES succeed (it would try to do DNS),
+        // so we just verify the length check doesn't fire — the next failure
+        // mode (DNS / network) is OK.
+        // For this test, just verify a URL one char longer is rejected with
+        // MalformedUrl.
+        let url_too_long = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH - "https://example.com/".len() + 1));
+        assert!(url_too_long.len() > MAX_URL_LENGTH);
+        let result = PinnedConnector::new(&url_too_long);
+        assert!(
+            matches!(result, Err(GatewayError::MalformedUrl(_))),
+            "URL > MAX_URL_LENGTH must be rejected with MalformedUrl, got {:?}",
+            result
+        );
     }
 
     #[test]
