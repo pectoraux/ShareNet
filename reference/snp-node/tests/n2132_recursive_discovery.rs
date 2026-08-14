@@ -193,8 +193,8 @@ impl TestMesh {
 /// - Each hop's assertion is verified.
 /// - The hop budget decreases: 16→15→14 (initial=16, 3 hops, remaining=13).
 /// - visited_nodes grows: [A] → [A,B] → [A,B,C].
-#[test]
-fn recursive_a_b_c_gateway_success() {
+#[tokio::test]
+async fn recursive_a_b_c_gateway_success() {
     assert!(
         DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
         "N2.1.3: distributed route discovery must be implemented"
@@ -206,6 +206,7 @@ fn recursive_a_b_c_gateway_success() {
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("recursive resolution must succeed for A→B→C→G");
 
     // Verify the path A → B → C → G.
@@ -283,14 +284,15 @@ fn recursive_a_b_c_gateway_success() {
 /// - remaining_hop_budget = 13 (16 - 3 hops).
 ///
 /// This is the "16→15→14→13" decrement pattern.
-#[test]
-fn recursive_hop_budget_decrements() {
+#[tokio::test]
+async fn recursive_hop_budget_decrements() {
     let mesh = TestMesh::new(b"budget-dec");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed with default budget=16");
 
     // 16 → 15 → 14 → 13 decrement pattern.
@@ -327,14 +329,14 @@ fn recursive_hop_budget_decrements() {
 ///   (would need budget=0 for the new query, which is invalid).
 /// - B returns a not-found response.
 /// - resolve_route returns None.
-#[test]
-fn recursive_hop_budget_exhaustion() {
+#[tokio::test]
+async fn recursive_hop_budget_exhaustion() {
     let mesh = TestMesh::new(b"budget-exh");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     // With budget=1, B can receive the query but can't forward (needs budget=0).
-    let result = resolver.resolve_route_with_budget(&mesh.g_id, &hint, 1);
+    let result = resolver.resolve_route_with_budget(&mesh.g_id, &hint, 1).await;
     assert!(
         result.is_none(),
         "resolution with budget=1 must fail for 3-hop destination"
@@ -354,8 +356,8 @@ fn recursive_hop_budget_exhaustion() {
 /// - B's find_next_hop: A is in visited_nodes → can't forward.
 /// - B returns None (no path to destination).
 /// - resolve_route returns None.
-#[test]
-fn recursive_loop_a_b_a_rejected() {
+#[tokio::test]
+async fn recursive_loop_a_b_a_rejected() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     // A's keypair.
@@ -397,7 +399,7 @@ fn recursive_loop_a_b_a_rejected() {
         .with_recursive_transport(&*transport);
 
     let hint = make_hint([0xAA; 32], b_id);
-    let result = resolver.resolve_route(&[0xAA; 32], &hint);
+    let result = resolver.resolve_route(&[0xAA; 32], &hint).await;
     assert!(
         result.is_none(),
         "loop A→B→A must be rejected (A is in visited_nodes)"
@@ -417,8 +419,8 @@ fn recursive_loop_a_b_a_rejected() {
 /// - C's only neighbor is B. B is in visited_nodes → C can't forward.
 /// - C returns None (no path to destination).
 /// - resolve_route returns None.
-#[test]
-fn recursive_loop_a_b_c_b_rejected() {
+#[tokio::test]
+async fn recursive_loop_a_b_c_b_rejected() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     let (a_sk, a_pk) = fresh_keypair(b"loop-abcb-a");
@@ -473,7 +475,7 @@ fn recursive_loop_a_b_c_b_rejected() {
         .with_recursive_transport(&*transport);
 
     let hint = make_hint([0xBB; 32], b_id);
-    let result = resolver.resolve_route(&[0xBB; 32], &hint);
+    let result = resolver.resolve_route(&[0xBB; 32], &hint).await;
     assert!(
         result.is_none(),
         "loop A→B→C→B must be rejected (B is in visited_nodes)"
@@ -498,8 +500,8 @@ fn recursive_loop_a_b_c_b_rejected() {
 /// - Tamper with the signature.
 /// - Call `ForwardingNode::handle_query` directly.
 /// - Verify it returns None.
-#[test]
-fn wrong_recursive_responder_rejected() {
+#[tokio::test]
+async fn wrong_recursive_responder_rejected() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     // B (the recipient of the query).
@@ -531,7 +533,7 @@ fn wrong_recursive_responder_rejected() {
     assert!(!query.verify_all(), "tampered query must fail verify_all");
 
     // B's handle_query must reject the tampered query.
-    let result = b_node_arc.handle_query(&query);
+    let result = b_node_arc.handle_query(&query).await;
     assert!(
         result.is_none(),
         "ForwardingNode must reject a query with a bad signature"
@@ -556,8 +558,8 @@ fn wrong_recursive_responder_rejected() {
 /// - Tamper with the parent_query_id.
 /// - Call `ForwardingNode::handle_query`.
 /// - Verify it returns None (verify_parent_signature fails).
-#[test]
-fn replayed_recursive_response_rejected() {
+#[tokio::test]
+async fn replayed_recursive_response_rejected() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     // B (the recipient).
@@ -601,7 +603,7 @@ fn replayed_recursive_response_rejected() {
     assert!(!query.verify_all(), "tampered query must fail verify_all");
 
     // B's handle_query must reject the tampered query.
-    let result = b_node_arc.handle_query(&query);
+    let result = b_node_arc.handle_query(&query).await;
     assert!(
         result.is_none(),
         "ForwardingNode must reject a query with a tampered parent binding (replay)"
@@ -622,8 +624,8 @@ fn replayed_recursive_response_rejected() {
 /// - When G responds, it returns the tampered advert.
 /// - The resolver at A calls `verify_into_verified()` on the advert, which
 ///   fails. resolve_route returns None.
-#[test]
-fn recursive_destination_advertisement_verified() {
+#[tokio::test]
+async fn recursive_destination_advertisement_verified() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     // A's keypair.
@@ -731,7 +733,7 @@ fn recursive_destination_advertisement_verified() {
         .with_recursive_transport(&*transport);
 
     let hint = make_hint(g_id, b_id);
-    let resolution = resolver.resolve_route(&g_id, &hint);
+    let resolution = resolver.resolve_route(&g_id, &hint).await;
     // Positive case: valid G advert → resolution succeeds.
     assert!(
         resolution.is_some(),
@@ -763,14 +765,15 @@ fn recursive_destination_advertisement_verified() {
 ///
 /// The `RoutingAssertion` type's fields capture "B claims C is the next hop"
 /// — they do NOT include any "link_proof" or "reachable" field.
-#[test]
-fn routing_assertion_not_link_proof() {
+#[tokio::test]
+async fn routing_assertion_not_link_proof() {
     let mesh = TestMesh::new(b"assertion-not-link");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Inspect the assertions — they are routing claims, NOT link proofs.
@@ -795,14 +798,15 @@ fn routing_assertion_not_link_proof() {
 
 /// Verify that `DistributedRouteResolution::verify()` passes for a valid
 /// resolution and fails for a tampered one.
-#[test]
-fn distributed_resolution_verifies_correctly() {
+#[tokio::test]
+async fn distributed_resolution_verifies_correctly() {
     let mesh = TestMesh::new(b"verify-correct");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // 1. Valid resolution verifies.
@@ -856,14 +860,15 @@ fn distributed_resolution_verifies_correctly() {
 
 /// Verify that `DistributedRouteResolution::into_route()` produces a valid
 /// `Route` for a successful recursive resolution.
-#[test]
-fn distributed_resolution_converts_to_route() {
+#[tokio::test]
+async fn distributed_resolution_converts_to_route() {
     let mesh = TestMesh::new(b"to-route");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Convert to a Route.
@@ -903,8 +908,8 @@ fn distributed_resolution_converts_to_route() {
 /// - R.resolve_route(G3) succeeds (A → B → C → G3).
 ///
 /// The failed branch (G2) must not affect the successful branches (G1, G3).
-#[test]
-fn failed_branch_does_not_poison_other_branch() {
+#[tokio::test]
+async fn failed_branch_does_not_poison_other_branch() {
     let transport = Arc::new(InMemoryRecursiveTransport::new());
 
     let (a_sk, a_pk) = fresh_keypair(b"no-poison-a");
@@ -988,17 +993,17 @@ fn failed_branch_does_not_poison_other_branch() {
 
     // 1. G1 succeeds.
     let hint_g1 = make_hint(g1_id, b_id);
-    let r1 = resolver.resolve_route(&g1_id, &hint_g1);
+    let r1 = resolver.resolve_route(&g1_id, &hint_g1).await;
     assert!(r1.is_some(), "G1 resolution must succeed");
 
     // 2. G2 fails (G2 is not registered — no path to destination).
     let hint_g2 = make_hint(g2_id, b_id);
-    let r2 = resolver.resolve_route(&g2_id, &hint_g2);
+    let r2 = resolver.resolve_route(&g2_id, &hint_g2).await;
     assert!(r2.is_none(), "G2 resolution must fail (no path)");
 
     // 3. G3 succeeds — the failed G2 branch did NOT poison the resolver.
     let hint_g3 = make_hint(g3_id, b_id);
-    let r3 = resolver.resolve_route(&g3_id, &hint_g3);
+    let r3 = resolver.resolve_route(&g3_id, &hint_g3).await;
     assert!(
         r3.is_some(),
         "G3 resolution must succeed despite G2's failure — failed branch must not poison resolver state"
@@ -1104,14 +1109,15 @@ fn forwarded_query_signs_and_verifies() {
 /// - Resolve successfully (both assertions are signed by their responders).
 /// - Tamper with the FIRST assertion's signature (flip one byte).
 /// - `verify()` must fail with `AssertionSignatureInvalid { index: 0 }`.
-#[test]
-fn tampered_assertion_rejected() {
+#[tokio::test]
+async fn tampered_assertion_rejected() {
     let mesh = TestMesh::new(b"tamper-assert");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed before tampering");
 
     // Sanity: the resolution verifies before tampering.
@@ -1157,8 +1163,8 @@ fn tampered_assertion_rejected() {
 /// forwarder cannot invent a `parent_query_id` for a query that was never
 /// sent — the parent_signature covers `parent_query_hash`, so any tampering
 /// invalidates the signature.
-#[test]
-fn tampered_parent_hash_rejected() {
+#[tokio::test]
+async fn tampered_parent_hash_rejected() {
     let (sk, pk) = fresh_keypair(b"tamper-hash-a");
     let node_id = derive_node_id(&pk);
     let destination = [0xAA; 32];
@@ -1206,7 +1212,7 @@ fn tampered_parent_hash_rejected() {
         transport.clone(),
     );
     let b_node_arc = Arc::new(b_node);
-    let result = b_node_arc.handle_query(&tampered);
+    let result = b_node_arc.handle_query(&tampered).await;
     assert!(
         result.is_none(),
         "ForwardingNode must reject a query with a tampered parent_query_hash"
@@ -1236,14 +1242,15 @@ fn tampered_parent_hash_rejected() {
 ///
 /// This is a positive test — it confirms that the security fix is in
 /// place and that legitimate assertions pass the signature check.
-#[test]
-fn assertion_signature_verified() {
+#[tokio::test]
+async fn assertion_signature_verified() {
     let mesh = TestMesh::new(b"assert-sig-verify");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Verify there are 2 assertions (B's and C's).
@@ -1321,14 +1328,15 @@ fn assertion_signature_verified() {
 /// - Swap ordered_assertions[0] (B's) and ordered_assertions[1] (C's).
 /// - `verify()` must fail (with `ResponseStepChainIncoherent` or
 ///   `HopOrderIncoherent`).
-#[test]
-fn swapped_assertion_entries_rejected() {
+#[tokio::test]
+async fn swapped_assertion_entries_rejected() {
     let mesh = TestMesh::new(b"swap-assert");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Sanity: the resolution verifies before tampering.
@@ -1412,14 +1420,15 @@ fn swapped_assertion_entries_rejected() {
 /// - Tamper with `response_steps[0].destination_reached` (flip false↔true).
 /// - The tampered step's `verify_signature()` must return false.
 /// - `verify()` must fail with `ResponseStepSignatureInvalid { index: 0 }`.
-#[test]
-fn forged_response_envelope_rejected() {
+#[tokio::test]
+async fn forged_response_envelope_rejected() {
     let mesh = TestMesh::new(b"forged-env");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed before tampering");
 
     // Sanity: the resolution verifies before tampering.
@@ -1475,8 +1484,8 @@ fn forged_response_envelope_rejected() {
 /// - Replace A's response_steps with B's response_steps.
 /// - verify() must fail because B's response_steps[i].received_query_id
 ///   != A's query_chain[i].query_id (different random nonces).
-#[test]
-fn response_chain_substitution_rejected() {
+#[tokio::test]
+async fn response_chain_substitution_rejected() {
     // Build two meshes with different destinations so the response_steps
     // are guaranteed to be from different resolutions. (Even with the
     // same destination, the random query_ids would differ, but using
@@ -1489,6 +1498,7 @@ fn response_chain_substitution_rejected() {
     let mut resolver_a = mesh_a.resolver();
     let mut resolution_a = resolver_a
         .resolve_route(&mesh_a.g_id, &hint_a)
+        .await
         .expect("resolution A must succeed");
 
     // Resolution B: A→B→C→G_b.
@@ -1496,6 +1506,7 @@ fn response_chain_substitution_rejected() {
     let mut resolver_b = mesh_b.resolver();
     let resolution_b = resolver_b
         .resolve_route(&mesh_b.g_id, &hint_b)
+        .await
         .expect("resolution B must succeed");
 
     // Sanity: both resolutions verify.
@@ -1544,14 +1555,15 @@ fn response_chain_substitution_rejected() {
 /// - Tamper with `query_chain[1].query_id` (the query B sent to C).
 /// - verify() must fail because response_steps[1].received_query_id !=
 ///   query_chain[1].query_id (the signed step still has the original).
-#[test]
-fn query_chain_tampering_rejected() {
+#[tokio::test]
+async fn query_chain_tampering_rejected() {
     let mesh = TestMesh::new(b"qchain-tamper");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Sanity: the resolution verifies.
@@ -1605,14 +1617,15 @@ fn query_chain_tampering_rejected() {
 /// - Tamper with `response_steps[0].not_found` (false → true).
 /// - The tampered step's signature no longer verifies.
 /// - verify() must fail with `ResponseStepSignatureInvalid { index: 0 }`.
-#[test]
-fn destination_state_tampering_rejected() {
+#[tokio::test]
+async fn destination_state_tampering_rejected() {
     let mesh = TestMesh::new(b"dest-state-tamper");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let mut resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // Sanity: the resolution verifies.
@@ -1665,8 +1678,8 @@ fn destination_state_tampering_rejected() {
 ///   - The injected step's received_query_id != query_chain[1].query_id.
 ///   - The injected step's received_query_hash != response_steps[0].sent_query_hash
 ///     (chain coherence from previous step).
-#[test]
-fn cross_chain_response_replay_rejected() {
+#[tokio::test]
+async fn cross_chain_response_replay_rejected() {
     let mesh_a = TestMesh::new(b"replay-a");
     let mesh_b = TestMesh::new(b"replay-b");
 
@@ -1675,6 +1688,7 @@ fn cross_chain_response_replay_rejected() {
     let mut resolver_a = mesh_a.resolver();
     let resolution_a = resolver_a
         .resolve_route(&mesh_a.g_id, &hint_a)
+        .await
         .expect("resolution A must succeed");
 
     // Resolution B: A→B→C→G_b.
@@ -1682,6 +1696,7 @@ fn cross_chain_response_replay_rejected() {
     let mut resolver_b = mesh_b.resolver();
     let mut resolution_b = resolver_b
         .resolve_route(&mesh_b.g_id, &hint_b)
+        .await
         .expect("resolution B must succeed");
 
     // Sanity: both resolutions verify.
@@ -1743,14 +1758,15 @@ fn cross_chain_response_replay_rejected() {
 /// - Each step's signature verifies.
 /// - Chain coherence: step[i].sent_query_hash == step[i+1].received_query_hash.
 /// - Terminal step's sent_query_hash is [0;32].
-#[test]
-fn response_steps_basic_properties() {
+#[tokio::test]
+async fn response_steps_basic_properties() {
     let mesh = TestMesh::new(b"resp-step-props");
     let hint = make_hint(mesh.g_id, mesh.b_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g_id, &hint)
+        .await
         .expect("resolution must succeed");
 
     // 3 response_steps (B, C, G).

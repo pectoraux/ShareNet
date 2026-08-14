@@ -127,9 +127,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use snp_crypto::{
     aead_open, aead_seal, derive_node_id, x25519_static_keypair, NonceBytes, SymmetricKey,
@@ -162,6 +164,26 @@ const MIN_SEALED_LEN: usize = TAG_LEN;
 /// the oldest entries are evicted. 4096 is generous for a discovery-time
 /// service (one entry per `(source_node_id, query_id)` pair).
 const REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// **N2.2.1-async.** Bound on how long the initiator will wait for the
+/// SNP-IK handshake to complete. The handshake is two round-trips of
+/// X25519 ephemeral-static DH + Ed25519 signatures — well under 1s on a
+/// healthy LAN; 10s is generous even across a slow wireless hop. A peer
+/// that takes longer is treated as unresponsive (the connection is closed
+/// and `forward_query` returns `None`).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// **N2.2.1-async.** Bound on how long the initiator will wait for a
+/// single AEAD-encrypted response frame after sending its query. Covers
+/// the worst case of recursive forwarding across a deep chain (each hop
+/// adds one round-trip); 30s is generous for an A→B→C→G discovery.
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// **N2.2.1-async.** Bound on how long the responder will wait for the
+/// SNP-IK handshake from an accepted connection. Idle connections that
+/// never start the handshake are dropped after 60s (defensive — the
+/// handshake itself is bounded by `HANDSHAKE_TIMEOUT` once it starts).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ════════════════════════════════════════════════════════════════════════════
 // AEAD-encrypted frame protocol (async Tokio I/O)
@@ -378,13 +400,15 @@ pub struct PeerInfo {
 /// reads the AEAD-encrypted response, decodes the `RecursiveRouteResponse`,
 /// and closes the connection.
 ///
-/// ## Sync↔async boundary
+/// ## Fully async (N2.2.1-async)
 ///
-/// The [`RecursiveNextHopTransport`] trait is synchronous. This impl
-/// creates a single-threaded Tokio runtime per `forward_query` call and
-/// `block_on`s the async TCP + AEAD operations on it. This is a
-/// discovery-time operation (not a data-plane hot path), so the per-call
-/// runtime overhead is acceptable.
+/// The trait's `forward_query` is now `async fn` via `#[async_trait]`.
+/// This impl implements it directly with `async`/`await` — no
+/// `Runtime::new()` / `block_on` boundary. Multiple `forward_query` calls
+/// can be `tokio::join!`ed against the same transport to discover multiple
+/// destinations concurrently on a single shared runtime. Each operation
+/// (TCP connect, SNP-IK handshake, AEAD frame write, AEAD frame read) is
+/// bounded by a timeout — see `HANDSHAKE_TIMEOUT` and `FRAME_READ_TIMEOUT`.
 pub struct TcpRecursiveTransport {
     /// Map from NodeId → peer info (TCP address + expected Ed25519 public).
     peers: HashMap<[u8; 32], PeerInfo>,
@@ -444,8 +468,16 @@ impl TcpRecursiveTransport {
     /// Async implementation of `forward_query`. Performs the actual TCP
     /// connect + SNP-IK handshake + AEAD-encrypted frame exchange.
     ///
-    /// This is the inner async body; the sync trait impl creates a runtime
-    /// and `block_on`s this future.
+    /// **N2.2.1-async.** This is now the trait impl body itself (the
+    /// `RecursiveNextHopTransport` trait's `forward_query` is `async`).
+    /// Each step is bounded by a timeout:
+    /// - TCP connect: bounded by `HANDSHAKE_TIMEOUT` (the same budget
+    ///   covers the connect + handshake).
+    /// - SNP-IK handshake: bounded by `HANDSHAKE_TIMEOUT`.
+    /// - AEAD frame write: bounded by `FRAME_READ_TIMEOUT` (a stalled
+    ///   peer that accepts the query but never responds is the failure
+    ///   mode we care about most).
+    /// - AEAD frame read: bounded by `FRAME_READ_TIMEOUT`.
     async fn forward_query_async(
         &self,
         neighbor_node_id: &[u8; 32],
@@ -458,26 +490,46 @@ impl TcpRecursiveTransport {
         stream.set_nodelay(true).ok();
         // 3. SNP-IK handshake as initiator, pinning expected peer NodeId.
         //    Returns a VerifiedHandshake with directional AEAD link keys.
-        let verified = perform_snp_ik_handshake_verified_async(
-            &mut stream,
-            true, // is_initiator
-            &self.local_ed25519_secret,
-            &self.local_ed25519_public,
-            &self.local_x25519_secret,
-            &self.local_x25519_public,
-            Some(neighbor_node_id),
+        //    Bounded by HANDSHAKE_TIMEOUT — a peer that takes too long to
+        //    complete the handshake is treated as unresponsive.
+        let verified = timeout(
+            HANDSHAKE_TIMEOUT,
+            perform_snp_ik_handshake_verified_async(
+                &mut stream,
+                true, // is_initiator
+                &self.local_ed25519_secret,
+                &self.local_ed25519_public,
+                &self.local_x25519_secret,
+                &self.local_x25519_public,
+                Some(neighbor_node_id),
+            ),
         )
         .await
-        .ok()?;
+        .ok()?  // timeout elapsed → None
+        .ok()?; // handshake error → None
         let LinkKeys { send_key, recv_key } = verified.link_keys();
         // 4. Encode the ForwardedQuery to canonical CBOR (== hash preimage).
         let query_bytes = query.encode_cbor();
-        // 5. AEAD-seal + write the frame.
-        write_sealed_frame(&mut stream, &send_key, &query_bytes)
-            .await
-            .ok()?;
-        // 6. Read the AEAD-encrypted response frame + AEAD-open.
-        let response_bytes = read_sealed_frame(&mut stream, &recv_key).await.ok()?;
+        // 5. AEAD-seal + write the frame. Bounded by FRAME_READ_TIMEOUT —
+        //    a stalled write (e.g. TCP send buffer full because the peer
+        //    is not reading) must not block the resolver indefinitely.
+        timeout(
+            FRAME_READ_TIMEOUT,
+            write_sealed_frame(&mut stream, &send_key, &query_bytes),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        // 6. Read the AEAD-encrypted response frame + AEAD-open. Bounded
+        //    by FRAME_READ_TIMEOUT — covers recursive forwarding across
+        //    a deep chain (each hop adds one round-trip).
+        let response_bytes = timeout(
+            FRAME_READ_TIMEOUT,
+            read_sealed_frame(&mut stream, &recv_key),
+        )
+        .await
+        .ok()?
+        .ok()?;
         // 7. Decode the RecursiveRouteResponse.
         let response = RecursiveRouteResponse::decode_cbor(&response_bytes)?;
         // 8. Drop the stream (closes the connection).
@@ -485,31 +537,18 @@ impl TcpRecursiveTransport {
     }
 }
 
+#[async_trait]
 impl RecursiveNextHopTransport for TcpRecursiveTransport {
-    fn forward_query(
+    /// **N2.2.1-async.** Direct async trait impl — no `Runtime::new()` /
+    /// `block_on` boundary. The future runs on whatever Tokio runtime the
+    /// caller's task is on (typically the production node's main runtime
+    /// or a `#[tokio::test]` runtime in tests).
+    async fn forward_query(
         &self,
         neighbor_node_id: &[u8; 32],
         query: &ForwardedQuery,
     ) -> Option<RecursiveRouteResponse> {
-        // The protocol layer (ForwardingNode, RecursiveNextHopTransport)
-        // is synchronous. We bridge to the async transport by creating a
-        // single-threaded Tokio runtime per call and block_on'ing the
-        // async forward_query_async future on it.
-        //
-        // This is a discovery-time operation (not a data-plane hot path),
-        // so the per-call runtime overhead is acceptable. A future
-        // async-protocol refactor would eliminate this block_on boundary.
-        //
-        // Using a new current-thread runtime (rather than
-        // `Handle::current().block_on`) is intentional: it is safe
-        // regardless of whether the caller is inside an outer runtime
-        // (we never panic on "cannot start a runtime from within a
-        // runtime"). The cost is a fresh mio reactor per call.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()?;
-        rt.block_on(self.forward_query_async(neighbor_node_id, query))
+        self.forward_query_async(neighbor_node_id, query).await
     }
 }
 
@@ -525,8 +564,17 @@ impl RecursiveNextHopTransport for TcpRecursiveTransport {
 /// multi-threaded Tokio runtime (`serve_in_background` spawns it). Each
 /// incoming connection is handled concurrently via `tokio::spawn`: the
 /// SNP-IK handshake, AEAD frame I/O, identity-binding check, replay
-/// check, and `ForwardingNode::handle_query` (via `spawn_blocking`) all
-/// run as independent tasks.
+/// check, and `ForwardingNode::handle_query` all run as independent
+/// async tasks.
+///
+/// **N2.2.1-async.** `ForwardingNode::handle_query` is now `async`, so
+/// the server no longer wraps it in `spawn_blocking`. The recursive
+/// forwarding (which calls `transport.forward_query().await` on the
+/// `ForwardingNode`'s own transport — typically a `TcpRecursiveTransport`)
+/// runs directly on the server's runtime worker pool, and the per-hop
+/// `block_on` boundary is gone. This means a single connection task can
+/// keep multiple downstream TCP connections open concurrently (e.g. via
+/// `tokio::join!`) once a fan-out transport is implemented.
 ///
 /// The server's `ForwardingNode` carries its OWN `RecursiveNextHopTransport`
 /// (typically a `TcpRecursiveTransport` pointing at the next hop). When
@@ -753,13 +801,32 @@ impl TcpForwardingServer {
 
     /// Handle a single connection (async): SNP-IK handshake → read
     /// AEAD-encrypted frame → identity-binding check → replay check →
-    /// `ForwardingNode::handle_query` (via `spawn_blocking`) → write
+    /// `ForwardingNode::handle_query` (direct `.await`) → write
     /// AEAD-encrypted response → close.
     ///
     /// On ANY error (handshake failure, AEAD failure, identity mismatch,
     /// replay, decode failure, handle_query rejection), the connection is
     /// dropped WITHOUT sending a response — the initiator sees EOF / error
     /// and treats it as failure.
+    ///
+    /// **N2.2.1-async.** `handle_query` is now `async`, so it is invoked
+    /// directly (`.await`) instead of via `spawn_blocking`. The recursive
+    /// forwarding (which calls `transport.forward_query().await` on the
+    /// `ForwardingNode`'s own transport) runs on the server's runtime
+    /// worker pool — no per-hop runtime, no `block_on`.
+    ///
+    /// Each I/O step is bounded by a timeout:
+    /// - SNP-IK handshake (responder): bounded by `IDLE_TIMEOUT`. Idle
+    ///   connections that never start the handshake are dropped.
+    /// - Read AEAD-encrypted ForwardedQuery frame: bounded by
+    ///   `FRAME_READ_TIMEOUT`. A peer that completes the handshake but
+    ///   never sends a query is dropped.
+    /// - `ForwardingNode::handle_query` (which itself includes recursive
+    ///   `forward_query` calls with their own timeouts): bounded by
+    ///   `FRAME_READ_TIMEOUT`. A stalled downstream hop must not block the
+    ///   responder's worker pool indefinitely.
+    /// - Write AEAD-encrypted response frame: bounded by
+    ///   `FRAME_READ_TIMEOUT`. A client that stops reading is dropped.
     async fn handle_connection(self: Arc<Self>, mut stream: TcpStream) -> io::Result<()> {
         stream.set_nodelay(true).ok();
 
@@ -767,16 +834,28 @@ impl TcpForwardingServer {
         //    accept any authenticated peer; the handshake itself proves
         //    the peer's identity). Returns a VerifiedHandshake with the
         //    authenticated peer_node_id + directional AEAD link keys.
-        let verified: VerifiedHandshake = perform_snp_ik_handshake_verified_async(
-            &mut stream,
-            false, // is_initiator = false (responder)
-            &self.ed25519_secret,
-            &self.ed25519_public,
-            &self.x25519_secret,
-            &self.x25519_public,
-            None, // no expected_peer_node_id — accept any authenticated peer
+        //
+        //    Bounded by IDLE_TIMEOUT — a connection that takes too long
+        //    to complete the handshake (or never starts it) is dropped.
+        let verified: VerifiedHandshake = timeout(
+            IDLE_TIMEOUT,
+            perform_snp_ik_handshake_verified_async(
+                &mut stream,
+                false, // is_initiator = false (responder)
+                &self.ed25519_secret,
+                &self.ed25519_public,
+                &self.x25519_secret,
+                &self.x25519_public,
+                None, // no expected_peer_node_id — accept any authenticated peer
+            ),
         )
         .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SNP-IK handshake timed out (responder) — IDLE_TIMEOUT elapsed",
+            )
+        })?
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::ConnectionReset,
@@ -787,7 +866,19 @@ impl TcpForwardingServer {
         let LinkKeys { send_key, recv_key } = verified.link_keys();
 
         // 2. Read the AEAD-encrypted ForwardedQuery frame + AEAD-open.
-        let query_bytes = read_sealed_frame(&mut stream, &recv_key).await?;
+        //    Bounded by FRAME_READ_TIMEOUT — a peer that completes the
+        //    handshake but never sends a query is dropped.
+        let query_bytes = timeout(
+            FRAME_READ_TIMEOUT,
+            read_sealed_frame(&mut stream, &recv_key),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ForwardedQuery frame read timed out — FRAME_READ_TIMEOUT elapsed",
+            )
+        })??;
         // 3. Decode the ForwardedQuery from canonical CBOR.
         let query = ForwardedQuery::decode_cbor(&query_bytes).ok_or_else(|| {
             io::Error::new(
@@ -825,21 +916,29 @@ impl TcpForwardingServer {
             }
         }
 
-        // 6. Hand the query to the ForwardingNode via `spawn_blocking`.
-        //    The ForwardingNode is synchronous (it may recursively call
-        //    transport.forward_query, which itself bridges to async via a
-        //    per-call runtime). Running it on a blocking thread ensures
-        //    we never stall the runtime's worker pool.
-        let node = Arc::clone(&self.node);
-        let query_clone = query;
-        let response_opt = tokio::task::spawn_blocking(move || node.handle_query(&query_clone))
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("ForwardingNode::handle_query panicked: {e}"),
-                )
-            })?;
+        // 6. Hand the query to the ForwardingNode directly (`.await`).
+        //    **N2.2.1-async:** `handle_query` is now `async` — no
+        //    `spawn_blocking`. The recursive forwarding (which calls
+        //    `transport.forward_query().await` on the ForwardingNode's own
+        //    transport — typically a `TcpRecursiveTransport`) runs on the
+        //    server's runtime worker pool. Bounded by FRAME_READ_TIMEOUT —
+        //    a stalled downstream hop must not block the worker.
+        //
+        //    We hold `&self.node` (an `Arc<ForwardingNode>`) by reference
+        //    rather than cloning into a `move` closure (the previous
+        //    `spawn_blocking` pattern), because the future is no longer
+        //    `'static` — it borrows from `&self`.
+        let response_opt = timeout(
+            FRAME_READ_TIMEOUT,
+            self.node.handle_query(&query),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ForwardingNode::handle_query timed out — FRAME_READ_TIMEOUT elapsed",
+            )
+        })?;
 
         let response = match response_opt {
             Some(r) => r,
@@ -854,8 +953,19 @@ impl TcpForwardingServer {
 
         // 7. Encode the RecursiveRouteResponse to canonical CBOR.
         let response_bytes = response.encode_cbor();
-        // 8. AEAD-seal + write the response frame.
-        write_sealed_frame(&mut stream, &send_key, &response_bytes).await?;
+        // 8. AEAD-seal + write the response frame. Bounded by
+        //    FRAME_READ_TIMEOUT — a client that stops reading is dropped.
+        timeout(
+            FRAME_READ_TIMEOUT,
+            write_sealed_frame(&mut stream, &send_key, &response_bytes),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "response frame write timed out — FRAME_READ_TIMEOUT elapsed",
+            )
+        })??;
         // 9. Connection closes on drop.
         Ok(())
     }

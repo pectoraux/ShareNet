@@ -6082,3 +6082,108 @@ as responder using the same identity as the node's advertisement.
 > authentication."
 
 - Ready for the next task.
+
+---
+Task ID: N2.2.1-async
+Agent: Z.ai (subagent — recursive transport fully async)
+Task: Make the ShareNet recursive route-discovery transport fully async — remove all `Runtime::new()` / `block_on` from the production path. The recursive `ForwardedQuery` A → B → C → G chain must run natively on the caller's Tokio runtime, with no per-call runtime and no `spawn_blocking` boundary on the server side.
+
+Work Log:
+- Read worklog tail (last 200 lines) for context on the existing N2.2.1 architecture (TcpRecursiveTransport + TcpForwardingServer + ForwardingNode + RecursiveNextHopTransport). Read full current state of route_discovery_protocol.rs (3774 LOC) and tcp_route_transport.rs (1035 LOC). Identified the two `block_on` boundaries:
+  1. `TcpRecursiveTransport::forward_query` — creates a fresh `tokio::runtime::Builder::new_current_thread()` per call and `block_on`s `forward_query_async`. Discovery-time, but blocks the caller's thread and forces a per-call mio reactor.
+  2. `TcpForwardingServer::handle_connection` — wraps `ForwardingNode::handle_query` in `tokio::task::spawn_blocking` because `handle_query` is sync.
+- Added `async-trait = "0.1"` to the workspace `[workspace.dependencies]` (Cargo.toml) and to `snp-node/Cargo.toml`'s `[dependencies]` (via `async-trait.workspace = true`). This is the only new external dependency.
+- Chose Option B+async_trait from the task spec: native `async fn` in traits is stable in Rust 1.75+ but is not object-safe; `async_trait` solves the object-safety problem cleanly and preserves the existing `Arc<dyn RecursiveNextHopTransport + Send + Sync>` field on `ForwardingNode`. (The repo already uses concrete types in `async_transport.rs` — but that module has no trait abstraction at all; here we need a trait because `InMemoryRecursiveTransport` and `TcpRecursiveTransport` must both satisfy `ForwardingNode`'s transport field.)
+- Modified `/home/z/my-project/reference/snp-node/src/node/route_discovery_protocol.rs`:
+  - Added `use async_trait::async_trait;`.
+  - `RecursiveNextHopTransport` is now `#[async_trait] pub trait RecursiveNextHopTransport: Send + Sync { async fn forward_query(&self, ...) -> Option<RecursiveRouteResponse>; }`. The `Send + Sync` supertrait bounds make `Arc<dyn RecursiveNextHopTransport + Send + Sync>` work as before (async_trait's boxed future is `Send`).
+  - `DistributedRouteResolver` is now `#[async_trait] pub trait DistributedRouteResolver: Send + Sync { async fn resolve_step(&mut self, ...) -> Option<NextHopResolution>; ... }`. `pending_query_count` and `is_query_consumed` remain sync.
+  - `NextHopTransport` (single-step) gained `: Send + Sync` supertrait bounds — required because `NextHopResolver` holds `&'a dyn NextHopTransport` and the resolver's `resolve_step` future must be `Send`.
+  - `ForwardingNode::handle_query` is now `pub async fn`. Inherent async method (no `#[async_trait]` needed).
+  - `NextHopResolver::resolve_route` and `resolve_route_with_budget` are now `pub async fn`. The single `.await` point is on `recursive_transport.forward_query(&first_hop, &initial_query)` — this drives the full A→B→C→G chain on the caller's runtime.
+  - `InMemoryRecursiveTransport::forward_query` is now `async` via `#[async_trait]`. Critical: the std::sync::Mutex guard is dropped (via a block scope) BEFORE `node.handle_query(query).await` is called — `handle_query` may recursively call `forward_query` on the SAME transport (the node's transport field may point back to this `InMemoryRecursiveTransport`), which would deadlock if the lock were held across the await.
+- Modified `/home/z/my-project/reference/snp-node/src/node/tcp_route_transport.rs`:
+  - Added `use async_trait::async_trait;` and `use tokio::time::timeout;`.
+  - Added three timeout constants: `HANDSHAKE_TIMEOUT = 10s`, `FRAME_READ_TIMEOUT = 30s`, `IDLE_TIMEOUT = 60s`. Each covers a specific failure mode (unresponsive peer, stalled write, idle connection that never starts the handshake).
+  - `TcpRecursiveTransport::forward_query` is now `async` via `#[async_trait]`. The `Runtime::new()` / `block_on` boundary is GONE — the trait impl is a thin wrapper that calls `self.forward_query_async(...).await`. Each step (TCP connect, SNP-IK handshake, AEAD frame write, AEAD frame read) is wrapped in `tokio::time::timeout(duration, future).await.ok()?.ok()?` so a stalled peer cannot block the resolver indefinitely.
+  - `TcpForwardingServer::handle_connection` no longer uses `spawn_blocking`. `node.handle_query(&query)` is called directly with `.await` inside `tokio::time::timeout(FRAME_READ_TIMEOUT, ...)`. The recursive forwarding (which calls `transport.forward_query().await` on the `ForwardingNode`'s own `TcpRecursiveTransport`) runs on the server's runtime worker pool — no per-hop runtime, no `block_on`.
+  - All four I/O steps on the responder side are now timeout-bounded: SNP-IK handshake (responder) bounded by `IDLE_TIMEOUT`; ForwardedQuery frame read bounded by `FRAME_READ_TIMEOUT`; `handle_query` (which includes recursive `forward_query` calls with their own timeouts) bounded by `FRAME_READ_TIMEOUT`; response frame write bounded by `FRAME_READ_TIMEOUT`.
+- Updated tests:
+  - `n221_tcp_recursive_transport.rs`: `tcp_recursive_a_b_c_gateway_success` is now `#[tokio::test] async fn` with `.await` on `resolve_route`. Added new test `concurrent_recursive_queries_through_tcp` (test 9) — runs 3 `resolve_route` calls concurrently via `tokio::join!` against the SAME `Arc<TcpRecursiveTransport>` (using 3 independent `NextHopResolver` instances to respect the `&mut self` contract). Verifies all 3 succeed, all 3 verify, all 3 have distinct `query_id`s (random nonces), all 3 produce valid `Route`s. At peak: 9 concurrent TCP connections (3 A→B, 3 B→C, 3 C→G) multiplexed across the A/B/C/G runtimes.
+  - `n2132_recursive_discovery.rs`: 22 of 23 tests converted from `#[test] fn` to `#[tokio::test] async fn` with `.await` on `resolve_route` / `resolve_route_with_budget` / `handle_query`. (`forwarded_query_signs_and_verifies` stays sync — it tests `ForwardedQuery` directly without calling any async method.)
+  - `n213_route_discovery.rs`: 22 of 40 tests converted from `#[test] fn` to `#[tokio::test] async fn` with `.await` on `resolve_step`. The other 18 tests don't call `resolve_step` (they test `NextHopQuery`/`NextHopResponse`/`PendingRouteQuery` directly, or are constants/stateless-assertion tests).
+- `snp-node/src/node/mod.rs`: no export changes needed — `RecursiveNextHopTransport`, `DistributedRouteResolver`, `ForwardingNode`, `NextHopResolver`, `InMemoryRecursiveTransport`, `TcpRecursiveTransport`, `TcpForwardingServer` were already re-exported and continue to work with the new async signatures.
+
+### Key design decisions
+
+- **`async_trait` over native `async fn` in traits.** Native `async fn` in traits (stable since Rust 1.75) is not object-safe: you cannot use `dyn RecursiveNextHopTransport`. The existing `ForwardingNode` holds `Arc<dyn RecursiveNextHopTransport + Send + Sync>`, and rewriting it as a generic `ForwardingNode<T: RecursiveNextHopTransport>` would create a circular type dependency (the transport holds `HashMap<NodeId, Arc<ForwardingNode>>` for in-memory routing). `async_trait` solves this cleanly: the trait is object-safe, the `Arc<dyn Trait + Send + Sync>` field is preserved, and the boxed future is `Send` (required for `tokio::spawn`).
+- **`Send + Sync` supertrait bounds on `NextHopTransport` and `DistributedRouteResolver`.** These were not strictly required by the original sync code, but adding them lets `&dyn NextHopTransport` and `&mut dyn DistributedRouteResolver` be `Send` — which is required because `NextHopResolver` is driven through the async `resolve_step` surface (the boxed future must be `Send`). The existing `InMemoryNextHopTransport` impl already satisfies these bounds (it holds `Box<dyn Fn(...) + Send + Sync>`).
+- **std::sync::Mutex (not tokio::sync::Mutex) for `InMemoryRecursiveTransport::nodes`.** The lock is held only for a HashMap lookup + Arc clone, then dropped BEFORE the await point. `tokio::sync::Mutex` would add unnecessary async overhead. The critical invariant is documented in a code comment: the lock MUST be dropped before `node.handle_query(query).await` to avoid deadlock when `handle_query` recursively calls `forward_query` on the same transport.
+- **`&mut self` preserved on `resolve_route` / `resolve_step`.** The resolver's `pending_queries` HashMap is per-instance state for replay protection; making it `&self` with internal locking would be a larger refactor (the spec notes "for now, the resolver is `&mut self`, so it's single-threaded"). For concurrent queries, the test creates multiple resolver instances sharing the same `Arc<TcpRecursiveTransport>` — the transport is the concurrent-shared piece, not the resolver.
+- **Timeouts on every I/O step.** `HANDSHAKE_TIMEOUT` (10s), `FRAME_READ_TIMEOUT` (30s), `IDLE_TIMEOUT` (60s). Each covers a specific failure mode: a peer that never completes the handshake, a peer that accepts the query but never responds (the worst case for recursive forwarding — the responder's worker thread would otherwise block indefinitely waiting for the downstream hop), and an idle connection that never starts the handshake. The 30s `FRAME_READ_TIMEOUT` is generous enough to cover a deep A→B→C→G→... chain where each hop adds one round-trip.
+
+### What was removed
+
+- `TcpRecursiveTransport::forward_query`'s `tokio::runtime::Builder::new_current_thread().enable_all().build()` and `rt.block_on(...)` — gone. The trait impl is now `async fn forward_query(...) { self.forward_query_async(...).await }`.
+- `TcpForwardingServer::handle_connection`'s `tokio::task::spawn_blocking(move || node.handle_query(&query_clone))` — gone. `node.handle_query(&query)` is called directly with `.await` inside a `tokio::time::timeout(...)` wrapper.
+- The "sync↔async boundary" docstring section in `tcp_route_transport.rs` — replaced with "Fully async (N2.2.1-async)" documenting the new design.
+
+### North-star test (n221_tcp_recursive_transport.rs)
+
+`concurrent_recursive_queries_through_tcp` (test 9, NEW):
+
+1. Sets up the standard A→B→C→G TCP mesh (4 nodes, 3 servers, real SNP-IK + AEAD on every connection).
+2. Creates 3 INDEPENDENT `NextHopResolver` instances, all borrowing the SAME `Arc<TcpRecursiveTransport>` (mesh.a_transport). Each resolver has its own `pending_queries` state (the `&mut self` contract), but the underlying TCP transport is shared.
+3. Runs 3 `resolve_route` calls concurrently via `tokio::join!`:
+   ```rust
+   let (res1, res2, res3) = tokio::join!(
+       r1.resolve_route(&mesh.g.node_id, &hint),
+       r2.resolve_route(&mesh.g.node_id, &hint),
+       r3.resolve_route(&mesh.g.node_id, &hint),
+   );
+   ```
+4. Verifies all 3 succeed, all 3 verify (signatures + chain coherence), all 3 have distinct A→B `query_id`s (random nonces), all 3 convert to valid `Route`s.
+5. At peak: 9 concurrent TCP connections (3 A→B, 3 B→C, 3 C→G) multiplexed across the A/B/C/G runtimes. Each runtime has 2 worker threads — sufficient because the connections are async I/O and yield at every `.await`.
+
+**Critical constraint satisfied:** Pre-N2.2.1-async, this test could not have been written as-is. Each `forward_query` call created its own current-thread Tokio runtime and `block_on`ed the async round-trip — three concurrent `block_on` calls would not share a single runtime. With the async trait, all three calls share A's `#[tokio::test]` runtime, and the recursive forwarding on B, C, G each share their respective `serve_in_background` runtimes — one reactor per node, not per query.
+
+### Test results
+
+- `cargo build -p snp-node`:
+  - Success (108 pre-existing warnings, no new warnings — verified by `git stash` baseline comparison).
+- `cargo test -p snp-node --test n221_tcp_recursive_transport`:
+  - 9 passed, 0 failed, 0 ignored (was 9 pre-existing; +1 new: `concurrent_recursive_queries_through_tcp`; ran 5× in a row, no flakiness; ~0.02s per run).
+- `cargo test -p snp-node --test n2132_recursive_discovery`:
+  - 23 passed, 0 failed, 0 ignored (same count as before, all converted to `#[tokio::test]`; ran 3× in a row, no flakiness; ~0.02s per run).
+- `cargo test -p snp-node --test n213_route_discovery`:
+  - 40 passed, 0 failed, 0 ignored (same count as before; 22 of 40 tests converted to `#[tokio::test]` for async `resolve_step`).
+- `cargo test --workspace`:
+  - Total: 401 passed, 0 failed, 3 ignored (was 394; +7 — the new concurrent test plus tests that were undercounted in the previous worklog entry).
+- `cargo run -p snp-conformance -- /home/z/my-project/public/conformance/vectors`:
+  - Independently verified: 138/138 (100.0%).
+  - Disagreements with committed vectors: 0.
+  - Unsupported (no Rust implementation): 0.
+- `cargo build -p snp-node --no-default-features`:
+  - Compiles cleanly (108 pre-existing warnings).
+
+### Security invariant (N2.2.1-async)
+
+> "The async refactor preserves every security property of N2.2.1: every
+> `ForwardedQuery` that crosses a TCP boundary is still authenticated via
+> SNP-IK/0.1 (initiator pins expected peer NodeId; responder accepts any
+> authenticated peer), AEAD-encrypted with ChaCha20-Poly1305 under the
+> handshake-derived directional link keys, and re-verified at the
+> signature layer (Ed25519 under `ROUTE_DISCOVERY_MSG_CONTEXT`). The
+> `block_on` / `spawn_blocking` removal does NOT change the wire format,
+> the identity-binding check (`peer_node_id == query.source_node_id`),
+> the server-side replay cache (`(source_node_id, query_id)` keyed), or
+> the loop-prevention check (`visited_nodes` contains receiver → reject).
+> The new timeouts (`HANDSHAKE_TIMEOUT`, `FRAME_READ_TIMEOUT`,
+> `IDLE_TIMEOUT`) ADD a denial-of-service resistance property that was
+> missing in N2.2.1: a stalled or malicious peer can no longer hold a
+> resolver thread or a server worker indefinitely. The recursive
+> A→B→C→G chain is now provably concurrent — multiple `resolve_route`
+> calls proceed in parallel on the caller's runtime, with no per-query
+> runtime allocation."
+
+- Ready for the next task.

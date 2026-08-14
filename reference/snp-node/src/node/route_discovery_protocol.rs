@@ -127,6 +127,7 @@
 //! for distributed resolution.
 
 use super::*;
+use async_trait::async_trait;
 use snp_cbor::CborValue;
 use snp_crypto::{ed25519_sign, ed25519_verify, sha256, sig_contexts};
 
@@ -1156,7 +1157,17 @@ impl RoutingAssertion {
 ///
 /// The two may be composed by a higher-level route-discovery orchestrator
 /// in a future milestone.
-pub trait DistributedRouteResolver {
+///
+/// **N2.2.1-async.** `resolve_step` is now an `async fn` via
+/// `#[async_trait]`. This is the single-step distributed discovery entry
+/// point; it is async so that production transports (e.g. TCP-backed
+/// `NextHopTransport` impls) can perform real network I/O without
+/// `block_on`. The `NextHopResolver` implementation still uses a
+/// synchronous `NextHopTransport` (the in-memory test transport), but the
+/// async surface lets callers swap in a TCP-backed single-step transport
+/// without changing the trait.
+#[async_trait]
+pub trait DistributedRouteResolver: Send + Sync {
     /// Resolve a destination by querying a single next-hop peer.
     ///
     /// This is SINGLE-STEP resolution. Recursive multi-hop discovery
@@ -1170,7 +1181,7 @@ pub trait DistributedRouteResolver {
     /// - `Some(NextHopResolution)` if a valid response was received and
     ///   the advertisement verified.
     /// - `None` if resolution failed.
-    fn resolve_step(
+    async fn resolve_step(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
@@ -1253,7 +1264,13 @@ pub struct NextHopResolver<'a> {
 
 /// A transport abstraction for sending `NextHopQuery` messages and
 /// receiving `NextHopResponse` messages.
-pub trait NextHopTransport {
+///
+/// **N2.2.1-async.** This trait carries `Send + Sync` supertrait bounds so
+/// that `&dyn NextHopTransport` (held by `NextHopResolver`) is `Send + Sync`
+/// — required because the resolver is now driven through the async
+/// `DistributedRouteResolver::resolve_step` surface (whose boxed future
+/// must be `Send`).
+pub trait NextHopTransport: Send + Sync {
     /// Send a `NextHopQuery` to the specified neighbor and wait for a
     /// `NextHopResponse`.
     fn query_next_hop(
@@ -1332,8 +1349,9 @@ impl<'a> NextHopResolver<'a> {
 /// memory just like unconsumed queries.
 pub const MAX_PENDING_ROUTE_QUERIES: usize = 256;
 
+#[async_trait]
 impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
-    fn resolve_step(
+    async fn resolve_step(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
@@ -2245,7 +2263,21 @@ pub struct RecursiveRouteResponse {
 ///
 /// The transport routes the query to the registered `ForwardingNode` for
 /// the target NodeId, which then handles the recursive forwarding logic.
-pub trait RecursiveNextHopTransport {
+///
+/// **N2.2.1-async.** `forward_query` is now an `async fn` via
+/// `#[async_trait]`. This eliminates the `Runtime::new()` / `block_on`
+/// boundary that previously lived in `TcpRecursiveTransport::forward_query`
+/// — every TCP connect, SNP-IK handshake, AEAD frame I/O, and recursive
+/// `ForwardingNode::handle_query` call now runs natively on the caller's
+/// Tokio runtime. Multiple `forward_query` calls can be `tokio::join!`ed
+/// against the same transport without spawning a per-query runtime.
+///
+/// The trait carries `Send + Sync` supertrait bounds so that
+/// `Arc<dyn RecursiveNextHopTransport + Send + Sync>` (held by
+/// `ForwardingNode`) is `Send + Sync` — required because `handle_query`
+/// is itself an async function and may be `tokio::spawn`ed.
+#[async_trait]
+pub trait RecursiveNextHopTransport: Send + Sync {
     /// Forward a `ForwardedQuery` to the specified neighbor and wait for a
     /// `RecursiveRouteResponse`.
     ///
@@ -2253,7 +2285,7 @@ pub trait RecursiveNextHopTransport {
     /// - The neighbor is not registered with this transport.
     /// - The neighbor's `handle_query` returned `None` (e.g., bad signature,
     ///   loop detected, hop budget exhausted, no path to destination).
-    fn forward_query(
+    async fn forward_query(
         &self,
         neighbor_node_id: &[u8; 32],
         query: &ForwardedQuery,
@@ -3160,18 +3192,26 @@ impl<'a> NextHopResolver<'a> {
     /// A does NOT query C or G directly — the forwarding happens inside the
     /// transport's `ForwardingNode` participants.
     ///
+    /// **N2.2.1-async.** This method is now `async`. The recursive transport's
+    /// `forward_query` is itself async, so the entire A→B→C→G chain runs on
+    /// the caller's Tokio runtime — no per-call `Runtime::new()` /
+    /// `block_on` boundary. Multiple `resolve_route` calls can be
+    /// `tokio::join!`ed against the same resolver to discover multiple
+    /// destinations concurrently.
+    ///
     /// # Returns
     /// - `Some(DistributedRouteResolution)` if the destination was reached.
     /// - `None` if resolution failed (no recursive transport, budget
     ///   exhausted, loop detected, destination not reached, advertisement
     ///   verification failed, etc.).
     #[must_use]
-    pub fn resolve_route(
+    pub async fn resolve_route(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
     ) -> Option<DistributedRouteResolution> {
         self.resolve_route_with_budget(destination, hint, MAX_RESPONSE_HOPS)
+            .await
     }
 
     /// **N2.1.3.2.** Recursively resolve a destination with a custom initial
@@ -3180,10 +3220,12 @@ impl<'a> NextHopResolver<'a> {
     /// This is the same as `resolve_route` but allows the caller to specify
     /// the initial hop budget. Useful for testing budget exhaustion.
     ///
+    /// **N2.2.1-async.** Now `async` — see `resolve_route` for details.
+    ///
     /// # Panics
     /// Panics if `initial_budget` is 0.
     #[must_use]
-    pub fn resolve_route_with_budget(
+    pub async fn resolve_route_with_budget(
         &mut self,
         destination: &[u8; 32],
         hint: &RemoteNodeHint,
@@ -3218,7 +3260,13 @@ impl<'a> NextHopResolver<'a> {
         // 2. Send the ForwardedQuery to the first hop via the recursive transport.
         //    The first hop (a ForwardingNode) handles recursive forwarding.
         //    A receives the full accumulated RecursiveRouteResponse.
-        let response = recursive_transport.forward_query(&first_hop, &initial_query)?;
+        //
+        //    **N2.2.1-async:** `forward_query` is now `async` — this `.await`
+        //    drives the full A→B→C→G chain on the caller's runtime (real
+        //    TCP + SNP-IK + AEAD for production; in-memory for tests).
+        let response = recursive_transport
+            .forward_query(&first_hop, &initial_query)
+            .await?;
 
         // 3. If the response indicates NotFound, resolution failed.
         if response.not_found || !response.destination_reached {
@@ -3404,16 +3452,25 @@ impl InMemoryRecursiveTransport {
     }
 }
 
+#[async_trait]
 impl RecursiveNextHopTransport for InMemoryRecursiveTransport {
-    fn forward_query(
+    async fn forward_query(
         &self,
         neighbor_node_id: &[u8; 32],
         query: &ForwardedQuery,
     ) -> Option<RecursiveRouteResponse> {
-        let nodes = self.nodes.lock().expect("nodes mutex poisoned");
-        let node = nodes.get(neighbor_node_id)?.clone();
-        drop(nodes);
-        node.handle_query(query)
+        // Look up the target ForwardingNode under the std::sync::Mutex guard,
+        // clone the Arc, and DROP the guard before recursing into
+        // `node.handle_query().await`. This is critical: `handle_query` may
+        // recursively call `forward_query` on the SAME transport (the node's
+        // transport field is an `Arc<dyn RecursiveNextHopTransport>` that may
+        // point back to this `InMemoryRecursiveTransport`), which would
+        // deadlock if we held the lock across the await.
+        let node = {
+            let nodes = self.nodes.lock().expect("nodes mutex poisoned");
+            nodes.get(neighbor_node_id)?.clone()
+        };
+        node.handle_query(query).await
     }
 }
 
@@ -3535,13 +3592,19 @@ impl ForwardingNode {
     /// This is the core forwarding logic. See the type-level documentation
     /// for the full algorithm.
     ///
+    /// **N2.2.1-async.** This method is now `async`. The transport's
+    /// `forward_query` is itself `async` (e.g. `TcpRecursiveTransport`'s
+    /// real TCP + SNP-IK + AEAD round-trip), so the recursive A→B→C→G chain
+    /// runs natively on the caller's Tokio runtime — no `spawn_blocking` /
+    /// `Runtime::new()` boundary on the server side.
+    ///
     /// # Returns
     /// - `Some(RecursiveRouteResponse)` if the query was successfully
     ///   handled (either this node is the destination, or the query was
     ///   forwarded and a response was received).
     /// - `None` if the query was rejected (bad signature, loop detected,
     ///   hop budget exhausted, no path to destination, etc.).
-    pub fn handle_query(&self, query: &ForwardedQuery) -> Option<RecursiveRouteResponse> {
+    pub async fn handle_query(&self, query: &ForwardedQuery) -> Option<RecursiveRouteResponse> {
         // 1. Verify the query signature + parent binding.
         if !query.verify_all() {
             return None;
@@ -3669,7 +3732,17 @@ impl ForwardingNode {
         );
 
         // 10. Forward to next hop via the shared transport.
-        let mut response = self.transport.forward_query(&next_hop_id, &new_query)?;
+        //
+        //     **N2.2.1-async:** `forward_query` is now `async`. This `.await`
+        //     drives the real TCP + SNP-IK + AEAD round-trip to the next hop
+        //     (for `TcpRecursiveTransport`) or the in-memory recursion (for
+        //     `InMemoryRecursiveTransport`). No `Runtime::new()` /
+        //     `block_on` boundary — the future is driven by whatever runtime
+        //     the caller's task is on.
+        let mut response = self
+            .transport
+            .forward_query(&next_hop_id, &new_query)
+            .await?;
 
         // If the response is not_found, propagate it (don't add our assertion).
         if response.not_found {

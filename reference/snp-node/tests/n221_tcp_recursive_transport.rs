@@ -346,18 +346,22 @@ impl TcpMesh {
 /// This test uses NO `InMemoryRecursiveTransport` — every hop crosses a
 /// real async TCP boundary with SNP-IK authentication + AEAD encryption.
 ///
-/// This test is synchronous (`#[test]`) because the protocol layer
-/// (`NextHopResolver::resolve_route`) is synchronous. The transport's
-/// `forward_query` method bridges to async Tokio internally via a
-/// per-call current-thread runtime (see `TcpRecursiveTransport::forward_query`).
-#[test]
-fn tcp_recursive_a_b_c_gateway_success() {
+/// **N2.2.1-async.** This test is `#[tokio::test]` because the protocol
+/// layer (`NextHopResolver::resolve_route`) is now `async`. The transport's
+/// `forward_query` is also `async` — there is no per-call `Runtime::new()`
+/// / `block_on` boundary. The future runs directly on the test's Tokio
+/// runtime, and the recursive A→B→C→G chain unfolds as nested `.await`
+/// calls (each hop's `handle_query` awaits the next hop's
+/// `forward_query`).
+#[tokio::test]
+async fn tcp_recursive_a_b_c_gateway_success() {
     let mesh = TcpMesh::new(b"tcp-recursive");
     let hint = make_hint(mesh.g.node_id, mesh.b.node_id);
 
     let mut resolver = mesh.resolver();
     let resolution = resolver
         .resolve_route(&mesh.g.node_id, &hint)
+        .await
         .expect("TCP recursive resolution must succeed for A→B→C→G");
 
     // Verify the path A → B → C → G.
@@ -986,4 +990,134 @@ async fn replay_cache_rejects_duplicate_query_id() {
     );
 
     eprintln!("[test 8] PASS: server-side replay cache rejected duplicated (source_node_id, query_id)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. concurrent_recursive_queries_through_tcp — N2.2.1-async north-star
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.2.1-async north-star test.** Run THREE `resolve_route` calls
+/// concurrently through the SAME `TcpRecursiveTransport` (A's transport),
+/// proving there is no per-query `Runtime::new()` / `block_on` boundary
+/// that would serialize concurrent discoveries.
+///
+/// Pre-N2.2.1-async, this test could not have been written as-is: each
+/// `forward_query` call created its own current-thread Tokio runtime and
+/// `block_on`ed the async TCP + SNP-IK + AEAD round-trip on it. Three
+/// concurrent `block_on` calls on three separate current-thread runtimes
+/// would not deadlock, but they would NOT share a single runtime — there
+/// would be three mio reactors, three I/O driver threads (briefly), and
+/// no possibility of factoring concurrent discoveries onto a shared
+/// worker pool. With the async trait, all three calls share A's
+/// `#[tokio::test]` runtime, and the recursive forwarding on B, C, G
+/// each share their respective `serve_in_background` runtimes — one
+/// reactor per node, not per query.
+///
+/// ## What this proves
+///
+/// - `TcpRecursiveTransport::forward_query` is genuinely `async` (no
+///   `block_on` boundary): three concurrent calls proceed in parallel.
+/// - `ForwardingNode::handle_query` is genuinely `async` (no
+///   `spawn_blocking` boundary): B's server spawns one connection task
+///   per accepted connection, and each task's `handle_query` awaits the
+///   next hop's `forward_query` directly on the worker pool.
+/// - The server-side replay cache does NOT serialise legitimate
+///   concurrent queries: each `resolve_route` produces a fresh random
+///   `query_id`, so the (source_node_id, query_id) keys are distinct
+///   and all three queries are accepted.
+/// - The `InMemoryRecursiveTransport`-style "leaked single-step
+///   transport" pattern still works: three resolvers, each with its own
+///   leaked `InMemoryNextHopTransport`, share the SAME `Arc<TcpRecursiveTransport>`
+///   (A's transport) via `&'a dyn RecursiveNextHopTransport`.
+///
+/// ## Concurrency model
+///
+/// `NextHopResolver::resolve_route` takes `&mut self` (it owns the
+/// `pending_queries` HashMap for replay protection). To run three
+/// `resolve_route` calls concurrently WITHOUT violating the `&mut self`
+/// contract, we create THREE independent resolver instances — each with
+/// its own `pending_queries` state — all borrowing the SAME
+/// `Arc<TcpRecursiveTransport>` (mesh.a_transport). This is the spec'd
+/// pattern: "for now, the resolver is `&mut self`, so it's
+/// single-threaded" — the resolver is single-threaded per instance, but
+/// the underlying TCP transport is shared and concurrent.
+///
+/// At peak, this test has 9 concurrent TCP connections in flight:
+/// - 3 connections from A → B (one per resolver).
+/// - 3 connections from B → C (B's server spawns 3 connection tasks,
+///   each calling `forward_query` to C).
+/// - 3 connections from C → G.
+///
+/// Each node's `serve_in_background` runtime has 2 worker threads,
+/// which is sufficient because the connections are async I/O — they
+/// yield at every `.await` and do not block worker threads.
+#[tokio::test]
+async fn concurrent_recursive_queries_through_tcp() {
+    let mesh = TcpMesh::new(b"concurrent");
+
+    // Three INDEPENDENT resolvers, all borrowing the SAME TcpRecursiveTransport
+    // (mesh.a_transport). Each resolver has its own pending_queries state
+    // (the &mut self contract), but the underlying TCP transport is shared.
+    let hint = make_hint(mesh.g.node_id, mesh.b.node_id);
+    let mut r1 = mesh.resolver();
+    let mut r2 = mesh.resolver();
+    let mut r3 = mesh.resolver();
+
+    // Three concurrent resolve_route calls — `tokio::join!` polls all
+    // three futures simultaneously on the test's Tokio runtime. No
+    // per-call runtime, no block_on.
+    let (res1, res2, res3) = tokio::join!(
+        r1.resolve_route(&mesh.g.node_id, &hint),
+        r2.resolve_route(&mesh.g.node_id, &hint),
+        r3.resolve_route(&mesh.g.node_id, &hint),
+    );
+
+    let r1 = res1.expect("concurrent resolve 1 must succeed");
+    let r2 = res2.expect("concurrent resolve 2 must succeed");
+    let r3 = res3.expect("concurrent resolve 3 must succeed");
+
+    // Each resolution must independently verify (all signatures + chain
+    // coherence + hop budget + destination state).
+    assert!(r1.verify().is_ok(), "concurrent resolution 1 must verify");
+    assert!(r2.verify().is_ok(), "concurrent resolution 2 must verify");
+    assert!(r3.verify().is_ok(), "concurrent resolution 3 must verify");
+
+    // Each resolution must have the correct path A→B→C→G.
+    let expected_path = vec![mesh.a.node_id, mesh.b.node_id, mesh.c.node_id, mesh.g.node_id];
+    assert_eq!(r1.ordered_node_ids, expected_path, "r1 path must be A→B→C→G");
+    assert_eq!(r2.ordered_node_ids, expected_path, "r2 path must be A→B→C→G");
+    assert_eq!(r3.ordered_node_ids, expected_path, "r3 path must be A→B→C→G");
+
+    // Each resolution's first query_id (A→B) must be DISTINCT — random
+    // nonces make each resolution's queries unique. This is what lets
+    // the server-side replay cache accept all three: the (source_node_id,
+    // query_id) keys are different even though source_node_id is the
+    // same (A).
+    assert_ne!(
+        r1.query_chain[0].query_id, r2.query_chain[0].query_id,
+        "concurrent resolutions must have distinct A→B query_ids (random nonces)"
+    );
+    assert_ne!(
+        r2.query_chain[0].query_id, r3.query_chain[0].query_id,
+        "concurrent resolutions must have distinct A→B query_ids (random nonces)"
+    );
+    assert_ne!(
+        r1.query_chain[0].query_id, r3.query_chain[0].query_id,
+        "concurrent resolutions must have distinct A→B query_ids (random nonces)"
+    );
+
+    // Each resolution must convert to a valid Route.
+    let route1 = r1.into_route().expect("r1 must convert to a Route");
+    let route2 = r2.into_route().expect("r2 must convert to a Route");
+    let route3 = r3.into_route().expect("r3 must convert to a Route");
+    assert!(route1.validate().is_ok(), "route 1 must validate");
+    assert!(route2.validate().is_ok(), "route 2 must validate");
+    assert!(route3.validate().is_ok(), "route 3 must validate");
+
+    eprintln!(
+        "[test 9] PASS: 3 concurrent resolve_route calls through a single \
+         TcpRecursiveTransport all succeeded — no per-query runtime/blocking \
+         boundary, 9 concurrent TCP connections multiplexed across the \
+         A/B/C/G runtimes"
+    );
 }

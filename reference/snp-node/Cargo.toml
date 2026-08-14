@@ -45,6 +45,7 @@ snp-frames.workspace = true
 snp-link.workspace = true
 snp-routing.workspace = true
 snp-gateway.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 getrandom = "0.2"

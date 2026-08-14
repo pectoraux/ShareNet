@@ -183,8 +183,8 @@ fn distributed_route_discovery_is_now_implemented() {
 ///
 /// Scenario: A wants to reach G. A knows B. B knows G.
 /// A queries B, B responds with G's advertisement.
-#[test]
-fn next_hop_resolver_resolves_destination_through_neighbor() {
+#[tokio::test]
+async fn next_hop_resolver_resolves_destination_through_neighbor() {
     let topology = TopologyGraph::new();
 
     // Local node A.
@@ -226,7 +226,7 @@ fn next_hop_resolver_resolves_destination_through_neighbor() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&g_id, &hint);
+    let resolved = resolver.resolve_step(&g_id, &hint).await;
 
     assert!(resolved.is_some(), "resolver must find G");
     let record = &resolved.unwrap().record;
@@ -236,8 +236,8 @@ fn next_hop_resolver_resolves_destination_through_neighbor() {
 }
 
 /// 10. next_hop_resolver_returns_none_when_neighbor_does_not_respond
-#[test]
-fn next_hop_resolver_returns_none_when_neighbor_does_not_respond() {
+#[tokio::test]
+async fn next_hop_resolver_returns_none_when_neighbor_does_not_respond() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"no-response-a");
     let a_id = derive_node_id(&a_pk);
@@ -258,14 +258,14 @@ fn next_hop_resolver_returns_none_when_neighbor_does_not_respond() {
     // Empty transport — no responders registered.
     let transport = InMemoryNextHopTransport::new();
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&[0xAA; 32], &hint);
+    let resolved = resolver.resolve_step(&[0xAA; 32], &hint).await;
     assert!(resolved.is_none(), "resolver must return None when neighbor doesn't respond");
     eprintln!("[test 10] PASS: resolver returns None when neighbor doesn't respond");
 }
 
 /// 11. next_hop_resolver_rejects_unsigned_response
-#[test]
-fn next_hop_resolver_rejects_unsigned_response() {
+#[tokio::test]
+async fn next_hop_resolver_rejects_unsigned_response() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"unsigned-a");
     let a_id = derive_node_id(&a_pk);
@@ -303,14 +303,14 @@ fn next_hop_resolver_rejects_unsigned_response() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&g_id, &hint);
+    let resolved = resolver.resolve_step(&g_id, &hint).await;
     assert!(resolved.is_none(), "resolver must reject unsigned response");
     eprintln!("[test 11] PASS: resolver rejects unsigned response");
 }
 
 /// 12. next_hop_resolver_rejects_response_with_mismatched_query_id
-#[test]
-fn next_hop_resolver_rejects_response_with_mismatched_query_id() {
+#[tokio::test]
+async fn next_hop_resolver_rejects_response_with_mismatched_query_id() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"mismatch-a");
     let a_id = derive_node_id(&a_pk);
@@ -345,14 +345,14 @@ fn next_hop_resolver_rejects_response_with_mismatched_query_id() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&g_id, &hint);
+    let resolved = resolver.resolve_step(&g_id, &hint).await;
     assert!(resolved.is_none(), "resolver must reject mismatched query_id");
     eprintln!("[test 12] PASS: resolver rejects mismatched query_id");
 }
 
 /// 13. next_hop_resolver_rejects_not_found_response
-#[test]
-fn next_hop_resolver_rejects_not_found_response() {
+#[tokio::test]
+async fn next_hop_resolver_rejects_not_found_response() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"notfound-a");
     let a_id = derive_node_id(&a_pk);
@@ -378,7 +378,7 @@ fn next_hop_resolver_rejects_not_found_response() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&[0xBB; 32], &hint);
+    let resolved = resolver.resolve_step(&[0xBB; 32], &hint).await;
     assert!(resolved.is_none(), "resolver must return None for NotFound");
     eprintln!("[test 13] PASS: resolver returns None for NotFound");
 }
@@ -387,8 +387,8 @@ fn next_hop_resolver_rejects_not_found_response() {
 ///
 /// The response contains an advertisement that fails verification
 /// (e.g., expired or tampered).
-#[test]
-fn next_hop_resolver_rejects_invalid_advertisement() {
+#[tokio::test]
+async fn next_hop_resolver_rejects_invalid_advertisement() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"invalid-advert-a");
     let a_id = derive_node_id(&a_pk);
@@ -431,7 +431,7 @@ fn next_hop_resolver_rejects_invalid_advertisement() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&[0xCC; 32], &hint);
+    let resolved = resolver.resolve_step(&[0xCC; 32], &hint).await;
     assert!(resolved.is_none(), "resolver must reject invalid advertisement");
     eprintln!("[test 14] PASS: resolver rejects invalid advertisement");
 }
@@ -444,8 +444,8 @@ fn next_hop_resolver_rejects_invalid_advertisement() {
 ///
 /// Full pipeline: A uses NextHopResolver to resolve G through B,
 /// then RouteEngine constructs a route using the resolved record.
-#[test]
-fn distributed_resolution_plus_local_route_construction() {
+#[tokio::test]
+async fn distributed_resolution_plus_local_route_construction() {
     use snp_node::node::{HopCountCost, LinkKey, RouteEngine};
     use snp_node::test_support::test_authenticated_link;
 
@@ -496,7 +496,7 @@ fn distributed_resolution_plus_local_route_construction() {
     // then mutate topology after the resolver is dropped.
     {
         let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-        let resolved = resolver.resolve_step(&g_id, &hint);
+        let resolved = resolver.resolve_step(&g_id, &hint).await;
         assert!(resolved.is_some(), "G must be resolved");
         let g_record = &resolved.unwrap().record;
         assert_eq!(g_record.node_id(), g_id);
@@ -543,8 +543,8 @@ use snp_node::node::{
 ///
 /// A response from a node OTHER than the queried neighbor must be rejected,
 /// even if the signature is valid.
-#[test]
-fn unexpected_responder_rejected() {
+#[tokio::test]
+async fn unexpected_responder_rejected() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"unexpected-a");
     let a_id = derive_node_id(&a_pk);
@@ -580,14 +580,14 @@ fn unexpected_responder_rejected() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "response from unexpected responder must be rejected");
     eprintln!("[test 16] PASS: unexpected responder rejected");
 }
 
 /// 17. expected_responder_accepted
-#[test]
-fn expected_responder_accepted() {
+#[tokio::test]
+async fn expected_responder_accepted() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"expected-a");
     let a_id = derive_node_id(&a_pk);
@@ -621,7 +621,7 @@ fn expected_responder_accepted() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_some(), "response from expected responder must be accepted");
     eprintln!("[test 17] PASS: expected responder accepted");
 }
@@ -658,8 +658,8 @@ fn replayed_response_rejected() {
 }
 
 /// 19. future_dated_response_rejected
-#[test]
-fn future_dated_response_rejected() {
+#[tokio::test]
+async fn future_dated_response_rejected() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"future-a");
     let a_id = derive_node_id(&a_pk);
@@ -697,7 +697,7 @@ fn future_dated_response_rejected() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "future-dated response must be rejected");
     eprintln!("[test 19] PASS: future-dated response rejected");
 }
@@ -726,8 +726,8 @@ fn max_hops_zero_rejected() {
 /// 21. routing_assertion_is_not_link_proof
 ///
 /// A RoutingAssertion proves "B claims C is next hop" — NOT "B has a link to C".
-#[test]
-fn routing_assertion_is_not_link_proof() {
+#[tokio::test]
+async fn routing_assertion_is_not_link_proof() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"assertion-a");
     let a_id = derive_node_id(&a_pk);
@@ -761,7 +761,7 @@ fn routing_assertion_is_not_link_proof() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_some());
 
     let resolution = result.unwrap();
@@ -783,8 +783,8 @@ fn routing_assertion_is_not_link_proof() {
 ///
 /// The advertisement in the response is verified independently via
 /// verify_into_verified(). A tampered advertisement must be rejected.
-#[test]
-fn destination_advertisement_verified_independently() {
+#[tokio::test]
+async fn destination_advertisement_verified_independently() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"indep-verify-a");
     let a_id = derive_node_id(&a_pk);
@@ -821,7 +821,7 @@ fn destination_advertisement_verified_independently() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "tampered advertisement must be rejected");
     eprintln!("[test 22] PASS: destination advertisement verified independently");
 }
@@ -929,8 +929,8 @@ fn response_freshness_validated() {
 /// so the pending-query state survives across calls. Verify that two
 /// successive `resolve_step()` calls leave BOTH queries in
 /// `resolver.pending_queries()`.
-#[test]
-fn distributed_resolver_state_survives_multiple_operations() {
+#[tokio::test]
+async fn distributed_resolver_state_survives_multiple_operations() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"state-survive-a");
     let a_id = derive_node_id(&a_pk);
@@ -981,11 +981,11 @@ fn distributed_resolver_state_survives_multiple_operations() {
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
 
     // First call — resolve G1.
-    let r1 = resolver.resolve_step(&g1_id, &hint1);
+    let r1 = resolver.resolve_step(&g1_id, &hint1).await;
     assert!(r1.is_some(), "first resolve_step must succeed for G1");
 
     // Second call — resolve G2. State (pending_queries) MUST persist across calls.
-    let r2 = resolver.resolve_step(&g2_id, &hint2);
+    let r2 = resolver.resolve_step(&g2_id, &hint2).await;
     assert!(r2.is_some(), "second resolve_step must succeed for G2");
 
     // Both pending queries must be tracked in the resolver's state.
@@ -1007,8 +1007,8 @@ fn distributed_resolver_state_survives_multiple_operations() {
 /// After a `resolve_step` call, the pending query MUST remain in
 /// `resolver.pending_queries()` and be marked as consumed (replay protection).
 /// The previous stateless `DestinationResolver` could not retain this state.
-#[test]
-fn pending_query_state_not_discarded() {
+#[tokio::test]
+async fn pending_query_state_not_discarded() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"pending-state-a");
     let a_id = derive_node_id(&a_pk);
@@ -1039,7 +1039,7 @@ fn pending_query_state_not_discarded() {
     });
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
-    let resolved = resolver.resolve_step(&g_id, &hint);
+    let resolved = resolver.resolve_step(&g_id, &hint).await;
     assert!(resolved.is_some(), "resolution must succeed");
 
     // The pending query MUST be retained in resolver state (NOT discarded).
@@ -1069,8 +1069,8 @@ fn pending_query_state_not_discarded() {
 /// N2.1.3.1.1: A consumed query_id is tracked across `resolve_step()` calls
 /// via `is_query_consumed`. The state lives in `resolver.pending_queries()`
 /// and persists across calls on the SAME resolver instance.
-#[test]
-fn consumed_query_replay_rejected_across_calls() {
+#[tokio::test]
+async fn consumed_query_replay_rejected_across_calls() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"replay-cross-a");
     let a_id = derive_node_id(&a_pk);
@@ -1103,7 +1103,7 @@ fn consumed_query_replay_rejected_across_calls() {
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
 
     // First call — should succeed.
-    let r1 = resolver.resolve_step(&g_id, &hint);
+    let r1 = resolver.resolve_step(&g_id, &hint).await;
     assert!(r1.is_some(), "first resolution must succeed");
 
     // The query_id from the first call MUST be tracked as consumed.
@@ -1120,7 +1120,7 @@ fn consumed_query_replay_rejected_across_calls() {
     // A second call on the SAME resolver generates a NEW query_id (each
     // NextHopQuery is created with a random 16-byte nonce). The original
     // consumed query_id must remain tracked as consumed across this call.
-    let r2 = resolver.resolve_step(&g_id, &hint);
+    let r2 = resolver.resolve_step(&g_id, &hint).await;
     assert!(r2.is_some(), "second resolution must succeed");
 
     // Original consumed query_id still tracked as consumed.
@@ -1389,8 +1389,8 @@ fn setup_resolver_with_response(
 ///
 /// N2.1.3.1.2: A response with an invalid/tampered advertisement must NOT
 /// consume the pending query. The query remains available for legitimate retry.
-#[test]
-fn invalid_advertisement_does_not_consume_query() {
+#[tokio::test]
+async fn invalid_advertisement_does_not_consume_query() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"txn-invalid-advert-a");
     let a_id = derive_node_id(&a_pk);
@@ -1432,7 +1432,7 @@ fn invalid_advertisement_does_not_consume_query() {
     assert_eq!(resolver.pending_query_count(), 0);
 
     // Resolve fails (invalid advertisement).
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "invalid advertisement must fail");
 
     // N2.1.3.1.2: The query must NOT be consumed.
@@ -1444,8 +1444,8 @@ fn invalid_advertisement_does_not_consume_query() {
 }
 
 /// 34. valid_response_consumes_query
-#[test]
-fn valid_response_consumes_query() {
+#[tokio::test]
+async fn valid_response_consumes_query() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"txn-valid-a");
     let a_id = derive_node_id(&a_pk);
@@ -1484,7 +1484,7 @@ fn valid_response_consumes_query() {
     assert_eq!(resolver.pending_query_count(), 0);
 
     // Resolve succeeds.
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_some(), "valid response must succeed");
 
     // After: query is consumed (0 unconsumed pending).
@@ -1495,8 +1495,8 @@ fn valid_response_consumes_query() {
 }
 
 /// 35. consumed_query_replay_rejected_after_success
-#[test]
-fn consumed_query_replay_rejected_after_success() {
+#[tokio::test]
+async fn consumed_query_replay_rejected_after_success() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"txn-replay-a");
     let a_id = derive_node_id(&a_pk);
@@ -1532,7 +1532,7 @@ fn consumed_query_replay_rejected_after_success() {
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
 
     // First resolution succeeds.
-    let result1 = resolver.resolve_step(&g_id, &hint);
+    let result1 = resolver.resolve_step(&g_id, &hint).await;
     assert!(result1.is_some());
 
     // The query from the first call is consumed (but retained in the map for replay detection).
@@ -1541,7 +1541,7 @@ fn consumed_query_replay_rejected_after_success() {
 
     // Second resolution creates a NEW query (different query_id), so the old
     // response won't match. This is correct replay protection behavior.
-    let result2 = resolver.resolve_step(&g_id, &hint);
+    let result2 = resolver.resolve_step(&g_id, &hint).await;
     // The second call creates a new query_id, so the old response (with old query_id)
     // won't match. The transport returns a response with the NEW query_id, which
     // should succeed if the transport is still registered.
@@ -1551,8 +1551,8 @@ fn consumed_query_replay_rejected_after_success() {
 }
 
 /// 36. response_from_wrong_responder_does_not_consume_query
-#[test]
-fn response_from_wrong_responder_does_not_consume_query() {
+#[tokio::test]
+async fn response_from_wrong_responder_does_not_consume_query() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"txn-wrong-resp-a");
     let a_id = derive_node_id(&a_pk);
@@ -1588,7 +1588,7 @@ fn response_from_wrong_responder_does_not_consume_query() {
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
 
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "wrong responder must fail");
 
     // N2.1.3.1.2: The query must NOT be consumed.
@@ -1599,8 +1599,8 @@ fn response_from_wrong_responder_does_not_consume_query() {
 }
 
 /// 37. stale_response_does_not_consume_query
-#[test]
-fn stale_response_does_not_consume_query() {
+#[tokio::test]
+async fn stale_response_does_not_consume_query() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"txn-stale-a");
     let a_id = derive_node_id(&a_pk);
@@ -1639,7 +1639,7 @@ fn stale_response_does_not_consume_query() {
 
     let mut resolver = NextHopResolver::new(&topology, &transport, a_sk, a_pk, a_id);
 
-    let result = resolver.resolve_step(&g_id, &hint);
+    let result = resolver.resolve_step(&g_id, &hint).await;
     assert!(result.is_none(), "stale response must fail");
 
     // N2.1.3.1.2: The query must NOT be consumed.
@@ -1659,8 +1659,8 @@ fn pending_query_capacity_limit() {
 }
 
 /// 39. purge_expired_pending_queries_works
-#[test]
-fn purge_expired_pending_queries_works() {
+#[tokio::test]
+async fn purge_expired_pending_queries_works() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"purge-a");
     let a_id = derive_node_id(&a_pk);
@@ -1684,7 +1684,7 @@ fn purge_expired_pending_queries_works() {
     };
 
     // Create a query (will fail since transport has no responder).
-    let _ = resolver.resolve_step(&[0xDD; 32], &hint);
+    let _ = resolver.resolve_step(&[0xDD; 32], &hint).await;
 
     // There should be 1 unconsumed pending query.
     assert_eq!(resolver.pending_query_count(), 1);
@@ -1708,8 +1708,8 @@ fn purge_expired_pending_queries_works() {
 /// against the total capacity. The resolver must refuse new queries when
 /// total_pending_queries() >= MAX_PENDING_ROUTE_QUERIES, even if all
 /// existing queries are consumed.
-#[test]
-fn consumed_queries_count_against_capacity() {
+#[tokio::test]
+async fn consumed_queries_count_against_capacity() {
     let topology = TopologyGraph::new();
     let (a_sk, a_pk) = fresh_keypair(b"capacity-a");
     let a_id = derive_node_id(&a_pk);
@@ -1751,13 +1751,13 @@ fn consumed_queries_count_against_capacity() {
     // increases (consumed entries are retained).
 
     // First query: succeeds, consumed, retained.
-    let r1 = resolver.resolve_step(&g_id, &hint);
+    let r1 = resolver.resolve_step(&g_id, &hint).await;
     assert!(r1.is_some());
     assert_eq!(resolver.total_pending_queries(), 1, "1 consumed entry retained");
     assert_eq!(resolver.pending_query_count(), 0, "0 unconsumed");
 
     // Second query: succeeds, consumed, retained.
-    let r2 = resolver.resolve_step(&g_id, &hint);
+    let r2 = resolver.resolve_step(&g_id, &hint).await;
     assert!(r2.is_some());
     assert_eq!(resolver.total_pending_queries(), 2, "2 consumed entries retained");
     assert_eq!(resolver.pending_query_count(), 0, "0 unconsumed");
