@@ -122,6 +122,7 @@ pub mod propagation_state;
 pub mod route_discovery;
 pub mod circuit_handshake;
 pub mod distributed_circuit;
+pub mod traffic;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
@@ -167,6 +168,11 @@ pub use distributed_circuit::{
     RelayHandshakeTransport, establish_distributed_circuit, accept_relay_handshake,
     derive_signed_hop_authorizations, compute_authorization_root,
     authorization_in_root, verify_dh_proof, MAX_AUTHORIZATION_HASHES,
+};
+pub use traffic::{
+    CircuitPacket, RelayForwardingTable, TrafficError, UnwrappedPacket,
+    wrap_packet, unwrap_final,
+    MAX_PACKET_PAYLOAD_BYTES, REPLAY_WINDOW_SIZE, PACKET_TTL_MAX,
 };
 pub use session::{
     PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,

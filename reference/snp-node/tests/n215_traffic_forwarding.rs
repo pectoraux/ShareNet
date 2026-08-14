@@ -1,0 +1,636 @@
+//! N2.3 — Traffic Forwarding integration tests.
+//!
+//! These tests prove REAL packet traversal over an established ActiveCircuit:
+//!
+//! ```text
+//! A ──sealed packet──> B ──sealed packet──> G
+//! ```
+//!
+//! where B and G genuinely consult their installed `RelayForwardingState`
+//! (from N2.2's `accept_relay_handshake`), unwrap one AEAD layer, and the
+//! plaintext reaches G without A talking directly to G.
+//!
+//! Plus adversarial tests covering the 15 N2.3 invariants:
+//!  1. Packet bound to exactly one circuit
+//!  2. Relay cannot substitute circuit/destination
+//!  3. Relay cannot decrypt beyond its layer
+//!  4. Packet replay rejected
+//!  5. Sequence/order bounded
+//!  6. Cannot inject into another circuit
+//!  7. Cannot skip a designated hop
+//!  8. Relay cannot change predecessor/successor
+//!  9. TTL prevents forwarding loops
+//! 10. Unknown circuit IDs rejected
+//! 11. Teardown immediately blocks new traffic
+//! 12. Oversized packets rejected before allocation
+//! 13. Malformed forwarding messages fail closed
+//! 14. Forwarding state cleaned up deterministically
+//! 15. Path operates without inspecting app payload
+
+#![allow(clippy::pedantic)]
+
+use snp_crypto::{
+    derive_node_id, derive_public_key, sha256, x25519_static_keypair,
+    x25519_ephemeral_keypair,
+};
+use snp_node::node::{
+    accept_relay_handshake, Capability, CircuitAcceptanceStore,
+    CircuitHandshake, CircuitSetup, CircuitTeardown, CommittedRoute,
+    commit_route, derive_signed_hop_authorizations, discover_path,
+    Link as Link_, LinkKey, MAX_PACKET_PAYLOAD_BYTES,
+    NodeAdvertisement, prepare_circuit_setup,
+    RelayForwardingState, RelayForwardingTable,
+    RelayHandshakeRequest, RouteAcceptance, RouteProposal, RouteRole,
+    ServiceAgreement, TopologyGraph,
+    TrafficError, TransportEndpoint, UnwrappedPacket,
+    validate_path, wrap_packet,
+};
+
+// ─── Test helpers (mirrors n214's setup, adapted for N2.3 traffic) ─────────
+
+fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let sk = sha256(label);
+    let pk = derive_public_key(&sk);
+    (sk, pk)
+}
+
+fn make_relay_advert(label: &[u8], seq: u64, x25519_pk: &[u8; 32]) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+    let (sk, pk) = fresh_keypair(label);
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:1234")],
+        Some(*x25519_pk), 3600, seq,
+    );
+    (advert, sk, pk)
+}
+
+fn make_gateway_advert(label: &[u8], seq: u64, x25519_pk: &[u8; 32]) -> (NodeAdvertisement, [u8; 32], [u8; 32]) {
+    let (sk, pk) = fresh_keypair(label);
+    let advert = NodeAdvertisement::create_and_sign(
+        &sk, &pk, vec![Capability::Gateway],
+        vec![TransportEndpoint::tcp("127.0.0.1:5678")],
+        Some(*x25519_pk), 3600, seq,
+    );
+    (advert, sk, pk)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+struct TestSetup {
+    source_id: [u8; 32],
+    source_sk: [u8; 32],
+    source_pk: [u8; 32],
+    relay_id: [u8; 32],
+    relay_sk: [u8; 32],
+    relay_pk: [u8; 32],
+    relay_x25519_sk: snp_crypto::X25519Secret,
+    relay_x25519_pk: [u8; 32],
+    gateway_id: [u8; 32],
+    gateway_sk: [u8; 32],
+    gateway_pk: [u8; 32],
+    gateway_x25519_sk: snp_crypto::X25519Secret,
+    gateway_x25519_pk: [u8; 32],
+    committed_route: CommittedRoute,
+    circuit_setup: CircuitSetup,
+    circuit_handshake: CircuitHandshake,
+    ephemeral_secret: snp_crypto::X25519Secret,
+}
+
+/// Build a real established circuit: A -> B -> G (source, one relay, gateway).
+/// Returns the full setup including the ActiveCircuit and all key material.
+fn setup() -> TestSetup {
+    let mut graph = TopologyGraph::new_for_testing();
+    let (source_sk, source_pk) = fresh_keypair(b"n23-source");
+    let source_id = derive_node_id(&source_pk);
+    let source_advert = NodeAdvertisement::create_and_sign(
+        &source_sk, &source_pk, vec![Capability::Relay],
+        vec![TransportEndpoint::tcp("127.0.0.1:0")], None, 3600, 1,
+    );
+    graph.accept_advertisement(source_advert.verify_into_verified().unwrap()).unwrap();
+
+    let (relay_x25519_sk, relay_x25519_pk_pair) = x25519_static_keypair();
+    let relay_x25519_pk = relay_x25519_pk_pair.to_bytes();
+    let (relay_advert, relay_sk, relay_pk) = make_relay_advert(b"n23-relay", 1, &relay_x25519_pk);
+    let relay_id = derive_node_id(&relay_pk);
+    graph.accept_advertisement(relay_advert.verify_into_verified().unwrap()).unwrap();
+
+    let (gateway_x25519_sk, gateway_x25519_pk_pair) = x25519_static_keypair();
+    let gateway_x25519_pk = gateway_x25519_pk_pair.to_bytes();
+    let (gw_advert, gw_sk, gw_pk) = make_gateway_advert(b"n23-gateway", 1, &gateway_x25519_pk);
+    let gateway_id = derive_node_id(&gw_pk);
+    graph.accept_advertisement(gw_advert.verify_into_verified().unwrap()).unwrap();
+
+    graph.add_link(Link_::new_up(
+        LinkKey::new(source_id, relay_id, TransportEndpoint::tcp("127.0.0.1:1")), None,
+    ));
+    graph.add_link(Link_::new_up(
+        LinkKey::new(relay_id, gateway_id, TransportEndpoint::tcp("127.0.0.1:2")), None,
+    ));
+
+    let exec = graph.snapshot_executable();
+    let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
+    let validated_path = validate_path(&exec, &discovered).unwrap();
+    let now = now_unix();
+    let proposal = RouteProposal::from_validated_path(
+        &validated_path, &source_sk, &source_pk,
+        ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        now + 3600,
+    ).unwrap();
+    let hash = proposal.proposal_hash().unwrap();
+    let relay_acc = RouteAcceptance::create_and_sign(
+        &relay_sk, &relay_pk, relay_id,
+        hash, RouteRole::Relay, vec![], now + 3600,
+    ).unwrap();
+    let gateway_acc = RouteAcceptance::create_and_sign(
+        &gw_sk, &gw_pk, gateway_id,
+        hash, RouteRole::Gateway, vec![], now + 3600,
+    ).unwrap();
+    let committed_route = commit_route(proposal, vec![relay_acc, gateway_acc], &validated_path, now).unwrap();
+
+    let (ephemeral_secret, _) = x25519_ephemeral_keypair();
+    let auth_count = (committed_route.validated_hops().len() - 1) as u8;
+    let circuit_handshake = CircuitHandshake::create_and_sign(
+        &committed_route, &source_sk, &source_pk, &ephemeral_secret,
+        [0u8; 32], auth_count,
+    ).unwrap();
+    let (final_root, _) = snp_node::node::compute_authorization_root(
+        &committed_route,
+        circuit_handshake.circuit_id,
+        circuit_handshake.commitment_hash,
+        &source_sk,
+    ).unwrap();
+    let mut circuit_handshake = circuit_handshake;
+    circuit_handshake.authorization_root = final_root;
+    let preimage = circuit_handshake.preimage_bytes().unwrap();
+    circuit_handshake.source_signature = snp_crypto::ed25519_sign(&source_sk, &preimage);
+    let circuit_setup = prepare_circuit_setup(&committed_route, &circuit_handshake, &ephemeral_secret).unwrap();
+
+    // NOTE: N2.3 traffic forwarding does not require a live ActiveCircuit
+    // object on the source side. wrap_packet() uses circuit_setup.hops()
+    // (the per-hop forwarding keys), which is identical to
+    // active_circuit.hops(). The relay-side state is installed by
+    // install_relay_state() in each test, which calls accept_relay_handshake
+    // directly (exactly what a real relay does).
+
+    TestSetup {
+        source_id, source_sk, source_pk,
+        relay_id, relay_sk, relay_pk,
+        relay_x25519_sk, relay_x25519_pk,
+        gateway_id, gateway_sk: gw_sk, gateway_pk: gw_pk,
+        gateway_x25519_sk, gateway_x25519_pk,
+        committed_route, circuit_setup, circuit_handshake,
+        ephemeral_secret,
+    }
+}
+
+// (StateRetainingTransport removed — N2.3 tests install relay state via
+// install_relay_state(), which is the real relay code path.)
+
+/// Build a relay's RelayForwardingState by calling accept_relay_handshake
+/// directly, and install it into a RelayForwardingTable. This is exactly what
+/// a real relay does on receiving a RelayHandshakeRequest.
+fn install_relay_state(
+    ts: &TestSetup,
+    table: &mut RelayForwardingTable,
+    acceptance_store: &mut CircuitAcceptanceStore,
+    relay_node_id: [u8; 32],
+    relay_x25519_sk: &snp_crypto::X25519Secret,
+    relay_sk: &[u8; 32],
+    relay_pk: &[u8; 32],
+) -> RelayForwardingState {
+    let authorizations = derive_signed_hop_authorizations(
+        &ts.committed_route, &ts.circuit_handshake, &ts.source_sk,
+    ).unwrap();
+    let auth = authorizations.iter()
+        .find(|a| a.relay_node_id == relay_node_id)
+        .cloned()
+        .unwrap();
+    // Compute the auth hashes (same as the source).
+    let mut hashes = Vec::new();
+    for a in &authorizations {
+        let preimage = a.canonical_preimage_bytes().unwrap();
+        hashes.push(sha256(&preimage));
+    }
+    let request = RelayHandshakeRequest {
+        handshake: ts.circuit_handshake.clone(),
+        authorization: auth.clone(),
+        authorization_hashes: hashes,
+    };
+    let (_response, state) = accept_relay_handshake(
+        &request, relay_x25519_sk, relay_sk, relay_pk, acceptance_store,
+    ).unwrap();
+    table.install(state.clone());
+    state
+}
+
+// ─── The end-to-end acceptance test ────────────────────────────────────────
+
+/// N2.3 acceptance: A → B → G packet traversal.
+///
+/// A wraps a plaintext into nested AEAD layers (one for B, one for G), sends
+/// to B. B consults its installed RelayForwardingState, peels its layer, and
+/// forwards the still-sealed packet to G. G peels its layer and recovers the
+/// plaintext. A never talks directly to G.
+#[test]
+fn end_to_end_packet_traversal_a_b_g() {
+    let ts = setup();
+
+    // Install relay B's forwarding state (simulating B having accepted the
+    // circuit handshake in N2.2).
+    let mut table_b = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let state_b = install_relay_state(
+        &ts, &mut table_b, &mut acc_b,
+        ts.relay_id, &ts.relay_x25519_sk, &ts.relay_sk, &ts.relay_pk,
+    );
+    assert_eq!(state_b.predecessor_node_id, ts.source_id);
+    assert_eq!(state_b.successor_node_id, Some(ts.gateway_id));
+
+    // Install gateway G's forwarding state.
+    let mut table_g = RelayForwardingTable::new();
+    let mut acc_g = CircuitAcceptanceStore::new();
+    let state_g = install_relay_state(
+        &ts, &mut table_g, &mut acc_g,
+        ts.gateway_id, &ts.gateway_x25519_sk, &ts.gateway_sk, &ts.gateway_pk,
+    );
+    assert_eq!(state_g.predecessor_node_id, ts.relay_id);
+    assert_eq!(state_g.successor_node_id, None); // terminal
+
+    // Source A wraps the plaintext. The hops include A (hop 0, no key), B, G.
+    let plaintext = b"hello gateway, this is the secret app payload".to_vec();
+    let packet = wrap_packet(
+        ts.circuit_setup.hops(),
+        &ts.circuit_handshake.circuit_id,
+        1, // seq
+        &ts.gateway_id,
+        &plaintext,
+    ).unwrap();
+
+    // A sends the packet to B (the first relay). B's predecessor is A.
+    let outcome_b = table_b.forward_packet(&packet, &ts.source_id).unwrap();
+    let (packet_to_g, successor) = match outcome_b {
+        UnwrappedPacket::Forward { packet, successor } => (packet, successor),
+        UnwrappedPacket::Deliver { .. } => panic!("B must forward, not deliver"),
+    };
+    assert_eq!(successor, ts.gateway_id, "B must forward to G");
+    assert_eq!(packet_to_g.ttl, packet.ttl - 1, "TTL decremented by B");
+
+    // B sends the forwarded packet to G. G's predecessor is B.
+    let outcome_g = table_g.forward_packet(&packet_to_g, &ts.relay_id).unwrap();
+    let recovered = match outcome_g {
+        UnwrappedPacket::Deliver { plaintext } => plaintext,
+        UnwrappedPacket::Forward { .. } => panic!("G must deliver, not forward"),
+    };
+    assert_eq!(recovered, plaintext, "G must recover the original plaintext");
+}
+
+// ─── Adversarial tests: the 15 invariants ─────────────────────────────────
+
+/// Helper: build the full A→B→G forwarding setup and return the tables + a
+/// valid first packet (seq=1).
+struct LiveCircuit {
+    ts: TestSetup,
+    table_b: RelayForwardingTable,
+    table_g: RelayForwardingTable,
+    _acc_b: CircuitAcceptanceStore,
+    _acc_g: CircuitAcceptanceStore,
+}
+fn live_circuit() -> LiveCircuit {
+    let ts = setup();
+    let mut table_b = RelayForwardingTable::new();
+    let mut table_g = RelayForwardingTable::new();
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut acc_g = CircuitAcceptanceStore::new();
+    install_relay_state(&ts, &mut table_b, &mut acc_b, ts.relay_id, &ts.relay_x25519_sk, &ts.relay_sk, &ts.relay_pk);
+    install_relay_state(&ts, &mut table_g, &mut acc_g, ts.gateway_id, &ts.gateway_x25519_sk, &ts.gateway_sk, &ts.gateway_pk);
+    LiveCircuit { ts, table_b, table_g, _acc_b: acc_b, _acc_g: acc_g }
+}
+
+/// Invariant #10: unknown circuit ID is rejected.
+#[test]
+fn unknown_circuit_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let mut packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Mutate the circuit_id to an unknown value.
+    packet.circuit_id = [0xff; 32];
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
+}
+
+/// Invariant #2/#8: predecessor mismatch is rejected.
+/// A packet arriving from a node that is NOT the registered predecessor is
+/// refused — a relay cannot be tricked into forwarding a packet injected by
+/// an unrelated node.
+#[test]
+fn predecessor_mismatch_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Claim the packet came from G (not A). B's predecessor is A.
+    let impostor = lc.ts.gateway_id;
+    let result = lc.table_b.forward_packet(&packet, &impostor);
+    assert!(matches!(result, Err(TrafficError::PredecessorMismatch { .. })));
+}
+
+/// Invariant #4: packet replay is rejected.
+/// The same (circuit, seq) cannot be forwarded twice.
+#[test]
+fn packet_replay_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // First forwarding succeeds.
+    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    // Replay the same seq → rejected.
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::PacketReplayOrStale { .. })));
+}
+
+/// Invariant #5: sequence must be monotonic; a stale seq (behind the replay
+/// window) is rejected.
+#[test]
+fn stale_sequence_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    // Send a high seq first (advances max_seen well past the window).
+    let high_seq = snp_node::node::REPLAY_WINDOW_SIZE + 20;
+    let p_high = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        high_seq, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let _ = lc.table_b.forward_packet(&p_high, &lc.ts.source_id).unwrap();
+    // Now send seq=5 — far behind max_seen (distance >> window) → stale.
+    let p_stale = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        5, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let result = lc.table_b.forward_packet(&p_stale, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::PacketReplayOrStale { .. })));
+}
+
+/// Invariant #9: TTL exhaustion is rejected.
+/// A packet with ttl=0 is dropped (not forwarded).
+#[test]
+fn ttl_exhausted_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let mut packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    packet.ttl = 0;
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::TtlExhausted { ttl: 0, .. })));
+}
+
+/// Invariant #6: a packet from one circuit cannot be unwrapped with another
+/// circuit's key. The AEAD AAD binds the circuit_id, so a cross-circuit
+/// injection fails authentication.
+#[test]
+fn cross_circuit_injection_rejected() {
+    let mut lc = live_circuit();
+    // Build a SECOND live circuit (different keys, different circuit_id).
+    let mut lc2 = live_circuit();
+    let plaintext = b"secret for circuit 1".to_vec();
+    // Wrap a packet for circuit 1.
+    let packet1 = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Try to forward it on circuit 2's relay B. The circuit_id won't match
+    // any state in lc2.table_b → UnknownCircuit. (Even if we crafted a packet
+    // with lc2's circuit_id, the AEAD would fail because the keys differ.)
+    let result = lc2.table_b.forward_packet(&packet1, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
+}
+
+/// Invariant #3/#13: a tampered payload fails AEAD authentication.
+/// Flip one byte of the sealed payload — the relay cannot decrypt it.
+#[test]
+fn tampered_payload_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let mut packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Flip a byte in the sealed payload.
+    packet.payload[0] ^= 0xff;
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
+}
+
+/// Invariant #2: the final destination cannot be substituted.
+/// The destination is bound into the AEAD AAD, so changing final_dst on the
+/// wire breaks authentication.
+#[test]
+fn destination_substitution_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let mut packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Substitute the final_dst with a different node.
+    packet.final_dst = [0xaa; 32];
+    let result = lc.table_b.forward_packet(&packet, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
+}
+
+/// Invariant #11: teardown immediately blocks new traffic.
+/// After remove_circuit (teardown), packets for that circuit are rejected.
+#[test]
+fn teardown_blocks_new_traffic() {
+    let mut lc = live_circuit();
+    let plaintext = b"payload".to_vec();
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // Before teardown: forwarding works.
+    let _ = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+
+    // Re-install B's state (the previous forward consumed the replay window).
+    let mut acc_b = CircuitAcceptanceStore::new();
+    let mut table_b = RelayForwardingTable::new();
+    install_relay_state(&lc.ts, &mut table_b, &mut acc_b, lc.ts.relay_id, &lc.ts.relay_x25519_sk, &lc.ts.relay_sk, &lc.ts.relay_pk);
+
+    // Teardown: remove the circuit's state.
+    let teardown = CircuitTeardown::create_and_sign(
+        &lc.ts.circuit_setup, &lc.ts.source_sk, &lc.ts.source_pk,
+    ).unwrap();
+    table_b.apply_teardown(&teardown);
+    assert!(!table_b.has_circuit(&lc.ts.circuit_handshake.circuit_id));
+
+    // A fresh packet (new seq, to avoid replay) is now rejected.
+    let packet2 = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        2, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let result = table_b.forward_packet(&packet2, &lc.ts.source_id);
+    assert!(matches!(result, Err(TrafficError::UnknownCircuit { .. })));
+}
+
+/// Invariant #12: oversized payload is rejected at the source (wrap) and at
+/// the wire decoder (decode_from_cbor).
+#[test]
+fn oversized_payload_rejected() {
+    let mut lc = live_circuit();
+    let big = vec![0u8; MAX_PACKET_PAYLOAD_BYTES + 1];
+    let result = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &big,
+    );
+    assert!(matches!(result, Err(TrafficError::PayloadTooLarge { .. })));
+}
+
+/// Invariant #12/#13: wire decode rejects an oversized payload at the CBOR
+/// head, before allocation.
+#[test]
+fn wire_decode_rejects_oversized_payload() {
+    use snp_cbor::{CborLimits, CborValue, decode_with_limits};
+    // Construct a CBOR map with an oversized payload byte string.
+    let big_payload = vec![0u8; MAX_PACKET_PAYLOAD_BYTES + 1];
+    let map = CborValue::Map(vec![
+        (CborValue::TextString("circuitId".into()), CborValue::ByteString(vec![0u8; 32])),
+        (CborValue::TextString("seq".into()), CborValue::UnsignedInt(1)),
+        (CborValue::TextString("ttl".into()), CborValue::UnsignedInt(16)),
+        (CborValue::TextString("payload".into()), CborValue::ByteString(big_payload)),
+        (CborValue::TextString("finalDst".into()), CborValue::ByteString(vec![0u8; 32])),
+    ]);
+    let wire = snp_cbor::encode(&map).unwrap();
+    // decode_with_limits with the packet profile rejects at the head.
+    let limits = CborLimits {
+        max_array_items: 4, max_map_entries: 8,
+        max_byte_string_len: MAX_PACKET_PAYLOAD_BYTES as u64,
+        max_text_string_len: 16, max_nesting_depth: 4,
+    };
+    let err = decode_with_limits(&wire, &limits).unwrap_err();
+    assert!(matches!(err, snp_cbor::CborError::LimitExceeded { kind: "byte_string", .. }));
+    // And decode_from_cbor surfaces it as a TrafficError.
+    let err = snp_node::node::CircuitPacket::decode_from_cbor(&wire).unwrap_err();
+    assert!(matches!(err, TrafficError::WireDecodeFailed { .. }));
+}
+
+/// Invariant #13: a malformed wire message (not CBOR / wrong shape) fails
+/// closed.
+#[test]
+fn malformed_wire_rejected() {
+    let garbage = b"not cbor at all".to_vec();
+    let result = snp_node::node::CircuitPacket::decode_from_cbor(&garbage);
+    assert!(matches!(result, Err(TrafficError::WireDecodeFailed { .. })));
+}
+
+/// Invariant #1 + round-trip: a well-formed packet survives encode→decode
+/// and the decoded packet equals the original.
+#[test]
+fn packet_wire_round_trip() {
+    let mut lc = live_circuit();
+    let plaintext = b"round trip payload".to_vec();
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        42, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let wire = packet.encode_to_cbor().unwrap();
+    let decoded = snp_node::node::CircuitPacket::decode_from_cbor(&wire).unwrap();
+    assert_eq!(decoded, packet);
+}
+
+/// Invariant #14: forwarding state is cleaned up deterministically.
+/// After teardown, the table no longer has the circuit, and len decreases.
+#[test]
+fn forwarding_state_cleanup_deterministic() {
+    let mut lc = live_circuit();
+    let cid = lc.ts.circuit_handshake.circuit_id;
+    assert!(lc.table_b.has_circuit(&cid));
+    let len_before = lc.table_b.len();
+    let teardown = CircuitTeardown::create_and_sign(
+        &lc.ts.circuit_setup, &lc.ts.source_sk, &lc.ts.source_pk,
+    ).unwrap();
+    lc.table_b.apply_teardown(&teardown);
+    assert!(!lc.table_b.has_circuit(&cid));
+    assert_eq!(lc.table_b.len(), len_before - 1);
+}
+
+/// Invariant #15: the relay does not inspect the application payload.
+/// The payload B sees is ciphertext (AEAD-sealed); B cannot read the
+/// plaintext. We verify this by checking that B's forwarded payload differs
+/// from the original plaintext.
+#[test]
+fn relay_does_not_inspect_payload() {
+    let mut lc = live_circuit();
+    let plaintext = b"plaintext that B must not see".to_vec();
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    let outcome = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+    let forwarded = match outcome {
+        UnwrappedPacket::Forward { packet, .. } => packet,
+        _ => panic!("expected Forward"),
+    };
+    // B's forwarded payload is still AEAD-sealed (for G). It is NOT the plaintext.
+    assert_ne!(forwarded.payload, plaintext, "B must not see the plaintext");
+    assert_ne!(forwarded.payload, packet.payload, "B's forwarded payload must differ from what it received (one layer peeled)");
+}
+
+/// Invariant #7: a packet cannot skip a hop.
+/// If G (terminal) receives a packet that still has an AEAD layer it cannot
+/// peel (because the layer was meant for B), G fails AEAD authentication.
+#[test]
+fn hop_skip_rejected() {
+    let mut lc = live_circuit();
+    let plaintext = b"trying to skip B".to_vec();
+    // Wrap a packet with BOTH layers (B and G). Send it DIRECTLY to G,
+    // skipping B. G tries to peel with G's key, but the outer layer is B's.
+    let packet = wrap_packet(
+        lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+        1, &lc.ts.gateway_id, &plaintext,
+    ).unwrap();
+    // G's predecessor is B, so claim it came from B — but the packet still
+    // has B's outer layer, which G's key cannot open.
+    let result = lc.table_g.forward_packet(&packet, &lc.ts.relay_id);
+    assert!(matches!(result, Err(TrafficError::PacketUnauthentic { .. })));
+}
+
+/// Multi-packet sequence: the source sends seq 1, 2, 3 and all traverse
+/// correctly (the replay window accepts monotonic seqs).
+#[test]
+fn multi_packet_sequence_traverses() {
+    let mut lc = live_circuit();
+    for seq in 1..=3u32 {
+        let plaintext = format!("packet {seq}").into_bytes();
+        let packet = wrap_packet(
+            lc.ts.circuit_setup.hops(), &lc.ts.circuit_handshake.circuit_id,
+            seq, &lc.ts.gateway_id, &plaintext,
+        ).unwrap();
+        // B forwards.
+        let outcome_b = lc.table_b.forward_packet(&packet, &lc.ts.source_id).unwrap();
+        let forwarded = match outcome_b {
+            UnwrappedPacket::Forward { packet, .. } => packet,
+            _ => panic!("B must forward seq {seq}"),
+        };
+        // G delivers.
+        let outcome_g = lc.table_g.forward_packet(&forwarded, &lc.ts.relay_id).unwrap();
+        let recovered = match outcome_g {
+            UnwrappedPacket::Deliver { plaintext } => plaintext,
+            _ => panic!("G must deliver seq {seq}"),
+        };
+        assert_eq!(recovered, plaintext, "seq {seq} payload mismatch");
+    }
+}

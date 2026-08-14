@@ -106,6 +106,58 @@ if [ -n "$WIRE_DECODE_MATCHES" ]; then
     REPORT+=$'\n'"[VIOLATION] unbounded snp_cbor::decode() in production source (N2.3 wire-decode gate):"$'\n'"$WIRE_DECODE_MATCHES"$'\n'
 fi
 
+# ───────────────────────────────────────────────────────────────────────
+# N2.3 guard hardening: forbid importing snp_cbor::decode into scope.
+#
+# The textual rule above ('snp_cbor::decode(') catches direct invocations,
+# but a future agent could bypass it with an import alias:
+#
+#     use snp_cbor::decode as unbounded_decode;
+#     unbounded_decode(bytes)   // not caught by the 'snp_cbor::decode(' rule
+#
+# Once `decode` is imported into scope (aliased or not), every subsequent
+# call is unbounded and invisible to the textual call-site check. So the
+# import itself is forbidden, regardless of whether the imported name is
+# ever called. The safe patterns `use snp_cbor::CborValue;`,
+# `use snp_cbor::decode_with_limits;`, and
+# `use snp_cbor::{CborValue, decode_with_limits};` are NOT matched.
+#
+# Matched forms (all forbidden in production src):
+#   use snp_cbor::decode;
+#   use snp_cbor::decode as <name>;
+#   use snp_cbor::{decode};
+#   use snp_cbor::{decode as <name>, ...};
+#   use snp_cbor::{..., decode, ...};
+#
+# Same allowlist as above (snp-cbor definition, snp-conformance harness,
+# tests/).
+# ───────────────────────────────────────────────────────────────────────
+DECODE_IMPORT_MATCHES=$(grep -rnE 'use[[:space:]]+snp_cbor::(\{[^}]*\bsnp_cbor)?\bdecode\b' "$ALL_REFERENCE_SRC" \
+    --include="*.rs" \
+    --exclude-dir="target" \
+    | grep -vE 'decode_with_limits' \
+    | grep -v '/snp-cbor/src/' \
+    | grep -v '/snp-conformance/src/' \
+    | grep -v '/tests/' \
+    || true)
+# The regex above may over-match `use snp_cbor::CborValue;`-style lines that
+# happen to contain the substring 'decode' elsewhere; refine to lines whose
+# imported path item is exactly 'decode' (optionally aliased). Use a precise
+# second pass.
+DECODE_IMPORT_MATCHES=$(grep -rnE 'use[[:space:]]+snp_cbor::' "$ALL_REFERENCE_SRC" \
+    --include="*.rs" \
+    --exclude-dir="target" \
+    | grep -v '/snp-cbor/src/' \
+    | grep -v '/snp-conformance/src/' \
+    | grep -v '/tests/' \
+    | grep -E '(::|\{|\s)[[:space:]]*decode[[:space:]]*(;|,|\}|[[:space:]]+as[[:space:]])' \
+    | grep -vE 'decode_with_limits' \
+    || true)
+if [ -n "$DECODE_IMPORT_MATCHES" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT+=$'\n'"[VIOLATION] import of snp_cbor::decode into scope (N2.3 wire-decode gate — would bypass the call-site check):"$'\n'"$DECODE_IMPORT_MATCHES"$'\n'
+fi
+
 if [ "$VIOLATIONS" -gt 0 ]; then
     echo "========================================" >&2
     echo "ARCHITECTURAL GUARD: $VIOLATIONS violation(s) found" >&2
@@ -119,6 +171,7 @@ if [ "$VIOLATIONS" -gt 0 ]; then
     echo "  - TopologyGraph::new() (private — use new_for_testing() in tests, open() in prod)" >&2
     echo "  - new_for_testing() (testing-only — production uses open(path))" >&2
     echo "  - snp_cbor::decode() (N2.3 gate — network decoders must use decode_with_limits())" >&2
+    echo "  - importing snp_cbor::decode into scope, aliased or not (N2.3 gate hardening)" >&2
     exit 1
 fi
 
