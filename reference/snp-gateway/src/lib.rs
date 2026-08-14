@@ -114,6 +114,24 @@ pub enum GatewayError {
     /// Frame body was not a valid TransitRequest.
     #[error("frame body was not a valid TransitRequest: {0}")]
     MalformedRequest(String),
+    /// **N2.2.4-hardening.** The upstream response (declared `Content-Length`
+    /// or actual body bytes) exceeds `max_response_bytes`. This is raised at
+    /// READ TIME — the gateway never allocates the full oversized body. The
+    /// read is aborted as soon as the limit is exceeded (or as soon as a
+    /// declared `Content-Length` is found to exceed the cap, before any body
+    /// bytes are read).
+    #[error("upstream response exceeds max_response_bytes ({limit} bytes): {detail}")]
+    ResponseTooLarge {
+        /// The configured maximum response body size in bytes.
+        limit: u64,
+        /// Human-readable detail (e.g. "Content-Length=12345678" or "read 1048577 bytes").
+        detail: String,
+    },
+    /// **N2.2.4-hardening.** The upstream response HTTP headers exceed
+    /// `MAX_HEADER_BYTES`. Raised at READ TIME — the gateway stops reading
+    /// before the header buffer can grow unboundedly.
+    #[error("upstream response headers exceed MAX_HEADER_BYTES={0}")]
+    HeadersTooLarge(usize),
 }
 
 /// Convenience `Result` alias.
@@ -144,11 +162,26 @@ pub const MAX_RESPONSE_BYTES_DEFAULT: u64 = 10 * 1024 * 1024;
 
 /// Maximum number of concurrent upstream fetches per gateway process.
 ///
-/// Beyond this limit, new requests must wait (or be rejected). NOT yet
-/// enforced by the gateway — the constant is reserved for the production
-/// semaphore that bounds the `spawn_blocking` queue depth (N2.2.4 reserves
-/// the constant so production code can refer to it without magic numbers).
+/// **N2.2.4-hardening:** This limit is now ENFORCED by the gateway runtime
+/// via an [`UpstreamLimiter`](../snp_node/node/async_node/struct.UpstreamLimiter.html)
+/// — a bounded `tokio::sync::Semaphore` with `MAX_CONCURRENT_UPSTREAM`
+/// permits. Every production upstream request acquires a permit BEFORE the
+/// `spawn_blocking` fetch begins, so the blocking-pool / network resources
+/// consumed by concurrent upstream fetches are bounded. When the limit is
+/// exhausted, new requests wait for an in-flight fetch to complete (they are
+/// NOT rejected — the semaphore is fair).
 pub const MAX_CONCURRENT_UPSTREAM: usize = 64;
+
+/// Maximum size of the HTTP response header block (status line + headers),
+/// in bytes. The gateway reads headers incrementally and aborts with
+/// [`GatewayError::HeadersTooLarge`] if the `\r\n\r\n` terminator is not
+/// found within this many bytes. This bounds the memory cost of accepting
+/// an untrusted upstream response (a malicious server could otherwise send
+/// an infinite header stream to exhaust gateway memory).
+///
+/// 64 KiB is generous (real-world header blocks are typically < 8 KiB) while
+/// still bounding the worst-case allocation.
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Connect timeout for the upstream TCP connection (seconds).
 ///
@@ -1069,32 +1102,105 @@ impl PinnedConnector {
         }
     }
 
-    /// Issue a single HTTP/1.1 request to the pinned IP. The `Host` header is
-    /// always the original `hostname` (NOT the IP). For HTTPS, a rustls TLS
-    /// handshake is driven over the pinned `TcpStream` with
-    /// `server_name = hostname` for SNI and certificate validation.
+    /// Issue a single HTTP/1.1 request to the pinned IP with NO response-size
+    /// limit. The `Host` header is always the original `hostname` (NOT the
+    /// IP). For HTTPS, a rustls TLS handshake is driven over the pinned
+    /// `TcpStream` with `server_name = hostname` for SNI and certificate
+    /// validation.
     ///
     /// Redirects are NOT followed — a 3xx response is returned verbatim.
+    ///
+    /// **N2.2.4-hardening:** This method reads until EOF (unbounded). It is
+    /// retained for backward compat with tests that fetch small, trusted
+    /// bodies. PRODUCTION code MUST use [`fetch_with_limit`] instead, which
+    /// enforces `max_response_bytes` at READ TIME (never allocating the full
+    /// oversized body).
     ///
     /// # Errors
     /// Returns [`GatewayError::Upstream`] on TCP or TLS failure, or
     /// [`GatewayError::MalformedHttp`] if the response cannot be parsed.
     pub fn fetch(&self, method: &str, headers: &[(String, String)]) -> GatewayResult<HttpResponse> {
+        self.fetch_with_limit(method, headers, u64::MAX)
+    }
+
+    /// **N2.2.4-hardening.** Issue a single HTTP/1.1 request to the pinned IP
+    /// with a HARD response-size limit enforced at READ TIME.
+    ///
+    /// This is the PRODUCTION fetch path. Unlike the old [`fetch`] (which
+    /// called `read_to_end` and then truncated the body post-hoc), this
+    /// method:
+    ///
+    /// 1. Reads HTTP headers incrementally (4 KiB chunks) until `\r\n\r\n`,
+    ///    bounded by [`MAX_HEADER_BYTES`]. If the header block exceeds
+    ///    `MAX_HEADER_BYTES`, the read is aborted with
+    ///    [`GatewayError::HeadersTooLarge`] — the header buffer never grows
+    ///    beyond 64 KiB.
+    /// 2. Parses `Content-Length` from the headers. If the DECLARED
+    ///    `Content-Length` exceeds `max_response_bytes`, the read is aborted
+    ///    with [`GatewayError::ResponseTooLarge`] BEFORE any body bytes are
+    ///    read — no oversized allocation.
+    /// 3. Reads the body incrementally (8 KiB chunks). For close-delimited
+    ///    bodies (no `Content-Length`), the read continues until EOF or until
+    ///    `max_response_bytes` is exceeded (whichever comes first). If the
+    ///    body exceeds `max_response_bytes`, the read is aborted with
+    ///    [`GatewayError::ResponseTooLarge`] — the body buffer never grows
+    ///    beyond `max_response_bytes + 8 KiB`.
+    ///
+    /// The body returned in [`HttpResponse`] is therefore GUARANTEED to be
+    /// `<= max_response_bytes` (or exactly the `Content-Length` if smaller).
+    /// The caller does NOT need to truncate post-hoc.
+    ///
+    /// # Errors
+    /// - [`GatewayError::Upstream`] on TCP/TLS/IO failure.
+    /// - [`GatewayError::HeadersTooLarge`] if headers exceed 64 KiB.
+    /// - [`GatewayError::ResponseTooLarge`] if the declared `Content-Length`
+    ///   or the actual body exceeds `max_response_bytes`.
+    /// - [`GatewayError::MalformedHttp`] if the response cannot be parsed.
+    pub fn fetch_with_limit(
+        &self,
+        method: &str,
+        headers: &[(String, String)],
+        max_response_bytes: u64,
+    ) -> GatewayResult<HttpResponse> {
         // Connect TCP to the EXACT validated IP. This is the core of the N1.9
         // DNS pinning: the TCP connection goes to the IP we validated, NOT
         // to a re-resolved hostname.
         let sock_addr = SocketAddr::new(self.resolved_ip, self.port);
-        let mut tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(15))
+        let mut tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .map_err(|e| GatewayError::Upstream(format!("TCP connect to {sock_addr}: {e}")))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(30)))
+        tcp.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
             .map_err(|e| GatewayError::Upstream(format!("set_read_timeout: {e}")))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(30)))
+        tcp.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
             .map_err(|e| GatewayError::Upstream(format!("set_write_timeout: {e}")))?;
         tcp.set_nodelay(true).ok();
 
-        // Build the HTTP/1.1 request. The Host header is the original
-        // hostname (NOT the pinned IP) — this preserves virtual-host routing
-        // and is what the TLS certificate was issued for.
+        let req_bytes = self.build_request_bytes(method, headers);
+
+        // Send the request and read the response, over plain TCP (http) or
+        // over a TLS stream (https). For https the TLS handshake is driven
+        // over the pinned TcpStream; the certificate is validated against
+        // the original hostname (NOT the pinned IP).
+        if self.scheme == "https" {
+            let mut tls = self.connect_tls(tcp)?;
+            tls.write_all(&req_bytes)
+                .map_err(|e| GatewayError::Upstream(format!("HTTPS write: {e}")))?;
+            tls.flush()
+                .map_err(|e| GatewayError::Upstream(format!("HTTPS flush: {e}")))?;
+            read_http_response_streaming(&mut tls, max_response_bytes)
+        } else {
+            tcp.write_all(&req_bytes)
+                .map_err(|e| GatewayError::Upstream(format!("HTTP write: {e}")))?;
+            tcp.flush()
+                .map_err(|e| GatewayError::Upstream(format!("HTTP flush: {e}")))?;
+            read_http_response_streaming(&mut tcp, max_response_bytes)
+        }
+    }
+
+    /// Build the HTTP/1.1 request bytes (request line + headers + `\r\n`).
+    /// The `Host` header is the original `hostname` (NOT the pinned IP) —
+    /// this preserves virtual-host routing and is what the TLS certificate
+    /// was issued for.
+    fn build_request_bytes(&self, method: &str, headers: &[(String, String)]) -> Vec<u8> {
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nHost: {hostname}\r\n",
             method = method,
@@ -1120,38 +1226,23 @@ impl PinnedConnector {
             req.push_str("Connection: close\r\n");
         }
         if !has_user_agent {
-            req.push_str("User-Agent: snp-gateway/0.1 (N1.9 pinned)\r\n");
+            req.push_str("User-Agent: snp-gateway/0.1 (N2.2.4 pinned+streaming)\r\n");
         }
         if !has_accept {
             req.push_str("Accept: */*\r\n");
         }
         req.push_str("\r\n");
-        let req_bytes = req.as_bytes();
-
-        // Send the request and read the response, over plain TCP (http) or
-        // over a TLS stream (https). For https the TLS handshake is driven
-        // over the pinned TcpStream; the certificate is validated against
-        // the original hostname (NOT the pinned IP).
-        let resp_bytes: Vec<u8> = if self.scheme == "https" {
-            self.fetch_https(tcp, req_bytes)?
-        } else {
-            tcp.write_all(req_bytes)
-                .map_err(|e| GatewayError::Upstream(format!("HTTP write: {e}")))?;
-            tcp.flush()
-                .map_err(|e| GatewayError::Upstream(format!("HTTP flush: {e}")))?;
-            let mut buf = Vec::new();
-            tcp.read_to_end(&mut buf)
-                .map_err(|e| GatewayError::Upstream(format!("HTTP read: {e}")))?;
-            buf
-        };
-
-        parse_http_response(&resp_bytes)
+        req.into_bytes()
     }
 
-    /// Drive a rustls TLS handshake over the pinned `TcpStream` and issue the
-    /// HTTP/1.1 request over the resulting TLS stream. Reads until EOF
-    /// (server-initiated close).
-    fn fetch_https(&self, tcp: TcpStream, req_bytes: &[u8]) -> GatewayResult<Vec<u8>> {
+    /// Drive a rustls TLS handshake over the pinned `TcpStream` and return
+    /// the resulting TLS stream. The caller writes the HTTP request and
+    /// reads the response over this stream. SNI / cert-validation name =
+    /// original hostname (NOT the pinned IP).
+    fn connect_tls(
+        &self,
+        tcp: TcpStream,
+    ) -> GatewayResult<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
         // Build a rustls ClientConfig with the Mozilla/webpki root CA bundle.
         // This is the same CA set browsers use; it lets us verify the server
         // certificate chain for any public CA-signed cert.
@@ -1173,43 +1264,200 @@ impl PinnedConnector {
         // StreamOwned takes ownership of both the connection and the
         // underlying TcpStream. We drive the TLS handshake implicitly on the
         // first write.
-        let mut tls = rustls::StreamOwned::new(conn, tcp);
-        tls.write_all(req_bytes)
-            .map_err(|e| GatewayError::Upstream(format!("HTTPS write: {e}")))?;
-        tls.flush()
-            .map_err(|e| GatewayError::Upstream(format!("HTTPS flush: {e}")))?;
-        // Read until EOF (server-initiated close after Connection: close).
-        let mut buf = Vec::new();
-        tls.read_to_end(&mut buf)
-            .map_err(|e| GatewayError::Upstream(format!("HTTPS read: {e}")))?;
-        Ok(buf)
+        Ok(rustls::StreamOwned::new(conn, tcp))
     }
 }
 
-/// Parse a raw HTTP/1.1 response into an [`HttpResponse`].
+/// **N2.2.4-hardening.** Read an HTTP/1.1 response from `stream` with a HARD
+/// response-size limit enforced at READ TIME.
 ///
-/// Handles:
-/// - Status line: `HTTP/1.1 <code> <reason>\r\n`
-/// - Headers (case-insensitive header names; values trimmed of trailing
-///   whitespace)
-/// - Body:
-///   - If `Content-Length: N` is present, takes the first N bytes after the
-///     header terminator.
-///   - Otherwise, takes everything after the header terminator (read-to-EOF
-///     semantics — the server is expected to close the connection).
-///   - `Transfer-Encoding: chunked` is NOT decoded in N1.9; if the response
-///     is chunked, the raw chunked body is returned and the caller will see
-///     chunk framing bytes. (The pinned mock servers in tests use plain
-///     Content-Length or Connection: close; the real example.com returns a
-///     Content-Length body.)
-fn parse_http_response(raw: &[u8]) -> GatewayResult<HttpResponse> {
-    // Find the header/body boundary (\r\n\r\n).
-    let boundary = find_subslice(raw, b"\r\n\r\n")
-        .ok_or_else(|| GatewayError::MalformedHttp("no \\r\\n\\r\\n header terminator".into()))?;
-    let header_bytes = &raw[..boundary];
-    let body_start = boundary + 4;
-    let body_bytes = &raw[body_start..];
+/// This is the core streaming-read function. It:
+///
+/// 1. Reads headers incrementally (4 KiB chunks) until `\r\n\r\n`, bounded by
+///    [`MAX_HEADER_BYTES`]. The header buffer never exceeds 64 KiB + 4 KiB.
+/// 2. Parses the status line and headers (including `Content-Length`).
+/// 3. If `Content-Length` is present and exceeds `max_response_bytes`, aborts
+///    with [`GatewayError::ResponseTooLarge`] BEFORE reading any body bytes.
+/// 4. Reads the body incrementally (8 KiB chunks):
+///    - For `Content-Length: N` bodies: reads exactly N bytes (or until EOF
+///      if the server closes early).
+///    - For close-delimited bodies: reads until EOF, aborting if the body
+///      exceeds `max_response_bytes`.
+///
+/// The body buffer is pre-allocated to `min(Content-Length, max_response_bytes)`
+/// — it never grows beyond `max_response_bytes + 8 KiB` (the 8 KiB is the
+/// read chunk; if the cap is exceeded, the read is aborted immediately).
+///
+/// This replaces the old `read_to_end` + post-hoc truncation pattern, which
+/// could allocate the full oversized body before the cap had any effect.
+fn read_http_response_streaming<R: Read>(
+    stream: &mut R,
+    max_response_bytes: u64,
+) -> GatewayResult<HttpResponse> {
+    // ── Phase 1: Read headers incrementally until \r\n\r\n ──────────────
+    // We read into a growing buffer, checking for the header terminator after
+    // each read. The buffer is capped at MAX_HEADER_BYTES.
+    let mut header_buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+    let body_prefix_start: usize;
+    loop {
+        // Check if we already have \r\n\r\n in the buffer.
+        if let Some(pos) = find_subslice(&header_buf, b"\r\n\r\n") {
+            body_prefix_start = pos + 4;
+            break;
+        }
+        if header_buf.len() >= MAX_HEADER_BYTES {
+            return Err(GatewayError::HeadersTooLarge(MAX_HEADER_BYTES));
+        }
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| GatewayError::Upstream(format!("header read: {e}")))?;
+        if n == 0 {
+            // EOF before \r\n\r\n — malformed response.
+            return Err(GatewayError::MalformedHttp(
+                "EOF before \\r\\n\\r\\n header terminator".into(),
+            ));
+        }
+        header_buf.extend_from_slice(&chunk[..n]);
+    }
 
+    // Split the buffer: header_bytes | body_prefix
+    let header_bytes = &header_buf[..body_prefix_start - 4];
+    let body_prefix = &header_buf[body_prefix_start..];
+
+    // ── Phase 2: Parse status line + headers ────────────────────────────
+    let (status, headers, content_length) = parse_http_status_and_headers(header_bytes)?;
+
+    // ── Phase 3: Read body with hard cap ───────────────────────────────
+    let body = match content_length {
+        Some(n) => {
+            let n_u64 = n as u64;
+            if n_u64 > max_response_bytes {
+                // DECLARED Content-Length exceeds the cap — abort BEFORE
+                // reading any body bytes. No oversized allocation.
+                return Err(GatewayError::ResponseTooLarge {
+                    limit: max_response_bytes,
+                    detail: format!("Content-Length={n}"),
+                });
+            }
+            read_body_content_length(stream, body_prefix, n)?
+        }
+        None => {
+            // Close-delimited body: read until EOF, bounded by max_response_bytes.
+            read_body_close_delimited(stream, body_prefix, max_response_bytes)?
+        }
+    };
+
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Read a `Content-Length: N` body. `body_prefix` is the body bytes that were
+/// already read into the header buffer (the bytes after `\r\n\r\n` in the
+/// same read chunk). Reads exactly `content_length` bytes total (or until
+/// EOF if the server closes early).
+///
+/// **Precondition:** `content_length <= max_response_bytes` (checked by the
+/// caller before invoking this function).
+fn read_body_content_length<R: Read>(
+    stream: &mut R,
+    body_prefix: &[u8],
+    content_length: usize,
+) -> GatewayResult<Vec<u8>> {
+    let mut body = Vec::with_capacity(content_length);
+    // Copy the body prefix (up to content_length bytes — if the server sent
+    // more than content_length in the header read, we take only what we need;
+    // the rest is discarded since we close the connection after the body).
+    let prefix_take = body_prefix.len().min(content_length);
+    body.extend_from_slice(&body_prefix[..prefix_take]);
+
+    if body.len() >= content_length {
+        // The header read already gave us the full body.
+        body.truncate(content_length);
+        return Ok(body);
+    }
+
+    let remaining = content_length - body.len();
+    let mut chunk = [0u8; 8192];
+    let mut to_read = remaining;
+    while to_read > 0 {
+        let buf_end = chunk.len().min(to_read);
+        let n = stream
+            .read(&mut chunk[..buf_end])
+            .map_err(|e| GatewayError::Upstream(format!("body read (Content-Length): {e}")))?;
+        if n == 0 {
+            // EOF before content_length — server sent fewer bytes than
+            // declared. Tolerate this (the old code did too).
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        to_read -= n;
+    }
+    body.truncate(content_length);
+    Ok(body)
+}
+
+/// Read a close-delimited body (no `Content-Length`). Reads until EOF,
+/// bounded by `max_response_bytes`. If the body exceeds `max_response_bytes`,
+/// aborts with [`GatewayError::ResponseTooLarge`].
+fn read_body_close_delimited<R: Read>(
+    stream: &mut R,
+    body_prefix: &[u8],
+    max_response_bytes: u64,
+) -> GatewayResult<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(body_prefix);
+
+    // Check the prefix first.
+    if body.len() as u64 > max_response_bytes {
+        return Err(GatewayError::ResponseTooLarge {
+            limit: max_response_bytes,
+            detail: format!("read {} bytes (close-delimited, exceeded cap in header read)", body.len()),
+        });
+    }
+
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| {
+                // rustls may return UnexpectedEof on clean TLS close — treat
+                // as EOF. For plain TCP, a clean close returns Ok(0).
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e);
+                }
+                e
+            });
+        let n = match n {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => return Err(GatewayError::Upstream(format!("body read (close-delimited): {e}"))),
+        };
+        if n == 0 {
+            break; // EOF — clean close.
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() as u64 > max_response_bytes {
+            return Err(GatewayError::ResponseTooLarge {
+                limit: max_response_bytes,
+                detail: format!("read {} bytes (close-delimited, exceeded cap during read)", body.len()),
+            });
+        }
+    }
+    Ok(body)
+}
+
+/// Parse the HTTP/1.1 status line and headers from `header_bytes` (the bytes
+/// BEFORE the `\r\n\r\n` terminator). Returns `(status, headers, content_length)`.
+///
+/// This is the pure-parsing part of the old `parse_http_response`, extracted
+/// so the streaming reader can call it after reading headers incrementally.
+fn parse_http_status_and_headers(
+    header_bytes: &[u8],
+) -> GatewayResult<(u16, Vec<(String, String)>, Option<usize>)> {
     let header_str = std::str::from_utf8(header_bytes)
         .map_err(|e| GatewayError::MalformedHttp(format!("header not UTF-8: {e}")))?;
     let mut lines = header_str.split("\r\n");
@@ -1243,14 +1491,34 @@ fn parse_http_response(raw: &[u8]) -> GatewayResult<HttpResponse> {
         }
         headers.push((name, value));
     }
+    Ok((status, headers, content_length))
+}
+
+/// Parse a raw, complete HTTP/1.1 response (headers + body in a single
+/// `&[u8]`) into an [`HttpResponse`].
+///
+/// **N2.2.4-hardening:** This function is retained for backward compat with
+/// code that already has the full response in memory (e.g. test helpers).
+/// Production fetches use [`read_http_response_streaming`] instead, which
+/// enforces `max_response_bytes` at READ TIME and never allocates the full
+/// oversized body.
+#[allow(dead_code)]
+fn parse_http_response(raw: &[u8]) -> GatewayResult<HttpResponse> {
+    // Find the header/body boundary (\r\n\r\n).
+    let boundary = find_subslice(raw, b"\r\n\r\n")
+        .ok_or_else(|| GatewayError::MalformedHttp("no \\r\\n\\r\\n header terminator".into()))?;
+    let header_bytes = &raw[..boundary];
+    let body_start = boundary + 4;
+    let body_bytes = &raw[body_start..];
+
+    let (status, headers, content_length) = parse_http_status_and_headers(header_bytes)?;
 
     // Determine the body slice.
     let body: Vec<u8> = match content_length {
         Some(n) if n <= body_bytes.len() => body_bytes[..n].to_vec(),
         Some(_) => {
-            // Server sent fewer bytes than Content-Length declared. N1.9
-            // takes what was received and continues — the caller caps at
-            // max_response_bytes anyway.
+            // Server sent fewer bytes than Content-Length declared. Tolerate
+            // this — take what was received.
             body_bytes.to_vec()
         }
         None => body_bytes.to_vec(),
@@ -1283,6 +1551,173 @@ pub struct FetchedResponse {
     /// The capped response body. For N1.9 the body is returned inline (no
     /// CAS). `object_id = SHA-256(capped body)`.
     pub body: Vec<u8>,
+}
+
+// ─── TransitEnvelope (N2.2.4-hardening: end-to-end body delivery) ───────────
+
+/// **N2.2.4-hardening.** An envelope carrying both the signed
+/// [`TransitResponse`] AND the bounded response body, for end-to-end body
+/// delivery through the circuit.
+///
+/// ## Why this exists
+///
+/// The frozen [`TransitResponse`] CBOR shape carries only the `objectId`
+/// (SHA-256 of the bounded body) — NOT the body itself. The N2.2.4 north-star
+/// requires the client to verify that the ACTUAL body it received crosses the
+/// circuit intact:
+///
+/// ```text
+/// known deterministic upstream body
+///     ↓
+/// Gateway
+///     ↓
+/// circuit
+///     ↓
+/// C → B → A
+///     ↓
+/// exact body received by A
+///     ↓
+/// SHA-256(body) == TransitResponse.object_id
+/// ```
+///
+/// [`TransitEnvelope`] extends the application-layer payload (NOT the circuit
+/// protocol — the circuit still carries an opaque encrypted blob) to carry
+/// both the signed attestation and the body. The client:
+///
+/// 1. Decrypts the circuit payload (unchanged circuit protocol).
+/// 2. Decodes the [`TransitEnvelope`] CBOR.
+/// 3. Decodes the `transit_response` field → [`TransitResponse`].
+/// 4. Verifies the gateway signature on the [`TransitResponse`] (unchanged).
+/// 5. Computes `SHA-256(body)` and verifies it equals
+///    `TransitResponse.object_id` — end-to-end body integrity.
+///
+/// ## CBOR shape
+///
+/// ```text
+/// TransitEnvelope = {
+///   transitResponse: bstr,   ; encoded TransitResponse (signed, unchanged CBOR)
+///   body: bstr               ; the bounded response body (<= max_response_bytes)
+/// }
+/// ```
+///
+/// The `transitResponse` field is the EXACT same CBOR bytes that
+/// [`encode_transit_response`] produces — the envelope is a pure wrapper,
+/// the TransitResponse wire format is UNCHANGED.
+///
+/// ## What is NOT changed
+///
+/// - The [`TransitResponse`] CDDL (frozen — `reqId`, `status`, `headers`,
+///   `objectId`, `fetchedAt`, `gatewayId`, `gatewaySig`).
+/// - The circuit protocol (SNP-IK handshake, AEAD frame encryption, key
+///   derivation).
+/// - The [`TransitRequest`] CDDL.
+/// - The discovery / route / transport protocols.
+///
+/// The envelope is an APPLICATION-LAYER extension to the payload INSIDE the
+/// encrypted circuit frame. The circuit itself is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitEnvelope {
+    /// The encoded [`TransitResponse`] bytes (signed, unchanged CBOR shape).
+    /// The client decodes this and verifies the gateway signature.
+    pub transit_response: Vec<u8>,
+    /// The bounded response body. The client computes `SHA-256(body)` and
+    /// verifies it equals `TransitResponse.object_id`.
+    pub body: Vec<u8>,
+}
+
+/// CBOR map key for the `transitResponse` field in [`TransitEnvelope`].
+const ENVELOPE_KEY_TRANSIT_RESPONSE: &str = "transitResponse";
+/// CBOR map key for the `body` field in [`TransitEnvelope`].
+const ENVELOPE_KEY_BODY: &str = "body";
+
+/// Encode a [`TransitResponse`] + body into a [`TransitEnvelope`] CBOR blob.
+///
+/// The `transit_response` field is the EXACT output of
+/// [`encode_transit_response`] — the TransitResponse wire format is unchanged.
+/// The `body` field is the bounded response body (already capped by
+/// [`fetch_with_limit`]).
+///
+/// # Errors
+/// Returns [`GatewayError::Cbor`] if CBOR encoding fails (should never happen
+/// for well-formed inputs).
+pub fn encode_transit_response_envelope(
+    resp: &TransitResponse,
+    body: &[u8],
+) -> GatewayResult<Vec<u8>> {
+    let transit_response_bytes = encode_transit_response(resp)?;
+    let envelope = CborValue::Map(vec![
+        (
+            t(ENVELOPE_KEY_TRANSIT_RESPONSE),
+            b(&transit_response_bytes),
+        ),
+        (t(ENVELOPE_KEY_BODY), b(body)),
+    ]);
+    Ok(snp_cbor::encode(&envelope)?)
+}
+
+/// Decode a [`TransitEnvelope`] from CBOR bytes. Returns the decoded
+/// [`TransitResponse`] (signature verified separately by the caller) and the
+/// bounded body.
+///
+/// # Errors
+/// Returns [`GatewayError::MalformedRequest`] if the bytes are not a valid
+/// TransitEnvelope, or if the `transitResponse` field is not a valid
+/// TransitResponse.
+pub fn decode_transit_response_envelope(bytes: &[u8]) -> GatewayResult<TransitEnvelope> {
+    let value = snp_cbor::decode(bytes)?;
+    let entries = match value {
+        CborValue::Map(entries) => entries,
+        other => {
+            return Err(GatewayError::MalformedRequest(format!(
+                "TransitEnvelope must be a CBOR map; got {other:?}"
+            )));
+        }
+    };
+    let mut transit_response: Option<Vec<u8>> = None;
+    let mut body: Option<Vec<u8>> = None;
+    for (k, v) in entries {
+        let key = match k {
+            CborValue::TextString(s) => s,
+            other => {
+                return Err(GatewayError::MalformedRequest(format!(
+                    "TransitEnvelope key must be a text string; got {other:?}"
+                )));
+            }
+        };
+        match key.as_str() {
+            ENVELOPE_KEY_TRANSIT_RESPONSE => {
+                transit_response = Some(extract_bstr(v, ENVELOPE_KEY_TRANSIT_RESPONSE)?);
+            }
+            ENVELOPE_KEY_BODY => {
+                body = Some(extract_bstr(v, ENVELOPE_KEY_BODY)?);
+            }
+            other => {
+                return Err(GatewayError::MalformedRequest(format!(
+                    "unknown TransitEnvelope key \"{other}\""
+                )));
+            }
+        }
+    }
+    let transit_response = transit_response.ok_or_else(|| {
+        GatewayError::MalformedRequest("TransitEnvelope: transitResponse missing".into())
+    })?;
+    let body = body.ok_or_else(|| {
+        GatewayError::MalformedRequest("TransitEnvelope: body missing".into())
+    })?;
+    Ok(TransitEnvelope {
+        transit_response,
+        body,
+    })
+}
+
+/// Extract a variable-length byte string from a [`CborValue`].
+fn extract_bstr(v: CborValue, field: &str) -> GatewayResult<Vec<u8>> {
+    match v {
+        CborValue::ByteString(bytes) => Ok(bytes),
+        other => Err(GatewayError::MalformedRequest(format!(
+            "{field} must be a byte string; got {other:?}"
+        ))),
+    }
 }
 
 /// Handle a TransitRequest: validate, fetch via the pinned connector, sign
@@ -1392,6 +1827,17 @@ pub fn handle_transit_request_with_connector(
 
 /// Shared fetch + cap + sign step used by both [`handle_transit_request`]
 /// and [`handle_transit_request_with_connector`].
+///
+/// **N2.2.4-hardening:** This function now calls [`PinnedConnector::fetch_with_limit`]
+/// instead of the old `fetch` + post-read truncation. The `max_response_bytes`
+/// cap is enforced at READ TIME — the gateway NEVER allocates the full
+/// oversized body. If the upstream declares a `Content-Length` exceeding
+/// `max_response_bytes`, or the actual body exceeds it, the fetch fails with
+/// [`GatewayError::ResponseTooLarge`] (or [`GatewayError::HeadersTooLarge`]
+/// for oversized headers). The old post-read `body[..cap].to_vec()` truncation
+/// is GONE — it was the bug that allowed an upstream server to force the
+/// gateway to buffer a 500 MB / 1 GB / 10 GB response before the cap had any
+/// effect.
 fn fetch_and_sign_with_connector(
     req: &TransitRequest,
     gateway_secret_key: &SymmetricKey,
@@ -1401,20 +1847,19 @@ fn fetch_and_sign_with_connector(
     let gateway_public = derive_public_key(gateway_secret_key);
     let gateway_id = derive_node_id(&gateway_public);
 
-    // Single fetch via the pinned connector. No redirect-following.
-    let http_response = connector.fetch(req.method.as_str(), &[])?;
+    // N2.2.4-hardening: fetch_with_limit enforces max_response_bytes at READ
+    // TIME. The body returned here is GUARANTEED to be <= max_response_bytes.
+    // If the upstream response exceeds the cap, this returns
+    // GatewayError::ResponseTooLarge (or HeadersTooLarge) — NOT a truncated
+    // body. This is the correct behaviour: an oversized response is an error,
+    // not a silently-truncated success.
+    let http_response = connector.fetch_with_limit(req.method.as_str(), &[], req.max_response_bytes)?;
     let status = http_response.status;
     let headers = http_response.headers;
+    let body = http_response.body;
 
-    // Cap the response body at max_response_bytes.
-    let cap = usize::try_from(req.max_response_bytes).unwrap_or(usize::MAX);
-    let body: Vec<u8> = if http_response.body.len() <= cap {
-        http_response.body
-    } else {
-        http_response.body[..cap].to_vec()
-    };
-
-    // objectId = SHA-256(capped body) per ADR-0009 (N1.9 simplified form).
+    // objectId = SHA-256(bounded body) per ADR-0009 (N1.9 simplified form).
+    // The body is already bounded by fetch_with_limit — no truncation needed.
     let object_id = sha256(&body);
 
     let fetched_at = std::time::SystemTime::now()
@@ -1819,5 +2264,70 @@ mod tests {
         let bytes = encode_transit_response(&resp).unwrap();
         let decoded = decode_transit_response(&bytes).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn transit_envelope_cbor_roundtrip() {
+        // N2.2.4-hardening: the TransitEnvelope wraps a signed TransitResponse
+        // + body. Verify CBOR roundtrip preserves both.
+        let resp = TransitResponse {
+            req_id: [12u8; 16],
+            status: 200,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            object_id: sha256(b"hello world"),
+            fetched_at: 1_700_000_001,
+            gateway_id: [13u8; 32],
+            gateway_sig: [14u8; 64],
+        };
+        let body = b"hello world".to_vec();
+        let envelope_bytes = encode_transit_response_envelope(&resp, &body).unwrap();
+        let envelope = decode_transit_response_envelope(&envelope_bytes).unwrap();
+        // The envelope's transit_response field must decode to the original
+        // TransitResponse.
+        let decoded_resp = decode_transit_response(&envelope.transit_response).unwrap();
+        assert_eq!(decoded_resp, resp, "envelope transit_response must roundtrip");
+        // The envelope's body field must match the original body.
+        assert_eq!(envelope.body, body, "envelope body must roundtrip");
+    }
+
+    #[test]
+    fn transit_envelope_rejects_missing_fields() {
+        // N2.2.4-hardening: the envelope must have both transitResponse and body.
+        // Missing transitResponse → error.
+        let bad_no_resp = snp_cbor::encode(&CborValue::Map(vec![
+            (t("body"), b(b"some body")),
+        ])).unwrap();
+        assert!(
+            matches!(decode_transit_response_envelope(&bad_no_resp), Err(GatewayError::MalformedRequest(_))),
+            "envelope without transitResponse must be rejected"
+        );
+        // Missing body → error.
+        let resp = TransitResponse {
+            req_id: [0u8; 16],
+            status: 200,
+            headers: vec![],
+            object_id: [0u8; 32],
+            fetched_at: 0,
+            gateway_id: [0u8; 32],
+            gateway_sig: [0u8; 64],
+        };
+        let resp_bytes = encode_transit_response(&resp).unwrap();
+        let bad_no_body = snp_cbor::encode(&CborValue::Map(vec![
+            (t("transitResponse"), b(&resp_bytes)),
+        ])).unwrap();
+        assert!(
+            matches!(decode_transit_response_envelope(&bad_no_body), Err(GatewayError::MalformedRequest(_))),
+            "envelope without body must be rejected"
+        );
+        // Unknown key → error (fail-closed).
+        let bad_unknown = snp_cbor::encode(&CborValue::Map(vec![
+            (t("transitResponse"), b(&resp_bytes)),
+            (t("body"), b(b"some body")),
+            (t("evil"), t("inject")),
+        ])).unwrap();
+        assert!(
+            matches!(decode_transit_response_envelope(&bad_unknown), Err(GatewayError::MalformedRequest(_))),
+            "envelope with unknown key must be rejected"
+        );
     }
 }

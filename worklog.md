@@ -6842,3 +6842,77 @@ SHARENET_EXTERNAL_NET_TESTS=1 cargo test -p snp-node --test n224_real_internet_e
 > signature verifies, Content-Type: text/html present)."
 
 - Ready for the next task.
+
+---
+Task ID: N2.2.4-hardening
+Agent: Z.ai Code (main)
+Task: Close the three concrete gaps identified in the N2.2.4 audit: (1) enforce MAX_CONCURRENT_UPSTREAM via a gateway-wide semaphore, (2) move max_response_bytes enforcement into the read boundary (streaming read, no post-hoc truncation), (3) prove end-to-end body integrity (client receives the actual body and verifies SHA-256(body) == TransitResponse.object_id). Keep the frozen circuit protocol unchanged. Keep the external Internet test opt-in. Add deterministic regression tests.
+
+Work Log:
+- Audited the existing N2.2.4 code in snp-gateway/src/lib.rs and snp-node/src/node/async_node.rs. Confirmed all three blockers:
+  1. MAX_CONCURRENT_UPSTREAM=64 was defined but "NOT yet enforced by the gateway" (no semaphore).
+  2. fetch_and_sign_with_connector called connector.fetch() (which does read_to_end into Vec<u8>) and THEN truncated with body[..cap].to_vec() — the full oversized body was allocated before the cap had any effect.
+  3. send_via_route returned only the signed TransitResponse (object_id hash), NOT the body. The external test explicitly admitted "The response body is NOT in the TransitResponse itself."
+
+- GAP 2 FIX (streaming read-time response memory bound) — snp-gateway/src/lib.rs:
+  - Added GatewayError::ResponseTooLarge { limit, detail } and GatewayError::HeadersTooLarge(usize) error variants.
+  - Added MAX_HEADER_BYTES = 64 KiB constant (bounds the header read).
+  - Added PinnedConnector::fetch_with_limit(method, headers, max_response_bytes) — the PRODUCTION fetch path. Reads headers incrementally (4 KiB chunks) until \r\n\r\n, bounded by MAX_HEADER_BYTES. Parses Content-Length; if declared > max_response_bytes, returns ResponseTooLarge BEFORE reading any body bytes. Reads body incrementally (8 KiB chunks); for Content-Length bodies reads exactly N bytes; for close-delimited bodies reads until EOF, aborting with ResponseTooLarge if the body exceeds max_response_bytes. The body buffer NEVER grows beyond max_response_bytes + 8 KiB.
+  - Refactored fetch() to delegate to fetch_with_limit(u64::MAX) (backward compat for tests).
+  - Added read_http_response_streaming<R: Read>() — the core streaming reader (generic over TcpStream and rustls::StreamOwned).
+  - Added read_body_content_length<R: Read>() and read_body_close_delimited<R: Read>() helpers.
+  - Extracted parse_http_status_and_headers() from parse_http_response() (reusable by both the streaming reader and the legacy full-buffer parser).
+  - Modified fetch_and_sign_with_connector() to call fetch_with_limit(req.method, &[], req.max_response_bytes) instead of fetch() + post-read truncation. Removed the body[..cap].to_vec() truncation — the body is now GUARANTEED <= max_response_bytes at read time. If the upstream response exceeds the cap, the fetch fails with ResponseTooLarge (not a silently-truncated success).
+
+- GAP 3a FIX (TransitEnvelope CBOR) — snp-gateway/src/lib.rs:
+  - Added TransitEnvelope struct { transit_response: Vec<u8>, body: Vec<u8> } — an APPLICATION-LAYER wrapper carrying both the signed TransitResponse (unchanged CBOR) and the bounded body. The circuit protocol (AEAD encryption, SNP-IK handshake, key derivation) is UNCHANGED — only the payload inside the encrypted frame is extended.
+  - Added encode_transit_response_envelope(resp, body) and decode_transit_response_envelope(bytes) — CBOR map { "transitResponse": bstr, "body": bstr }. The transitResponse field is the EXACT output of encode_transit_response (the TransitResponse wire format is frozen/unchanged).
+  - Added extract_bstr() helper for variable-length byte string extraction.
+  - Added 2 unit tests: transit_envelope_cbor_roundtrip, transit_envelope_rejects_missing_fields (verifies missing transitResponse, missing body, and unknown keys are all rejected).
+
+- GAP 1 FIX (UpstreamLimiter semaphore) — snp-node/src/node/async_node.rs:
+  - Added UpstreamLimiter struct — a gateway-wide bounded tokio::sync::Semaphore with capacity = MAX_CONCURRENT_UPSTREAM (64). Clone shares the same Arc<Semaphore>.
+  - UpstreamLimiter::new(capacity), with_default_limit(), acquire() (async, awaits if saturated), available_permits(), capacity().
+  - Modified serve_one_gateway_request_protocol_circuit (private) to take &UpstreamLimiter and acquire a permit BEFORE spawn_blocking. The permit is held in the async frame for the duration of the blocking fetch and released when the block scope ends.
+  - Modified serve_gateway_with_protocol_circuit (pub) to create a default UpstreamLimiter internally and pass it.
+  - Added serve_gateway_with_protocol_circuit_with_body (pub) — takes an explicit UpstreamLimiter (for testing) and uses the body-delivery path.
+
+- GAP 3b FIX (end-to-end body delivery) — snp-node/src/node/async_node.rs:
+  - Added serve_one_gateway_request_protocol_circuit_with_body (pub) — like the bare variant but sends TransitEnvelope (transitResponse + body) instead of bare TransitResponse. Acquires the limiter permit, calls handle_transit_request_with_connector (which uses fetch_with_limit), encodes the envelope, encrypts with circuit send_key.
+  - Added send_with_protocol_circuit_async_with_body (pub) — client-side. Uses MAX_RESPONSE_BYTES_DEFAULT (10 MiB) as max_response_bytes. Decrypts the circuit payload, decodes TransitEnvelope, decodes TransitResponse, verifies gateway signature, then VERIFIES SHA-256(body) == TransitResponse.object_id (end-to-end body integrity). Returns (TransitResponse, Vec<u8>).
+  - Added send_via_route_with_body (pub) — Route-authoritative wrapper around send_with_protocol_circuit_async_with_body. Returns (TransitResponse, body).
+  - Refactored serve_gateway_with_protocol_circuit_inner() as a shared inner implementation for both bare-response and body-delivery gateway serve functions (selected by a send_body bool flag).
+
+- REGRESSION TESTS — snp-node/tests/n224_gateway_security.rs (6 new tests):
+  1. response_size_limit_enforced_at_read_time — 100-byte body with max=50 → ResponseTooLarge (Content-Length > cap, rejected before body read).
+  2. response_size_limit_boundary_at_cap — body == cap (50 bytes) → OK; body == cap+1 (51 bytes) → ResponseTooLarge.
+  3. huge_content_length_rejected_before_body_read — Content-Length: 999999999 but actual body 10 bytes → ResponseTooLarge (rejected based on DECLARED Content-Length, not actual body).
+  4. huge_close_delimited_response_rejected — 200-byte close-delimited body (no Content-Length) with max=100 → ResponseTooLarge (read incrementally, aborted when cap exceeded).
+  5. upstream_limiter_enforces_concurrency — UpstreamLimiter with capacity 3, 10 concurrent tasks, verified max concurrent <= 3 (and >= 2, proving concurrency happened). All permits available after completion.
+  6. end_to_end_body_integrity_through_mesh — full 4-node mesh (A→B→C→G) with serve_gateway_with_protocol_circuit_with_body + send_via_route_with_body. Known deterministic body → gateway → circuit → client. Verified: status 200, gateway signature, gateway_id match, body EXACTLY matches known upstream body, SHA-256(body) == TransitResponse.object_id.
+
+- Added helper functions: start_local_http_raw (sends raw HTTP response bytes), build_raw_response_with_content_length, build_raw_response_with_liar_content_length, build_raw_response_close_delimited, test_connector_for_port, start_gateway_with_body, BodyDeliveryMesh struct.
+
+Stage Summary:
+- All three blockers are CLOSED:
+  1. MAX_CONCURRENT_UPSTREAM is now ENFORCED via UpstreamLimiter (tokio::sync::Semaphore). Every production upstream request acquires a permit before spawn_blocking.
+  2. max_response_bytes is enforced at READ TIME via fetch_with_limit (streaming read, hard cap). The gateway NEVER allocates the full oversized body. Content-Length > cap → reject before body read. Close-delimited body > cap → abort during read.
+  3. End-to-end body integrity is PROVEN. The client receives the actual body (via TransitEnvelope) and verifies SHA-256(body) == TransitResponse.object_id. The body crosses Gateway → B → A → Client intact.
+
+- What is UNCHANGED (frozen):
+  - TransitResponse CDDL (reqId, status, headers, objectId, fetchedAt, gatewayId, gatewaySig).
+  - TransitRequest CDDL.
+  - Circuit protocol (SNP-IK handshake, AEAD frame encryption, key derivation).
+  - Discovery / route / transport protocols.
+  - SSRF defences (is_private_destination, alternative IP encodings, port policy, URL length limit, DNS pinning, TLS validation, no redirect following).
+  - The existing serve_gateway_with_protocol_circuit and send_via_route APIs (backward compat — they send/receive bare TransitResponse).
+  - The external Internet test is still #[ignore] + SHARENET_EXTERNAL_NET_TESTS=1 (opt-in, deterministic CI).
+
+- Test results:
+  - cargo test -p snp-gateway --lib: 14 passed (was 12; +2 new envelope tests).
+  - cargo test -p snp-node --test n224_gateway_security: 24 passed (was 18; +6 new hardening tests).
+  - cargo test --workspace: 461 passed, 0 failed, 5 ignored (was 453 passed, 5 ignored; +8 new tests).
+  - cargo run -p snp-conformance: 138/138 (100.0%) — no regressions.
+  - SHARENET_EXTERNAL_NET_TESTS=1 cargo test -p snp-node --test n224_real_internet_egress -- --ignored: 2 passed — the streaming read (fetch_with_limit) works against real HTTPS (example.com, status 200, signature verified, Content-Type text/html).
+
+- The gateway is now a proper security appliance boundary: bounded concurrency, bounded read-time response memory, and proven end-to-end body delivery. Ready for N2.3 (desktop TUN) / N2.4 (Android VPN) — the gateway can no longer be turned into an unbounded remotely-controllable HTTP client.

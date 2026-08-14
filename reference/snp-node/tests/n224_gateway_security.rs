@@ -837,3 +837,564 @@ async fn upstream_http_404() {
     );
     eprintln!("[n224-404] PASS: HTTP 404 propagated with body");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.2.4-HARDENING: STREAMING RESPONSE-SIZE LIMIT (read-time enforcement)
+//
+// These tests verify that `PinnedConnector::fetch_with_limit()` enforces
+// `max_response_bytes` at READ TIME — the gateway NEVER allocates the full
+// oversized body. The old `fetch()` + post-read truncation pattern is GONE.
+//
+// Test matrix:
+//   1. response_size_limit_enforced_at_read_time
+//      body > max (with Content-Length) → ResponseTooLarge error
+//   2. response_size_limit_boundary_at_cap
+//      body == max → OK; body == max+1 → error
+//   3. huge_content_length_rejected_before_body_read
+//      Content-Length > max (but actual body small) → error BEFORE body read
+//   4. huge_close_delimited_response_rejected
+//      close-delimited body > max (no Content-Length) → error
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Start a local HTTP server that sends a RAW HTTP response (exact bytes).
+/// This gives full control over Content-Length, body size, and framing —
+/// needed to test the streaming read boundary conditions.
+async fn start_local_http_raw(
+    raw_response: Vec<u8>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let response = raw_response.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&response).await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// Build a raw HTTP/1.1 response with `Content-Length: N` and an N-byte body.
+fn build_raw_response_with_content_length(body: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut raw = header.into_bytes();
+    raw.extend_from_slice(body);
+    raw
+}
+
+/// Build a raw HTTP/1.1 response with a LIAR Content-Length (claims N bytes
+/// but sends a different number). Used to test that the gateway rejects
+/// based on the DECLARED Content-Length, not the actual body.
+fn build_raw_response_with_liar_content_length(
+    declared_content_length: usize,
+    actual_body: &[u8],
+) -> Vec<u8> {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        declared_content_length
+    );
+    let mut raw = header.into_bytes();
+    raw.extend_from_slice(actual_body);
+    raw
+}
+
+/// Build a raw HTTP/1.1 response with NO Content-Length (close-delimited).
+/// The server sends the body and closes the connection.
+fn build_raw_response_close_delimited(body: &[u8]) -> Vec<u8> {
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
+    let mut raw = header.as_bytes().to_vec();
+    raw.extend_from_slice(body);
+    raw
+}
+
+/// Build a test connector pointing at 127.0.0.1 for the given port.
+fn test_connector_for_port(port: u16) -> PinnedConnector {
+    PinnedConnector::from_parts(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        "test.local".to_string(),
+        port,
+        "http".to_string(),
+        "/".to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_size_limit_enforced_at_read_time() {
+    // Body of 100 bytes, max_response_bytes = 50. The Content-Length (100)
+    // exceeds the cap (50), so fetch_with_limit must reject with
+    // ResponseTooLarge BEFORE reading any body bytes.
+    let body = vec![b'A'; 100];
+    let raw = build_raw_response_with_content_length(&body);
+    let (addr, _handle) = start_local_http_raw(raw).await;
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let connector = test_connector_for_port(port);
+
+    let result = tokio::task::spawn_blocking(move || {
+        connector.fetch_with_limit("GET", &[], 50)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    assert!(
+        matches!(result, Err(GatewayError::ResponseTooLarge { limit: 50, .. })),
+        "response_size_limit_enforced_at_read_time: expected Err(ResponseTooLarge {{ limit: 50, .. }}), got {:?}",
+        result
+    );
+    eprintln!(
+        "[n224-stream-cap] PASS: 100-byte body with max=50 rejected at read time ({})",
+        match &result {
+            Err(GatewayError::ResponseTooLarge { detail, .. }) => detail.as_str(),
+            _ => "(unexpected)",
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_size_limit_boundary_at_cap() {
+    // Body of exactly 50 bytes, max_response_bytes = 50. This is the
+    // boundary — the body fits exactly within the cap. Must succeed.
+    let body_ok = vec![b'B'; 50];
+    let raw_ok = build_raw_response_with_content_length(&body_ok);
+    let (addr_ok, _handle_ok) = start_local_http_raw(raw_ok).await;
+    let port_ok: u16 = addr_ok.rsplit(':').next().unwrap().parse().unwrap();
+    let connector_ok = test_connector_for_port(port_ok);
+
+    let result_ok = tokio::task::spawn_blocking(move || {
+        connector_ok.fetch_with_limit("GET", &[], 50)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    let response_ok = result_ok.expect("boundary: body == cap must succeed");
+    assert_eq!(
+        response_ok.body,
+        body_ok,
+        "boundary: body must match exactly when body == cap"
+    );
+    eprintln!("[n224-stream-boundary] PASS: body == cap (50 bytes) accepted");
+
+    // Body of 51 bytes, max_response_bytes = 50. One byte over the cap.
+    // Must fail with ResponseTooLarge.
+    let body_over = vec![b'C'; 51];
+    let raw_over = build_raw_response_with_content_length(&body_over);
+    let (addr_over, _handle_over) = start_local_http_raw(raw_over).await;
+    let port_over: u16 = addr_over.rsplit(':').next().unwrap().parse().unwrap();
+    let connector_over = test_connector_for_port(port_over);
+
+    let result_over = tokio::task::spawn_blocking(move || {
+        connector_over.fetch_with_limit("GET", &[], 50)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    assert!(
+        matches!(result_over, Err(GatewayError::ResponseTooLarge { limit: 50, .. })),
+        "boundary: body == cap+1 must be rejected with ResponseTooLarge, got {:?}",
+        result_over
+    );
+    eprintln!("[n224-stream-boundary] PASS: body == cap+1 (51 bytes) rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn huge_content_length_rejected_before_body_read() {
+    // The server DECLARES Content-Length: 999999999 (≈1 GB) but sends only
+    // 10 bytes of body. The gateway must reject based on the DECLARED
+    // Content-Length — NOT read the body first. This is the key defence
+    // against a malicious server that claims a huge body to force the
+    // gateway to allocate memory.
+    let actual_body = vec![b'D'; 10];
+    let raw = build_raw_response_with_liar_content_length(999_999_999, &actual_body);
+    let (addr, _handle) = start_local_http_raw(raw).await;
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let connector = test_connector_for_port(port);
+
+    let result = tokio::task::spawn_blocking(move || {
+        connector.fetch_with_limit("GET", &[], 1024)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    assert!(
+        matches!(result, Err(GatewayError::ResponseTooLarge { limit: 1024, .. })),
+        "huge_content_length: expected Err(ResponseTooLarge {{ limit: 1024, .. }}), got {:?}",
+        result
+    );
+    eprintln!(
+        "[n224-huge-cl] PASS: Content-Length=999999999 rejected before body read ({})",
+        match &result {
+            Err(GatewayError::ResponseTooLarge { detail, .. }) => detail.as_str(),
+            _ => "(unexpected)",
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn huge_close_delimited_response_rejected() {
+    // No Content-Length — the body is close-delimited (server sends body +
+    // closes). The body is 200 bytes, max_response_bytes = 100. The gateway
+    // must read incrementally and abort when the body exceeds the cap.
+    let body = vec![b'E'; 200];
+    let raw = build_raw_response_close_delimited(&body);
+    let (addr, _handle) = start_local_http_raw(raw).await;
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let connector = test_connector_for_port(port);
+
+    let result = tokio::task::spawn_blocking(move || {
+        connector.fetch_with_limit("GET", &[], 100)
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    assert!(
+        matches!(result, Err(GatewayError::ResponseTooLarge { limit: 100, .. })),
+        "huge_close_delimited: expected Err(ResponseTooLarge {{ limit: 100, .. }}), got {:?}",
+        result
+    );
+    eprintln!(
+        "[n224-close-delimited] PASS: 200-byte close-delimited body with max=100 rejected ({})",
+        match &result {
+            Err(GatewayError::ResponseTooLarge { detail, .. }) => detail.as_str(),
+            _ => "(unexpected)",
+        }
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.2.4-HARDENING: UPSTREAM CONCURRENCY LIMIT (semaphore enforcement)
+//
+// This test verifies that `UpstreamLimiter` (a bounded tokio::sync::Semaphore)
+// enforces the concurrency limit. We use a SMALL capacity (3) so the test is
+// fast and deterministic — the same semantics apply at the production
+// capacity of 64.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_limiter_enforces_concurrency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    // Create a limiter with capacity 3.
+    let limiter = async_node::UpstreamLimiter::new(3);
+    assert_eq!(limiter.capacity(), 3, "limiter capacity must be 3");
+    assert_eq!(
+        limiter.available_permits(),
+        3,
+        "all 3 permits must be available initially"
+    );
+
+    // Track the max concurrent count. We use an atomic because multiple tasks
+    // will increment/decrement it.
+    let current = StdArc::new(AtomicUsize::new(0));
+    let max_seen = StdArc::new(AtomicUsize::new(0));
+
+    // Spawn 10 tasks, each acquiring a permit, holding it for 50ms, then
+    // releasing. With capacity 3, at most 3 tasks can hold a permit at once.
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let limiter = limiter.clone();
+        let current = StdArc::clone(&current);
+        let max_seen = StdArc::clone(&max_seen);
+        tasks.push(tokio::spawn(async move {
+            let _permit = limiter.acquire().await.expect("acquire permit");
+            let cur = current.fetch_add(1, Ordering::SeqCst) + 1;
+            // Update max_seen if cur > max_seen.
+            let mut prev = max_seen.load(Ordering::SeqCst);
+            while cur > prev {
+                match max_seen.compare_exchange(prev, cur, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(actual) => prev = actual,
+                }
+            }
+            // Hold the permit for 50ms.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            current.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+
+    // Wait for all tasks to complete.
+    for task in tasks {
+        task.await.expect("task join");
+    }
+
+    let max = max_seen.load(Ordering::SeqCst);
+    assert!(
+        max <= 3,
+        "upstream_limiter: max concurrent ({}) must be <= capacity (3)",
+        max
+    );
+    assert!(
+        max >= 2,
+        "upstream_limiter: max concurrent ({}) must be >= 2 (proves concurrency actually happened)",
+        max
+    );
+    assert_eq!(
+        limiter.available_permits(),
+        3,
+        "all 3 permits must be available after all tasks complete"
+    );
+    eprintln!(
+        "[n224-limiter] PASS: max concurrent = {} (capacity 3) — semaphore enforced",
+        max
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.2.4-HARDENING: END-TO-END BODY INTEGRITY
+//
+// This is the N2.2.4 north-star test. It proves that the ACTUAL response body
+// crosses the full circuit intact:
+//
+//   known deterministic upstream body
+//       ↓
+//   Gateway (fetch_with_limit → bounded body)
+//       ↓
+//   circuit (AEAD encryption — unchanged)
+//       ↓
+//   C → B → A (relay forwarding — unchanged)
+//       ↓
+//   A receives TransitEnvelope
+//       ↓
+//   A verifies gateway signature on TransitResponse
+//       ↓
+//   A computes SHA-256(body) and verifies == object_id  ✓
+//
+// The existing `concurrent_upstream_through_mesh` test only verifies the
+// `object_id` (the hash the gateway signed). This test verifies the ACTUAL
+// BODY the client receives — proving the body crossed the circuit, not just
+// the hash.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Start a gateway that uses `serve_gateway_with_protocol_circuit_with_body`
+/// (the body-delivery variant). This sends a TransitEnvelope carrying both
+/// the signed TransitResponse and the bounded body.
+fn start_gateway_with_body(
+    gateway_idents: &NodeIdents,
+    gateway_listen_addr: &str,
+    limiter: &std::sync::Arc<async_node::UpstreamLimiter>,
+) -> tokio::task::JoinHandle<()> {
+    let gateway_node = Node::new(
+        gateway_idents.identity(),
+        vec![Capability::Gateway],
+        gateway_listen_addr.to_string(),
+    );
+    let gw_x_sk = std::sync::Arc::clone(&gateway_idents.x_sk);
+    let gw_x_pk = gateway_idents.x_pk;
+    let listen = gateway_listen_addr.to_string();
+    let limiter = std::sync::Arc::clone(limiter);
+    tokio::spawn(async move {
+        let _ = async_node::serve_gateway_with_protocol_circuit_with_body(
+            &gateway_node,
+            &listen,
+            &gw_x_sk,
+            &gw_x_pk,
+            &limiter,
+            |url| test_connector_factory(url),
+        )
+        .await;
+    })
+}
+
+/// A 4-node mesh that uses the body-delivery gateway variant.
+#[allow(dead_code)]
+struct BodyDeliveryMesh {
+    client_idents: NodeIdents,
+    relay_a_idents: NodeIdents,
+    relay_b_idents: NodeIdents,
+    gateway_idents: NodeIdents,
+    gateway_addr: String,
+    relay_a_addr: String,
+    relay_b_addr: String,
+    http_url: String,
+    expected_body: Vec<u8>,
+    #[allow(dead_code)]
+    _http_handle: tokio::task::JoinHandle<()>,
+    gateway_handle: tokio::task::JoinHandle<()>,
+    relay_a_handle: tokio::task::JoinHandle<()>,
+    relay_b_handle: tokio::task::JoinHandle<()>,
+}
+
+impl BodyDeliveryMesh {
+    async fn start_with_body(body: &str) -> Self {
+        let client_idents = NodeIdents::fresh();
+        let relay_a_idents = NodeIdents::fresh();
+        let relay_b_idents = NodeIdents::fresh();
+        let gateway_idents = NodeIdents::fresh();
+
+        let gateway_addr = ephemeral_addr().await;
+        let relay_b_addr = ephemeral_addr().await;
+        let relay_a_addr = ephemeral_addr().await;
+        let (http_addr, http_handle) = start_local_http_with_body(body.to_string()).await;
+        let http_url = format!("http://test.local:{}/", http_addr.rsplit(':').next().unwrap());
+
+        // Use a limiter with capacity 64 (the production default).
+        let limiter = std::sync::Arc::new(async_node::UpstreamLimiter::with_default_limit());
+        let gateway_handle = start_gateway_with_body(&gateway_idents, &gateway_addr, &limiter);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let relay_b_route = Route::new_with_hop_details(
+            relay_a_idents.node_id,
+            gateway_idents.node_id,
+            vec![
+                RouteHop::new(
+                    relay_b_idents.relay_descriptor(),
+                    TransportEndpoint::tcp(&relay_b_addr),
+                ),
+                RouteHop::new(
+                    gateway_idents.gateway_descriptor(),
+                    TransportEndpoint::tcp(&gateway_addr),
+                ),
+            ],
+        );
+        let relay_b_handle = start_relay(&relay_b_idents, &relay_b_route, 0, &relay_b_addr);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let relay_a_route = Route::new_with_hop_details(
+            client_idents.node_id,
+            gateway_idents.node_id,
+            vec![
+                RouteHop::new(
+                    relay_a_idents.relay_descriptor(),
+                    TransportEndpoint::tcp(&relay_a_addr),
+                ),
+                RouteHop::new(
+                    relay_b_idents.relay_descriptor(),
+                    TransportEndpoint::tcp(&relay_b_addr),
+                ),
+                RouteHop::new(
+                    gateway_idents.gateway_descriptor(),
+                    TransportEndpoint::tcp(&gateway_addr),
+                ),
+            ],
+        );
+        let relay_a_handle = start_relay(&relay_a_idents, &relay_a_route, 0, &relay_a_addr);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        Self {
+            client_idents,
+            relay_a_idents,
+            relay_b_idents,
+            gateway_idents,
+            gateway_addr,
+            relay_a_addr,
+            relay_b_addr,
+            http_url,
+            expected_body: body.as_bytes().to_vec(),
+            _http_handle: http_handle,
+            gateway_handle,
+            relay_a_handle,
+            relay_b_handle,
+        }
+    }
+
+    fn client_route(&self) -> Route {
+        build_route(
+            &self.client_idents,
+            &self.relay_a_idents,
+            &self.relay_b_idents,
+            &self.gateway_idents,
+            &self.relay_a_addr,
+            &self.relay_b_addr,
+            &self.gateway_addr,
+        )
+    }
+
+    fn client_node(&self) -> Node {
+        Node::new(
+            self.client_idents.identity(),
+            vec![Capability::Client],
+            String::new(),
+        )
+    }
+}
+
+/// Send a transit request through the mesh using the body-delivery API.
+/// Returns (TransitResponse, body).
+async fn send_via_route_with_body(
+    mesh: &BodyDeliveryMesh,
+) -> Result<(TransitResponse, Vec<u8>), snp_node::legacy::NodeError> {
+    let client_node = mesh.client_node();
+    let route = mesh.client_route();
+    let client_x_sk = std::sync::Arc::clone(&mesh.client_idents.x_sk);
+    let client_x_pk = mesh.client_idents.x_pk;
+    async_node::send_via_route_with_body(
+        &client_node,
+        &route,
+        &mesh.http_url,
+        &client_x_sk,
+        &client_x_pk,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_to_end_body_integrity_through_mesh() {
+    // Use a distinctive, deterministic body so we can verify exact byte
+    // integrity at the client.
+    let known_body = "N2.2.4-hardening: end-to-end body integrity test body";
+    let mesh = BodyDeliveryMesh::start_with_body(known_body).await;
+
+    let (transit_resp, received_body) = send_via_route_with_body(&mesh)
+        .await
+        .expect("send_via_route_with_body must succeed through the 4-node mesh");
+
+    // 1. The TransitResponse must be HTTP 200.
+    assert_eq!(
+        transit_resp.status, 200,
+        "end_to_end_body_integrity: status must be 200, got {}",
+        transit_resp.status
+    );
+
+    // 2. The gateway signature must verify.
+    assert!(
+        verify_transit_response(&transit_resp, &mesh.gateway_idents.ed_pk),
+        "end_to_end_body_integrity: gateway signature must verify"
+    );
+
+    // 3. The gateway_id must match the mesh's gateway.
+    assert_eq!(
+        transit_resp.gateway_id,
+        mesh.gateway_idents.node_id,
+        "end_to_end_body_integrity: gateway_id must match"
+    );
+
+    // 4. THE KEY ASSERTION: the body received by the client must EXACTLY
+    //    match the known upstream body. This proves the body crossed the
+    //    full circuit (Gateway → B → A → Client) intact — not just the
+    //    hash.
+    assert_eq!(
+        received_body,
+        mesh.expected_body,
+        "end_to_end_body_integrity: body received by client must EXACTLY match the known upstream body"
+    );
+
+    // 5. THE NORTH-STAR: SHA-256(body) == TransitResponse.object_id.
+    //    The client independently verifies that the hash of the body it
+    //    received matches the hash the gateway signed. (The
+    //    send_via_route_with_body function already checks this internally
+    //    and returns an error if it fails — but we assert it here too for
+    //    documentation.)
+    let body_hash = sha256(&received_body);
+    assert_eq!(
+        body_hash,
+        transit_resp.object_id,
+        "end_to_end_body_integrity: SHA-256(body) must equal TransitResponse.object_id — \
+         the body received by the client is the EXACT body the gateway fetched and hashed"
+    );
+
+    eprintln!(
+        "[n224-e2e-body] PASS: body crossed Gateway → B → A → Client intact. \
+         status={}, body={} bytes, SHA-256(body)=object_id={}",
+        transit_resp.status,
+        received_body.len(),
+        hex_short(&body_hash)
+    );
+}

@@ -33,12 +33,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use snp_crypto::derive_node_id;
+use snp_crypto::{derive_node_id, sha256};
 use snp_frames::{should_drop, Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_gateway::{
-    decode_transit_request, decode_transit_response, encode_transit_request,
-    encode_transit_response, handle_transit_request_with_connector, sign_transit_request,
-    verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
+    decode_transit_request, decode_transit_response, decode_transit_response_envelope,
+    encode_transit_request, encode_transit_response, encode_transit_response_envelope,
+    handle_transit_request_with_connector, sign_transit_request, verify_transit_response,
+    PinnedConnector, TransitRequest, TransitResponse,
 };
 use snp_link::async_link::{
     perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError,
@@ -46,6 +47,7 @@ use snp_link::async_link::{
 use snp_link::{decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, LinkKeys};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use super::{
     now_unix, random_fid, random_req_id, GatewayAdvertisement, Node, NodeError, NodeResult,
@@ -63,6 +65,90 @@ fn async_err_to_node(e: AsyncLinkError) -> NodeError {
         AsyncLinkError::Cbor(msg) => NodeError::Other(format!("cbor: {msg}")),
         AsyncLinkError::ReplayDetected => NodeError::Other("replay detected".into()),
         AsyncLinkError::Handshake(msg) => NodeError::Other(format!("handshake: {msg}")),
+    }
+}
+
+// ─── UpstreamLimiter (N2.2.4-hardening: gateway-wide concurrency bound) ─────
+
+/// **N2.2.4-hardening.** A gateway-wide bounded semaphore that limits the
+/// number of concurrent upstream fetches to [`snp_gateway::MAX_CONCURRENT_UPSTREAM`]
+/// (64 by default).
+///
+/// ## Why this exists
+///
+/// The N2.2.4 audit identified that `MAX_CONCURRENT_UPSTREAM` was defined as
+/// a constant but NOT enforced — the gateway's production path invoked the
+/// blocking connector via `spawn_blocking` without any semaphore, so an
+/// attacker could create many simultaneous upstream fetch tasks and consume
+/// the Tokio blocking pool / network resources without hitting the limit.
+///
+/// `UpstreamLimiter` closes that gap. Every production upstream request
+/// acquires a permit BEFORE the `spawn_blocking` fetch begins. The permit is
+/// held for the duration of the blocking fetch and released when the fetch
+/// completes. When the limit is exhausted, new requests await an in-flight
+/// fetch to complete (the semaphore is fair — permits are granted in FIFO
+/// order).
+///
+/// ## Usage
+///
+/// The limiter is owned by the gateway runtime. [`serve_gateway_with_protocol_circuit`]
+/// creates a default limiter (capacity = `MAX_CONCURRENT_UPSTREAM`) internally.
+/// [`serve_gateway_with_protocol_circuit_with_body`] accepts an explicit
+/// limiter (so tests can use a small capacity to verify the limit is enforced).
+///
+/// ## Clone semantics
+///
+/// `UpstreamLimiter` is `Clone` (the inner `Arc<Semaphore>` is shared). All
+/// clones share the same permit pool — cloning does NOT create an independent
+/// limiter.
+#[derive(Debug, Clone)]
+pub struct UpstreamLimiter {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl UpstreamLimiter {
+    /// Create a new limiter with the given capacity.
+    #[must_use]
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            capacity: max_concurrent,
+        }
+    }
+
+    /// Create a new limiter with the default capacity
+    /// ([`snp_gateway::MAX_CONCURRENT_UPSTREAM`] = 64).
+    #[must_use]
+    pub fn with_default_limit() -> Self {
+        Self::new(snp_gateway::MAX_CONCURRENT_UPSTREAM)
+    }
+
+    /// Acquire a permit, awaiting if the limit is exhausted. The permit is
+    /// held until the returned [`tokio::sync::SemaphorePermit`] is dropped.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::Other`] if the semaphore is closed (which only
+    /// happens if `close()` is called — production code never closes it).
+    pub async fn acquire(&self) -> NodeResult<tokio::sync::SemaphorePermit<'_>> {
+        self.semaphore
+            .acquire()
+            .await
+            .map_err(|e| NodeError::Other(format!("UpstreamLimiter closed: {e}")))
+    }
+
+    /// Returns the number of available permits (for observability / testing).
+    /// A value of 0 means the limiter is saturated — new requests will await.
+    #[must_use]
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Returns the total capacity of this limiter (the maximum number of
+    /// concurrent permits that can be held at once).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 
@@ -913,6 +999,74 @@ pub async fn serve_gateway_with_protocol_circuit<F>(
 where
     F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync + 'static,
 {
+    // N2.2.4-hardening: Create a default UpstreamLimiter (capacity =
+    // MAX_CONCURRENT_UPSTREAM = 64). Every production upstream request
+    // acquires a permit before spawn_blocking, bounding concurrent fetches.
+    let limiter = UpstreamLimiter::with_default_limit();
+    serve_gateway_with_protocol_circuit_inner(
+        node,
+        listen_addr,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        &limiter,
+        connector_factory,
+        /* send_body = */ false,
+    )
+    .await
+}
+
+/// **N2.2.4-hardening.** Like [`serve_gateway_with_protocol_circuit`] but:
+///
+/// 1. Accepts an explicit [`UpstreamLimiter`] (so tests can use a small
+///    capacity to verify the concurrency limit is enforced).
+/// 2. Sends a [`snp_gateway::TransitEnvelope`] (signed TransitResponse + body)
+///    instead of a bare TransitResponse. The client uses
+///    [`send_via_route_with_body`] to decode the envelope and verify
+///    `SHA-256(body) == TransitResponse.object_id`.
+///
+/// This is the PRODUCTION path for end-to-end body delivery. The circuit
+/// protocol (SNP-IK handshake, AEAD frame encryption, key derivation) is
+/// UNCHANGED — only the application-layer payload inside the encrypted frame
+/// is extended.
+pub async fn serve_gateway_with_protocol_circuit_with_body<F>(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    limiter: &UpstreamLimiter,
+    connector_factory: F,
+) -> NodeResult<()>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync + 'static,
+{
+    serve_gateway_with_protocol_circuit_inner(
+        node,
+        listen_addr,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        limiter,
+        connector_factory,
+        /* send_body = */ true,
+    )
+    .await
+}
+
+/// Shared inner implementation for the bare-response and body-delivery
+/// gateway serve functions. The `send_body` flag selects between
+/// [`serve_one_gateway_request_protocol_circuit`] (bare TransitResponse) and
+/// [`serve_one_gateway_request_protocol_circuit_with_body`] (TransitEnvelope).
+async fn serve_gateway_with_protocol_circuit_inner<F>(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    limiter: &UpstreamLimiter,
+    connector_factory: F,
+    send_body: bool,
+) -> NodeResult<()>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync + 'static,
+{
     let gateway_node_id = node.identity.node_id;
     let gateway_ed_sk = node.identity.secret_key;
     let gateway_ed_pk = node.identity.public_key;
@@ -920,8 +1074,9 @@ where
         .await
         .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
     eprintln!(
-        "[gateway-protocol {}] listening on {listen_addr}",
-        super::hex_short(&gateway_node_id)
+        "[gateway-protocol {}] listening on {listen_addr} (body_delivery={})",
+        super::hex_short(&gateway_node_id),
+        send_body
     );
     let (mut stream, _) = listener
         .accept()
@@ -952,20 +1107,35 @@ where
     let connector = Arc::new(connector_factory);
     let mut seen_req_ids = HashSet::new();
     loop {
-        let outcome = serve_one_gateway_request_protocol_circuit(
-            &link,
-            gateway_node_id,
-            &gateway_ed_sk,
-            gateway_x25519_secret,
-            &mut seen_req_ids,
-            connector.as_ref(),
-        )
-        .await;
+        let outcome = if send_body {
+            serve_one_gateway_request_protocol_circuit_with_body(
+                &link,
+                gateway_node_id,
+                &gateway_ed_sk,
+                gateway_x25519_secret,
+                &mut seen_req_ids,
+                limiter,
+                connector.as_ref(),
+            )
+            .await
+        } else {
+            serve_one_gateway_request_protocol_circuit(
+                &link,
+                gateway_node_id,
+                &gateway_ed_sk,
+                gateway_x25519_secret,
+                &mut seen_req_ids,
+                limiter,
+                connector.as_ref(),
+            )
+            .await
+        };
         match outcome {
             Ok(ServeOutcome::Continue) => {
                 eprintln!(
-                    "[gateway-protocol {}] served one request (protocol-driven circuit)",
-                    super::hex_short(&gateway_node_id)
+                    "[gateway-protocol {}] served one request (protocol-driven circuit, body_delivery={})",
+                    super::hex_short(&gateway_node_id),
+                    send_body
                 );
                 break; // one request is enough for the north-star test
             }
@@ -984,12 +1154,24 @@ where
 /// The gateway derives the circuit keys FROM the client's ephemeral X25519
 /// public key (in the first 32 bytes of the request frame body) — NOT from
 /// a pre-supplied `CircuitKeys` parameter. This is the N2.0.7 invariant.
+///
+/// **N2.2.4-hardening:** This function now acquires a permit from the
+/// [`UpstreamLimiter`] BEFORE the `spawn_blocking` fetch begins. The permit
+/// bounds the number of concurrent upstream fetches to
+/// [`snp_gateway::MAX_CONCURRENT_UPSTREAM`] (64). The permit is held for the
+/// duration of the blocking fetch and released when the fetch completes.
+///
+/// This function sends a BARE [`TransitResponse`] (no body). For end-to-end
+/// body delivery, use [`serve_one_gateway_request_protocol_circuit_with_body`]
+/// instead, which sends a [`snp_gateway::TransitEnvelope`] carrying both the
+/// signed TransitResponse and the bounded body.
 async fn serve_one_gateway_request_protocol_circuit<F>(
     link: &Arc<AsyncLink>,
     gateway_node_id: [u8; 32],
     gateway_sk: &[u8; 32],
     gateway_x25519_secret: &snp_crypto::X25519Secret,
     seen_req_ids: &mut HashSet<[u8; 16]>,
+    limiter: &UpstreamLimiter,
     connector_factory: &F,
 ) -> NodeResult<ServeOutcome>
 where
@@ -1067,12 +1249,22 @@ where
     }
 
     let connector = connector_factory(&transit_req.url)?;
+
+    // N2.2.4-hardening: Acquire a permit BEFORE spawn_blocking. The permit is
+    // held in this async frame for the duration of the blocking fetch and
+    // released when the block scope ends (after the await). This bounds the
+    // number of concurrent upstream fetches to MAX_CONCURRENT_UPSTREAM (64).
     let gateway_sk_arr = *gateway_sk;
-    let fetched = tokio::task::spawn_blocking(move || {
-        handle_transit_request_with_connector(&transit_req, &gateway_sk_arr, &connector)
-    })
-    .await
-    .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))??;
+    let fetched = {
+        let _permit = limiter.acquire().await?;
+        let join_result = tokio::task::spawn_blocking(move || {
+            handle_transit_request_with_connector(&transit_req, &gateway_sk_arr, &connector)
+        })
+        .await
+        .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))?;
+        // _permit still held here — released when this block scope ends.
+        join_result?
+    };
 
     // Derive the RESPONSE-direction keys from the SAME DH. The gateway's
     // `send_key` (responder role) equals the client's `recv_key`.
@@ -1082,6 +1274,128 @@ where
     );
     let resp_bytes = encode_transit_response(&fetched.response)?;
     let sealed_resp = encrypt_circuit_payload(&response_keys.send_key, &resp_bytes);
+
+    let resp_frame = Frame {
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: req_frame.src,
+        src: gateway_node_id,
+        ttl: FRAME_TTL_MAX,
+        fid: req_frame.fid,
+        seq: req_frame.seq + 1,
+        body: sealed_resp,
+    };
+    link.send_frame(&resp_frame)
+        .await
+        .map_err(async_err_to_node)?;
+    Ok(ServeOutcome::Continue)
+}
+
+/// **N2.2.4-hardening.** Serve ONE transit request with PROTOCOL-DRIVEN
+/// circuit key derivation AND end-to-end body delivery.
+///
+/// This is identical to [`serve_one_gateway_request_protocol_circuit`] except
+/// it sends a [`snp_gateway::TransitEnvelope`] (carrying both the signed
+/// [`TransitResponse`] AND the bounded response body) instead of a bare
+/// TransitResponse. The client uses [`send_via_route_with_body`] to decode
+/// the envelope and verify `SHA-256(body) == TransitResponse.object_id`.
+///
+/// ## Why a separate function
+///
+/// The bare-TransitResponse path ([`serve_one_gateway_request_protocol_circuit`])
+/// is retained for backward compat with existing tests that only verify the
+/// `object_id` / status / signature. The envelope path is the PRODUCTION
+/// path for clients that need the actual body (the N2.2.4 north-star:
+/// "exact body received by A, SHA-256(body) == object_id").
+///
+/// ## Circuit protocol unchanged
+///
+/// The circuit protocol (SNP-IK handshake, AEAD frame encryption, key
+/// derivation) is UNCHANGED. Only the APPLICATION-LAYER payload inside the
+/// encrypted frame is extended from bare TransitResponse to TransitEnvelope.
+pub async fn serve_one_gateway_request_protocol_circuit_with_body<F>(
+    link: &Arc<AsyncLink>,
+    gateway_node_id: [u8; 32],
+    gateway_sk: &[u8; 32],
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    seen_req_ids: &mut HashSet<[u8; 16]>,
+    limiter: &UpstreamLimiter,
+    connector_factory: &F,
+) -> NodeResult<ServeOutcome>
+where
+    F: Fn(&str) -> NodeResult<PinnedConnector> + Send + Sync,
+{
+    let req_frame = match link.recv_frame().await {
+        Ok(f) => f,
+        Err(AsyncLinkError::Io(msg))
+            if msg.contains("unexpected eof") || msg.contains("reset") =>
+        {
+            return Ok(ServeOutcome::Closed);
+        }
+        Err(e) => return Err(async_err_to_node(e)),
+    };
+    if req_frame.dst != gateway_node_id {
+        return Err(NodeError::Other(format!(
+            "gateway {:?} received frame addressed to {:?} (dst mismatch)",
+            gateway_node_id, req_frame.dst
+        )));
+    }
+    if should_drop(&req_frame) {
+        return Ok(ServeOutcome::Continue);
+    }
+
+    let (client_eph_pub, req_bytes) = snp_link::open_circuit_payload_with_fresh_eph(
+        gateway_x25519_secret,
+        &req_frame.body,
+    )
+    .ok_or(NodeError::CircuitDecryptionFailed)?;
+
+    let transit_req = decode_transit_request(&req_bytes)?;
+
+    let expected_src = derive_node_id(&transit_req.client_ed25519_public_key);
+    if expected_src != req_frame.src {
+        return Err(NodeError::Other(format!(
+            "frame source {:?} does not match the client identity derived \
+             from the TransitRequest's client_ed25519_public_key (expected {:?}) — \
+             possible impersonation attempt",
+            req_frame.src, expected_src
+        )));
+    }
+
+    let req_id_arr: [u8; 16] = transit_req.req_id;
+    if !seen_req_ids.insert(req_id_arr) {
+        return Err(NodeError::Other(format!(
+            "replay detected: reqId {:?} already seen",
+            req_id_arr
+        )));
+    }
+
+    let connector = connector_factory(&transit_req.url)?;
+
+    // N2.2.4-hardening: Acquire a permit BEFORE spawn_blocking.
+    let gateway_sk_arr = *gateway_sk;
+    let fetched = {
+        let _permit = limiter.acquire().await?;
+        let join_result = tokio::task::spawn_blocking(move || {
+            handle_transit_request_with_connector(&transit_req, &gateway_sk_arr, &connector)
+        })
+        .await
+        .map_err(|e| NodeError::Other(format!("spawn_blocking join: {e}")))?;
+        join_result?
+    };
+
+    // Derive the RESPONSE-direction keys from the SAME DH.
+    let response_keys = snp_link::derive_gateway_response_keys(
+        gateway_x25519_secret,
+        &client_eph_pub,
+    );
+
+    // N2.2.4-hardening: Encode the TransitEnvelope (transitResponse + body).
+    // The envelope is the APPLICATION-LAYER payload — the circuit protocol
+    // (AEAD encryption) is unchanged. The body is the bounded response body
+    // (already capped at read time by fetch_with_limit).
+    let envelope_bytes = encode_transit_response_envelope(&fetched.response, &fetched.body)?;
+    let sealed_resp = encrypt_circuit_payload(&response_keys.send_key, &envelope_bytes);
 
     let resp_frame = Frame {
         v: FRAME_VERSION,
@@ -1720,6 +2034,167 @@ pub async fn send_with_protocol_circuit_async(
     Ok(transit_resp)
 }
 
+/// **N2.2.4-hardening.** Like [`send_with_protocol_circuit_async`] but:
+///
+/// 1. Uses [`snp_gateway::MAX_RESPONSE_BYTES_DEFAULT`] (10 MiB) as the
+///    `max_response_bytes` (the bare path uses 64 KiB — too small for the
+///    body-delivery / streaming-cap tests).
+/// 2. Decodes a [`snp_gateway::TransitEnvelope`] (transitResponse + body)
+///    instead of a bare TransitResponse. The gateway must have used
+///    [`serve_one_gateway_request_protocol_circuit_with_body`] to send the
+///    envelope.
+/// 3. Verifies END-TO-END BODY INTEGRITY: `SHA-256(body) == TransitResponse.object_id`.
+///    This proves the actual response body crossed the circuit intact — not
+///    just that the gateway fetched SOMETHING and signed its hash.
+/// 4. Returns `(TransitResponse, Vec<u8>)` — the signed attestation AND the
+///    body.
+///
+/// ## What this proves
+///
+/// ```text
+/// known deterministic upstream body
+///     ↓
+/// Gateway (fetch_with_limit → bounded body)
+///     ↓
+/// circuit (AEAD encryption — unchanged)
+///     ↓
+/// C → B → A (relay forwarding — unchanged)
+///     ↓
+/// A receives TransitEnvelope
+///     ↓
+/// A verifies gateway signature on TransitResponse
+///     ↓
+/// A computes SHA-256(body) and verifies == object_id  ✓
+/// ```
+///
+/// This is the N2.2.4 north-star: the client receives the ACTUAL body, not
+/// just an attestation that a body was fetched.
+pub async fn send_with_protocol_circuit_async_with_body(
+    node: &Node,
+    url: &str,
+    gateway_node_id: &[u8; 32],
+    gateway_ed25519_public: &[u8; 32],
+    gateway_x25519_pub: &snp_crypto::X25519PubKey,
+    relay_addr: &str,
+    relay_node_id: &[u8; 32],
+    client_x25519_secret: &snp_crypto::X25519Secret,
+    client_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<(TransitResponse, Vec<u8>)> {
+    // 1. SNP-IK/0.1 link handshake with the relay (INTERNAL).
+    let mut stream = AsyncLink::connect_raw(relay_addr)
+        .await
+        .map_err(async_err_to_node)?;
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream,
+        true, // initiator
+        &node.identity.secret_key,
+        &node.identity.public_key,
+        client_x25519_secret,
+        client_x25519_public,
+        Some(relay_node_id), // pin the relay's NodeId
+    )
+    .await
+    .map_err(async_err_to_node)?;
+    if handshake.peer_node_id != *relay_node_id {
+        return Err(NodeError::Other(format!(
+            "relay identity substitution detected: expected {}, got {}",
+            super::hex_short(relay_node_id),
+            super::hex_short(&handshake.peer_node_id)
+        )));
+    }
+    let link = AsyncLink::new(stream, handshake.link_keys);
+
+    // 2. Build + sign the TransitRequest.
+    //
+    // N2.2.4-hardening: Use MAX_RESPONSE_BYTES_DEFAULT (10 MiB) — the
+    // production default. The bare path uses 64 KiB (too small for the
+    // body-delivery / streaming-cap tests). The gateway's fetch_with_limit
+    // enforces this at READ TIME.
+    let mut req = TransitRequest {
+        req_id: random_req_id(),
+        method: "GET".into(),
+        url: url.to_string(),
+        tls_termination: "GATEWAY_PLAINTEXT".into(),
+        max_response_bytes: snp_gateway::MAX_RESPONSE_BYTES_DEFAULT,
+        deadline: now_unix() + 60,
+        reply_to: [0u8; 32],
+        client_ed25519_public_key: node.identity.public_key,
+        client_sig: [0u8; 64],
+    };
+    sign_transit_request(&mut req, &node.identity.secret_key);
+    let req_bytes = encode_transit_request(&req)?;
+
+    // 3. Seal with fresh ephemeral circuit key (protocol-driven).
+    let (circuit_keys, _client_eph_pub, sealed_body) =
+        snp_link::seal_circuit_payload_with_fresh_eph(gateway_x25519_pub, &req_bytes);
+
+    // 4. Build + send the Class B frame.
+    let req_frame = Frame {
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: *gateway_node_id,
+        src: node.identity.node_id,
+        ttl: FRAME_TTL_MAX,
+        fid: random_fid(),
+        seq: 1,
+        body: sealed_body,
+    };
+    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
+
+    if resp_frame.cls != b'B' {
+        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+            return Err(NodeError::UpstreamFailure);
+        }
+        return Err(NodeError::Other(format!(
+            "expected Class B response, got Class {} — likely upstream failure",
+            resp_frame.cls as char
+        )));
+    }
+
+    // 5. Decrypt the response (circuit protocol UNCHANGED).
+    let resp_bytes = decrypt_circuit_payload(&circuit_keys.recv_key, &resp_frame.body)
+        .ok_or(NodeError::CircuitDecryptionFailed)?;
+
+    // 6. Decode the TransitEnvelope (APPLICATION-LAYER extension — the circuit
+    //    protocol is unchanged, only the payload inside the encrypted frame is
+    //    a TransitEnvelope instead of a bare TransitResponse).
+    let envelope = decode_transit_response_envelope(&resp_bytes)?;
+    let transit_resp: TransitResponse = decode_transit_response(&envelope.transit_response)?;
+
+    // 7. Verify the gateway's signature on the TransitResponse.
+    if !verify_transit_response(&transit_resp, gateway_ed25519_public) {
+        return Err(NodeError::GatewaySignatureFailed);
+    }
+
+    // 8. N2.2.4-hardening: VERIFY END-TO-END BODY INTEGRITY.
+    //
+    // The TransitResponse.object_id is SHA-256(bounded body) — computed by
+    // the gateway after fetch_with_limit capped the body at READ TIME. The
+    // body crossed the circuit inside the TransitEnvelope. We recompute
+    // SHA-256(body) and verify it matches object_id.
+    //
+    // This proves the ACTUAL body the client received is the EXACT body the
+    // gateway fetched and hashed — not just that the gateway signed a hash
+    // of SOMETHING. If the body was corrupted in transit (by a buggy relay,
+    // a MITM, or a circuit decryption failure), this check fails.
+    let body_hash = sha256(&envelope.body);
+    if body_hash != transit_resp.object_id {
+        return Err(NodeError::Other(format!(
+            "END-TO-END BODY INTEGRITY CHECK FAILED: \
+             SHA-256(body) != TransitResponse.object_id \
+             (computed={}, signed={}) — the body received by the client does \
+             NOT match the hash the gateway signed",
+            super::hex_short(&body_hash),
+            super::hex_short(&transit_resp.object_id)
+        )));
+    }
+
+    node.seen_req_ids.lock().unwrap().insert(req.req_id);
+    *node.current_gateway.lock().unwrap() = Some(*gateway_node_id);
+    Ok((transit_resp, envelope.body))
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // N2.0.7 — ROUTE-AUTHORITATIVE ENTRY POINTS
 // ════════════════════════════════════════════════════════════════════════════
@@ -1816,6 +2291,83 @@ pub async fn send_via_route(
 
     // 3. Delegate to the protocol-driven circuit send.
     send_with_protocol_circuit_async(
+        node,
+        url,
+        &gateway_node_id,
+        &gateway_ed25519_public,
+        &gateway_x25519_pub,
+        relay_addr,
+        &relay_node_id,
+        client_x25519_secret,
+        client_x25519_public,
+    )
+    .await
+}
+
+/// **N2.2.4-hardening.** Like [`send_via_route`] but returns BOTH the signed
+/// [`TransitResponse`] AND the bounded response body, and verifies
+/// end-to-end body integrity (`SHA-256(body) == TransitResponse.object_id`).
+///
+/// The gateway MUST have used [`serve_gateway_with_protocol_circuit_with_body`]
+/// (which sends a [`snp_gateway::TransitEnvelope`]) to serve the request. If
+/// the gateway sent a bare TransitResponse, this function will fail to decode
+/// the envelope and return an error.
+///
+/// ## What this proves
+///
+/// The client receives the ACTUAL response body that crossed the circuit —
+/// not just an attestation (`object_id`) that a body was fetched. The client
+/// independently verifies `SHA-256(body) == object_id`, proving the body was
+/// not corrupted in transit.
+///
+/// # Errors
+/// Returns [`NodeError`] on any protocol failure, signature failure, or
+/// end-to-end body integrity mismatch.
+pub async fn send_via_route_with_body(
+    node: &Node,
+    route: &super::Route,
+    url: &str,
+    client_x25519_secret: &snp_crypto::X25519Secret,
+    client_x25519_public: &snp_crypto::X25519PubKey,
+) -> NodeResult<(snp_gateway::TransitResponse, Vec<u8>)> {
+    if route.hop_details().is_empty() {
+        return Err(NodeError::Other(
+            "send_via_route_with_body: route has no hop_details".into(),
+        ));
+    }
+    let first_hop = &route.hop_details()[0];
+    let relay_endpoint = first_hop.first_endpoint().ok_or_else(|| {
+        NodeError::Other("send_via_route_with_body: first hop has no endpoints".into())
+    })?;
+    let relay_addr = relay_endpoint.as_tcp().ok_or_else(|| {
+        NodeError::Other(format!(
+            "send_via_route_with_body: first hop endpoint is not TCP (got {:?})",
+            relay_endpoint
+        ))
+    })?;
+    let relay_node_id = first_hop.node_id();
+
+    let gateway_descriptor = route.destination_descriptor().ok_or_else(|| {
+        NodeError::Other("send_via_route_with_body: route has no destination descriptor".into())
+    })?;
+    let gateway_node_id = gateway_descriptor.node_id();
+    let gateway_ed25519_public = *gateway_descriptor.ed25519_public_key();
+    let gateway_x25519_pub_bytes = gateway_descriptor.circuit_x25519_pub().ok_or_else(|| {
+        NodeError::Other(
+            "send_via_route_with_body: destination descriptor has no X25519 circuit public key".into(),
+        )
+    })?;
+    let gateway_x25519_pub = snp_crypto::x25519_public_from_bytes(gateway_x25519_pub_bytes);
+
+    eprintln!(
+        "[send-via-route-body {}] route: {} hops, first={}, dest={}",
+        super::hex_short(&node.identity.node_id),
+        route.hop_details().len(),
+        super::hex_short(&relay_node_id),
+        super::hex_short(&gateway_node_id)
+    );
+
+    send_with_protocol_circuit_async_with_body(
         node,
         url,
         &gateway_node_id,
