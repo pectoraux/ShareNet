@@ -354,6 +354,17 @@ impl IssuerAuthority {
             CborValue::UnsignedInt(u64::from(self.status as u8)),
         ])
     }
+
+    /// P0 #2 rev3: Complete CBOR encoding INCLUDING the governance signature.
+    /// Used for persistence — restores the complete signed object on load.
+    pub fn to_cbor_value(&self) -> CborValue {
+        let mut arr = match self.to_cbor_value_excluding_signature() {
+            CborValue::Array(a) => a,
+            _ => return CborValue::Null,
+        };
+        arr.push(CborValue::ByteString(self.governance_signature.to_vec()));
+        CborValue::Array(arr)
+    }
 }
 
 // ─── CapabilityAuthorization ───────────────────────────────────────────────
@@ -482,6 +493,18 @@ impl GovernanceIssuerRevocation {
         Ok(preimage)
     }
 
+    /// P0 #2 rev3: Complete CBOR encoding including the governance signature.
+    pub fn to_cbor_value(&self) -> CborValue {
+        CborValue::Array(vec![
+            CborValue::ByteString(self.issuer_id.to_vec()),
+            CborValue::UnsignedInt(self.authority_version),
+            CborValue::UnsignedInt(self.revocation_version),
+            CborValue::UnsignedInt(self.revocation_timestamp),
+            CborValue::ByteString(self.nonce.to_vec()),
+            CborValue::ByteString(self.governance_signature.to_vec()),
+        ])
+    }
+
     /// P0 #3: Compute the revocation digest for equivocation detection.
     pub fn revocation_digest(&self) -> SerResult<[u8; 32]> {
         let cbor = try_encode(&CborValue::Array(vec![
@@ -555,6 +578,19 @@ impl SubjectCapabilityRevocation {
         let mut preimage = SUBJECT_REVOCATION_CONTEXT.to_vec();
         preimage.extend_from_slice(&cbor);
         Ok(preimage)
+    }
+
+    /// P0 #2 rev3: Complete CBOR encoding including the issuer signature.
+    pub fn to_cbor_value(&self) -> CborValue {
+        CborValue::Array(vec![
+            CborValue::ByteString(self.issuer_id.to_vec()),
+            CborValue::ByteString(self.subject_id.to_vec()),
+            CborValue::UnsignedInt(u64::from(self.capability.to_byte())),
+            CborValue::UnsignedInt(self.revocation_version),
+            CborValue::UnsignedInt(self.revocation_timestamp),
+            CborValue::ByteString(self.nonce.to_vec()),
+            CborValue::ByteString(self.issuer_signature.to_vec()),
+        ])
     }
 
     /// P0 #3: Compute the revocation digest for equivocation detection.
@@ -655,32 +691,39 @@ pub enum ScopeEvaluationResult {
 
 /// Persistent state for the authority chain.
 /// P0 #2: Real file-based persistence with atomic commit and fail-closed load.
-/// P0 #3: Revocation digests stored for equivocation detection.
+/// P0 #2 rev3: Persists complete signed objects, not just version floors.
+/// P0 #3: Transactional mutations — clone → mutate → persist → swap.
+/// P0 #1 rev3: Verifies cryptographic signatures before acceptance.
+/// P0 #4 rev3: Subject revocation acceptance resolves issuer authority.
+/// P1 #5: Fail closed on malformed persisted entries.
 /// P1 #7: This is the single authoritative state — VerificationContext queries it.
 #[derive(Debug, Clone)]
 pub struct AuthorityStateStore {
-    // Authority state
+    /// The governance public key (needed for signature verification on acceptance).
+    governance_public_key: Option<PublicKey>,
+
+    // Authority state — complete signed objects
     highest_authority_version: HashMap<[u8; 32], u64>,
     authority_digests: HashMap<([u8; 32], u64), [u8; 32]>,
     authorities: HashMap<([u8; 32], u64), IssuerAuthority>,
 
-    // Governance revocation state (P0 #3: includes digests)
-    highest_gov_revocation_version: HashMap<([u8; 32], u64), u64>, // (issuer_id, authority_version) → highest rev_version
-    gov_revocation_digests: HashMap<([u8; 32], u64, u64), [u8; 32]>, // (issuer_id, auth_version, rev_version) → digest
-    governance_revocations: HashMap<([u8; 32], u64), GovernanceIssuerRevocation>, // (issuer_id, authority_version) → revocation
+    // Governance revocation state — complete signed objects
+    highest_gov_revocation_version: HashMap<([u8; 32], u64), u64>,
+    gov_revocation_digests: HashMap<([u8; 32], u64, u64), [u8; 32]>,
+    governance_revocations: HashMap<([u8; 32], u64), GovernanceIssuerRevocation>,
 
-    // Subject revocation state (P0 #3: includes digests)
+    // Subject revocation state — complete signed objects
     highest_subj_revocation_version: HashMap<([u8; 32], [u8; 32], u8), u64>,
     subj_revocation_digests: HashMap<([u8; 32], [u8; 32], u8, u64), [u8; 32]>,
     subject_revocations: HashMap<([u8; 32], [u8; 32], u8), SubjectCapabilityRevocation>,
 
-    // Persistence path (None = in-memory only)
-    path: Option<PathBuf>,
+    // Persistence path (None = in-memory only). pub for testing.
+    pub path: Option<PathBuf>,
 }
 
 /// Magic + version for persistence file.
 const STORE_MAGIC: &[u8] = b"SNCA"; // ShareNet Capability Authority
-const STORE_VERSION: u8 = 1;
+const STORE_VERSION: u8 = 2; // Version 2: complete signed objects
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -692,9 +735,51 @@ pub enum StoreError {
     Serialization(String),
 }
 
+/// Helper: extract a fixed-size byte array from a CborValue, or error.
+/// P1 #5: Fail closed — no unwrap_or_default.
+fn require_bytes<const N: usize>(v: &CborValue, field: &str) -> Result<[u8; N], StoreError> {
+    match v {
+        CborValue::ByteString(b) if b.len() == N => {
+            let mut arr = [0u8; N];
+            arr.copy_from_slice(b);
+            Ok(arr)
+        }
+        CborValue::ByteString(b) => Err(StoreError::Format(format!(
+            "{field}: expected {N} bytes, got {}",
+            b.len()
+        ))),
+        _ => Err(StoreError::Format(format!("{field}: expected byte string"))),
+    }
+}
+
+/// Helper: extract a u64 from a CborValue, or error.
+fn require_u64(v: &CborValue, field: &str) -> Result<u64, StoreError> {
+    match v {
+        CborValue::UnsignedInt(n) => Ok(*n),
+        _ => Err(StoreError::Format(format!("{field}: expected unsigned int"))),
+    }
+}
+
+/// Helper: extract a Vec<u8> from a CborValue, or error.
+fn require_byte_vec(v: &CborValue, field: &str) -> Result<Vec<u8>, StoreError> {
+    match v {
+        CborValue::ByteString(b) => Ok(b.clone()),
+        _ => Err(StoreError::Format(format!("{field}: expected byte string"))),
+    }
+}
+
+/// Helper: extract a String from a CborValue, or error.
+fn require_string(v: &CborValue, field: &str) -> Result<String, StoreError> {
+    match v {
+        CborValue::TextString(s) => Ok(s.clone()),
+        _ => Err(StoreError::Format(format!("{field}: expected text string"))),
+    }
+}
+
 impl AuthorityStateStore {
     pub fn new() -> Self {
         Self {
+            governance_public_key: None,
             highest_authority_version: HashMap::new(),
             authority_digests: HashMap::new(),
             authorities: HashMap::new(),
@@ -706,6 +791,11 @@ impl AuthorityStateStore {
             subject_revocations: HashMap::new(),
             path: None,
         }
+    }
+
+    /// Set the governance public key (needed for signature verification on acceptance).
+    pub fn set_governance_public_key(&mut self, key: PublicKey) {
+        self.governance_public_key = Some(key);
     }
 
     /// Open a persistent store from a file path.
@@ -722,12 +812,13 @@ impl AuthorityStateStore {
 
     /// Load state from the persistence file.
     /// P0 #2: Fail-closed — any error aborts the load.
+    /// P0 #2 rev3: Restores complete signed objects.
+    /// P1 #5: Fail closed on malformed entries — no unwrap_or_default.
     fn load(&mut self) -> Result<(), StoreError> {
         let path = self.path.as_ref().ok_or_else(|| StoreError::Io("no path set".into()))?;
         let mut file = fs::File::open(path).map_err(|e| StoreError::Io(e.to_string()))?;
 
-        // Read and verify magic + version.
-        let mut header = [0u8; 5]; // 4 magic + 1 version
+        let mut header = [0u8; 5];
         file.read_exact(&mut header).map_err(|e| StoreError::Io(e.to_string()))?;
         if &header[..4] != STORE_MAGIC {
             return Err(StoreError::Format("bad magic".into()));
@@ -736,13 +827,9 @@ impl AuthorityStateStore {
             return Err(StoreError::Format(format!("unsupported version {}", header[4])));
         }
 
-        // Read serialized state as CBOR.
         let mut data = Vec::new();
         file.read_to_end(&mut data).map_err(|e| StoreError::Io(e.to_string()))?;
 
-        // P0 #2: For this implementation, we use a simple serialization:
-        // Each entry is a 4-byte length prefix + CBOR-encoded entry.
-        // This is a reference-implementation persistence format, NOT a wire format.
         let mut cursor = 0;
         while cursor < data.len() {
             if cursor + 4 > data.len() {
@@ -758,83 +845,68 @@ impl AuthorityStateStore {
             let entry = &data[cursor..cursor + len];
             cursor += len;
 
-            // Decode entry type + data.
             let decoded = snp_cbor::decode(entry)
                 .map_err(|e| StoreError::Format(format!("CBOR decode: {e}")))?;
 
-            // We store entries as: { "type": "authority"|"gov_rev"|"subj_rev", "data": ... }
+            // Entry format: { "type": "authority"|"gov_rev"|"subj_rev", "object": <complete CBOR> }
             if let CborValue::Map(entries) = decoded {
                 let mut entry_type = String::new();
-                let mut entry_data = CborValue::Null;
+                let mut entry_object = CborValue::Null;
                 for (k, v) in &entries {
                     if let (CborValue::TextString(t), val) = (k, v) {
                         if t == "type" {
                             if let CborValue::TextString(s) = val {
                                 entry_type = s.clone();
                             }
-                        } else if t == "data" {
-                            entry_data = val.clone();
+                        } else if t == "object" {
+                            entry_object = val.clone();
                         }
                     }
                 }
+
                 match entry_type.as_str() {
-                    "authority_v" => {
-                        // Store: issuer_id (32) + version (8 LE) + digest (32) + issuer_public_key (32)
-                        if let CborValue::Array(arr) = entry_data {
-                            if arr.len() == 4 {
-                                let issuer_id = extract_bytes(&arr[0]).unwrap_or_default();
-                                let version = extract_u64(&arr[1]).unwrap_or(0);
-                                let digest = extract_bytes(&arr[2]).unwrap_or_default();
-                                let pk = extract_bytes(&arr[3]).unwrap_or_default();
-                                if issuer_id.len() == 32 && digest.len() == 32 && pk.len() == 32 {
-                                    let iid: [u8; 32] = issuer_id.try_into().unwrap();
-                                    let dig: [u8; 32] = digest.try_into().unwrap();
-                                    let pk_arr: [u8; 32] = pk.try_into().unwrap();
-                                    self.highest_authority_version.insert(iid, version);
-                                    self.authority_digests.insert((iid, version), dig);
-                                    // Note: we don't store the full IssuerAuthority on load;
-                                    // the caller re-registers it. We store the version floor and digest.
-                                    let _ = pk_arr; // issuer_public_key stored in the authority object when re-registered
-                                }
-                            }
-                        }
+                    "authority" => {
+                        // P0 #2 rev3: Restore complete IssuerAuthority.
+                        let authority = decode_authority_from_cbor(&entry_object)?;
+                        let issuer = authority.issuer_id;
+                        let version = authority.authority_version;
+                        let digest = authority.authority_digest()
+                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        self.highest_authority_version.insert(issuer, version);
+                        self.authority_digests.insert((issuer, version), digest);
+                        self.authorities.insert((issuer, version), authority);
                     }
-                    "gov_rev_v" => {
-                        if let CborValue::Array(arr) = entry_data {
-                            if arr.len() == 5 {
-                                let issuer_id = extract_bytes(&arr[0]).unwrap_or_default();
-                                let auth_ver = extract_u64(&arr[1]).unwrap_or(0);
-                                let rev_ver = extract_u64(&arr[2]).unwrap_or(0);
-                                let digest = extract_bytes(&arr[3]).unwrap_or_default();
-                                if issuer_id.len() == 32 && digest.len() == 32 {
-                                    let iid: [u8; 32] = issuer_id.try_into().unwrap();
-                                    let dig: [u8; 32] = digest.try_into().unwrap();
-                                    self.highest_gov_revocation_version.insert((iid, auth_ver), rev_ver);
-                                    self.gov_revocation_digests.insert((iid, auth_ver, rev_ver), dig);
-                                }
-                            }
-                        }
+                    "gov_rev" => {
+                        // P0 #2 rev3: Restore complete GovernanceIssuerRevocation.
+                        let revocation = decode_gov_revocation_from_cbor(&entry_object)?;
+                        let issuer = revocation.issuer_id;
+                        let auth_ver = revocation.authority_version;
+                        let rev_ver = revocation.revocation_version;
+                        let digest = revocation.revocation_digest()
+                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        self.highest_gov_revocation_version.insert((issuer, auth_ver), rev_ver);
+                        self.gov_revocation_digests.insert((issuer, auth_ver, rev_ver), digest);
+                        self.governance_revocations.insert((issuer, auth_ver), revocation);
                     }
-                    "subj_rev_v" => {
-                        if let CborValue::Array(arr) = entry_data {
-                            if arr.len() == 6 {
-                                let issuer_id = extract_bytes(&arr[0]).unwrap_or_default();
-                                let subject_id = extract_bytes(&arr[1]).unwrap_or_default();
-                                let cap_byte = extract_u64(&arr[2]).unwrap_or(0) as u8;
-                                let rev_ver = extract_u64(&arr[3]).unwrap_or(0);
-                                let digest = extract_bytes(&arr[4]).unwrap_or_default();
-                                if issuer_id.len() == 32 && subject_id.len() == 32 && digest.len() == 32 {
-                                    let iid: [u8; 32] = issuer_id.try_into().unwrap();
-                                    let sid: [u8; 32] = subject_id.try_into().unwrap();
-                                    let dig: [u8; 32] = digest.try_into().unwrap();
-                                    let key = (iid, sid, cap_byte);
-                                    self.highest_subj_revocation_version.insert(key, rev_ver);
-                                    self.subj_revocation_digests.insert((iid, sid, cap_byte, rev_ver), dig);
-                                }
-                            }
-                        }
+                    "subj_rev" => {
+                        // P0 #2 rev3: Restore complete SubjectCapabilityRevocation.
+                        let revocation = decode_subj_revocation_from_cbor(&entry_object)?;
+                        let key = (
+                            revocation.issuer_id,
+                            revocation.subject_id,
+                            revocation.capability.to_byte(),
+                        );
+                        let rev_ver = revocation.revocation_version;
+                        let digest = revocation.revocation_digest()
+                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        self.highest_subj_revocation_version.insert(key, rev_ver);
+                        self.subj_revocation_digests.insert((key.0, key.1, key.2, rev_ver), digest);
+                        self.subject_revocations.insert(key, revocation);
                     }
-                    _ => {} // Unknown entry type — skip (forward compatibility)
+                    _ => {
+                        // P1 #5: Unknown entry type — fail closed.
+                        return Err(StoreError::Format(format!("unknown entry type: {entry_type}")));
+                    }
                 }
             }
         }
@@ -844,81 +916,50 @@ impl AuthorityStateStore {
 
     /// Atomically commit the current state to the persistence file.
     /// P0 #2: Write-to-temp-then-rename for atomicity.
+    /// P0 #2 rev3: Serializes complete signed objects.
     fn commit(&self) -> Result<(), StoreError> {
         let path = self.path.as_ref().ok_or_else(|| StoreError::Io("no path set".into()))?;
 
-        // Serialize all state entries.
         let mut data = Vec::new();
         data.extend_from_slice(STORE_MAGIC);
         data.push(STORE_VERSION);
 
-        // Serialize authority version floors.
-        for ((issuer_id, version), digest) in &self.authority_digests {
-            let pk = self.authorities.get(&(*issuer_id, *version))
-                .map(|a| a.issuer_public_key.to_vec())
-                .unwrap_or_default();
+        // Serialize complete authority objects.
+        for ((issuer_id, version), authority) in &self.authorities {
             let entry = CborValue::Map(vec![
-                (CborValue::TextString("type".into()), CborValue::TextString("authority_v".into())),
-                (CborValue::TextString("data".into()), CborValue::Array(vec![
-                    CborValue::ByteString(issuer_id.to_vec()),
-                    CborValue::UnsignedInt(*version),
-                    CborValue::ByteString(digest.to_vec()),
-                    CborValue::ByteString(pk),
-                ])),
+                (CborValue::TextString("type".into()), CborValue::TextString("authority".into())),
+                (CborValue::TextString("object".into()), authority.to_cbor_value()),
             ]);
             let encoded = snp_cbor::encode(&entry)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let len = encoded.len() as u32;
-            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             data.extend_from_slice(&encoded);
         }
 
-        // Serialize governance revocation version floors + digests.
-        for ((issuer_id, auth_ver), rev_ver) in &self.highest_gov_revocation_version {
-            let digest = self.gov_revocation_digests
-                .get(&(*issuer_id, *auth_ver, *rev_ver))
-                .copied()
-                .unwrap_or_default();
+        // Serialize complete governance revocation objects.
+        for ((issuer_id, auth_ver), revocation) in &self.governance_revocations {
             let entry = CborValue::Map(vec![
-                (CborValue::TextString("type".into()), CborValue::TextString("gov_rev_v".into())),
-                (CborValue::TextString("data".into()), CborValue::Array(vec![
-                    CborValue::ByteString(issuer_id.to_vec()),
-                    CborValue::UnsignedInt(*auth_ver),
-                    CborValue::UnsignedInt(*rev_ver),
-                    CborValue::ByteString(digest.to_vec()),
-                ])),
+                (CborValue::TextString("type".into()), CborValue::TextString("gov_rev".into())),
+                (CborValue::TextString("object".into()), revocation.to_cbor_value()),
             ]);
             let encoded = snp_cbor::encode(&entry)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let len = encoded.len() as u32;
-            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             data.extend_from_slice(&encoded);
         }
 
-        // Serialize subject revocation version floors + digests.
-        for ((issuer_id, subject_id, cap_byte), rev_ver) in &self.highest_subj_revocation_version {
-            let digest = self.subj_revocation_digests
-                .get(&(*issuer_id, *subject_id, *cap_byte, *rev_ver))
-                .copied()
-                .unwrap_or_default();
+        // Serialize complete subject revocation objects.
+        for ((issuer_id, subject_id, cap_byte), revocation) in &self.subject_revocations {
             let entry = CborValue::Map(vec![
-                (CborValue::TextString("type".into()), CborValue::TextString("subj_rev_v".into())),
-                (CborValue::TextString("data".into()), CborValue::Array(vec![
-                    CborValue::ByteString(issuer_id.to_vec()),
-                    CborValue::ByteString(subject_id.to_vec()),
-                    CborValue::UnsignedInt(u64::from(*cap_byte)),
-                    CborValue::UnsignedInt(*rev_ver),
-                    CborValue::ByteString(digest.to_vec()),
-                ])),
+                (CborValue::TextString("type".into()), CborValue::TextString("subj_rev".into())),
+                (CborValue::TextString("object".into()), revocation.to_cbor_value()),
             ]);
             let encoded = snp_cbor::encode(&entry)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let len = encoded.len() as u32;
-            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             data.extend_from_slice(&encoded);
         }
 
-        // Atomic write: write to temp file, then rename.
         let tmp_path = path.with_extension("tmp");
         fs::write(&tmp_path, &data).map_err(|e| StoreError::Io(e.to_string()))?;
         fs::rename(&tmp_path, path).map_err(|e| StoreError::Io(e.to_string()))?;
@@ -926,9 +967,35 @@ impl AuthorityStateStore {
         Ok(())
     }
 
-    // ─── Authority acceptance ──────────────────────────────────────────────
+    // ─── P0 #3: Transactional mutation helper ──────────────────────────────
 
-    /// P0 #1: Accept an IssuerAuthority. Verifies issuer_id == NodeId(issuer_public_key).
+    /// Apply a mutation transactionally: clone → mutate clone → persist → swap.
+    /// On persistence failure, memory is unchanged.
+    fn transactional_apply<F>(&mut self, f: F) -> Result<(), AuthorityStateError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), AuthorityStateError>,
+    {
+        // Clone the current state (shallow — HashMaps clone their entries).
+        let mut candidate = self.clone();
+
+        // Apply the mutation to the candidate.
+        f(&mut candidate)?;
+
+        // If persistent, commit the candidate first.
+        if candidate.path.is_some() {
+            candidate.commit()
+                .map_err(|e| AuthorityStateError::PersistenceError(e.to_string()))?;
+        }
+
+        // Swap: replace self with the committed candidate.
+        *self = candidate;
+        Ok(())
+    }
+
+    // ─── P0 #1 rev3: Authority acceptance with signature verification ─────
+
+    /// P0 #1 rev3: Accept an IssuerAuthority.
+    /// Verifies: issuer identity binding + governance signature BEFORE acceptance.
     pub fn try_accept_authority(
         &mut self,
         authority: &IssuerAuthority,
@@ -936,6 +1003,13 @@ impl AuthorityStateStore {
         // P0 #1: Verify issuer identity binding.
         if !authority.verify_issuer_identity_binding() {
             return Err(AuthorityStateError::IssuerIdentityBindingInvalid);
+        }
+
+        // P0 #1 rev3: Verify governance signature BEFORE acceptance.
+        let gov_pk = self.governance_public_key
+            .ok_or(AuthorityStateError::GovernanceKeyNotSet)?;
+        if !authority.verify_governance_signature(&gov_pk) {
+            return Err(AuthorityStateError::AuthorityNotGovernanceSigned);
         }
 
         let issuer = authority.issuer_id;
@@ -948,50 +1022,51 @@ impl AuthorityStateStore {
         let result = if version > known_version {
             AuthorityAcceptResult::Accepted
         } else if version == known_version {
-            let known_digest = self
-                .authority_digests
-                .get(&(issuer, version))
-                .copied();
+            let known_digest = self.authority_digests.get(&(issuer, version)).copied();
             match known_digest {
                 Some(kd) if kd == digest => AuthorityAcceptResult::Duplicate,
                 Some(kd) => {
                     return Err(AuthorityStateError::AuthorityEquivocation {
-                        issuer_id: issuer,
-                        version,
-                        known_digest: kd,
-                        new_digest: digest,
+                        issuer_id: issuer, version,
+                        known_digest: kd, new_digest: digest,
                     });
                 }
-                None => AuthorityAcceptResult::Accepted, // Should not happen, but accept.
+                None => AuthorityAcceptResult::Accepted,
             }
         } else {
-            AuthorityAcceptResult::Stale {
-                known_version,
-                attempted_version: version,
-            }
+            AuthorityAcceptResult::Stale { known_version, attempted_version: version }
         };
 
         if result == AuthorityAcceptResult::Accepted {
-            self.highest_authority_version.insert(issuer, version);
-            self.authority_digests.insert((issuer, version), digest);
-            self.authorities.insert((issuer, version), authority.clone());
-
-            // P0 #2: Persist after acceptance.
-            if self.path.is_some() {
-                self.commit()
-                    .map_err(|e| AuthorityStateError::PersistenceError(e.to_string()))?;
-            }
+            // P0 #3: Transactional — clone, mutate, persist, swap.
+            let authority_clone = authority.clone();
+            let issuer_clone = issuer;
+            let version_clone = version;
+            let digest_clone = digest;
+            self.transactional_apply(|candidate| {
+                candidate.highest_authority_version.insert(issuer_clone, version_clone);
+                candidate.authority_digests.insert((issuer_clone, version_clone), digest_clone);
+                candidate.authorities.insert((issuer_clone, version_clone), authority_clone);
+                Ok(())
+            })?;
         }
 
         Ok(result)
     }
 
-    // ─── Governance revocation acceptance (P0 #3: with digest equivocation) ─
+    // ─── P0 #1 rev3: Governance revocation with signature verification ─────
 
     pub fn try_accept_governance_revocation(
         &mut self,
         revocation: &GovernanceIssuerRevocation,
     ) -> Result<RevocationAcceptResult, AuthorityStateError> {
+        // P0 #1 rev3: Verify governance signature BEFORE acceptance.
+        let gov_pk = self.governance_public_key
+            .ok_or(AuthorityStateError::GovernanceKeyNotSet)?;
+        if !revocation.verify_governance_signature(&gov_pk) {
+            return Err(AuthorityStateError::RevocationSignatureInvalid);
+        }
+
         let issuer = revocation.issuer_id;
         let auth_ver = revocation.authority_version;
         let rev_ver = revocation.revocation_version;
@@ -1004,48 +1079,69 @@ impl AuthorityStateStore {
         let result = if rev_ver > known {
             RevocationAcceptResult::Accepted
         } else if rev_ver == known {
-            // P0 #3: Check digest for equivocation.
-            let known_digest = self.gov_revocation_digests
-                .get(&(issuer, auth_ver, rev_ver))
-                .copied();
+            let known_digest = self.gov_revocation_digests.get(&(issuer, auth_ver, rev_ver)).copied();
             match known_digest {
                 Some(kd) if kd == digest => RevocationAcceptResult::Duplicate,
                 Some(kd) => {
                     return Err(AuthorityStateError::RevocationEquivocation {
                         kind: "governance".into(),
-                        known_digest: kd,
-                        new_digest: digest,
+                        known_digest: kd, new_digest: digest,
                     });
                 }
-                None => RevocationAcceptResult::Accepted, // Should not happen.
+                None => RevocationAcceptResult::Accepted,
             }
         } else {
-            RevocationAcceptResult::Stale {
-                known_version: known,
-                attempted_version: rev_ver,
-            }
+            RevocationAcceptResult::Stale { known_version: known, attempted_version: rev_ver }
         };
 
         if result == RevocationAcceptResult::Accepted {
-            self.highest_gov_revocation_version.insert(key, rev_ver);
-            self.gov_revocation_digests.insert((issuer, auth_ver, rev_ver), digest);
-            self.governance_revocations.insert(key, revocation.clone());
-
-            if self.path.is_some() {
-                self.commit()
-                    .map_err(|e| AuthorityStateError::PersistenceError(e.to_string()))?;
-            }
+            let rev_clone = revocation.clone();
+            self.transactional_apply(|candidate| {
+                candidate.highest_gov_revocation_version.insert(key, rev_ver);
+                candidate.gov_revocation_digests.insert((issuer, auth_ver, rev_ver), digest);
+                candidate.governance_revocations.insert(key, rev_clone);
+                Ok(())
+            })?;
         }
 
         Ok(result)
     }
 
-    // ─── Subject revocation acceptance (P0 #3: with digest equivocation) ───
+    // ─── P0 #4 rev3: Subject revocation with authority resolution ─────────
 
+    /// P0 #4 rev3: Accept a SubjectCapabilityRevocation.
+    /// Resolves the issuer authority to obtain the issuer public key,
+    /// verifies issuer identity binding, and verifies the issuer signature
+    /// BEFORE acceptance.
     pub fn try_accept_subject_revocation(
         &mut self,
         revocation: &SubjectCapabilityRevocation,
     ) -> Result<RevocationAcceptResult, AuthorityStateError> {
+        // P0 #4: Resolve the issuer authority to get the issuer public key.
+        // We look for the highest known authority version for this issuer.
+        let highest_ver = self.highest_authority_version
+            .get(&revocation.issuer_id)
+            .copied()
+            .ok_or(AuthorityStateError::IssuerAuthorityNotFound {
+                issuer_id: revocation.issuer_id,
+            })?;
+
+        let authority = self.authorities
+            .get(&(revocation.issuer_id, highest_ver))
+            .ok_or(AuthorityStateError::IssuerAuthorityNotFound {
+                issuer_id: revocation.issuer_id,
+            })?;
+
+        // P0 #4: Verify issuer identity binding on the resolved authority.
+        if !authority.verify_issuer_identity_binding() {
+            return Err(AuthorityStateError::IssuerIdentityBindingInvalid);
+        }
+
+        // P0 #4: Verify the subject revocation signature using the authority-bound issuer key.
+        if !revocation.verify_issuer_signature(&authority.issuer_public_key) {
+            return Err(AuthorityStateError::RevocationSignatureInvalid);
+        }
+
         let key = (
             revocation.issuer_id,
             revocation.subject_id,
@@ -1060,7 +1156,6 @@ impl AuthorityStateStore {
         let result = if rev_ver > known {
             RevocationAcceptResult::Accepted
         } else if rev_ver == known {
-            // P0 #3: Check digest for equivocation.
             let known_digest = self.subj_revocation_digests
                 .get(&(key.0, key.1, key.2, rev_ver))
                 .copied();
@@ -1069,28 +1164,23 @@ impl AuthorityStateStore {
                 Some(kd) => {
                     return Err(AuthorityStateError::RevocationEquivocation {
                         kind: "subject".into(),
-                        known_digest: kd,
-                        new_digest: digest,
+                        known_digest: kd, new_digest: digest,
                     });
                 }
                 None => RevocationAcceptResult::Accepted,
             }
         } else {
-            RevocationAcceptResult::Stale {
-                known_version: known,
-                attempted_version: rev_ver,
-            }
+            RevocationAcceptResult::Stale { known_version: known, attempted_version: rev_ver }
         };
 
         if result == RevocationAcceptResult::Accepted {
-            self.highest_subj_revocation_version.insert(key, rev_ver);
-            self.subj_revocation_digests.insert((key.0, key.1, key.2, rev_ver), digest);
-            self.subject_revocations.insert(key, revocation.clone());
-
-            if self.path.is_some() {
-                self.commit()
-                    .map_err(|e| AuthorityStateError::PersistenceError(e.to_string()))?;
-            }
+            let rev_clone = revocation.clone();
+            self.transactional_apply(|candidate| {
+                candidate.highest_subj_revocation_version.insert(key, rev_ver);
+                candidate.subj_revocation_digests.insert((key.0, key.1, key.2, rev_ver), digest);
+                candidate.subject_revocations.insert(key, rev_clone);
+                Ok(())
+            })?;
         }
 
         Ok(result)
@@ -1098,38 +1188,31 @@ impl AuthorityStateStore {
 
     // ─── Lookups for verification ───────────────────────────────────────────
 
-    /// Get an IssuerAuthority by (issuer_id, version).
     pub fn get_authority(&self, issuer_id: &[u8; 32], version: u64) -> Option<&IssuerAuthority> {
         self.authorities.get(&(*issuer_id, version))
     }
 
-    /// P0 #4: Get a GovernanceIssuerRevocation by (issuer_id, authority_version).
-    /// Returns None if no revocation exists for that exact authority version.
     pub fn get_governance_revocation(
-        &self,
-        issuer_id: &[u8; 32],
-        authority_version: u64,
+        &self, issuer_id: &[u8; 32], authority_version: u64,
     ) -> Option<&GovernanceIssuerRevocation> {
         self.governance_revocations.get(&(*issuer_id, authority_version))
     }
 
-    /// Get a SubjectCapabilityRevocation by (issuer_id, subject_id, capability_byte).
     pub fn get_subject_revocation(
-        &self,
-        issuer_id: &[u8; 32],
-        subject_id: &[u8; 32],
+        &self, issuer_id: &[u8; 32], subject_id: &[u8; 32],
         capability: ProtocolCapability,
     ) -> Option<&SubjectCapabilityRevocation> {
-        self.subject_revocations
-            .get(&(*issuer_id, *subject_id, capability.to_byte()))
+        self.subject_revocations.get(&(*issuer_id, *subject_id, capability.to_byte()))
     }
 
-    /// Simulate a restart by reloading from the persistence file.
-    /// P0 #2: Real restart — loads from file, not in-memory copy.
     pub fn restart(&self) -> Result<Self, StoreError> {
         match &self.path {
-            None => Ok(Self::new()), // In-memory: simulates data loss.
-            Some(path) => Self::open(path),
+            None => Ok(Self::new()),
+            Some(path) => {
+                let mut store = Self::open(path)?;
+                store.governance_public_key = self.governance_public_key;
+                Ok(store)
+            }
         }
     }
 }
@@ -1140,20 +1223,130 @@ impl Default for AuthorityStateStore {
     }
 }
 
-// ─── Helper: extract bytes from CborValue ──────────────────────────────────
+// ─── CBOR decode helpers for persistence ───────────────────────────────────
 
-fn extract_bytes(v: &CborValue) -> Option<Vec<u8>> {
-    match v {
-        CborValue::ByteString(b) => Some(b.clone()),
-        _ => None,
+fn decode_auth_scope_from_cbor(v: &CborValue) -> Result<AuthScope, StoreError> {
+    let map = match v {
+        CborValue::Map(m) => m,
+        _ => return Err(StoreError::Format("AuthScope: expected map".into())),
+    };
+    let mut destinations = Vec::new();
+    let mut protocols = Vec::new();
+    let mut constraints = Vec::new();
+    for (k, val) in map {
+        let key = require_string(k, "scope key")?;
+        match key.as_str() {
+            "destinations" => {
+                if let CborValue::Array(arr) = val {
+                    for item in arr {
+                        destinations.push(require_string(item, "destination")?);
+                    }
+                }
+            }
+            "protocols" => {
+                if let CborValue::Array(arr) = val {
+                    for item in arr {
+                        protocols.push(require_string(item, "protocol")?);
+                    }
+                }
+            }
+            "constraints" => {
+                if let CborValue::Array(arr) = val {
+                    for item in arr {
+                        constraints.push(require_string(item, "constraint")?);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
+    Ok(AuthScope { destinations, protocols, constraints })
 }
 
-fn extract_u64(v: &CborValue) -> Option<u64> {
-    match v {
-        CborValue::UnsignedInt(n) => Some(*n),
-        _ => None,
+fn decode_authority_from_cbor(v: &CborValue) -> Result<IssuerAuthority, StoreError> {
+    let arr = match v {
+        CborValue::Array(a) => a,
+        _ => return Err(StoreError::Format("authority: expected array".into())),
+    };
+    if arr.len() != 10 {
+        return Err(StoreError::Format(format!("authority: expected 10 fields, got {}", arr.len())));
     }
+    let issuer_id = require_bytes(&arr[0], "issuer_id")?;
+    let issuer_public_key = require_bytes(&arr[1], "issuer_public_key")?;
+    let authority_version = require_u64(&arr[2], "authority_version")?;
+    let issued_at = require_u64(&arr[3], "issued_at")?;
+    let valid_from = require_u64(&arr[4], "valid_from")?;
+    let valid_until = require_u64(&arr[5], "valid_until")?;
+    let capabilities_authorized = match &arr[6] {
+        CborValue::Array(caps) => caps.iter()
+            .map(|c| {
+                let b = require_u64(c, "capability")? as u8;
+                ProtocolCapability::from_byte(b)
+                    .ok_or_else(|| StoreError::Format(format!("unknown capability byte: {b}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(StoreError::Format("capabilities: expected array".into())),
+    };
+    let maximum_scope = decode_auth_scope_from_cbor(&arr[7])?;
+    let status_byte = require_u64(&arr[8], "status")? as u8;
+    let status = match status_byte {
+        0 => IssuerStatus::Active,
+        1 => IssuerStatus::Revoked,
+        _ => return Err(StoreError::Format(format!("unknown status byte: {status_byte}"))),
+    };
+    let governance_signature = require_bytes(&arr[9], "governance_signature")?;
+    Ok(IssuerAuthority {
+        issuer_id,
+        issuer_public_key,
+        authority_version,
+        issued_at,
+        valid_from,
+        valid_until,
+        capabilities_authorized,
+        maximum_scope,
+        status,
+        governance_signature,
+    })
+}
+
+fn decode_gov_revocation_from_cbor(v: &CborValue) -> Result<GovernanceIssuerRevocation, StoreError> {
+    let arr = match v {
+        CborValue::Array(a) => a,
+        _ => return Err(StoreError::Format("gov_rev: expected array".into())),
+    };
+    if arr.len() != 6 {
+        return Err(StoreError::Format(format!("gov_rev: expected 6 fields, got {}", arr.len())));
+    }
+    Ok(GovernanceIssuerRevocation {
+        issuer_id: require_bytes(&arr[0], "issuer_id")?,
+        authority_version: require_u64(&arr[1], "authority_version")?,
+        revocation_version: require_u64(&arr[2], "revocation_version")?,
+        revocation_timestamp: require_u64(&arr[3], "revocation_timestamp")?,
+        nonce: require_bytes(&arr[4], "nonce")?,
+        governance_signature: require_bytes(&arr[5], "governance_signature")?,
+    })
+}
+
+fn decode_subj_revocation_from_cbor(v: &CborValue) -> Result<SubjectCapabilityRevocation, StoreError> {
+    let arr = match v {
+        CborValue::Array(a) => a,
+        _ => return Err(StoreError::Format("subj_rev: expected array".into())),
+    };
+    if arr.len() != 7 {
+        return Err(StoreError::Format(format!("subj_rev: expected 7 fields, got {}", arr.len())));
+    }
+    let cap_byte = require_u64(&arr[2], "capability")? as u8;
+    let capability = ProtocolCapability::from_byte(cap_byte)
+        .ok_or_else(|| StoreError::Format(format!("unknown capability byte: {cap_byte}")))?;
+    Ok(SubjectCapabilityRevocation {
+        issuer_id: require_bytes(&arr[0], "issuer_id")?,
+        subject_id: require_bytes(&arr[1], "subject_id")?,
+        capability,
+        revocation_version: require_u64(&arr[3], "revocation_version")?,
+        revocation_timestamp: require_u64(&arr[4], "revocation_timestamp")?,
+        nonce: require_bytes(&arr[5], "nonce")?,
+        issuer_signature: require_bytes(&arr[6], "issuer_signature")?,
+    })
 }
 
 // ─── Result types ──────────────────────────────────────────────────────────
@@ -1189,6 +1382,16 @@ pub enum AuthorityStateError {
     },
     #[error("issuer identity binding invalid: issuer_id != NodeId(issuer_public_key)")]
     IssuerIdentityBindingInvalid,
+    #[error("governance public key not set on store")]
+    GovernanceKeyNotSet,
+    #[error("authority not governance-signed")]
+    AuthorityNotGovernanceSigned,
+    #[error("revocation signature invalid")]
+    RevocationSignatureInvalid,
+    #[error("issuer authority not found for issuer {issuer_id:?}")]
+    IssuerAuthorityNotFound {
+        issuer_id: [u8; 32],
+    },
     #[error("serialization error: {0}")]
     SerializationError(String),
     #[error("persistence error: {0}")]
@@ -1208,14 +1411,17 @@ pub struct VerificationContext {
 
 impl VerificationContext {
     pub fn new(governance_public_key: PublicKey) -> Self {
+        let mut store = AuthorityStateStore::new();
+        store.set_governance_public_key(governance_public_key);
         Self {
             governance_public_key,
-            store: AuthorityStateStore::new(),
+            store,
         }
     }
 
     /// Create with a persistent store.
-    pub fn with_store(governance_public_key: PublicKey, store: AuthorityStateStore) -> Self {
+    pub fn with_store(governance_public_key: PublicKey, mut store: AuthorityStateStore) -> Self {
+        store.set_governance_public_key(governance_public_key);
         Self {
             governance_public_key,
             store,
