@@ -96,6 +96,7 @@
 pub mod bridge;
 pub mod dns;
 pub mod flow_table;
+pub mod network_intelligence;
 pub mod smol_device;
 pub mod tcp_engine;
 pub mod transport;
