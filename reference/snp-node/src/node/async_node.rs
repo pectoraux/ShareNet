@@ -2563,6 +2563,8 @@ pub async fn serve_gateway_mode_b(
     // This is the OUTER frame sequence (for AEAD nonce + AsyncLink replay
     // protection). It is SEPARATE from the inner StreamData.sequence (which
     // is the per-stream byte-order counter). Do NOT conflate them.
+    // Non-wrapping: if we ever reach u32::MAX, we terminate the stream
+    // rather than wrapping and risking nonce reuse.
     let mut next_gateway_frame_seq: u32 = first_frame.seq.wrapping_add(2);
 
     // 6. Persistent loop: read from circuit + read from TCP.
@@ -2571,6 +2573,24 @@ pub async fn serve_gateway_mode_b(
             circuit_result = link.recv_frame() => {
                 match circuit_result {
                     Ok(frame) => {
+                        // Validate outer frame metadata BEFORE circuit
+                        // decryption. The outer frame fields (cls, dst, fid)
+                        // are NOT protected by the circuit AEAD — they must
+                        // be checked explicitly. The src field is the
+                        // immediate authenticated relay peer, not necessarily
+                        // the original client, so we do not check src here.
+                        if frame.cls != b'B'
+                            || frame.dst != gateway_node_id
+                            || frame.fid != first_frame.fid
+                        {
+                            eprintln!(
+                                "[gateway-mode-b] outer frame validation failed \
+                                 (cls={}, dst={:?}, fid={:?}) — closing",
+                                frame.cls as char, frame.dst, frame.fid,
+                            );
+                            break;
+                        }
+
                         let plaintext = match snp_link::decrypt_circuit_payload(
                             &response_keys.recv_key, &frame.body,
                         ) {
@@ -2615,11 +2635,17 @@ pub async fn serve_gateway_mode_b(
                         // Use the monotonically increasing outer frame sequence
                         // to ensure unique AEAD nonces. Each (fid, seq) pair
                         // must be unique per direction/key.
+                        // Non-wrapping: terminate before u32::MAX to avoid
+                        // nonce reuse.
+                        if next_gateway_frame_seq == u32::MAX {
+                            eprintln!("[gateway-mode-b] frame seq exhausted — terminating");
+                            break;
+                        }
                         let frame = Frame {
                             v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
                             ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: next_gateway_frame_seq, body: sealed,
                         };
-                        next_gateway_frame_seq = next_gateway_frame_seq.wrapping_add(1);
+                        next_gateway_frame_seq += 1;
                         if let Err(_) = link.send_frame(&frame).await { break; }
                     }
                     Ok(None) => {
