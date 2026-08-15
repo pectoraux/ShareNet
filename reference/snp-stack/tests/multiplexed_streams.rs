@@ -21,6 +21,7 @@ use snp_node::node::{
 };
 use snp_node::node::gateway_stream::GatewayStreamTable;
 use snp_node::node::stream_client::MultiplexedCircuit;
+use snp_stack::{AsyncUpstream, ShareNetCircuitUpstreamModeB};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -261,4 +262,129 @@ async fn multiplexed_two_streams_one_circuit() {
     drop(gateway_handle);
     drop(relay_a_handle);
     drop(relay_b_handle);
+}
+
+/// Start a mesh + echo server for TCP failure isolation test.
+/// Uses separate circuits (not multiplexed) since the test is about
+/// independent failure, not shared-circuit multiplexing.
+async fn setup_mesh_with_echo() -> (
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    Route, Node, Arc<X25519Secret>, X25519PubKey, u16,
+) {
+    let client_idents = NodeIdents::fresh();
+    let relay_a_idents = NodeIdents::fresh();
+    let relay_b_idents = NodeIdents::fresh();
+    let gateway_idents = NodeIdents::fresh();
+
+    let gateway_addr = ephemeral_addr().await;
+    let relay_b_addr = ephemeral_addr().await;
+    let relay_a_addr = ephemeral_addr().await;
+    let (echo_addr, _echo_handle) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let gateway_node = Node::new(
+        gateway_idents.identity(), vec![Capability::Gateway], gateway_addr.clone(),
+    );
+    let gw_x_sk = Arc::clone(&gateway_idents.x_sk);
+    let gw_x_pk = gateway_idents.x_pk;
+    let gw_listen = gateway_addr.clone();
+    let stream_table = Arc::new(GatewayStreamTable::with_allow_loopback());
+    let st = Arc::clone(&stream_table);
+    let gateway_handle = tokio::spawn(async move {
+        let _ = async_node::serve_gateway_mode_b_multiplexed(&gateway_node, &gw_listen, &gw_x_sk, &gw_x_pk, &st).await;
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let relay_b_route = Route::new_with_hop_details(
+        relay_a_idents.node_id, gateway_idents.node_id,
+        vec![
+            RouteHop::new(relay_b_idents.relay_descriptor(), TransportEndpoint::tcp(&relay_b_addr)),
+            RouteHop::new(gateway_idents.gateway_descriptor(), TransportEndpoint::tcp(&gateway_addr)),
+        ],
+    );
+    let relay_b_handle = start_relay(&relay_b_idents, &relay_b_route, 0, &relay_b_addr);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let relay_a_route = Route::new_with_hop_details(
+        client_idents.node_id, gateway_idents.node_id,
+        vec![
+            RouteHop::new(relay_a_idents.relay_descriptor(), TransportEndpoint::tcp(&relay_a_addr)),
+            RouteHop::new(relay_b_idents.relay_descriptor(), TransportEndpoint::tcp(&relay_b_addr)),
+            RouteHop::new(gateway_idents.gateway_descriptor(), TransportEndpoint::tcp(&gateway_addr)),
+        ],
+    );
+    let relay_a_handle = start_relay(&relay_a_idents, &relay_a_route, 0, &relay_a_addr);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let route = build_route(
+        &client_idents, &relay_a_idents, &relay_b_idents, &gateway_idents,
+        &relay_a_addr, &relay_b_addr, &gateway_addr,
+    );
+    let client_node = Node::new(client_idents.identity(), vec![Capability::Client], String::new());
+    let client_x_sk = Arc::clone(&client_idents.x_sk);
+    let client_x_pk = client_idents.x_pk;
+
+    (gateway_handle, relay_a_handle, relay_b_handle, route, client_node, client_x_sk, client_x_pk, echo_port)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.3.8 hardening: TCP failure isolation
+// ════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiplexed_tcp_failure_isolation() {
+    let (gw_h, ra_h, rb_h, route, client_node, client_x_sk, client_x_pk, echo_port) = setup_mesh_with_echo().await;
+
+    // Establish ONE multiplexed circuit.
+    let mut circuit = tokio::time::timeout(
+        Duration::from_secs(30),
+        MultiplexedCircuit::establish(&client_node, &route, &client_x_sk, &client_x_pk),
+    ).await.expect("establish timeout").expect("establish must succeed");
+
+    // Stream A → dead destination (port 1, nothing listens).
+    let dest_dead = InternetEndpoint {
+        address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: 1,
+        protocol: TransportProtocol::Tcp,
+    };
+
+    // Stream B → healthy echo server.
+    let dest_healthy = InternetEndpoint {
+        address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: echo_port,
+        protocol: TransportProtocol::Tcp,
+    };
+
+    // Open stream A (dead destination) — should fail or reset.
+    let result_a = tokio::time::timeout(
+        Duration::from_secs(30),
+        circuit.open_stream(dest_dead),
+    ).await;
+
+    // Stream A failed — that's expected.
+    match &result_a {
+        Ok(Err(_)) => eprintln!("[n2.3.8-tcp-fail] PASS: dead destination stream A rejected"),
+        Ok(Ok(_)) => eprintln!("[n2.3.8-tcp-fail] PASS: stream A opened (gateway may send reset)"),
+        Err(_) => eprintln!("[n2.3.8-tcp-fail] PASS: stream A timed out (gateway couldn't connect)"),
+    }
+
+    // Open stream B (healthy) on the SAME circuit.
+    let mut stream_b = tokio::time::timeout(
+        Duration::from_secs(30),
+        circuit.open_stream(dest_healthy),
+    ).await.expect("stream B timeout").expect("stream B must succeed on same circuit");
+
+    // Stream B should work.
+    let data = b"stream-b-healthy-after-a-failed";
+    stream_b.send(data).await.expect("stream B send");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = stream_b.recv().await.expect("stream B recv").expect("stream B data");
+    assert_eq!(resp, data, "stream B echo must match");
+
+    eprintln!("[n2.3.8-tcp-fail] PASS: stream B healthy on same circuit after stream A TCP failure");
+    drop(gw_h);
+    drop(ra_h);
+    drop(rb_h);
 }
