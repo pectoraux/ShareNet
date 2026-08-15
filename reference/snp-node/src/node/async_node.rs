@@ -2507,6 +2507,25 @@ pub async fn serve_gateway_mode_b(
     // 1. Receive the first frame (StreamOpen).
     let first_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
+    // Validate the first frame's outer metadata BEFORE any cryptographic
+    // processing. The frame must be Class B addressed to this gateway.
+    // (fid is not checked here — it becomes the circuit identifier.)
+    if first_frame.cls != b'B' || first_frame.dst != gateway_node_id {
+        return Err(NodeError::Other(format!(
+            "first frame validation failed: cls={}, dst={:?} (expected cls=B, dst={:?})",
+            first_frame.cls as char, first_frame.dst, gateway_node_id,
+        )));
+    }
+
+    // Validate the first frame's sequence can safely accommodate the ACK
+    // and subsequent outbound frames without wrapping.
+    let ack_seq = first_frame.seq.checked_add(1).ok_or_else(|| {
+        NodeError::Other("first frame seq is u32::MAX — cannot allocate ACK seq".into())
+    })?;
+    let initial_gateway_seq = first_frame.seq.checked_add(2).ok_or_else(|| {
+        NodeError::Other("first frame seq is u32::MAX-1 — cannot allocate data seq".into())
+    })?;
+
     // 2. Derive circuit keys from eph_pub.
     let (client_eph_pub, plaintext) = snp_link::open_circuit_payload_with_fresh_eph(
         gateway_x25519_secret, &first_frame.body,
@@ -2546,7 +2565,7 @@ pub async fn serve_gateway_mode_b(
 
     let ack_frame = Frame {
         v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
-        ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: first_frame.seq + 1, body: ack_sealed,
+        ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: ack_seq, body: ack_sealed,
     };
     link.send_frame(&ack_frame).await.map_err(async_err_to_node)?;
 
@@ -2565,7 +2584,7 @@ pub async fn serve_gateway_mode_b(
     // is the per-stream byte-order counter). Do NOT conflate them.
     // Non-wrapping: if we ever reach u32::MAX, we terminate the stream
     // rather than wrapping and risking nonce reuse.
-    let mut next_gateway_frame_seq: u32 = first_frame.seq.wrapping_add(2);
+    let mut next_gateway_frame_seq: u32 = initial_gateway_seq;
 
     // 6. Persistent loop: read from circuit + read from TCP.
     loop {
