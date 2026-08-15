@@ -311,40 +311,71 @@ GatewayAdvert = {
 
 Gossip answers "does anyone have object X?" — a **content** question, appropriate for Class A. Routing must answer **"what is the current best path to an Internet gateway, and what do I do when it disappears?"** These are different problems and gossip cannot answer the second.
 
-### 6.2 Model: gateway-anchored, source-hinted, hop-by-hop
+### 6.2 Model: progressive next-hop discovery (IMPLEMENTED)
 
-Full link-state does not survive mobile churn; pure reactive flooding is too expensive on battery. ShareNet uses a hybrid tuned to the actual topology — **traffic is overwhelmingly directed at a small number of gateways**, which is a much easier problem than general any-to-any routing.
+> **⚠️ Architecture correction:** The original spec described a
+> gateway-anchored distance-vector routing model with `RouteAdvert`
+> propagation. That model has been **superseded** by progressive
+> next-hop discovery, which is what the Rust reference implements.
+>
+> Authenticated topology is **NOT** an executable global graph.
+> `ExecutableNetworkSnapshot` is locally observed authenticated
+> executable state. Multi-hop discovery is **progressive**: A asks B
+> for next-hop candidates, resolves C, authenticates B→C, continues
+> toward G.
 
-- **Proactive toward gateways.** Gateways originate `RouteAdvert`s that propagate outward with accumulating metrics, building a distance-vector gradient. Every node therefore knows a path to a gateway without asking.
-- **Reactive for peer-to-peer.** Node-to-node paths (rare; mostly Class A) use on-demand route request/reply.
-- **Source-hinted, hop-by-hop forwarding.** The client proposes a path; each relay MAY substitute a better next hop for the same destination. This gives source control *and* local repair.
+ShareNet uses **progressive next-hop route discovery** — each hop is
+independently authenticated through actual advertisement verification
+rather than being promoted from a topology claim:
 
 ```
-        [GW]                    RouteAdvert propagation
-       /    \                   metric accumulates per hop
-     R1      R2                 loop-free via path vector
-    /  \    /  \
-   C1   R3 ─ R4  C2
+Destination Discovery (RemoteNodeHint → CandidateDestination)
+        ↓
+Target Authentication (fetch + verify target advertisement)
+        ↓
+Next-Hop Discovery (ask authenticated neighbor for next-hop candidates)
+        ↓
+Per-hop Authentication (fetch + verify each candidate's advertisement)
+        ↓
+Path Assembly (ordered authenticated hops + link evidence)
+        ↓
+Path Validation (every hop authenticated + every edge backed by evidence)
+        ↓
+Service Agreement (signed terms — typed, NOT full capability negotiation yet)
+        ↓
+Route Proposal (source's belief — NOT participant consent)
+        ↓
+Route Acceptance (per-participant signed consent, typed role + capability)
+        ↓
+Committed Route (finalized — ALL required participants accepted,
+                 retains full hop evidence for circuit establishment)
 ```
 
-### 6.3 RouteAdvert
+**Key invariants (implemented and tested):**
 
-```cddl
-RouteAdvert = {
-  destination:  bstr .size 32,
-  destType:     "gateway" / "node",
-  seq:          uint,                ; per-destination, monotonic — anti-loop
-  pathVector:   [* bstr .size 32],   ; NodeIds traversed — loop detection
-  hopCount:     uint,
-  metric:       RouteMetric,
-  originSig:    bstr .size 64,       ; destination signs the immutable part
-  expiresAt:    uint
-}
-```
+- `RemoteNodeHint` ≠ `AuthenticatedNodeRecord` — remote claims are
+  discovery hints, not identity authority.
+- `direct_gateways()` (authenticated, directly reachable) ≠
+  `gateway_hints()` (remote claims) — no `all_known_gateways()` conflation.
+- `RouteProposal` ≠ `CommittedRoute` — commitment requires participant
+  acceptances.
+- Every hop in a `CommittedRoute` retains its `AuthenticatedHop` evidence
+  (verified node record + link evidence + endpoint + role).
+- `PropagationSequence` prevents replay/stale summary lists.
 
-**Loop freedom** via path vector: a node MUST discard an advert containing its own `NodeId`, and MUST discard adverts whose `seq` is lower than the best known for that destination.
+### 6.3 CommittedRoute (IMPLEMENTED)
 
-**Metric integrity:** `originSig` covers `{destination, destType, seq, expiresAt}` — the fields the origin owns. Per-hop metrics are *not* signed by the origin (they cannot be), so **the metric is untrusted input.** Metric manipulation is the primary routing attack; mitigation is reputation-weighting and end-to-end verification, not signatures on metrics. See the Threat Model.
+The implemented route representation is `CommittedRoute`, not the
+legacy `RouteAdvert`. A `CommittedRoute` contains:
+
+- The source's `RouteProposal` (signed by the source).
+- Per-participant `RouteAcceptance` records (signed by each relay/gateway).
+- The ordered `AuthenticatedHop` list with full evidence.
+- The `ServiceAgreement` (typed terms).
+
+Commitment logic verifies: proposal signature, proposal freshness,
+participant membership, role, capability/role consistency, duplicate
+acceptances, and complete acceptance set.
 
 ### 6.4 Route metric
 

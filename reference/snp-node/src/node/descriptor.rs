@@ -136,16 +136,18 @@ impl IdentityConsistentNodeDescriptor {
         &self.inner.capabilities
     }
 
-    /// Check if this descriptor has the Gateway capability.
+    /// Check if this descriptor has a gateway capability.
+    /// N2.5-T2: Now checks all gateway-capability variants.
     #[must_use]
     pub fn is_gateway(&self) -> bool {
-        self.inner.capabilities.contains(&Capability::Gateway)
+        self.inner.capabilities.iter().any(|c| c.is_gateway_capability())
     }
 
-    /// Check if this descriptor has the Relay capability.
+    /// Check if this descriptor has a relay capability.
+    /// N2.5-T2: Now checks all relay-capability variants.
     #[must_use]
     pub fn is_relay(&self) -> bool {
-        self.inner.capabilities.contains(&Capability::Relay)
+        self.inner.capabilities.iter().any(|c| c.is_relay_capability())
     }
 
     /// Compute the canonical CBOR encoding of this descriptor for

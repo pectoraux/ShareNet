@@ -1,21 +1,31 @@
 # ShareNet — Migration Plan, Repository Structure & Roadmap
 
+> **Status:** Live roadmap. The network stack described below is now
+> **implemented** in the Rust reference at `reference/snp-node/src/node/`.
+> This document is updated to reflect the current implementation state
+> at commit `f7bd6ec` (N2.4-I1 rev5).
+
 ---
 
 ## 1. Migration strategy
 
 **Do not rewrite. Do not refactor in place. Extract, verify, rebuild beneath.**
 
-The audit found a clean seam: the **content stack is sound and the network stack does not exist.** The Merkle/chunking/CAS/catalog work is genuinely good and represents most of the repository's real value. Everything the new thesis needs — routing, gateways, circuits, virtual interfaces — is new construction, not modification.
+The original audit found a clean seam: the **content stack was sound and
+the network stack did not exist.** That has now changed — the network
+stack (identity, discovery, topology, progressive route discovery,
+distributed circuits, per-hop encrypted traffic, capability authority)
+is **implemented and tested** in the Rust reference.
 
-So the migration is:
+The current migration state is:
 
 ```
+DONE      identity, discovery, topology, routing, circuits, traffic, capability authority
 KEEP      content addressing, chunking, CAS, catalog trust model, receipt concept
-FIX       crypto providers, CBOR ordering, Merkle construction, golden vectors
-BUILD     identity split, discovery, sync, routing, gateway, virtual network
+FIX       (ongoing) spec synchronization, capability model unification, gateway service model
+BUILD     real Internet gateway service (Mode A), multi-process network harness, Android adapter
 DEFER     iOS, decentralised settlement, transferable points, card hardware
-DELETE    the architecture review doc, dead code, mislabelled stubs
+DELETE    stale documentation claims, legacy-circuit-keys (after migration)
 ```
 
 ### 1.1 Phase 0 — Stop the bleeding (Week 1)

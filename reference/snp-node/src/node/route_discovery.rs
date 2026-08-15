@@ -1184,10 +1184,13 @@ pub fn commit_route(
 
     // 4. P0/P1 #3: capability binding.
     //    Check every hop's authenticated capability matches its role.
+    //    N2.5-T2: Uses is_gateway_capability()/is_relay_capability() to
+    //    cover all gateway/relay variants (Gateway/InternetGateway/CryptoGateway,
+    //    Relay/MeshRelay/CryptoRelay).
     for hop in validated_path.hops() {
         let caps = hop.record.descriptor.capabilities();
-        let has_gateway = caps.contains(&Capability::Gateway);
-        let has_relay = caps.contains(&Capability::Relay);
+        let has_gateway = caps.iter().any(|c| c.is_gateway_capability());
+        let has_relay = caps.iter().any(|c| c.is_relay_capability());
         match hop.role {
             RouteRole::Gateway => {
                 if !has_gateway {

@@ -8,44 +8,87 @@ This directory is the **Rust reference implementation** of ShareNet 2.0, per
 
 ## Authority
 
-This implementation is the **authoritative** reference for ShareNet 2.0. When
-complete, conformance vectors generated here are the golden vectors; every
-other implementation (TypeScript, Kotlin, Python) must match byte-for-byte.
+This implementation is the **authoritative** reference for ShareNet 2.0.
+Conformance vectors generated here are the golden vectors; every other
+implementation (Kotlin, Python, Swift) must match byte-for-byte.
 
-## Status: SKELETON
+## Status: PARTIAL — Network core implemented
 
-The crates in this workspace are **stubs**. The directory structure,
-`Cargo.toml` workspace, public API skeletons, and build configuration are in
-place; the actual protocol logic is not yet implemented. Each `lib.rs` declares
-its major public types and functions with `todo!()` bodies.
+The following crates contain **real protocol logic** (not stubs):
 
-The **TypeScript implementation in `/src/lib/snp/`** is the sandbox reference
-per ADR-0001 (`/public/docs/adr/0001-typescript-reference-language.md`). It
-remains authoritative for vector generation until this Rust workspace reaches
-parity. At that point Rust regenerates the vectors and the TypeScript
-implementation must match byte-for-byte.
+| Crate | Status | What's implemented |
+|---|---|---|
+| `snp-cbor` | ✅ Complete | Canonical CBOR per RFC 8949 §4.2.1 (sorted keys, shortest-form, no floats/tags, dup keys rejected) |
+| `snp-crypto` | ✅ Complete | Ed25519, X25519, SHA-256, HKDF-SHA256, ChaCha20-Poly1305 (ed25519-dalek / sha2 / hkdf / chacha20poly1305) |
+| `snp-node` | ✅ Substantial | The reference daemon — 20+ submodules: identity, capability, gateway, node_advert, descriptor, route, route_discovery, topology, peer_directory, topology_protocol, propagation_state, link, circuit, circuit_handshake, distributed_circuit, traffic, session, discovery, transport, async_node |
+| `snp-link` | ✅ Complete | L8 link abstraction with directional AEAD-encrypted frame transport (N1.9 fixes bidirectional nonce-reuse risk) |
+| `snp-gateway` | ✅ Substantial | Mode A TransitRequest/Response, SSRF defence (`is_private_destination`), N1.9 IP-pinning HTTPS fetcher (`PinnedConnector`) |
+| `snp-object` | ✅ Complete | Gear CDC chunking, RFC 6962 Merkle trees, CAS, manifests |
+| `snp-frames` | ✅ Complete | SNP/0.1 §7 Frame format — Class A/B/C |
+| `snp-conformance` | ✅ Complete | Independent conformance harness — loads JSON vectors, classifies INDEPENDENT/NEGATIVE/UNSUPPORTED/FAILED |
 
-The skeleton exists to prove the repository structure required by 07 §3 is in
-place; a future Rust implementation agent will fill in the `todo!()` bodies.
+The following crates remain **skeleton stubs** — their functionality is
+implemented inside `snp-node/src/node/` (the reference daemon holds the
+production code):
+
+| Crate | Status | Where functionality lives |
+|---|---|---|
+| `snp-identity` | 🔲 Skeleton | `snp-node/src/node/identity.rs` |
+| `snp-discovery` | 🔲 Skeleton | `snp-node/src/node/discovery.rs` |
+| `snp-sync` | 🔲 Skeleton | (future) |
+| `snp-routing` | 🔲 Skeleton | `snp-node/src/node/route_discovery.rs` + `route.rs` |
+| `snp-circuit` | 🔲 Skeleton | `snp-node/src/node/distributed_circuit.rs` + `circuit_handshake.rs` + `circuit.rs` |
+| `snp-civic` | 🔲 Skeleton | (future — contribution proofs deferred) |
+
+## Implemented architecture (at commit `f7bd6ec`)
+
+The network core is implemented and tested:
+
+```
+NodeIdentity (Ed25519 + NodeId = SHA-256("SNP/0.1 node\0" ‖ pk))
+    ↓
+NodeAdvertisement (signed, sequence, expiry, capabilities, endpoints)
+    ↓
+Discovery (link-local beacons, mDNS, authenticated descriptor exchange)
+    ↓
+Links (TCP + SNP-IK/0.1 handshake, directional AEAD LinkKeys)
+    ↓
+Topology (RemoteNodeHint ≠ AuthenticatedNodeRecord; direct_gateways() ≠ gateway_hints())
+    ↓
+Propagation (propagation_sequence, replay/stale rejection)
+    ↓
+Route Discovery (progressive next-hop: destination discovery → target auth →
+                 next-hop discovery → per-hop auth → path assembly → path
+                 validation → service agreement → route proposal →
+                 participant acceptance → committed route)
+    ↓
+Distributed Circuits (CircuitSetup → relay handshake → X25519 possession proof →
+                      forwarding state → ActiveCircuit)
+    ↓
+Traffic Forwarding (A → B → C → G, per-hop AEAD unwrap, circuit-owned sequence)
+    ↓
+Capability Authority (governance → issuer → authorization → capability →
+                      revocation; durable persistence; semantic validation;
+                      conformance vectors)
+```
 
 ## Crate layout
 
-The 12-crate layout mirrors the layer model in `01-ARCHITECTURE.md`:
-
-| Crate | Layer | Responsibility | TypeScript equivalent |
-|---|---|---|---|
-| `snp-cbor` | — | Canonical CBOR per RFC 8949 §4.2.1 | `cbor.ts` |
-| `snp-crypto` | L1 | Ed25519, X25519, SHA-256, HKDF, ChaCha20-Poly1305 | `crypto.ts` + `hashing.ts` |
-| `snp-object` | L2 | Chunking, Merkle (RFC 6962), CAS, Manifest | `chunking.ts` + `merkle.ts` + `manifest.ts` |
-| `snp-identity` | L1 | Four-way identity split, NodeId, DeviceCert, NodeDescriptor | `identity.ts` |
-| `snp-link` | L8 | Link abstraction, Noise_IK handshake structure | `link.ts` + `frames.ts` |
-| `snp-discovery` | L4 | Link-local beacons, descriptor store, HAVE vectors | `discovery.ts` |
-| `snp-sync` | L5 | Anti-entropy, store-carry-forward, Mode A bundle custody | `sync.ts` |
-| `snp-routing` | L6 | Gateway-anchored routing, path-vector, metrics, migration | `routing.ts` |
-| `snp-circuit` | L6/L7 | Circuit abstraction, E2E AEAD, replay windows | (new) |
-| `snp-gateway` | L7 | Internet gateway, egress policy, Mode A/B/C | `gateway.ts` |
-| `snp-civic` | L11 | Contribution proofs, value function (NOT settlement) | `civic.ts` + `receipts.ts` |
-| `snp-node` | — | The daemon binary that ties it all together | (new) |
+| Crate | Layer | Responsibility |
+|---|---|---|
+| `snp-cbor` | — | Canonical CBOR per RFC 8949 §4.2.1 |
+| `snp-crypto` | L1 | Ed25519, X25519, SHA-256, HKDF, ChaCha20-Poly1305 |
+| `snp-object` | L2 | Chunking, Merkle (RFC 6962), CAS, Manifest |
+| `snp-identity` | L1 | Four-way identity split, NodeId, DeviceCert, NodeDescriptor |
+| `snp-link` | L8 | Link abstraction, SNP-IK/0.1 handshake, directional AEAD |
+| `snp-discovery` | L4 | Link-local beacons, descriptor store, HAVE vectors |
+| `snp-sync` | L5 | Anti-entropy, store-carry-forward, Mode A bundle custody |
+| `snp-routing` | L6 | Progressive next-hop route discovery, path validation |
+| `snp-circuit` | L6/L7 | Circuit abstraction, E2E AEAD, replay windows |
+| `snp-gateway` | L7 | Internet gateway, egress policy, Mode A/B/C |
+| `snp-civic` | L11 | Contribution proofs, value function (NOT settlement) |
+| `snp-node` | — | The reference daemon binary that ties it all together |
+| `snp-conformance` | — | Independent conformance harness |
 
 ## Build
 
@@ -59,30 +102,32 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The test suite includes:
+- Unit tests per crate
+- Adversarial security tests (`n19_adversarial.rs`, `n19_security.rs`)
+- Topology tests (`n211_topology.rs`) — RemoteNodeHint vs AuthenticatedNodeRecord
+- Routing tests (`n212_routing.rs`) — progressive route discovery
+- Circuit tests (`n213_circuits.rs`, `n214_distributed_circuits.rs`)
+- Traffic forwarding tests (`n215_traffic_forwarding.rs`)
+- Capability authority tests (`n24_capability_authority.rs` — 54 tests)
+- Conformance vectors (`n24_conformance_vectors.rs` — 12 frozen vectors)
+
 ## Run conformance suite
 
 ```sh
 cargo run -p snp-node -- conformance
 ```
 
-Other daemon subcommands (also skeletons):
-
-```sh
-cargo run -p snp-node -- run        # start the node daemon
-cargo run -p snp-node -- keygen     # generate a new node identity
-cargo run -p snp-node -- discover   # scan for peers
-```
-
 ## Tooling
 
 - `cargo fmt` — formatting (config in `.rustfmt.toml`)
 - `cargo clippy` — lints (config in `clippy.toml`)
-- `cargo test --workspace` — unit tests
+- `cargo test --workspace` — unit tests + integration tests
 - `cargo run -p snp-node -- conformance` — conformance vectors
 
 ## Invariants enforced (per 06-CONFORMANCE-AND-AI-MODEL §B3)
 
-When complete, every crate MUST enforce the protocol invariants:
+Every crate MUST enforce the protocol invariants:
 
 - **I1** — All signed structures use SNP-CBOR with length-first key ordering
 - **I2** — Every signature is over `SIG_CONTEXT ‖ CBOR(payload)`

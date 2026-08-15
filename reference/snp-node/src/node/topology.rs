@@ -107,18 +107,34 @@ pub struct RemoteNodeHint {
 impl RemoteNodeHint {
     /// Check if this hint claims the target is a gateway.
     ///
+    /// N2.5-T2: Now checks for all gateway-capability strings (old "gateway"
+    /// and new "internet-gateway" / "crypto-gateway") using the typed
+    /// `Capability::from_str()` + `is_gateway_capability()` bridge.
+    ///
     /// **This is a CLAIM, not an authenticated fact.**
     #[must_use]
     pub fn claims_gateway(&self) -> bool {
-        self.claimed_capabilities.iter().any(|c| c == "gateway")
+        self.claimed_capabilities.iter().any(|c| {
+            crate::node::identity::Capability::from_str(c)
+                .map(|cap| cap.is_gateway_capability())
+                .unwrap_or(false)
+        })
     }
 
     /// Check if this hint claims the target is a relay.
     ///
+    /// N2.5-T2: Now checks for all relay-capability strings (old "relay"
+    /// and new "mesh-relay" / "crypto-relay") using the typed
+    /// `Capability::from_str()` + `is_relay_capability()` bridge.
+    ///
     /// **This is a CLAIM, not an authenticated fact.**
     #[must_use]
     pub fn claims_relay(&self) -> bool {
-        self.claimed_capabilities.iter().any(|c| c == "relay")
+        self.claimed_capabilities.iter().any(|c| {
+            crate::node::identity::Capability::from_str(c)
+                .map(|cap| cap.is_relay_capability())
+                .unwrap_or(false)
+        })
     }
 
     /// Get the target NodeId.

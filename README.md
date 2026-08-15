@@ -1,84 +1,80 @@
 # ShareNet — Offline-First Mesh Platform
 
-> **Status:** M0-M5 implemented, M6-M13 scaffolded with interfaces + fakes. Open in Android Studio to build.
+> **Status:** N2.4-I1 complete. Rust reference implementation is the
+> authoritative protocol implementation. Android/Kotlin is a future
+> platform consumer, not the protocol authority.
 
-ShareNet is an offline-first content distribution and value-transfer platform for Android (minSdk 26).
-Content propagates device-to-device over Nearby Connections (BLE + BT + Wi-Fi Direct), signed with Ed25519, content-addressed with Merkle trees. No internet required on the receiving device.
+ShareNet is a cross-platform, delay-tolerant distributed network for
+offline-first content distribution and value transfer. The protocol is
+defined by the frozen architecture in `public/spec/` and implemented in
+the Rust reference at `reference/`.
 
-Companion specs: `sharenetimplementationroadmap.md` (execution spec), offline telecom roadmap.
+## Reference implementation
+
+The **authoritative** implementation is Rust on Linux:
+
+```sh
+cd reference
+cargo build --workspace
+cargo test --workspace
+```
+
+See `reference/README.md` for the current implementation status (network
+core implemented: identity, discovery, topology, progressive route
+discovery, distributed circuits, per-hop encrypted traffic, capability
+authority with durable persistence).
 
 ## Monorepo layout
 
 ```
 ShareNet/
-├── android/
-│   ├── core-crypto/        Identity, signing, Keystore, CBOR
-│   ├── core-content/       Chunking, Merkle, blob store
-│   ├── core-catalog/       Manifests, revocation, publisher trust
-│   ├── core-transport/     Nearby Connections abstraction + fakes
-│   ├── core-attest/        Delivery receipts, points ledger
-│   ├── sharenet-sdk/       Public SDK for apps
-│   ├── app-demo/           Reference consumer (proves SDK)
-│   ├── app-assistant/      Offline AI assistant (MediaPipe + language pipeline)
-│   ├── app-wallet/         NFC value transfer terminal
-│   └── testing/            FakeTransport, FakeClock, fixtures
-├── card-applet/            JavaCard applet + jCardSim harness
-├── backend/                FastAPI + Postgres (catalog, attest, corpus, settlement)
-└── docs/
+├── reference/              Rust reference implementation (14 crates)
+├── public/
+│   ├── spec/              Frozen normative specification (10 files)
+│   ├── docs/adr/          Architecture Decision Records (25 ADRs)
+│   └── conformance/       Golden conformance vectors + coverage
+├── android/               Android platform consumers (future — NOT the protocol authority)
+├── backend/               Python backend (catalog, attest, corpus)
+├── docs/                  General documentation
+└── sharenetimplementationroadmap.md  (HISTORICAL — superseded by public/spec/)
 ```
 
-## Locked stack
+## Architecture authority hierarchy
 
-Kotlin + Jetpack Compose, Room + SQLCipher, Google Tink (Ed25519/AES-GCM), Nearby `P2P_CLUSTER`, MediaPipe LLM Inference, ONNX Runtime, FastAPI + PostgreSQL, JavaCard 3.x on NXP JCOP, jCardSim.
-
-## Quick start
-
-### Android (all apps)
-
-```bash
-export JAVA_HOME=/home/tetevi/Downloads/android-studio/jbr
-export ANDROID_HOME=~/Android/Sdk
-
-# Open in Android Studio
-# File → Open → ShareNet/android
-
-# Or command line (first sync downloads dependencies)
-cd android
-./gradlew assembleDebug
-./gradlew :app-demo:installDebug
-./gradlew :app-assistant:installDebug
-./gradlew :app-wallet:installDebug
-
-# Run unit tests
-./gradlew test
-./gradlew connectedAndroidTest   # needs device/emulator
-./gradlew lint detekt
+```
+Frozen specification (public/spec/)
+    ↓
+Golden conformance vectors (public/conformance/)
+    ↓
+Rust reference implementation (reference/)
+    ↓
+Platform implementations (Kotlin, Python, Swift — future)
 ```
 
-### Backend
+The frozen architecture is normative. The Rust reference is the executable
+authority. Platform implementations must match byte-for-byte.
 
-```bash
-cd backend
-uv sync          # or pip install -e .
-uv run uvicorn backend.main:app --reload
-pytest
+## Key architecture documents
+
+| Document | Location | Status |
+|----------|----------|--------|
+| Protocol specification | `public/spec/02-PROTOCOL-SPEC.md` | Live |
+| Architecture | `public/spec/01-ARCHITECTURE.md` | Live |
+| Migration & roadmap | `public/spec/07-MIGRATION-AND-ROADMAP.md` | Live |
+| Threat model | `public/spec/04-THREAT-MODEL.md` | Live |
+| Conformance model | `public/spec/06-CONFORMANCE-AND-AI-MODEL.md` | Live |
+| Circuit spec | `public/spec/08-circuits.md` | Live |
+| ADR index | `public/docs/adr/README.md` | Live |
+
+## Build the reference
+
+```sh
+cd reference
+cargo build --workspace
+cargo test --workspace
 ```
-
-### Card applet (no hardware)
-
-```bash
-cd card-applet
-./gradlew jCardSimTest
-```
-
-## M0 Golden vector
-
-Kotlin and Python produce byte-identical CBOR + Ed25519 signatures for 20 fixtures. See `android/core-crypto/src/test/resources/golden-vectors.json` and `backend/common/golden_vectors.py`.
-
-## Human-blocked
-
-See roadmap §7: Play Services audit, card procurement/HSM, payment licence, corpora partnerships, etc. — tracked as GitHub issues, not faked.
 
 ## License
 
-TBD — pending dataset governance agreement.
+Dual-licensed under MIT OR Apache-2.0 (matching the Rust ecosystem
+convention). See `reference/README.md`.

@@ -239,7 +239,8 @@ impl NodeAdvertisement {
         // REQUIRED for per-hop circuit key derivation. The old check that
         // rejected non-gateway nodes with X25519 keys is REMOVED.
         // Gateways MUST still have an X25519 key (enforced by route validation).
-        let has_gateway = self.capabilities.contains(&Capability::Gateway);
+        // N2.5-T2: Uses is_gateway_capability() to cover all gateway variants.
+        let has_gateway = self.capabilities.iter().any(|c| c.is_gateway_capability());
         let has_x25519 = self.x25519_circuit_public.is_some();
         if has_gateway && !has_x25519 {
             // Gateway MUST have X25519 key.
@@ -353,16 +354,20 @@ impl VerifiedNodeAdvertisement {
         self.advert.timestamp
     }
 
-    /// Check if this node has the Gateway capability.
+    /// Check if this node has a gateway capability.
+    /// N2.5-T2: Now checks all gateway-capability variants (Gateway,
+    /// InternetGateway, CryptoGateway) via `is_gateway_capability()`.
     #[must_use]
     pub fn is_gateway(&self) -> bool {
-        self.advert.capabilities.contains(&Capability::Gateway)
+        self.advert.capabilities.iter().any(|c| c.is_gateway_capability())
     }
 
-    /// Check if this node has the Relay capability.
+    /// Check if this node has a relay capability.
+    /// N2.5-T2: Now checks all relay-capability variants (Relay,
+    /// MeshRelay, CryptoRelay) via `is_relay_capability()`.
     #[must_use]
     pub fn is_relay(&self) -> bool {
-        self.advert.capabilities.contains(&Capability::Relay)
+        self.advert.capabilities.iter().any(|c| c.is_relay_capability())
     }
 
     /// Get the inner advertisement.

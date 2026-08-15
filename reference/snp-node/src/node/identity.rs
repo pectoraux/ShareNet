@@ -44,18 +44,58 @@ impl NodeIdentity {
     }
 }
 
-// ─── Capability ──────────────────────────────────────────────────────────────
+// ─── NodeCapability (extensible) ────────────────────────────────────────────
+//
+// N2.5-T2: The old Capability enum (Client/Relay/Gateway) is replaced by
+// the extensible NodeCapability set from the frozen architecture. A node
+// MAY advertise multiple capabilities simultaneously.
+//
+// This is SEPARATE from the N2.4 governance/authority ProtocolCapability
+// (in capability.rs), which answers "under what trusted authority/policy
+// is this capability authorized?" Use `to_protocol_capability()` to bridge
+// the node-level capability to the authority-level capability.
+//
+// Relationship:
+//   NodeAdvertisement → NodeCapabilities → optional Governance/Authorization
 
-/// A node's role in the network. A single node MAY hold multiple capabilities
-/// (e.g. a gateway might also relay), but in N2.0.1 each node has exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A node's network service capability. A node MAY hold multiple capabilities
+/// simultaneously (e.g. a node can be both a mesh relay and an Internet
+/// gateway).
+///
+/// N2.5-T2: This replaces the old Client/Relay/Gateway-only enum with the
+/// full extensible set from the frozen architecture. The old variants are
+/// retained as deprecated aliases for migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
-    /// Can send TransitRequests (a client node).
+    // ─── Deprecated aliases (N2.0.1 compatibility) ───
+    /// Deprecated: use `MeshRelay`. Can send TransitRequests (a client node).
     Client,
-    /// Can forward frames between peers (a relay node).
+    /// Deprecated: use `MeshRelay`. Can forward frames between peers.
     Relay,
-    /// Can terminate circuits and fetch from the Internet (a gateway node).
+    /// Deprecated: use `InternetGateway`. Can terminate circuits and fetch.
     Gateway,
+
+    // ─── Frozen architecture capabilities ───
+    /// Can relay mesh traffic (replaces old `Relay`).
+    MeshRelay,
+    /// Can provide Internet gateway transit (replaces old `Gateway`).
+    InternetGateway,
+    /// Can seed content chunks for mesh distribution.
+    ContentSeed,
+    /// Can provide storage for content chunks.
+    Storage,
+    /// Can participate in the discovery layer.
+    Discovery,
+    /// Can participate in anti-entropy sync.
+    Sync,
+    /// Can provide compute resources.
+    Compute,
+    /// Can relay using crypto-protected channels (enhanced relay).
+    CryptoRelay,
+    /// Can provide crypto-protected Internet gateway transit.
+    CryptoGateway,
+    /// Can relay payment-related traffic.
+    PaymentRelay,
 }
 
 impl Capability {
@@ -63,20 +103,92 @@ impl Capability {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            // Deprecated aliases
             Capability::Client => "client",
             Capability::Relay => "relay",
             Capability::Gateway => "gateway",
+            // Frozen architecture capabilities
+            Capability::MeshRelay => "mesh-relay",
+            Capability::InternetGateway => "internet-gateway",
+            Capability::ContentSeed => "content-seed",
+            Capability::Storage => "storage",
+            Capability::Discovery => "discovery",
+            Capability::Sync => "sync",
+            Capability::Compute => "compute",
+            Capability::CryptoRelay => "crypto-relay",
+            Capability::CryptoGateway => "crypto-gateway",
+            Capability::PaymentRelay => "payment-relay",
         }
     }
 
     /// Parse from string (for advertisement deserialisation).
+    /// Accepts both old-style ("client"/"relay"/"gateway") and new-style
+    /// ("mesh-relay"/"internet-gateway"/...) strings.
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            // Deprecated aliases
             "client" => Some(Capability::Client),
             "relay" => Some(Capability::Relay),
             "gateway" => Some(Capability::Gateway),
+            // Frozen architecture capabilities
+            "mesh-relay" => Some(Capability::MeshRelay),
+            "internet-gateway" => Some(Capability::InternetGateway),
+            "content-seed" => Some(Capability::ContentSeed),
+            "storage" => Some(Capability::Storage),
+            "discovery" => Some(Capability::Discovery),
+            "sync" => Some(Capability::Sync),
+            "compute" => Some(Capability::Compute),
+            "crypto-relay" => Some(Capability::CryptoRelay),
+            "crypto-gateway" => Some(Capability::CryptoGateway),
+            "payment-relay" => Some(Capability::PaymentRelay),
             _ => None,
+        }
+    }
+
+    /// N2.5-T2: Returns true if this capability implies gateway transit
+    /// (either old `Gateway` or new `InternetGateway`/`CryptoGateway`).
+    #[must_use]
+    pub fn is_gateway_capability(&self) -> bool {
+        matches!(
+            self,
+            Capability::Gateway | Capability::InternetGateway | Capability::CryptoGateway
+        )
+    }
+
+    /// N2.5-T2: Returns true if this capability implies relay forwarding
+    /// (either old `Relay` or new `MeshRelay`/`CryptoRelay`).
+    #[must_use]
+    pub fn is_relay_capability(&self) -> bool {
+        matches!(
+            self,
+            Capability::Relay | Capability::MeshRelay | Capability::CryptoRelay
+        )
+    }
+
+    /// N2.5-T2: Bridge to the N2.4 governance/authority ProtocolCapability.
+    /// Returns `None` for capabilities that don't have an authority-level
+    /// counterpart (e.g. `Client`, `PaymentRelay`).
+    #[must_use]
+    pub fn to_protocol_capability(&self) -> Option<crate::node::capability::ProtocolCapability> {
+        use crate::node::capability::ProtocolCapability;
+        match self {
+            Capability::MeshRelay | Capability::Relay => Some(ProtocolCapability::MeshRelay),
+            Capability::InternetGateway | Capability::Gateway => {
+                Some(ProtocolCapability::InternetGateway)
+            }
+            Capability::ContentSeed => Some(ProtocolCapability::ContentSeed),
+            Capability::Storage => Some(ProtocolCapability::Storage),
+            Capability::Discovery => Some(ProtocolCapability::Discovery),
+            Capability::Sync => Some(ProtocolCapability::Sync),
+            Capability::Compute => Some(ProtocolCapability::Compute),
+            // CryptoRelay/CryptoGateway map to the same authority capability
+            // as their non-crypto counterparts (the crypto variant is a
+            // transport enhancement, not a separate authority).
+            Capability::CryptoRelay => Some(ProtocolCapability::MeshRelay),
+            Capability::CryptoGateway => Some(ProtocolCapability::InternetGateway),
+            // Client and PaymentRelay don't have authority-level counterparts.
+            Capability::Client | Capability::PaymentRelay => None,
         }
     }
 }

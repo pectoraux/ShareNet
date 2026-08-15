@@ -1,9 +1,10 @@
-# ShareNet — Architecture Redesign Package
+# ShareNet — Architecture Specification Package
 
-**Prepared by:** Principal System Architect (Claude)
-**Audited commit:** `pectoraux/ShareNet` @ `c4266d5`
-**Date:** 2026-08-11
-**Status:** architecture phase — no implementation
+**Status:** Live specification. Implementation authority: `reference/snp-node/src/node/`.
+
+This package is the **frozen normative specification** for ShareNet 2.0.
+The Rust reference implementation at `reference/` is the executable authority;
+conformance vectors at `public/conformance/` are the golden vectors.
 
 ---
 
@@ -11,60 +12,70 @@
 
 | # | Document | Covers |
 |---|---|---|
-| 0 | `00-AUDIT.md` | **Part 1** — gap analysis of the real repository, with file references and two executed proofs |
-| 1 | `01-ARCHITECTURE.md` | **Parts 2, 3** — revised thesis, 12-layer model, traffic classes, Internet Modes A/B/C |
-| 2 | `02-PROTOCOL-SPEC.md` | **Parts 4, 5, 6, 7** — SNP/0.1 wire spec, node model, routing, circuits |
-| 3 | `03-PLATFORM-MATRIX.md` | **Part 13** — what each platform actually permits |
-| 4 | `04-THREAT-MODEL.md` | **Parts 7, 14** — 15 threats, privacy analysis, AI/human review boundary |
-| 5 | `05-CIVIC-CONTENT-CONSISTENCY.md` | **Parts 8, 9, 10** — Civic Points, content as capability, consistency classes |
-| 6 | `06-CONFORMANCE-AND-AI-MODEL.md` | **Parts 11, 12** — golden vectors, invariants, module ownership |
-| 7 | `07-MIGRATION-AND-ROADMAP.md` | **Part 15 (16–23)** — migration, module disposition, repo layout, roadmap, work division |
+| 0 | `00-AUDIT.md` | Historical gap analysis of the pre-redesign repository (commit `c4266d5`). Findings describe the OLD repo state; preserved as context for the architecture decisions. |
+| 1 | `01-ARCHITECTURE.md` | Revised thesis, 12-layer model, traffic classes, Internet Modes A/B/C |
+| 2 | `02-PROTOCOL-SPEC.md` | SNP/0.1 wire spec, node model, routing, circuits |
+| 3 | `03-PLATFORM-MATRIX.md` | What each platform actually permits |
+| 4 | `04-THREAT-MODEL.md` | 15 threats, privacy analysis, AI/human review boundary |
+| 5 | `05-CIVIC-CONTENT-CONSISTENCY.md` | Civic Points, content as capability, consistency classes |
+| 6 | `06-CONFORMANCE-AND-AI-MODEL.md` | Golden vectors, invariants, module ownership |
+| 7 | `07-MIGRATION-AND-ROADMAP.md` | Migration, module disposition, repo layout, roadmap |
+| 8 | `08-circuits.md` | Circuit establishment, traffic forwarding, packet format |
 
 ---
 
-## The five findings that drive everything
-
-1. **The production crypto provider does not work.** `TinkCryptoProvider` derives "Ed25519 public keys" as `sha256(handle.toString())`, its `ephemeralHandleFromPrivate` signs with an unrelated random key (its own comment admits this), and `createRawVerifyHandle` throws unconditionally — so **verification of any remote peer's key always returns `false`**. `KeystoreCryptoProvider`, the provider actually wired into the production factory, is self-documented as "a **stub** for M0" and delegates to it.
-
-2. **The golden vectors are placeholders and the README claim is false.** `cbor_hex` is `sha256("cbor-manifest-0")`; all 20 signatures are zero bytes; the referenced Kotlin test resource does not exist; the regeneration script does not exist. Verified by running the repo's own encoder: stored 32 bytes vs actual 241 bytes. **M0 — "blocks everything" — was never completed**, which is why findings 1 and 3 survived.
-
-3. **The two CBOR implementations produce different bytes.** Kotlin sorts map keys lexicographically; Python sorts by encoded key (RFC 8949, length-first). Executed on the real `Contribution` field set, the orderings are completely different. Cross-platform signatures cannot verify.
-
-4. **There is no mesh.** No routing, no gateway, no relay, no multi-hop, no tunnel anywhere in the repository. The claimed gossip protocol sends the literal ASCII string `"HAVE:"` and nothing ever reads `transport.incoming`. `Transport`'s peer identifier is documented as "issued by Nearby Connections" — a platform API defining protocol semantics.
-
-5. **Civic Points can be minted by claiming.** `pointsForBridging(bytes)` has **no proof object at all** — a node calls the function and mints points. Fraud controls are in-memory and reset on restart. This is the exact anti-pattern the brief forbids, already in the code.
-
----
-
-## The core architectural judgement
-
-The repository has a **clean seam**: the content stack (chunking, Merkle, CAS, catalog trust model) is genuinely good and worth preserving; the network stack does not exist and must be built. The redesign therefore **preserves the entire content layer and replaces the entire network layer** — an evolution, not a rewrite.
-
-The new thesis is delivered by inserting a real bearer beneath the preserved content services:
+## Architecture authority hierarchy
 
 ```
-apps → virtual network (L9) → gateway (L7) → routing (L6) → sync (L5)
-     → discovery (L4) → trust (L3) → object (L2) → identity (L1) → links (L8)
+Frozen specification (this package)
+    ↓
+Golden conformance vectors (public/conformance/)
+    ↓
+Rust reference implementation (reference/)
+    ↓
+Platform implementations (Kotlin, Python, Swift — future)
 ```
 
-with a **hard split between Class A content traffic** (mesh-understood, cached, content-addressed) **and Class B transit traffic** (opaque ciphertext, never cached, circuit-addressed).
+The frozen architecture is normative. The Rust reference is the executable
+authority. Platform implementations must match byte-for-byte.
 
 ---
 
-## Three things this package refuses to claim
+## Current implementation status (at commit `f7bd6ec`)
 
-1. **iOS cannot be an Internet gateway or a reliable relay.** `NEPacketTunnelProvider` sends *the device's own* traffic to a remote server; it is not a mechanism for egressing others' traffic, and background execution cannot sustain relaying. An all-iOS neighbourhood is a non-functional ShareNet. iOS is a consumer of the mesh.
+The network core is **implemented and tested** in the Rust reference:
 
-2. **Live TCP connections cannot survive gateway migration.** The origin-side socket lives on the gateway. When it dies, that connection dies. What survives: the virtual interface stays up, the client's virtual IP is stable, new connections succeed immediately via another gateway, and Mode A bundles complete regardless.
+- ✅ Node identity (Ed25519 + NodeId derivation)
+- ✅ Signed node advertisements with sequence + expiry
+- ✅ Link-layer transport (TCP + SNP-IK/0.1 handshake, directional AEAD)
+- ✅ Topology (RemoteNodeHint ≠ AuthenticatedNodeRecord; `direct_gateways()` ≠ `gateway_hints()`)
+- ✅ Propagation freshness (propagation_sequence, replay/stale rejection)
+- ✅ Progressive multi-hop route discovery (destination → target auth → next-hop → path validation → proposal → acceptance → committed route)
+- ✅ Distributed circuit establishment (CircuitSetup → relay handshake → X25519 proof → ActiveCircuit)
+- ✅ Per-hop encrypted traffic forwarding (A → B → C → G, circuit-owned sequence)
+- ✅ Capability authority subsystem (governance → issuer → authorization → revocation; durable persistence; semantic validation; 12 frozen conformance vectors)
 
-3. **ShareNet is not an anonymity network.** The first-hop relay knows who you are; the gateway knows where you are going. The design goal is that no single node knows both — achievable in a healthy topology, **false in a sparse one**, which the implementation must detect and disclose. And in Mode A with `GATEWAY_PLAINTEXT`, the gateway operator reads everything — which is why that field is mandatory and per-request.
+### What is NOT yet done
+
+- 🔴 Real Internet gateway service (Mode A end-to-end through real external Internet)
+- 🔴 Route recovery (link failure → new route)
+- 🔴 Live circuit key rotation
+- 🔴 Multi-process Linux network harness (separate node processes, not shared memory)
+- 🔴 Android VPN/TUN adapter
+- 🔴 Contribution proofs + Civic Points closed-loop settlement
+
+See `07-MIGRATION-AND-ROADMAP.md` for the closure roadmap.
 
 ---
 
-## What must happen first
+## Historical context
 
-**No implementation work begins until `spec/` and `conformance/` exist.**
+The "five findings" in `00-AUDIT.md` described the repository at commit
+`c4266d5` (pre-redesign). They are preserved as historical context for
+the architecture decisions, but the negative findings (broken crypto,
+fake golden vectors, no mesh) **no longer describe the current repository**.
+The Rust reference at `reference/` has real crypto, real conformance
+vectors, and a real network stack.
 
-The current repository is what happens when 100 Kotlin files are written against prose instead of executable vectors: plausible structure, KDoc on every class, threat matrices, milestone tables — and a crypto layer that cannot verify a signature. Comments repeatedly describe intended behaviour while the adjacent code does something else, and in several places the code **honestly documents its own incorrectness** in a comment that no test ever escalated into a failure.
-
-With three AI agents about to work in parallel, golden vectors are not a testing artefact. They are the only thing that will hold the protocol together.
+The core architectural judgement remains valid: the content stack is sound,
+the network stack needed to be built. That has now been done.

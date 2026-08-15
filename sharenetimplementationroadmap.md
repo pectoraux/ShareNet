@@ -1,5 +1,23 @@
 # ShareNet — Implementation Roadmap for Autonomous Agents
 
+> **⚠️ HISTORICAL / SUPERSEDED — DO NOT USE FOR IMPLEMENTATION**
+>
+> This document is **superseded** by the frozen architecture at
+> `public/spec/`. The technology decisions herein (Kotlin, Tink, Nearby
+> Connections) were repudiated by the architecture redesign — the
+> reference implementation is Rust on Linux at `reference/`.
+>
+> The M0–M13 milestone scheme was explicitly repudiated (see
+> `public/spec/07-MIGRATION-AND-ROADMAP.md` §4: "Milestones renamed
+> N0…N9 to break association with the old M0–M13, whose completion
+> claims cannot be trusted").
+>
+> This file is preserved as historical context only. For the current
+> roadmap, see `public/spec/07-MIGRATION-AND-ROADMAP.md`. For the
+> current implementation status, see `reference/README.md`.
+
+---
+
 **Audience:** AI coding agents (Gemini / Android Studio Agent) executing implementation, plus the human reviewing their output.
 **Companion to:** `sharenet-platform-strategy.md` (the *why*), `offline-telecom-roadmap.md` (mesh background).
 **Scope:** Full platform plus both first-party applications, built together.
