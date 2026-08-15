@@ -1,0 +1,274 @@
+{
+  "frozen_at_commit": "39dee10",
+  "generated_by": "snp-node gen_n25_vectors",
+  "protocol_version": "2.5",
+  "suites": {
+    "capability-authority": "IssuerAuthority, CapabilityAuthorization, GovernanceIssuerRevocation, SubjectCapabilityRevocation — CBOR + signatures + digests",
+    "capability-model": "NodeCapability string mappings (extensible set, old + new variants)"
+  },
+  "vectors": [
+    {
+      "description": "Frozen IssuerAuthority CBOR + governance signature + authority digest",
+      "expected": {
+        "digest_hex": "9a9d9631cfd6eb69d40a4486daec6f4a06950d11a6978b1073350d5ccdc88687",
+        "signature_hex": "6d08a2a43bbb69de8b6a0882827c724c450288856ca8d4e655ce527891420874e3c34ae37d723284922573f54f29d51342bcd6a3b1f9bbca66c707bdc242db0b",
+        "signer_public_key_hex": "80ff6f5b506652281ea28598bedcab4b7c6c1c3c4346a6a8c821ddbea6696e25",
+        "subject_node_id_hex": "0afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c",
+        "verifies": true
+      },
+      "id": "issuer-authority-v1",
+      "input": {
+        "cbor_hex": "8a58200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c582058c481d138a092af819dc5281f88662b6b73f8433dba2abf30b6c39bddb9b162011a6553f1001a6553f1001a655542808105a36970726f746f636f6c73806b636f6e73747261696e7473806c64657374696e6174696f6e73800058406d08a2a43bbb69de8b6a0882827c724c450288856ca8d4e655ce527891420874e3c34ae37d723284922573f54f29d51342bcd6a3b1f9bbca66c707bdc242db0b",
+        "preimage_hex": "534e502f302e31206973737565722d617574686f72697479008958200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c582058c481d138a092af819dc5281f88662b6b73f8433dba2abf30b6c39bddb9b162011a6553f1001a6553f1001a655542808105a36970726f746f636f6c73806b636f6e73747261696e7473806c64657374696e6174696f6e738000"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-authority"
+    },
+    {
+      "description": "Frozen CapabilityAuthorization signing preimage + issuer signature",
+      "expected": {
+        "digest_hex": "2a39f8c4c0ddde336d0696028382dbd66c9da96d35ebb36ec82bea69acf935a6",
+        "signature_hex": "44b3f034d2f547cf867bb1b4cc2da8696cd8e936bb8143321aee68a5c252455094a9119307cdd98358d81dbe52d010441f474459829e4562f2b1d5728bf3870c",
+        "signer_public_key_hex": "58c481d138a092af819dc5281f88662b6b73f8433dba2abf30b6c39bddb9b162",
+        "subject_node_id_hex": "0957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a50",
+        "verifies": true
+      },
+      "id": "capability-authorization-v1",
+      "input": {
+        "cbor_hex": "534e502f302e31206361706162696c6974792d617574686f72697a6174696f6e008958200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c0158209a9d9631cfd6eb69d40a4486daec6f4a06950d11a6978b1073350d5ccdc8868758200957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a5005a36970726f746f636f6c73806b636f6e73747261696e7473806c64657374696e6174696f6e73801a6553f1001a6553ff105000000000000000000000000000000000",
+        "preimage_hex": "534e502f302e31206361706162696c6974792d617574686f72697a6174696f6e008958200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c0158209a9d9631cfd6eb69d40a4486daec6f4a06950d11a6978b1073350d5ccdc8868758200957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a5005a36970726f746f636f6c73806b636f6e73747261696e7473806c64657374696e6174696f6e73801a6553f1001a6553ff105000000000000000000000000000000000"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-authority"
+    },
+    {
+      "description": "Frozen GovernanceIssuerRevocation CBOR + governance signature + revocation digest",
+      "expected": {
+        "digest_hex": "26be291f75dfae3a5e6671f6f41f9fb1da78351632e7caee3c7b0728b431ef8b",
+        "signature_hex": "74707a5768d41436d0bafcf4bbeb579156925d8d94b52ec564c145a71f64c3daadbe69f44028879eb069f48a54f95f9d152585356fef37a98ea3771abbcc910f",
+        "signer_public_key_hex": "80ff6f5b506652281ea28598bedcab4b7c6c1c3c4346a6a8c821ddbea6696e25",
+        "subject_node_id_hex": "0afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c",
+        "verifies": true
+      },
+      "id": "governance-issuer-revocation-v1",
+      "input": {
+        "cbor_hex": "8658200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c01011a6553f09c5000000000000000000000000000000000584074707a5768d41436d0bafcf4bbeb579156925d8d94b52ec564c145a71f64c3daadbe69f44028879eb069f48a54f95f9d152585356fef37a98ea3771abbcc910f",
+        "preimage_hex": "534e502f302e3120676f7665726e616e63652d7265766f636174696f6e008558200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c01011a6553f09c5000000000000000000000000000000000"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-authority"
+    },
+    {
+      "description": "Frozen SubjectCapabilityRevocation CBOR + issuer signature + revocation digest (authority-version bound)",
+      "expected": {
+        "digest_hex": "ba4796f7fb36972f3e944cc880a9b411ce0df885472dbb4a7f8b92473bc15218",
+        "signature_hex": "26a377dd018895752b56c209b5a9941857cb9a1228ae0e6cb2a5dc6530e658cacc1f4dadb435039dc663895a172664f328ce2dca9f961b43be846154b4f84b0b",
+        "signer_public_key_hex": "58c481d138a092af819dc5281f88662b6b73f8433dba2abf30b6c39bddb9b162",
+        "subject_node_id_hex": "0957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a50",
+        "verifies": true
+      },
+      "id": "subject-capability-revocation-v1",
+      "input": {
+        "cbor_hex": "8958200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c0158209a9d9631cfd6eb69d40a4486daec6f4a06950d11a6978b1073350d5ccdc8868758200957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a5005011a6553f1005000000000000000000000000000000000584026a377dd018895752b56c209b5a9941857cb9a1228ae0e6cb2a5dc6530e658cacc1f4dadb435039dc663895a172664f328ce2dca9f961b43be846154b4f84b0b",
+        "preimage_hex": "534e502f302e31207375626a6563742d7265766f636174696f6e008858200afff195187bd698ceafd33bbc34cc1a36cd3beb7d2b1d68f28ff90faa8a880c0158209a9d9631cfd6eb69d40a4486daec6f4a06950d11a6978b1073350d5ccdc8868758200957f231db191129ab1d262c1b33f367305e5ba11c814c8b5a689324f0d13a5005011a6553f1005000000000000000000000000000000000"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-authority"
+    },
+    {
+      "description": "Capability::Client serializes to \"client\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": null,
+        "string": "client"
+      },
+      "id": "capability-string-client",
+      "input": {
+        "capability_variant": "Client"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Relay serializes to \"relay\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": true,
+        "protocol_capability_byte": 0,
+        "string": "relay"
+      },
+      "id": "capability-string-relay",
+      "input": {
+        "capability_variant": "Relay"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Gateway serializes to \"gateway\"",
+      "expected": {
+        "is_gateway_capability": true,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 5,
+        "string": "gateway"
+      },
+      "id": "capability-string-gateway",
+      "input": {
+        "capability_variant": "Gateway"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::MeshRelay serializes to \"mesh-relay\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": true,
+        "protocol_capability_byte": 0,
+        "string": "mesh-relay"
+      },
+      "id": "capability-string-mesh-relay",
+      "input": {
+        "capability_variant": "MeshRelay"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::InternetGateway serializes to \"internet-gateway\"",
+      "expected": {
+        "is_gateway_capability": true,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 5,
+        "string": "internet-gateway"
+      },
+      "id": "capability-string-internet-gateway",
+      "input": {
+        "capability_variant": "InternetGateway"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::ContentSeed serializes to \"content-seed\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 3,
+        "string": "content-seed"
+      },
+      "id": "capability-string-content-seed",
+      "input": {
+        "capability_variant": "ContentSeed"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Storage serializes to \"storage\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 4,
+        "string": "storage"
+      },
+      "id": "capability-string-storage",
+      "input": {
+        "capability_variant": "Storage"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Discovery serializes to \"discovery\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 1,
+        "string": "discovery"
+      },
+      "id": "capability-string-discovery",
+      "input": {
+        "capability_variant": "Discovery"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Sync serializes to \"sync\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 2,
+        "string": "sync"
+      },
+      "id": "capability-string-sync",
+      "input": {
+        "capability_variant": "Sync"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Compute serializes to \"compute\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 6,
+        "string": "compute"
+      },
+      "id": "capability-string-compute",
+      "input": {
+        "capability_variant": "Compute"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::CryptoRelay serializes to \"crypto-relay\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": true,
+        "protocol_capability_byte": 0,
+        "string": "crypto-relay"
+      },
+      "id": "capability-string-crypto-relay",
+      "input": {
+        "capability_variant": "CryptoRelay"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::CryptoGateway serializes to \"crypto-gateway\"",
+      "expected": {
+        "is_gateway_capability": true,
+        "is_relay_capability": false,
+        "protocol_capability_byte": 5,
+        "string": "crypto-gateway"
+      },
+      "id": "capability-string-crypto-gateway",
+      "input": {
+        "capability_variant": "CryptoGateway"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::PaymentRelay serializes to \"payment-relay\"",
+      "expected": {
+        "is_gateway_capability": false,
+        "is_relay_capability": false,
+        "protocol_capability_byte": null,
+        "string": "payment-relay"
+      },
+      "id": "capability-string-payment-relay",
+      "input": {
+        "capability_variant": "PaymentRelay"
+      },
+      "protocol_version": "2.5",
+      "suite": "capability-model"
+    }
+  ]
+}

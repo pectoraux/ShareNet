@@ -58,6 +58,7 @@ getrandom = "0.2"
 # on snp-node — they only get test-utils if they explicitly request it.
 snp-node = { path = ".", features = ["test-utils"] }
 serde_json.workspace = true
+hex.workspace = true
 url.workspace = true
 
 # N2.0.7.3: The legacy-circuit-keys feature is NOT enabled by default for
