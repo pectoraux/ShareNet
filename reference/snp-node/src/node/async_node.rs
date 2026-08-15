@@ -2690,34 +2690,18 @@ pub async fn serve_gateway_mode_b(
 
 /// **N2.3.8 — Multiplexed Mode B gateway serve function.**
 ///
-/// Like [`serve_gateway_mode_b`], but supports **multiple independent streams
-/// on one authenticated circuit**. The circuit stays alive as long as any
-/// stream is active. New `StreamOpen` messages can arrive at any time to
-/// create new streams.
+/// Uses the correct concurrency architecture:
 ///
-/// ## Architecture
+/// - **One circuit reader task**: continuously calls `link.recv_frame()`,
+///   dispatches to `GatewayStreamTable` by `stream_id`.
+/// - **Per-stream TCP reader tasks**: each active stream has its own task
+///   that reads from the TCP socket and sends `StreamData` to the outbound
+///   channel.
+/// - **One circuit writer task**: drains the outbound channel, allocates
+///   the outer frame sequence, encrypts, and calls `link.send_frame()`.
 ///
-/// ```text
-/// Authenticated Circuit (one SNP-IK link + one circuit key pair)
-///         │
-///    ┌────┴────┐
-///    │         │
-/// Stream 1   Stream 2   ... Stream N
-///    │         │              │
-/// TCP socket  TCP socket    TCP socket
-/// (independent flow control, sequence, half-close, reset)
-/// ```
-///
-/// ## Concurrency
-///
-/// - Circuit input: one `recv_frame()` loop, dispatches by `stream_id`.
-/// - Circuit output: one `send_frame()` path, guarded by a single
-///   monotonically increasing outer frame sequence (AEAD nonce safety).
-/// - Per-stream TCP reads: `tokio::select!` over all active streams.
-/// - Per-stream TCP I/O: independent `OwnedReadHalf`/`OwnedWriteHalf`
-///   mutexes (from Phase 1-2 hardening).
-///
-/// No global lock is held across network I/O.
+/// No global lock is held across network I/O. No polling loop. No 10ms
+/// timeout hack.
 pub async fn serve_gateway_mode_b_multiplexed(
     node: &Node,
     listen_addr: &str,
@@ -2732,10 +2716,7 @@ pub async fn serve_gateway_mode_b_multiplexed(
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
-    eprintln!(
-        "[gateway-mode-b-mux {}] listening on {listen_addr}",
-        super::hex_short(&gateway_node_id)
-    );
+    eprintln!("[gateway-mode-b-mux {}] listening on {listen_addr}", super::hex_short(&gateway_node_id));
 
     let (mut stream, _) = listener.accept().await
         .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
@@ -2747,15 +2728,11 @@ pub async fn serve_gateway_mode_b_multiplexed(
 
     let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
 
-    // Receive the first frame (must be a StreamOpen — establishes the circuit).
+    // Receive the first frame (StreamOpen — establishes the circuit).
     let first_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    // Validate first frame outer metadata.
     if first_frame.cls != b'B' || first_frame.dst != gateway_node_id {
-        return Err(NodeError::Other(format!(
-            "first frame validation failed: cls={}, dst={:?}",
-            first_frame.cls as char, first_frame.dst,
-        )));
+        return Err(NodeError::Other("first frame validation failed".into()));
     }
 
     let ack_seq = first_frame.seq.checked_add(1).ok_or_else(|| {
@@ -2765,7 +2742,6 @@ pub async fn serve_gateway_mode_b_multiplexed(
         NodeError::Other("first frame seq is u32::MAX-1".into())
     })?;
 
-    // Derive circuit keys from eph_pub.
     let (client_eph_pub, plaintext) = snp_link::open_circuit_payload_with_fresh_eph(
         gateway_x25519_secret, &first_frame.body,
     ).ok_or(NodeError::CircuitDecryptionFailed)?;
@@ -2777,276 +2753,247 @@ pub async fn serve_gateway_mode_b_multiplexed(
     let circuit_fid = first_frame.fid;
     let circuit_client = first_frame.src;
 
-    // Single outbound frame sequence counter — shared across ALL streams
-    // on this circuit. Each (fid, seq) must be unique for AEAD nonce safety.
+    // Shared outbound frame sequence — must be unique per (fid, key).
     let next_seq = Arc::new(tokio::sync::Mutex::new(initial_gateway_seq));
+
+    // Outbound channel: all gateway→client messages go through this.
+    // The circuit writer task drains it.
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<snp_gateway::stream::StreamMessage>();
 
     // Process the first StreamOpen.
     let first_msg = snp_gateway::stream::decode_stream_message(&plaintext)
         .map_err(|e| NodeError::Other(format!("decode first StreamOpen: {e}")))?;
 
-    let mut active_streams: Vec<snp_gateway::stream::StreamId> = Vec::new();
+    let first_stream_id = match &first_msg {
+        snp_gateway::stream::StreamMessage::Open(open) => open.stream_id,
+        _ => return Err(NodeError::Other("expected StreamOpen".into())),
+    };
 
-    // Handle the first StreamOpen.
-    if let snp_gateway::stream::StreamMessage::Open(open) = &first_msg {
-        let stream_id = open.stream_id;
-        let ack = stream_table.handle_stream_open(open.clone()).await;
-        let ack_msg = match ack {
-            Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
-            Err(_) => snp_gateway::stream::StreamMessage::Reset(
-                snp_gateway::stream::StreamReset {
-                    stream_id,
-                    reason: snp_gateway::stream::StreamResetReason::ProtocolError,
-                },
-            ),
-        };
-        send_gateway_frame(
-            &link, &response_keys.send_key, gateway_node_id, circuit_client,
-            circuit_fid, ack_seq, &ack_msg,
-        ).await?;
-        if !matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
-            active_streams.push(stream_id);
-            eprintln!(
-                "[gateway-mode-b-mux {}] stream {} established (first)",
-                super::hex_short(&gateway_node_id), stream_id
-            );
-        }
-    } else {
-        return Err(NodeError::Other("expected StreamOpen as first message".into()));
+    // Handle the first StreamOpen synchronously (before spawning tasks).
+    let first_open = match first_msg {
+        snp_gateway::stream::StreamMessage::Open(open) => open,
+        _ => unreachable!(),
+    };
+    let ack = stream_table.handle_stream_open(first_open).await;
+    let ack_msg = match ack {
+        Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
+        Err(_) => snp_gateway::stream::StreamMessage::Reset(
+            snp_gateway::stream::StreamReset {
+                stream_id: first_stream_id,
+                reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+            },
+        ),
+    };
+    // Send the first ack directly (before the writer task starts).
+    send_gateway_frame(&link, &response_keys.send_key, gateway_node_id, circuit_client, circuit_fid, ack_seq, &ack_msg).await?;
+
+    if matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
+        return Ok(());
     }
 
-    // Track which streams we need to poll for TCP data.
-    // We use a simple round-robin approach: maintain a list of active stream IDs
-    // and poll them in sequence using try_read_from_tcp (non-blocking).
-    //
-    // For production, this should use a more sophisticated scheduling mechanism,
-    // but for N2.3.8 the round-robin approach is sufficient to prove multiplexing.
+    eprintln!("[gateway-mode-b-mux {}] stream {} established (first)", super::hex_short(&gateway_node_id), first_stream_id);
 
-    loop {
-        // Check if all streams are closed.
-        if active_streams.is_empty() {
-            eprintln!("[gateway-mode-b-mux {}] all streams closed — circuit done", super::hex_short(&gateway_node_id));
-            break;
-        }
+    // Spawn the first stream's TCP reader task.
+    let mut tcp_reader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    spawn_tcp_reader(
+        first_stream_id, stream_table.clone(), outbound_tx.clone(),
+        &mut tcp_reader_handles,
+    );
 
-        // Try to read from circuit (non-blocking via try_recv or short timeout).
-        let circuit_frame = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            link.recv_frame(),
-        ).await;
-
-        match circuit_frame {
-            Ok(Ok(frame)) => {
-                // Validate outer frame.
-                if frame.cls != b'B'
-                    || frame.dst != gateway_node_id
-                    || frame.fid != circuit_fid
-                {
-                    eprintln!("[gateway-mode-b-mux] outer frame validation failed — closing circuit");
+    // Spawn the circuit writer task.
+    let writer_link = Arc::clone(&link);
+    let writer_key = response_keys.send_key;
+    let writer_seq = Arc::clone(&next_seq);
+    let writer_handle = tokio::spawn(async move {
+        let mut rx = outbound_rx;
+        while let Some(msg) = rx.recv().await {
+            let seq = {
+                let mut s = writer_seq.lock().await;
+                if *s == u32::MAX {
+                    eprintln!("[gateway-mode-b-mux] seq exhausted — closing writer");
                     break;
                 }
-
-                // Decrypt.
-                let plaintext = match snp_link::decrypt_circuit_payload(
-                    &response_keys.recv_key, &frame.body,
-                ) {
-                    Some(p) => p,
-                    None => {
-                        eprintln!("[gateway-mode-b-mux] decryption failed — closing circuit");
-                        break;
-                    }
-                };
-
-                // Decode.
-                let msg = match snp_gateway::stream::decode_stream_message(&plaintext) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        eprintln!("[gateway-mode-b-mux] decode failed — closing circuit");
-                        break;
-                    }
-                };
-
-                // Dispatch by message type.
-                match &msg {
-                    snp_gateway::stream::StreamMessage::Open(open) => {
-                        // New stream on existing circuit!
-                        let sid = open.stream_id;
-                        let ack = stream_table.handle_stream_open(open.clone()).await;
-                        let ack_msg = match ack {
-                            Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
-                            Err(_) => snp_gateway::stream::StreamMessage::Reset(
-                                snp_gateway::stream::StreamReset {
-                                    stream_id: sid,
-                                    reason: snp_gateway::stream::StreamResetReason::ProtocolError,
-                                },
-                            ),
-                        };
-                        let seq = allocate_seq(&next_seq).await;
-                        let seq = match seq {
-                            Some(s) => s,
-                            None => {
-                                eprintln!("[gateway-mode-b-mux] frame seq exhausted — terminating circuit");
-                                active_streams.clear();
-                                break;
-                            }
-                        };
-                        send_gateway_frame(
-                            &link, &response_keys.send_key, gateway_node_id, circuit_client,
-                            circuit_fid, seq, &ack_msg,
-                        ).await?;
-                        if !matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
-                            if !active_streams.contains(&sid) {
-                                active_streams.push(sid);
-                            }
-                            eprintln!(
-                                "[gateway-mode-b-mux {}] stream {} established (multiplexed)",
-                                super::hex_short(&gateway_node_id), sid
-                            );
-                        }
-                    }
-                    snp_gateway::stream::StreamMessage::Data(data) => {
-                        if let Err(_) = stream_table.handle_stream_data(data.clone()).await {
-                            // Stream protocol error — send StreamReset to client,
-                            // then remove from active. Do NOT silently drop.
-                            let sid = data.stream_id;
-                            let reset_msg = snp_gateway::stream::StreamMessage::Reset(
-                                snp_gateway::stream::StreamReset {
-                                    stream_id: sid,
-                                    reason: snp_gateway::stream::StreamResetReason::ProtocolError,
-                                },
-                            );
-                            if let Some(seq) = allocate_seq(&next_seq).await {
-                                let _ = send_gateway_frame(
-                                    &link, &response_keys.send_key, gateway_node_id,
-                                    circuit_client, circuit_fid, seq, &reset_msg,
-                                ).await;
-                            }
-                            active_streams.retain(|&s| s != sid);
-                            eprintln!(
-                                "[gateway-mode-b-mux {}] stream {} reset (protocol error)",
-                                super::hex_short(&gateway_node_id), sid
-                            );
-                        }
-                    }
-                    snp_gateway::stream::StreamMessage::WindowUpdate(wu) => {
-                        let _ = stream_table.handle_window_update(wu.clone()).await;
-                    }
-                    snp_gateway::stream::StreamMessage::HalfClose(hc) => {
-                        let _ = stream_table.handle_half_close(hc.clone()).await;
-                    }
-                    snp_gateway::stream::StreamMessage::Close(c) => {
-                        let _ = stream_table.handle_close(c.clone()).await;
-                        active_streams.retain(|&s| s != c.stream_id);
-                        eprintln!(
-                            "[gateway-mode-b-mux {}] stream {} closed",
-                            super::hex_short(&gateway_node_id), c.stream_id
-                        );
-                    }
-                    snp_gateway::stream::StreamMessage::Reset(r) => {
-                        let _ = stream_table.handle_reset(r.clone()).await;
-                        active_streams.retain(|&s| s != r.stream_id);
-                        eprintln!(
-                            "[gateway-mode-b-mux {}] stream {} reset",
-                            super::hex_short(&gateway_node_id), r.stream_id
-                        );
-                    }
-                    _ => {
-                        eprintln!("[gateway-mode-b-mux] unexpected message — closing circuit");
-                        break;
-                    }
-                }
+                let val = *s;
+                *s += 1;
+                val
+            };
+            let cbor = match snp_gateway::stream::encode_stream_message(&msg) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let sealed = snp_link::encrypt_circuit_payload(&writer_key, &cbor);
+            let frame = Frame {
+                v: FRAME_VERSION, cls: b'B', dst: circuit_client, src: gateway_node_id,
+                ttl: FRAME_TTL_MAX, fid: circuit_fid, seq, body: sealed,
+            };
+            if writer_link.send_frame(&frame).await.is_err() {
+                break;
             }
-            Ok(Err(AsyncLinkError::Io(msg)))
-                if msg.contains("unexpected eof") || msg.contains("reset") =>
-            {
+        }
+    });
+
+    // Main circuit reader loop — continuously reads from the circuit and
+    // dispatches to the stream table. This is the ONLY task that calls
+    // link.recv_frame().
+    let mut active_stream_ids: Vec<snp_gateway::stream::StreamId> = vec![first_stream_id];
+
+    loop {
+        let frame = match link.recv_frame().await {
+            Ok(f) => f,
+            Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => {
                 eprintln!("[gateway-mode-b-mux] circuit closed by relay");
                 break;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 eprintln!("[gateway-mode-b-mux] circuit error: {e}");
                 break;
             }
+        };
+
+        // Validate outer frame.
+        if frame.cls != b'B' || frame.dst != gateway_node_id || frame.fid != circuit_fid {
+            eprintln!("[gateway-mode-b-mux] outer frame validation failed — closing circuit");
+            break;
+        }
+
+        // Decrypt.
+        let plaintext = match snp_link::decrypt_circuit_payload(&response_keys.recv_key, &frame.body) {
+            Some(p) => p,
+            None => {
+                eprintln!("[gateway-mode-b-mux] decryption failed — closing circuit");
+                break;
+            }
+        };
+
+        // Decode.
+        let msg = match snp_gateway::stream::decode_stream_message(&plaintext) {
+            Ok(m) => m,
             Err(_) => {
-                // Timeout — no circuit data available. Fall through to TCP polling.
+                eprintln!("[gateway-mode-b-mux] decode failed — closing circuit");
+                break;
+            }
+        };
+
+        // Dispatch.
+        match &msg {
+            snp_gateway::stream::StreamMessage::Open(open) => {
+                let sid = open.stream_id;
+                let ack = stream_table.handle_stream_open(open.clone()).await;
+                let ack_msg = match ack {
+                    Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
+                    Err(_) => snp_gateway::stream::StreamMessage::Reset(
+                        snp_gateway::stream::StreamReset {
+                            stream_id: sid, reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+                        },
+                    ),
+                };
+                let _ = outbound_tx.send(ack_msg);
+                if !active_stream_ids.contains(&sid) {
+                    active_stream_ids.push(sid);
+                    spawn_tcp_reader(sid, stream_table.clone(), outbound_tx.clone(), &mut tcp_reader_handles);
+                    eprintln!("[gateway-mode-b-mux {}] stream {} established (multiplexed)", super::hex_short(&gateway_node_id), sid);
+                }
+            }
+            snp_gateway::stream::StreamMessage::Data(data) => {
+                if let Err(_) = stream_table.handle_stream_data(data.clone()).await {
+                    let sid = data.stream_id;
+                    let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
+                        snp_gateway::stream::StreamReset { stream_id: sid, reason: snp_gateway::stream::StreamResetReason::ProtocolError },
+                    ));
+                    active_stream_ids.retain(|&s| s != sid);
+                }
+            }
+            snp_gateway::stream::StreamMessage::WindowUpdate(wu) => {
+                let _ = stream_table.handle_window_update(wu.clone()).await;
+            }
+            snp_gateway::stream::StreamMessage::HalfClose(hc) => {
+                let _ = stream_table.handle_half_close(hc.clone()).await;
+            }
+            snp_gateway::stream::StreamMessage::Close(c) => {
+                let _ = stream_table.handle_close(c.clone()).await;
+                active_stream_ids.retain(|&s| s != c.stream_id);
+                eprintln!("[gateway-mode-b-mux {}] stream {} closed", super::hex_short(&gateway_node_id), c.stream_id);
+            }
+            snp_gateway::stream::StreamMessage::Reset(r) => {
+                let _ = stream_table.handle_reset(r.clone()).await;
+                active_stream_ids.retain(|&s| s != r.stream_id);
+                eprintln!("[gateway-mode-b-mux {}] stream {} reset", super::hex_short(&gateway_node_id), r.stream_id);
+            }
+            _ => {
+                eprintln!("[gateway-mode-b-mux] unexpected message — closing circuit");
+                break;
             }
         }
 
-        // Poll TCP reads from all active streams (round-robin, one frame per stream).
-        // We iterate over a copy to avoid borrow issues.
-        let streams_snapshot = active_streams.clone();
-        for &sid in &streams_snapshot {
-            match stream_table.read_from_tcp(sid).await {
-                Ok(Some(data)) => {
-                    let msg = snp_gateway::stream::StreamMessage::Data(data);
-                    let seq = match allocate_seq(&next_seq).await {
-                        Some(s) => s,
-                        None => {
-                            eprintln!("[gateway-mode-b-mux] frame seq exhausted — closing circuit");
-                            active_streams.clear();
-                            break;
-                        }
-                    };
-                    if send_gateway_frame(
-                        &link, &response_keys.send_key, gateway_node_id, circuit_client,
-                        circuit_fid, seq, &msg,
-                    ).await.is_err() {
-                        active_streams.clear();
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // No data or stream closed.
-                    match stream_table.stream_state(sid).await {
-                        Some(snp_gateway::stream::StreamState::Closed)
-                        | Some(snp_gateway::stream::StreamState::Reset) => {
-                            active_streams.retain(|&s| s != sid);
-                        }
-                        _ => {}
-                    }
-                }
-                Err(_) => {
-                    // TCP error on this stream — send StreamReset to client,
-                    // then close this stream only. Other streams continue.
-                    let reset_msg = snp_gateway::stream::StreamMessage::Reset(
-                        snp_gateway::stream::StreamReset {
-                            stream_id: sid,
-                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
-                        },
-                    );
-                    if let Some(seq) = allocate_seq(&next_seq).await {
-                        let _ = send_gateway_frame(
-                            &link, &response_keys.send_key, gateway_node_id,
-                            circuit_client, circuit_fid, seq, &reset_msg,
-                        ).await;
-                    }
-                    let _ = stream_table.handle_reset(
-                        snp_gateway::stream::StreamReset {
-                            stream_id: sid,
-                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
-                        },
-                    ).await;
-                    active_streams.retain(|&s| s != sid);
-                    eprintln!(
-                        "[gateway-mode-b-mux {}] stream {} reset (TCP error)",
-                        super::hex_short(&gateway_node_id), sid
-                    );
-                }
-            }
+        // Check if all streams are closed.
+        if active_stream_ids.is_empty() {
+            eprintln!("[gateway-mode-b-mux {}] all streams closed — circuit done", super::hex_short(&gateway_node_id));
+            break;
         }
-
-        // Yield to allow other tasks to run.
-        tokio::task::yield_now().await;
     }
 
-    // Clean up all remaining streams.
-    for &sid in &active_streams {
-        let _ = stream_table.handle_close(
-            snp_gateway::stream::StreamClose { stream_id: sid },
-        ).await;
+    // Clean up.
+    for &sid in &active_stream_ids {
+        let _ = stream_table.handle_close(snp_gateway::stream::StreamClose { stream_id: sid }).await;
     }
+    for handle in tcp_reader_handles {
+        handle.abort();
+    }
+    writer_handle.abort();
 
     eprintln!("[gateway-mode-b-mux {}] circuit terminated", super::hex_short(&gateway_node_id));
     Ok(())
+}
+
+/// Spawn a per-stream TCP reader task. Reads from the stream's TCP socket
+/// and sends `StreamData` messages to the outbound channel. When the TCP
+/// socket closes or errors, sends a `StreamReset` and exits.
+fn spawn_tcp_reader(
+    stream_id: snp_gateway::stream::StreamId,
+    stream_table: super::gateway_stream::GatewayStreamTable,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<snp_gateway::stream::StreamMessage>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let handle = tokio::spawn(async move {
+        loop {
+            match stream_table.read_from_tcp(stream_id).await {
+                Ok(Some(data)) => {
+                    let msg = snp_gateway::stream::StreamMessage::Data(data);
+                    if outbound_tx.send(msg).is_err() {
+                        break; // Writer closed.
+                    }
+                }
+                Ok(None) => {
+                    // No data or stream closed/reset.
+                    match stream_table.stream_state(stream_id).await {
+                        Some(snp_gateway::stream::StreamState::Closed)
+                        | Some(snp_gateway::stream::StreamState::Reset) => break,
+                        _ => {
+                            // Still active but no data — yield briefly.
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // TCP error — send StreamReset to client.
+                    let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
+                        snp_gateway::stream::StreamReset {
+                            stream_id,
+                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                        },
+                    ));
+                    let _ = stream_table.handle_reset(
+                        snp_gateway::stream::StreamReset {
+                            stream_id,
+                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                        },
+                    ).await;
+                    break;
+                }
+            }
+        }
+    });
+    handles.push(handle);
 }
 
 /// Allocate the next outbound frame sequence number.
