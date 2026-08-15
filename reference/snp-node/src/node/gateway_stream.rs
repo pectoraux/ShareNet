@@ -121,12 +121,20 @@ impl Default for GatewayStreamTable {
 }
 
 impl GatewayStreamTable {
-    /// Create an empty stream table.
+    /// Create an empty stream table with the default quota
+    /// (`MAX_STREAMS_PER_GATEWAY` = 256).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_quota(MAX_STREAMS_PER_GATEWAY)
+    }
+
+    /// Create an empty stream table with a custom quota. Used by tests to
+    /// verify quota enforcement without creating 256 streams.
+    #[must_use]
+    pub fn with_quota(max_streams: usize) -> Self {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
-            quota: Arc::new(Semaphore::new(MAX_STREAMS_PER_GATEWAY)),
+            quota: Arc::new(Semaphore::new(max_streams)),
         }
     }
 
@@ -143,9 +151,11 @@ impl GatewayStreamTable {
         &self,
         open: StreamOpen,
     ) -> Result<StreamOpenAck, GatewayError> {
-        // 1. Atomically acquire a quota slot. This is held for the lifetime
-        //    of the stream — no race between check and insert.
-        let permit = match self.quota.clone().acquire_owned().await {
+        // 1. Atomically acquire a quota slot. Use try_acquire (non-blocking)
+        //    so that a full quota is rejected immediately rather than
+        //    blocking forever. The permit is held for the lifetime of the
+        //    stream — no race between check and insert.
+        let permit = match self.quota.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 return Ok(StreamOpenAck {
@@ -623,7 +633,7 @@ impl GatewayStreamTable {
         client_credit: u64,
         gateway_credit: u64,
     ) {
-        let permit = self.quota.clone().acquire_owned().await.unwrap();
+        let permit = self.quota.clone().try_acquire_owned().unwrap();
         let now = Instant::now();
         let entry = Arc::new(StreamEntry {
             stream_id,
@@ -826,9 +836,11 @@ mod tests {
 
     #[tokio::test]
     async fn stream_quota_enforced() {
-        let table = GatewayStreamTable::new();
+        // Use a small quota (4) for test speed — the production constant is
+        // MAX_STREAMS_PER_GATEWAY (256), but the enforcement logic is the same.
+        let table = GatewayStreamTable::with_quota(4);
         // Fill the quota with mock streams.
-        for i in 0..MAX_STREAMS_PER_GATEWAY {
+        for i in 0..4 {
             table.insert_mock_stream(i as StreamId, 65536, 65536).await;
         }
 
@@ -898,13 +910,13 @@ mod tests {
 
     #[tokio::test]
     async fn quota_is_atomic_no_check_then_insert_race() {
-        // Test: >256 concurrent opens never exceed the quota.
-        // We use mock inserts (which acquire permits) to verify the semaphore
-        // enforces the limit atomically.
-        let table = GatewayStreamTable::new();
+        // Test: concurrent opens never exceed the quota.
+        // Use a small quota (4) for test speed — the semaphore enforces the
+        // limit atomically regardless of the quota size.
+        let table = GatewayStreamTable::with_quota(4);
 
-        // Acquire all 256 permits via mock streams.
-        for i in 0..MAX_STREAMS_PER_GATEWAY {
+        // Acquire all 4 permits via mock streams.
+        for i in 0..4 {
             table.insert_mock_stream(i as StreamId, 65536, 65536).await;
         }
 
@@ -912,10 +924,10 @@ mod tests {
         assert_eq!(
             table.available_quota(),
             0,
-            "all permits must be acquired after 256 streams"
+            "all permits must be acquired after 4 streams"
         );
 
-        // A 257th stream must be rejected.
+        // A 5th stream must be rejected.
         let open = StreamOpen {
             stream_id: 999,
             destination: InternetEndpoint {
@@ -927,7 +939,7 @@ mod tests {
             version: 0,
         };
         let ack = table.handle_stream_open(open).await.unwrap();
-        assert!(!ack.connected, "257th stream must be rejected");
+        assert!(!ack.connected, "5th stream must be rejected");
 
         // Remove a stream (frees the permit).
         table.handle_close(StreamClose { stream_id: 0 }).await.unwrap();
