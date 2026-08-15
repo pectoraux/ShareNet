@@ -2556,6 +2556,15 @@ pub async fn serve_gateway_mode_b(
 
     eprintln!("[gateway-mode-b {}] stream {} established — persistent loop", super::hex_short(&gateway_node_id), stream_id);
 
+    // Gateway outbound frame sequence — MUST be unique per (fid, key) to
+    // avoid AEAD nonce reuse. The StreamOpenAck used seq = first_frame.seq + 1,
+    // so the next outbound frame starts at first_frame.seq + 2.
+    //
+    // This is the OUTER frame sequence (for AEAD nonce + AsyncLink replay
+    // protection). It is SEPARATE from the inner StreamData.sequence (which
+    // is the per-stream byte-order counter). Do NOT conflate them.
+    let mut next_gateway_frame_seq: u32 = first_frame.seq.wrapping_add(2);
+
     // 6. Persistent loop: read from circuit + read from TCP.
     loop {
         tokio::select! {
@@ -2603,10 +2612,14 @@ pub async fn serve_gateway_mode_b(
                         let msg = snp_gateway::stream::StreamMessage::Data(data);
                         let cbor = match snp_gateway::stream::encode_stream_message(&msg) { Ok(c) => c, Err(_) => break };
                         let sealed = snp_link::encrypt_circuit_payload(&response_keys.send_key, &cbor);
+                        // Use the monotonically increasing outer frame sequence
+                        // to ensure unique AEAD nonces. Each (fid, seq) pair
+                        // must be unique per direction/key.
                         let frame = Frame {
                             v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
-                            ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: 0, body: sealed,
+                            ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: next_gateway_frame_seq, body: sealed,
                         };
+                        next_gateway_frame_seq = next_gateway_frame_seq.wrapping_add(1);
                         if let Err(_) = link.send_frame(&frame).await { break; }
                     }
                     Ok(None) => {
