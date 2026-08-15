@@ -123,6 +123,7 @@ pub mod route_discovery;
 pub mod circuit_handshake;
 pub mod distributed_circuit;
 pub mod traffic;
+pub mod capability;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
