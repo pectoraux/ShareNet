@@ -2458,3 +2458,170 @@ pub async fn serve_relay_via_route(
     )
     .await
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.2.5 Phase 5 — Mode B gateway serve function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.2.5 Phase 5 — Mode B gateway serve function.**
+///
+/// This is the gateway-side entry point for Mode B (raw TCP stream). It:
+///
+/// 1. Accepts a relay connection + performs SNP-IK handshake (same as Mode A).
+/// 2. Receives the first frame → extracts eph_pub → derives circuit keys.
+/// 3. Decrypts the payload → decodes as `StreamMessage::Open`.
+/// 4. Dispatches to `GatewayStreamTable::handle_stream_open()`.
+/// 5. Enters a persistent loop using `tokio::select!`:
+///    - Reads `StreamData` / `StreamWindowUpdate` / etc. from the circuit.
+///    - Reads from the TCP socket → sends `StreamData` back to the client.
+/// 6. Runs until the stream is closed/reset.
+///
+/// Unlike Mode A (one request, one response, circuit closes), Mode B keeps
+/// the circuit alive for the lifetime of the stream.
+pub async fn serve_gateway_mode_b(
+    node: &Node,
+    listen_addr: &str,
+    gateway_x25519_secret: &snp_crypto::X25519Secret,
+    gateway_x25519_public: &snp_crypto::X25519PubKey,
+    stream_table: &super::gateway_stream::GatewayStreamTable,
+) -> NodeResult<()> {
+    let gateway_node_id = node.identity.node_id;
+    let gateway_ed_sk = node.identity.secret_key;
+    let gateway_ed_pk = node.identity.public_key;
+
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
+    eprintln!("[gateway-mode-b {}] listening on {listen_addr}", super::hex_short(&gateway_node_id));
+
+    let (mut stream, _) = listener.accept().await
+        .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
+
+    let handshake = perform_snp_ik_handshake_async(
+        &mut stream, false, &gateway_ed_sk, &gateway_ed_pk,
+        gateway_x25519_secret, gateway_x25519_public, None,
+    ).await.map_err(async_err_to_node)?;
+
+    let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+
+    // 1. Receive the first frame (StreamOpen).
+    let first_frame = link.recv_frame().await.map_err(async_err_to_node)?;
+
+    // 2. Derive circuit keys from eph_pub.
+    let (client_eph_pub, plaintext) = snp_link::open_circuit_payload_with_fresh_eph(
+        gateway_x25519_secret, &first_frame.body,
+    ).ok_or(NodeError::CircuitDecryptionFailed)?;
+
+    let response_keys = snp_link::derive_gateway_response_keys(
+        gateway_x25519_secret, &client_eph_pub,
+    );
+
+    // 3. Decode the StreamOpen.
+    let stream_msg = snp_gateway::stream::decode_stream_message(&plaintext)
+        .map_err(|e| NodeError::Other(format!("decode StreamOpen: {e}")))?;
+
+    let stream_id = match &stream_msg {
+        snp_gateway::stream::StreamMessage::Open(open) => open.stream_id,
+        other => return Err(NodeError::Other(format!("expected StreamOpen, got {other:?}"))),
+    };
+
+    // 4. Dispatch to GatewayStreamTable.
+    let ack = if let snp_gateway::stream::StreamMessage::Open(open) = stream_msg {
+        stream_table.handle_stream_open(open).await
+    } else { unreachable!() };
+
+    let ack_msg = match ack {
+        Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
+        Err(e) => snp_gateway::stream::StreamMessage::Reset(
+            snp_gateway::stream::StreamReset {
+                stream_id, reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+            },
+        ),
+    };
+
+    // 5. Send the StreamOpenAck back through the circuit.
+    let ack_cbor = snp_gateway::stream::encode_stream_message(&ack_msg)
+        .map_err(|e| NodeError::Other(format!("encode ack: {e}")))?;
+    let ack_sealed = snp_link::encrypt_circuit_payload(&response_keys.send_key, &ack_cbor);
+
+    let ack_frame = Frame {
+        v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
+        ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: first_frame.seq + 1, body: ack_sealed,
+    };
+    link.send_frame(&ack_frame).await.map_err(async_err_to_node)?;
+
+    if matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
+        return Ok(());
+    }
+
+    eprintln!("[gateway-mode-b {}] stream {} established — persistent loop", super::hex_short(&gateway_node_id), stream_id);
+
+    // 6. Persistent loop: read from circuit + read from TCP.
+    loop {
+        tokio::select! {
+            circuit_result = link.recv_frame() => {
+                match circuit_result {
+                    Ok(frame) => {
+                        let plaintext = match snp_link::decrypt_circuit_payload(
+                            &response_keys.send_key, &frame.body,
+                        ) {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        let msg = match snp_gateway::stream::decode_stream_message(&plaintext) {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+                        match &msg {
+                            snp_gateway::stream::StreamMessage::Data(data) => {
+                                if let Err(_) = stream_table.handle_stream_data(data.clone()).await { break; }
+                            }
+                            snp_gateway::stream::StreamMessage::WindowUpdate(wu) => {
+                                let _ = stream_table.handle_window_update(wu.clone()).await;
+                            }
+                            snp_gateway::stream::StreamMessage::HalfClose(hc) => {
+                                let _ = stream_table.handle_half_close(hc.clone()).await;
+                            }
+                            snp_gateway::stream::StreamMessage::Close(c) => {
+                                let _ = stream_table.handle_close(c.clone()).await;
+                                break;
+                            }
+                            snp_gateway::stream::StreamMessage::Reset(r) => {
+                                let _ = stream_table.handle_reset(r.clone()).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => break,
+                    Err(_) => break,
+                }
+            }
+            tcp_result = stream_table.read_from_tcp(stream_id) => {
+                match tcp_result {
+                    Ok(Some(data)) => {
+                        let msg = snp_gateway::stream::StreamMessage::Data(data);
+                        let cbor = match snp_gateway::stream::encode_stream_message(&msg) { Ok(c) => c, Err(_) => break };
+                        let sealed = snp_link::encrypt_circuit_payload(&response_keys.recv_key, &cbor);
+                        let frame = Frame {
+                            v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
+                            ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: 0, body: sealed,
+                        };
+                        if let Err(_) = link.send_frame(&frame).await { break; }
+                    }
+                    Ok(None) => {
+                        match stream_table.stream_state(stream_id).await {
+                            Some(snp_gateway::stream::StreamState::Closed)
+                            | Some(snp_gateway::stream::StreamState::Reset) => break,
+                            _ => tokio::task::yield_now().await,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let _ = stream_table.handle_close(snp_gateway::stream::StreamClose { stream_id }).await;
+    Ok(())
+}
