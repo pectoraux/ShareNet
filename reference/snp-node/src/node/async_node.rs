@@ -2882,9 +2882,17 @@ pub async fn serve_gateway_mode_b_multiplexed(
                             ),
                         };
                         let seq = allocate_seq(&next_seq).await;
+                        let seq = match seq {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("[gateway-mode-b-mux] frame seq exhausted — terminating circuit");
+                                active_streams.clear();
+                                break;
+                            }
+                        };
                         send_gateway_frame(
                             &link, &response_keys.send_key, gateway_node_id, circuit_client,
-                            circuit_fid, seq.unwrap_or(0), &ack_msg,
+                            circuit_fid, seq, &ack_msg,
                         ).await?;
                         if !matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
                             if !active_streams.contains(&sid) {
@@ -2898,8 +2906,26 @@ pub async fn serve_gateway_mode_b_multiplexed(
                     }
                     snp_gateway::stream::StreamMessage::Data(data) => {
                         if let Err(_) = stream_table.handle_stream_data(data.clone()).await {
-                            // Stream error — remove from active.
-                            active_streams.retain(|&s| s != data.stream_id);
+                            // Stream protocol error — send StreamReset to client,
+                            // then remove from active. Do NOT silently drop.
+                            let sid = data.stream_id;
+                            let reset_msg = snp_gateway::stream::StreamMessage::Reset(
+                                snp_gateway::stream::StreamReset {
+                                    stream_id: sid,
+                                    reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+                                },
+                            );
+                            if let Some(seq) = allocate_seq(&next_seq).await {
+                                let _ = send_gateway_frame(
+                                    &link, &response_keys.send_key, gateway_node_id,
+                                    circuit_client, circuit_fid, seq, &reset_msg,
+                                ).await;
+                            }
+                            active_streams.retain(|&s| s != sid);
+                            eprintln!(
+                                "[gateway-mode-b-mux {}] stream {} reset (protocol error)",
+                                super::hex_short(&gateway_node_id), sid
+                            );
                         }
                     }
                     snp_gateway::stream::StreamMessage::WindowUpdate(wu) => {
@@ -2952,15 +2978,17 @@ pub async fn serve_gateway_mode_b_multiplexed(
             match stream_table.read_from_tcp(sid).await {
                 Ok(Some(data)) => {
                     let msg = snp_gateway::stream::StreamMessage::Data(data);
-                    let seq = allocate_seq(&next_seq).await;
-                    if seq.is_none() {
-                        eprintln!("[gateway-mode-b-mux] frame seq exhausted — closing circuit");
-                        active_streams.clear();
-                        break;
-                    }
+                    let seq = match allocate_seq(&next_seq).await {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("[gateway-mode-b-mux] frame seq exhausted — closing circuit");
+                            active_streams.clear();
+                            break;
+                        }
+                    };
                     if send_gateway_frame(
                         &link, &response_keys.send_key, gateway_node_id, circuit_client,
-                        circuit_fid, seq.unwrap(), &msg,
+                        circuit_fid, seq, &msg,
                     ).await.is_err() {
                         active_streams.clear();
                         break;
@@ -2977,11 +3005,31 @@ pub async fn serve_gateway_mode_b_multiplexed(
                     }
                 }
                 Err(_) => {
-                    // TCP error on this stream — close just this stream.
-                    let _ = stream_table.handle_close(
-                        snp_gateway::stream::StreamClose { stream_id: sid },
+                    // TCP error on this stream — send StreamReset to client,
+                    // then close this stream only. Other streams continue.
+                    let reset_msg = snp_gateway::stream::StreamMessage::Reset(
+                        snp_gateway::stream::StreamReset {
+                            stream_id: sid,
+                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                        },
+                    );
+                    if let Some(seq) = allocate_seq(&next_seq).await {
+                        let _ = send_gateway_frame(
+                            &link, &response_keys.send_key, gateway_node_id,
+                            circuit_client, circuit_fid, seq, &reset_msg,
+                        ).await;
+                    }
+                    let _ = stream_table.handle_reset(
+                        snp_gateway::stream::StreamReset {
+                            stream_id: sid,
+                            reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                        },
                     ).await;
                     active_streams.retain(|&s| s != sid);
+                    eprintln!(
+                        "[gateway-mode-b-mux {}] stream {} reset (TCP error)",
+                        super::hex_short(&gateway_node_id), sid
+                    );
                 }
             }
         }

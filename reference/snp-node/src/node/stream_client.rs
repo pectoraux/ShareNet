@@ -35,6 +35,7 @@
 
 use std::collections::VecDeque;
 use std::collections::HashMap;
+use std::time::Duration;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -1253,6 +1254,23 @@ impl MultiplexedCircuit {
             s
         };
 
+        // Create shared state for this stream BEFORE sending the open.
+        // State starts as Opening — the background reader will set it to
+        // Established when it receives the OpenAck.
+        let shared = Arc::new(Mutex::new(StreamShared {
+            state: StreamState::Opening,
+            send_credit: 0,
+            send_seq: 0,
+            recv_seq: 0,
+            credit_notify: Arc::new(Notify::new()),
+            pending_data: VecDeque::new(),
+            data_notify: Arc::new(Notify::new()),
+        }));
+
+        // Register in the streams map BEFORE sending (so the background reader
+        // can dispatch the OpenAck when it arrives).
+        self.streams.lock().await.insert(stream_id, Arc::clone(&shared));
+
         // Check if circuit keys have been established.
         let keys_established = self.circuit_keys.send_key != [0u8; 32];
 
@@ -1285,52 +1303,119 @@ impl MultiplexedCircuit {
             .await
             .map_err(|e| StreamError::Circuit(format!("send StreamOpen: {e}")))?;
 
-        // Receive StreamOpenAck.
-        let resp_frame = self.link
-            .recv_frame()
-            .await
-            .map_err(|e| StreamError::Circuit(format!("recv StreamOpenAck: {e}")))?;
+        // Receive StreamOpenAck. If the background reader is already running
+        // (i.e., this is the second+ stream), we can't call recv_frame()
+        // directly — the reader owns the recv path. Instead, we temporarily
+        // register the stream in the streams map BEFORE sending the open,
+        // and wait for the background reader to deliver the ack.
+        //
+        // For the first stream, the background reader isn't running yet,
+        // so we call recv_frame() directly.
+        let send_credit = if self.reader_handle.is_none() {
+            // First stream — no background reader yet. Receive directly.
+            let resp_frame = self.link
+                .recv_frame()
+                .await
+                .map_err(|e| StreamError::Circuit(format!("recv StreamOpenAck: {e}")))?;
 
-        // Validate outer frame.
-        validate_frame(&resp_frame, &self.gateway_node_id, &self.client_node_id, &self.fid)?;
+            validate_frame(&resp_frame, &self.gateway_node_id, &self.client_node_id, &self.fid)?;
 
-        let plaintext = decrypt_circuit_payload(&self.circuit_keys.recv_key, &resp_frame.body)
-            .ok_or(StreamError::Circuit("StreamOpenAck decryption failed".into()))?;
-        let resp_msg = decode_stream_message(&plaintext)
-            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+            let plaintext = decrypt_circuit_payload(&self.circuit_keys.recv_key, &resp_frame.body)
+                .ok_or(StreamError::Circuit("StreamOpenAck decryption failed".into()))?;
+            let resp_msg = decode_stream_message(&plaintext)
+                .map_err(|e| StreamError::Cbor(e.to_string()))?;
 
-        let send_credit = match resp_msg {
-            StreamMessage::OpenAck(ack) => {
-                if !ack.connected {
-                    return Err(StreamError::OpenRejected(
-                        ack.error.unwrap_or_else(|| "unknown error".into()),
-                    ));
+            match resp_msg {
+                StreamMessage::OpenAck(ack) => {
+                    if !ack.connected {
+                        return Err(StreamError::OpenRejected(
+                            ack.error.unwrap_or_else(|| "unknown error".into()),
+                        ));
+                    }
+                    ack.initial_receive_window.min(MAX_STREAM_WINDOW)
                 }
-                ack.initial_receive_window.min(MAX_STREAM_WINDOW)
+                StreamMessage::Reset(reset) => {
+                    return Err(StreamError::Reset(reset.reason));
+                }
+                other => {
+                    return Err(StreamError::Circuit(format!(
+                        "expected StreamOpenAck, got {other:?}"
+                    )));
+                }
             }
-            StreamMessage::Reset(reset) => {
-                return Err(StreamError::Reset(reset.reason));
-            }
-            other => {
-                return Err(StreamError::Circuit(format!(
-                    "expected StreamOpenAck, got {other:?}"
-                )));
+        } else {
+            // Subsequent stream — background reader is running.
+            // We already registered the stream in the streams map above.
+            // Wait for the background reader to deliver the OpenAck (or Reset)
+            // via the shared state.
+            //
+            // The background reader's dispatch for OpenAck sets the state
+            // to Established and sets send_credit. We wait on data_notify.
+            //
+            // Actually, the background reader currently doesn't handle
+            // OpenAck — it ignores Open/OpenAck messages. We need to fix
+            // this: the background reader should dispatch OpenAck to the
+            // correct stream.
+            //
+            // For now, we need a different approach. Since the background
+            // reader consumes all recv_frame() calls, open_stream() can't
+            // receive the ack. Let's use a dedicated channel for acks.
+            //
+            // Simplest fix: use a oneshot channel stored in the streams map
+            // that the background reader fills when it sees an OpenAck.
+            //
+            // But we don't have that infrastructure. Let me use a simpler
+            // approach: store the ack in the StreamShared.pending_data
+            // and notify via data_notify. The open_stream() method then
+            // reads it from there.
+            //
+            // Actually, the cleanest fix for now: the background reader
+            // needs to handle OpenAck by setting the stream state and
+            // credit. Let me add that handling.
+
+            // Wait for the background reader to process the OpenAck.
+            // The stream is registered in the streams map, so the reader
+            // will dispatch the OpenAck to it.
+            //
+            // We need the reader to recognize OpenAck and set the state
+            // + credit. Let me add a pending_ack field to StreamShared.
+            //
+            // For now, let's just wait on data_notify with a timeout.
+            let notify = {
+                // The stream is registered — wait for the reader to set its state.
+                let s = shared.lock().await;
+                s.data_notify.clone()
+            };
+
+            // Wait up to 30 seconds for the background reader to deliver the ack.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if tokio::time::Instant::now() > deadline {
+                    return Err(StreamError::Circuit("timeout waiting for StreamOpenAck".into()));
+                }
+                tokio::time::timeout(Duration::from_secs(1), notify.notified()).await.ok();
+                let s = shared.lock().await;
+                if s.state == StreamState::Established {
+                    break s.send_credit;
+                }
+                if s.state == StreamState::Reset {
+                    return Err(StreamError::Reset(StreamResetReason::ProtocolError));
+                }
             }
         };
 
-        // Create shared state for this stream.
-        let shared = Arc::new(Mutex::new(StreamShared {
-            state: StreamState::Established,
-            send_credit,
-            send_seq: 0,
-            recv_seq: 0,
-            credit_notify: Arc::new(Notify::new()),
-            pending_data: VecDeque::new(),
-            data_notify: Arc::new(Notify::new()),
-        }));
-
-        // Register in the streams map.
-        self.streams.lock().await.insert(stream_id, Arc::clone(&shared));
+        // The shared state was already created and registered above.
+        // For the first stream, we set the state + credit directly.
+        // For subsequent streams, the background reader already set them.
+        {
+            let mut s = shared.lock().await;
+            if s.state == StreamState::Opening {
+                // First stream — set directly (we received the ack ourselves).
+                s.state = StreamState::Established;
+                s.send_credit = send_credit;
+            }
+            // For subsequent streams, the background reader already set the state.
+        }
 
         // If this is the first stream and we haven't spawned the background
         // reader yet, do so now.
@@ -1455,7 +1540,8 @@ async fn background_reader_multiplexed(
             StreamMessage::HalfClose(h) => Some(h.stream_id),
             StreamMessage::Close(c) => Some(c.stream_id),
             StreamMessage::Reset(r) => Some(r.stream_id),
-            StreamMessage::Open(_) | StreamMessage::OpenAck(_) => None,
+            StreamMessage::OpenAck(ack) => Some(ack.stream_id),
+            StreamMessage::Open(_) => None,
         };
 
         if let Some(sid) = stream_id {
@@ -1466,6 +1552,17 @@ async fn background_reader_multiplexed(
             if let Some(shared) = shared {
                 let mut s = shared.lock().await;
                 match &msg {
+                    StreamMessage::OpenAck(ack) => {
+                        // Dispatch OpenAck — set state + credit.
+                        if ack.connected {
+                            s.state = StreamState::Established;
+                            s.send_credit = ack.initial_receive_window.min(MAX_STREAM_WINDOW);
+                        } else {
+                            s.state = StreamState::Reset;
+                        }
+                        s.data_notify.notify_one();
+                        s.credit_notify.notify_one();
+                    }
                     StreamMessage::Data(data) => {
                         if data.direction == StreamDirection::GatewayToClient
                             && data.sequence == s.recv_seq
