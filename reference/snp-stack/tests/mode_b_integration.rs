@@ -129,7 +129,7 @@ async fn mode_b_end_to_end_raw_tcp_through_mesh() {
     let gw_x_sk = Arc::clone(&gateway_idents.x_sk);
     let gw_x_pk = gateway_idents.x_pk;
     let gw_listen = gateway_addr.clone();
-    let stream_table = Arc::new(GatewayStreamTable::new());
+    let stream_table = Arc::new(GatewayStreamTable::with_allow_loopback());
     let st = Arc::clone(&stream_table);
     let gateway_handle = tokio::spawn(async move {
         let _ = async_node::serve_gateway_mode_b(&gateway_node, &gw_listen, &gw_x_sk, &gw_x_pk, &st).await;
@@ -175,7 +175,7 @@ async fn mode_b_end_to_end_raw_tcp_through_mesh() {
         protocol: TransportProtocol::Tcp,
     };
 
-    let upstream = tokio::time::timeout(
+    let mut upstream = tokio::time::timeout(
         Duration::from_secs(30),
         ShareNetCircuitUpstreamModeB::open(&client_node, &route, &client_x_sk, &client_x_pk, destination),
     )
@@ -184,7 +184,7 @@ async fn mode_b_end_to_end_raw_tcp_through_mesh() {
     .expect("open must succeed");
 
     // Send arbitrary binary data.
-    let test_data = b"Hello from Mode B — arbitrary TCP bytes!";
+    let test_data = b"Hello from Mode B - arbitrary TCP bytes!";
     let sent = upstream.send(test_data).await.expect("send must succeed");
     assert_eq!(sent, test_data.len(), "all bytes must be sent");
 

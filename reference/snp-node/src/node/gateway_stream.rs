@@ -112,6 +112,9 @@ pub struct GatewayStreamTable {
     streams: Arc<Mutex<HashMap<StreamId, Arc<StreamEntry>>>>,
     /// Semaphore for atomic stream-count quota enforcement.
     quota: Arc<Semaphore>,
+    /// Whether to allow loopback/private destinations. Production = false.
+    /// Tests = true (so the test can connect to a local echo server).
+    allow_loopback: bool,
 }
 
 impl Default for GatewayStreamTable {
@@ -135,6 +138,18 @@ impl GatewayStreamTable {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
             quota: Arc::new(Semaphore::new(max_streams)),
+            allow_loopback: false,
+        }
+    }
+
+    /// Create a table that allows loopback/private destinations.
+    /// **TEST ONLY** — production must never use this.
+    #[must_use]
+    pub fn with_allow_loopback() -> Self {
+        Self {
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            quota: Arc::new(Semaphore::new(MAX_STREAMS_PER_GATEWAY)),
+            allow_loopback: true,
         }
     }
 
@@ -170,9 +185,10 @@ impl GatewayStreamTable {
         };
 
         // 2. Validate the destination through the existing SSRF policy.
+        //    (Skipped when allow_loopback is set — TEST ONLY.)
         let endpoint = &open.destination;
         let ip_str = endpoint.address.to_string();
-        if is_private_ip_str(&ip_str) {
+        if !self.allow_loopback && is_private_ip_str(&ip_str) {
             return Ok(StreamOpenAck {
                 stream_id: open.stream_id,
                 initial_receive_window: 0,
@@ -183,15 +199,17 @@ impl GatewayStreamTable {
             });
         }
 
-        // 3. Validate the port.
-        let scheme = if endpoint.port == 443 { "https" } else { "http" };
-        if let Err(e) = validate_port(scheme, endpoint.port) {
-            return Ok(StreamOpenAck {
-                stream_id: open.stream_id,
-                initial_receive_window: 0,
-                connected: false,
-                error: Some(format!("port policy: {e}")),
-            });
+        // 3. Validate the port. (Skipped when allow_loopback — TEST ONLY.)
+        if !self.allow_loopback {
+            let scheme = if endpoint.port == 443 { "https" } else { "http" };
+            if let Err(e) = validate_port(scheme, endpoint.port) {
+                return Ok(StreamOpenAck {
+                    stream_id: open.stream_id,
+                    initial_receive_window: 0,
+                    connected: false,
+                    error: Some(format!("port policy: {e}")),
+                });
+            }
         }
 
         // 4. Open a real TCP socket with connect timeout.
