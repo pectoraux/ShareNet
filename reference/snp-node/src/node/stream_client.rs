@@ -33,6 +33,7 @@
 //!                              HalfClose/Close/Reset → state
 //! ```
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -102,7 +103,8 @@ struct StreamShared {
     /// Notify the send() path when credit is replenished.
     credit_notify: Arc<Notify>,
     /// Pending data received by the background reader (for recv()).
-    pending_data: Vec<Vec<u8>>,
+    /// FIFO — uses push_back / pop_front to preserve byte ordering.
+    pending_data: VecDeque<Vec<u8>>,
     /// Notify the recv() path when data arrives.
     data_notify: Arc<Notify>,
 }
@@ -239,13 +241,17 @@ impl StreamHandle {
         let fid = random_fid();
         let client_node_id = node.identity.node_id;
 
-        // We need a dummy payload to seal (just to get the circuit keys).
-        // The actual StreamOpen will be encrypted with these keys.
-        let dummy = vec![0u8; 1];
-        let (circuit_keys, _client_eph_pub, _) =
-            seal_circuit_payload_with_fresh_eph(&gateway_x25519_pub, &dummy);
-
-        // 4. Send StreamOpen.
+        // 4. Send StreamOpen — sealed with fresh ephemeral X25519.
+        //
+        // This is the CRITICAL step: we must use seal_circuit_payload_with_fresh_eph()
+        // to seal the ACTUAL StreamOpen CBOR. This produces:
+        //   body = eph_pub(32) || nonce(12) || ciphertext
+        //
+        // The gateway will extract eph_pub from the first 32 bytes, derive the
+        // same circuit keys via DH(gateway_static_secret, eph_pub), and decrypt.
+        //
+        // We MUST NOT use encrypt_circuit_payload() for the first frame — that
+        // would omit eph_pub and the gateway could not derive the keys.
         let open_msg = StreamMessage::Open(StreamOpen {
             stream_id,
             destination,
@@ -255,10 +261,11 @@ impl StreamHandle {
 
         let link = Arc::new(Mutex::new(link));
 
-        // Send the StreamOpen through the circuit.
-        let cbor = encode_stream_message(&open_msg)
+        let open_cbor = encode_stream_message(&open_msg)
             .map_err(|e| StreamError::Cbor(e.to_string()))?;
-        let sealed = encrypt_circuit_payload(&circuit_keys.send_key, &cbor);
+        let (circuit_keys, _client_eph_pub, sealed_body) =
+            seal_circuit_payload_with_fresh_eph(&gateway_x25519_pub, &open_cbor);
+
         let frame = Frame {
             v: FRAME_VERSION,
             cls: b'B',
@@ -267,7 +274,7 @@ impl StreamHandle {
             ttl: FRAME_TTL_MAX,
             fid,
             seq: 1,
-            body: sealed,
+            body: sealed_body, // eph_pub(32) || nonce || ciphertext
         };
         link.lock()
             .await
@@ -317,7 +324,7 @@ impl StreamHandle {
             send_seq: 0,
             recv_seq: 0,
             credit_notify: Arc::new(Notify::new()),
-            pending_data: Vec::new(),
+            pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
         }));
 
@@ -388,6 +395,15 @@ impl StreamHandle {
 
             if credit == 0 {
                 // Wait for the background reader to replenish credit.
+                //
+                // Race safety: `send_credit` is the authoritative state. The
+                // `Notify` is only a wakeup mechanism. Even if a notification
+                // is "collapsed" (tokio::Notify stores only one permit), the
+                // credit from that WindowUpdate was already added to
+                // `send_credit` before `notify_one()` was called. So when we
+                // loop back and re-check `send_credit`, we see the combined
+                // credit from all WindowUpdates that arrived while we were
+                // waiting.
                 let notify = {
                     let shared = self.shared.lock().await;
                     if shared.state == StreamState::Closed || shared.state == StreamState::Reset {
@@ -396,7 +412,7 @@ impl StreamHandle {
                     shared.credit_notify.clone()
                 };
                 notify.notified().await;
-                continue;
+                continue; // Re-check credit (and state) after wakeup.
             }
 
             let chunk_size = remaining
@@ -446,7 +462,7 @@ impl StreamHandle {
             // Check for pending data.
             {
                 let mut shared = self.shared.lock().await;
-                if let Some(data) = shared.pending_data.pop() {
+                if let Some(data) = shared.pending_data.pop_front() {
                     return Ok(Some(data));
                 }
                 if shared.state == StreamState::Closed {
@@ -676,50 +692,68 @@ async fn background_reader(
             }
         };
 
-        // Validate outer frame.
+        // Validate outer frame. An authenticated frame from the correct
+        // gateway with the wrong fid is a protocol violation — reset.
         if let Err(_) = validate_frame(&frame, &gateway_node_id, &client_node_id, &fid) {
-            continue; // Ignore invalid frames.
+            // If the frame passed AEAD at the link layer but has wrong
+            // src/dst/fid, it's a protocol violation from an authenticated
+            // peer — reset the stream.
+            let mut s = shared.lock().await;
+            s.state = StreamState::Reset;
+            s.credit_notify.notify_one();
+            s.data_notify.notify_one();
+            break;
         }
 
-        // Decrypt.
+        // Decrypt. If the frame is from the correct gateway but can't be
+        // decrypted with the circuit key, it's a protocol violation — reset.
         let plaintext = match decrypt_circuit_payload(&circuit_keys.recv_key, &frame.body) {
             Some(p) => p,
-            None => continue, // Ignore undecryptable frames.
+            None => {
+                let mut s = shared.lock().await;
+                s.state = StreamState::Reset;
+                s.credit_notify.notify_one();
+                s.data_notify.notify_one();
+                break;
+            }
         };
 
-        // Decode.
+        // Decode. Malformed CBOR from an authenticated gateway is a
+        // protocol violation — reset.
         let msg = match decode_stream_message(&plaintext) {
             Ok(m) => m,
-            Err(_) => continue, // Ignore malformed messages.
+            Err(_) => {
+                let mut s = shared.lock().await;
+                s.state = StreamState::Reset;
+                s.credit_notify.notify_one();
+                s.data_notify.notify_one();
+                break;
+            }
         };
 
         // Dispatch.
         match msg {
             StreamMessage::Data(data) => {
-                // Validate direction + sequence.
+                // Validate direction.
                 if data.direction != StreamDirection::GatewayToClient {
-                    continue;
+                    // Protocol violation — reset.
+                    let mut s = shared.lock().await;
+                    s.state = StreamState::Reset;
+                    s.credit_notify.notify_one();
+                    s.data_notify.notify_one();
+                    break;
                 }
                 let mut s = shared.lock().await;
+                // Validate sequence — must be exactly recv_seq.
                 if data.sequence != s.recv_seq {
-                    continue; // Out of order — ignore.
+                    // Out of order from an authenticated gateway — reset.
+                    s.state = StreamState::Reset;
+                    s.credit_notify.notify_one();
+                    s.data_notify.notify_one();
+                    break;
                 }
                 s.recv_seq += 1;
-
-                // Push to the data channel. If the channel is full, the
-                // application isn't consuming fast enough — we drop the data.
-                // (A production implementation would apply backpressure here.)
-                let data_bytes = data.data;
-                drop(s); // Release the lock before sending.
-                let _ = shared.lock().await; // Re-acquire briefly.
-                // Actually, we need to send through the channel. The channel
-                // sender is not in shared — it's in StreamHandle. We need
-                // a different approach.
-                //
-                // For now, store the data in a buffer in shared state.
-                // The recv() method will drain it.
-                let mut s = shared.lock().await;
-                s.pending_data.push(data_bytes);
+                s.pending_data.push_back(data.data);
                 s.data_notify.notify_one();
             }
             StreamMessage::WindowUpdate(update) => {
@@ -738,21 +772,29 @@ async fn background_reader(
                         StreamState::HalfClosedLocal => StreamState::Closed,
                         other => other,
                     };
+                    s.data_notify.notify_one();
                 }
             }
             StreamMessage::Close(_) => {
                 let mut s = shared.lock().await;
                 s.state = StreamState::Closed;
+                s.data_notify.notify_one();
                 break;
             }
             StreamMessage::Reset(reset) => {
                 let mut s = shared.lock().await;
                 s.state = StreamState::Reset;
-                s.credit_notify.notify_one(); // Wake up any blocked send().
+                s.credit_notify.notify_one();
+                s.data_notify.notify_one();
                 break;
             }
             StreamMessage::Open(_) | StreamMessage::OpenAck(_) => {
-                // Unexpected — ignore.
+                // Unexpected message type from authenticated gateway — reset.
+                let mut s = shared.lock().await;
+                s.state = StreamState::Reset;
+                s.credit_notify.notify_one();
+                s.data_notify.notify_one();
+                break;
             }
         }
     }
@@ -910,7 +952,7 @@ mod tests {
             send_seq: 0,
             recv_seq: 0,
             credit_notify: Arc::new(Notify::new()),
-            pending_data: Vec::new(),
+            pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
         }));
 
@@ -939,7 +981,7 @@ mod tests {
             send_seq: 0,
             recv_seq: 0,
             credit_notify: Arc::new(Notify::new()),
-            pending_data: Vec::new(),
+            pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
         }));
 
@@ -964,7 +1006,7 @@ mod tests {
             send_seq: 0,
             recv_seq: 0,
             credit_notify: Arc::new(Notify::new()),
-            pending_data: Vec::new(),
+            pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
         }));
 
