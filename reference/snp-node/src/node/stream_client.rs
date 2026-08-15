@@ -136,14 +136,48 @@ pub struct StreamHandle {
     client_node_id: [u8; 32],
     /// The stream ID.
     stream_id: StreamId,
-    /// The frame ID for this stream (outer frame validation).
+    /// The frame ID for this circuit (outer frame validation).
     fid: [u8; 8],
-    /// The next frame sequence number for outbound frames.
-    next_frame_seq: u32,
+    /// The shared circuit-level frame sequencer (for AEAD nonce safety).
+    /// All streams on the same circuit share one sequencer.
+    frame_seq: Arc<CircuitFrameSequencer>,
     /// Shared state (protected by mutex).
     shared: Arc<Mutex<StreamShared>>,
     /// Handle to the background reader task (to abort on close).
+    /// None for multiplexed streams (the circuit owns the reader).
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// **N2.3.8** — Circuit-level frame sequence allocator.
+///
+/// All streams on one circuit share this sequencer. Each outbound frame
+/// gets a unique `(fid, seq)` pair, ensuring AEAD nonce uniqueness.
+///
+/// This is the client-side counterpart of the gateway's shared
+/// `next_gateway_frame_seq`.
+pub struct CircuitFrameSequencer {
+    next: Mutex<u32>,
+}
+
+impl CircuitFrameSequencer {
+    /// Create a new sequencer starting at the given value.
+    #[must_use]
+    pub fn new(start: u32) -> Self {
+        Self {
+            next: Mutex::new(start),
+        }
+    }
+
+    /// Allocate the next frame sequence. Returns `None` if exhausted.
+    pub async fn allocate(&self) -> Option<u32> {
+        let mut next = self.next.lock().await;
+        if *next == u32::MAX {
+            return None;
+        }
+        let seq = *next;
+        *next += 1;
+        Some(seq)
+    }
 }
 
 impl std::fmt::Debug for StreamHandle {
@@ -355,7 +389,7 @@ impl StreamHandle {
             client_node_id,
             stream_id,
             fid,
-            next_frame_seq: 2, // 1 was used for StreamOpen
+            frame_seq: Arc::new(CircuitFrameSequencer::new(2)), // 1 was used for StreamOpen
             shared,
             reader_handle: Some(reader_handle),
         })
@@ -587,6 +621,9 @@ impl StreamHandle {
         let cbor = encode_stream_message(msg).map_err(|e| StreamError::Cbor(e.to_string()))?;
         let sealed = encrypt_circuit_payload(&self.circuit_keys.send_key, &cbor);
 
+        let seq = self.frame_seq.allocate().await
+            .ok_or(StreamError::Circuit("frame sequence exhausted".into()))?;
+
         let frame = Frame {
             v: FRAME_VERSION,
             cls: b'B',
@@ -594,10 +631,9 @@ impl StreamHandle {
             src: self.client_node_id,
             ttl: FRAME_TTL_MAX,
             fid: self.fid,
-            seq: self.next_frame_seq,
+            seq,
             body: sealed,
         };
-        self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
 
         self.link
             .send_frame(&frame)
@@ -624,7 +660,7 @@ impl StreamHandle {
         gateway_node_id: [u8; 32],
         client_node_id: [u8; 32],
         fid: [u8; 8],
-        _next_frame_seq: Arc<Mutex<u32>>,
+        frame_seq: Arc<CircuitFrameSequencer>,
         shared: Arc<Mutex<StreamShared>>,
         reader_handle: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
@@ -632,13 +668,13 @@ impl StreamHandle {
             link,
             circuit_keys: CircuitKeys {
                 send_key,
-                recv_key: [0u8; 32], // Not used — recv is handled by the circuit's reader
+                recv_key: [0u8; 32],
             },
             gateway_node_id,
             client_node_id,
             stream_id,
             fid,
-            next_frame_seq: 2,
+            frame_seq,
             shared,
             reader_handle,
         }
@@ -1125,7 +1161,7 @@ pub struct MultiplexedCircuit {
     /// The frame ID for this circuit.
     fid: [u8; 8],
     /// The next frame sequence number for outbound frames (client→gateway).
-    next_frame_seq: Arc<Mutex<u32>>,
+    frame_seq: Arc<CircuitFrameSequencer>,
     /// Active stream dispatchers: stream_id → shared state.
     streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
     /// Background reader task handle.
@@ -1207,7 +1243,7 @@ impl MultiplexedCircuit {
             gateway_node_id,
             client_node_id,
             fid,
-            next_frame_seq: Arc::new(Mutex::new(1)),
+            frame_seq: Arc::new(CircuitFrameSequencer::new(1)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
         };
@@ -1247,12 +1283,8 @@ impl MultiplexedCircuit {
         // Send the StreamOpen. If this is the first stream, use
         // seal_circuit_payload_with_fresh_eph to establish the circuit keys.
         // Otherwise, use encrypt_circuit_payload with the existing keys.
-        let frame_seq = {
-            let mut seq = self.next_frame_seq.lock().await;
-            let s = *seq;
-            *seq += 1;
-            s
-        };
+        let frame_seq = self.frame_seq.allocate().await
+            .ok_or(StreamError::Circuit("frame sequence exhausted".into()))?;
 
         // Create shared state for this stream BEFORE sending the open.
         // State starts as Opening — the background reader will set it to
@@ -1452,7 +1484,7 @@ impl MultiplexedCircuit {
             self.gateway_node_id,
             self.client_node_id,
             self.fid,
-            Arc::clone(&self.next_frame_seq),
+            Arc::clone(&self.frame_seq),
             shared,
             None, // No individual reader handle — the circuit owns it.
         ))
