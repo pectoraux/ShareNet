@@ -2563,7 +2563,7 @@ pub async fn serve_gateway_mode_b(
                 match circuit_result {
                     Ok(frame) => {
                         let plaintext = match snp_link::decrypt_circuit_payload(
-                            &response_keys.send_key, &frame.body,
+                            &response_keys.recv_key, &frame.body,
                         ) {
                             Some(p) => p,
                             None => break,
@@ -2602,7 +2602,7 @@ pub async fn serve_gateway_mode_b(
                     Ok(Some(data)) => {
                         let msg = snp_gateway::stream::StreamMessage::Data(data);
                         let cbor = match snp_gateway::stream::encode_stream_message(&msg) { Ok(c) => c, Err(_) => break };
-                        let sealed = snp_link::encrypt_circuit_payload(&response_keys.recv_key, &cbor);
+                        let sealed = snp_link::encrypt_circuit_payload(&response_keys.send_key, &cbor);
                         let frame = Frame {
                             v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
                             ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: 0, body: sealed,
