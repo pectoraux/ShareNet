@@ -125,7 +125,7 @@ struct StreamShared {
 /// application calling `recv()`.
 pub struct StreamHandle {
     /// The circuit link (shared with the background reader task).
-    link: Arc<Mutex<AsyncLink>>,
+    link: Arc<AsyncLink>,
     /// The circuit keys (send_key for client→gateway, recv_key for gateway→client).
     circuit_keys: CircuitKeys,
     /// The gateway's NodeId (frame destination + outer frame validation).
@@ -259,7 +259,7 @@ impl StreamHandle {
             version: 0,
         });
 
-        let link = Arc::new(Mutex::new(link));
+        let link = Arc::new(link);
 
         let open_cbor = encode_stream_message(&open_msg)
             .map_err(|e| StreamError::Cbor(e.to_string()))?;
@@ -276,16 +276,12 @@ impl StreamHandle {
             seq: 1,
             body: sealed_body, // eph_pub(32) || nonce || ciphertext
         };
-        link.lock()
-            .await
-            .send_frame(&frame)
+        link.send_frame(&frame)
             .await
             .map_err(|e| StreamError::Circuit(format!("send StreamOpen: {e}")))?;
 
         // 5. Receive StreamOpenAck (with outer frame validation).
         let resp_frame = link
-            .lock()
-            .await
             .recv_frame()
             .await
             .map_err(|e| StreamError::Circuit(format!("recv StreamOpenAck: {e}")))?;
@@ -602,8 +598,6 @@ impl StreamHandle {
         self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
 
         self.link
-            .lock()
-            .await
             .send_frame(&frame)
             .await
             .map_err(|e| StreamError::Circuit(e.to_string()))?;
@@ -673,7 +667,7 @@ fn validate_frame(
 /// - `StreamClose` → update state + close data channel.
 /// - `StreamReset` → update state + close data channel.
 async fn background_reader(
-    link: Arc<Mutex<AsyncLink>>,
+    link: Arc<AsyncLink>,
     circuit_keys: CircuitKeys,
     gateway_node_id: [u8; 32],
     client_node_id: [u8; 32],
@@ -682,7 +676,7 @@ async fn background_reader(
 ) {
     loop {
         // Receive a frame from the circuit.
-        let frame = match link.lock().await.recv_frame().await {
+        let frame = match link.recv_frame().await {
             Ok(f) => f,
             Err(e) => {
                 // Link error — mark the stream as closed.
