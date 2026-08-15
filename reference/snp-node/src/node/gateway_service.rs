@@ -68,6 +68,43 @@ impl GatewayPolicy {
     pub fn evidence_level() -> EvidenceLevel {
         EvidenceLevel::Authenticated
     }
+
+    /// N2.7: Check if a destination is allowed by this policy.
+    /// Delegates to the same logic as `PolicyConstraint::destination_allowed`.
+    #[must_use]
+    pub fn destination_allowed(&self, destination: &str) -> bool {
+        if self.allowed_destinations.is_empty() {
+            return true; // wildcard
+        }
+        self.allowed_destinations.iter().any(|pattern| {
+            pattern == destination
+                || pattern == "*"
+                || pattern == "*:*"
+                || destination_matches_pattern(destination, pattern)
+        })
+    }
+
+    /// N2.7: Check if a protocol is allowed by this policy.
+    #[must_use]
+    pub fn protocol_allowed(&self, protocol: &str) -> bool {
+        if self.allowed_protocols.is_empty() {
+            return true; // wildcard
+        }
+        self.allowed_protocols.iter().any(|p| p == protocol || p == "*")
+    }
+}
+
+/// Simple glob matching: "*" matches any sequence.
+fn destination_matches_pattern(dest: &str, pattern: &str) -> bool {
+    if pattern.contains('*') {
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            return dest.ends_with(suffix);
+        }
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            return dest.starts_with(prefix);
+        }
+    }
+    dest == pattern
 }
 
 impl Default for GatewayPolicy {
