@@ -300,6 +300,7 @@ impl GatewayServiceManager {
     /// # Arguments
     /// * `request` — The TransitRequest from the client.
     /// * `client_node_id` — The NodeId of the client (for the receipt).
+    /// * `client_public_key` — The client's Ed25519 public key (for TransitRequest signature verification).
     /// * `connector` — The pre-built PinnedConnector for the fetch.
     /// * `now` — Current time (unix seconds).
     ///
@@ -313,6 +314,7 @@ impl GatewayServiceManager {
         &mut self,
         request: &snp_gateway::TransitRequest,
         client_node_id: [u8; 32],
+        client_public_key: &[u8; 32],
         connector: &snp_gateway::PinnedConnector,
         now: u64,
     ) -> Result<GatewayServiceResult, GatewayServiceError> {
@@ -360,14 +362,7 @@ impl GatewayServiceManager {
         let fetched = snp_gateway::handle_transit_request_with_connector(
             request,
             &self.gateway_secret_key,
-            // The client public key is needed for TransitRequest verification.
-            // For the receipt, we use the client_node_id directly.
-            // The snp_gateway function needs the client's Ed25519 public key.
-            // We derive it from the request's client_sig verification context.
-            // For now, we pass the client's public key extracted from the
-            // request verification. In a real gateway, the circuit layer
-            // would provide the client's verified public key.
-            &snp_crypto::derive_public_key(&[0u8; 32]), // placeholder — real impl gets it from circuit
+            client_public_key,
             connector,
         );
         let fetch_duration_ms = SystemTime::now()
