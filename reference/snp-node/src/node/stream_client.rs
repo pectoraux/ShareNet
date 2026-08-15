@@ -34,6 +34,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -610,6 +611,37 @@ impl StreamHandle {
             handle.abort();
         }
     }
+
+    /// **N2.3.8** — Create a StreamHandle from a multiplexed circuit.
+    /// The handle shares the link and background reader with the parent
+    /// `MultiplexedCircuit`. The `reader_handle` is None — the circuit
+    /// owns the background reader.
+    pub fn from_multiplexed(
+        stream_id: StreamId,
+        link: Arc<AsyncLink>,
+        send_key: snp_crypto::SymmetricKey,
+        gateway_node_id: [u8; 32],
+        client_node_id: [u8; 32],
+        fid: [u8; 8],
+        _next_frame_seq: Arc<Mutex<u32>>,
+        shared: Arc<Mutex<StreamShared>>,
+        reader_handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            link,
+            circuit_keys: CircuitKeys {
+                send_key,
+                recv_key: [0u8; 32], // Not used — recv is handled by the circuit's reader
+            },
+            gateway_node_id,
+            client_node_id,
+            stream_id,
+            fid,
+            next_frame_seq: 2,
+            shared,
+            reader_handle,
+        }
+    }
 }
 
 impl Drop for StreamHandle {
@@ -1050,5 +1082,435 @@ mod tests {
         let decoded = decode_stream_message(&plaintext).unwrap();
 
         assert_eq!(decoded, msg);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.3.8 — MultiplexedCircuit (multiple streams on one circuit)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.3.8** — A multiplexed Mode B circuit that can carry multiple
+/// independent streams.
+///
+/// This owns the circuit link (one SNP-IK connection + one fresh ephemeral
+/// X25519 key derivation). Multiple [`StreamHandle`]s can be opened on the
+/// same circuit, each with its own `stream_id`, sequence space, flow control,
+/// and TCP socket at the gateway.
+///
+/// ## Architecture
+///
+/// ```text
+/// MultiplexedCircuit (owns AsyncLink + circuit keys)
+///     │
+///     ├── open_stream() → StreamHandle #1
+///     ├── open_stream() → StreamHandle #2
+///     └── open_stream() → StreamHandle #3
+///         (each has independent stream_id, sequence, flow control)
+/// ```
+///
+/// A background reader task dispatches inbound frames to the correct
+/// stream via `stream_id`.
+pub struct MultiplexedCircuit {
+    /// The circuit link (shared by all streams on this circuit).
+    link: Arc<AsyncLink>,
+    /// The circuit keys (established on first open_stream).
+    circuit_keys: CircuitKeys,
+    /// The gateway's X25519 public key (for the first seal_circuit_payload_with_fresh_eph).
+    gateway_x25519_pub: snp_crypto::X25519PubKey,
+    /// The gateway's NodeId (frame destination).
+    gateway_node_id: [u8; 32],
+    /// The client's NodeId (frame source).
+    client_node_id: [u8; 32],
+    /// The frame ID for this circuit.
+    fid: [u8; 8],
+    /// The next frame sequence number for outbound frames (client→gateway).
+    next_frame_seq: Arc<Mutex<u32>>,
+    /// Active stream dispatchers: stream_id → shared state.
+    streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
+    /// Background reader task handle.
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for MultiplexedCircuit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiplexedCircuit")
+            .field("fid", &self.fid)
+            .field("gateway_node_id", &self.gateway_node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MultiplexedCircuit {
+    /// Establish a new multiplexed circuit to the gateway.
+    ///
+    /// This performs the SNP-IK handshake + fresh ephemeral X25519 derivation
+    /// (same as [`StreamHandle::open`]), but does NOT open any streams yet.
+    /// Use [`open_stream`] to create individual streams on this circuit.
+    ///
+    /// # Errors
+    /// Returns [`StreamError`] on circuit establishment failure.
+    pub async fn establish(
+        node: &Node,
+        route: &Route,
+        client_x25519_secret: &snp_crypto::X25519Secret,
+        client_x25519_public: &snp_crypto::X25519PubKey,
+    ) -> Result<Self, StreamError> {
+        // Extract relay + gateway from route.
+        if route.hop_details().is_empty() {
+            return Err(StreamError::Circuit("route has no hop_details".into()));
+        }
+        let first_hop = &route.hop_details()[0];
+        let relay_endpoint = first_hop
+            .first_endpoint()
+            .ok_or_else(|| StreamError::Circuit("first hop has no endpoints".into()))?;
+        let relay_addr = relay_endpoint
+            .as_tcp()
+            .ok_or_else(|| StreamError::Circuit("first hop is not TCP".into()))?;
+        let relay_node_id = first_hop.node_id();
+
+        let gateway_descriptor = route
+            .destination_descriptor()
+            .ok_or_else(|| StreamError::Circuit("route has no destination descriptor".into()))?;
+        let gateway_node_id = gateway_descriptor.node_id();
+        let gateway_x25519_pub_bytes = gateway_descriptor
+            .circuit_x25519_pub()
+            .ok_or_else(|| StreamError::Circuit("no gateway X25519 key".into()))?;
+        let gateway_x25519_pub = snp_crypto::x25519_public_from_bytes(gateway_x25519_pub_bytes);
+
+        // Connect + SNP-IK handshake.
+        let mut stream = AsyncLink::connect_raw(relay_addr)
+            .await
+            .map_err(|e| StreamError::Circuit(format!("relay connect: {e}")))?;
+        let handshake = perform_snp_ik_handshake_async(
+            &mut stream, true,
+            &node.identity.secret_key, &node.identity.public_key,
+            client_x25519_secret, client_x25519_public,
+            Some(&relay_node_id),
+        ).await.map_err(|e| StreamError::Circuit(format!("SNP-IK: {e}")))?;
+        if handshake.peer_node_id != relay_node_id {
+            return Err(StreamError::Circuit("relay identity substitution".into()));
+        }
+        let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
+
+        let fid = random_fid();
+        let client_node_id = node.identity.node_id;
+
+        // Store the gateway X25519 pub key for the first open_stream() call.
+        let circuit = Self {
+            link,
+            circuit_keys: CircuitKeys {
+                send_key: [0u8; 32],
+                recv_key: [0u8; 32],
+            },
+            gateway_x25519_pub,
+            gateway_node_id,
+            client_node_id,
+            fid,
+            next_frame_seq: Arc::new(Mutex::new(1)),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            reader_handle: None,
+        };
+
+        Ok(circuit)
+    }
+
+    /// Open a new stream on this circuit.
+    ///
+    /// The first call to this method establishes the circuit keys (via
+    /// `seal_circuit_payload_with_fresh_eph`). Subsequent calls reuse the
+    /// same keys (via `encrypt_circuit_payload`).
+    ///
+    /// # Errors
+    /// Returns [`StreamError`] on failure.
+    pub async fn open_stream(
+        &mut self,
+        destination: InternetEndpoint,
+    ) -> Result<StreamHandle, StreamError> {
+        // Generate stream ID.
+        let stream_id: StreamId = {
+            let mut buf = [0u8; 8];
+            getrandom::getrandom(&mut buf).expect("getrandom");
+            u64::from_be_bytes(buf)
+        };
+
+        // Build StreamOpen.
+        let open_msg = StreamMessage::Open(StreamOpen {
+            stream_id,
+            destination,
+            initial_receive_window: DEFAULT_RECEIVE_WINDOW,
+            version: 0,
+        });
+        let open_cbor = encode_stream_message(&open_msg)
+            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+
+        // Send the StreamOpen. If this is the first stream, use
+        // seal_circuit_payload_with_fresh_eph to establish the circuit keys.
+        // Otherwise, use encrypt_circuit_payload with the existing keys.
+        let frame_seq = {
+            let mut seq = self.next_frame_seq.lock().await;
+            let s = *seq;
+            *seq += 1;
+            s
+        };
+
+        // Check if circuit keys have been established.
+        let keys_established = self.circuit_keys.send_key != [0u8; 32];
+
+        let sealed_body = if !keys_established {
+            // First stream — establish circuit keys.
+            let (keys, _eph_pub, sealed) =
+                seal_circuit_payload_with_fresh_eph(
+                    &self.gateway_x25519_pub,
+                    &open_cbor,
+                );
+            self.circuit_keys = keys;
+            sealed
+        } else {
+            encrypt_circuit_payload(&self.circuit_keys.send_key, &open_cbor)
+        };
+
+        // Send the frame.
+        let frame = Frame {
+            v: FRAME_VERSION,
+            cls: b'B',
+            dst: self.gateway_node_id,
+            src: self.client_node_id,
+            ttl: FRAME_TTL_MAX,
+            fid: self.fid,
+            seq: frame_seq,
+            body: sealed_body,
+        };
+        self.link
+            .send_frame(&frame)
+            .await
+            .map_err(|e| StreamError::Circuit(format!("send StreamOpen: {e}")))?;
+
+        // Receive StreamOpenAck.
+        let resp_frame = self.link
+            .recv_frame()
+            .await
+            .map_err(|e| StreamError::Circuit(format!("recv StreamOpenAck: {e}")))?;
+
+        // Validate outer frame.
+        validate_frame(&resp_frame, &self.gateway_node_id, &self.client_node_id, &self.fid)?;
+
+        let plaintext = decrypt_circuit_payload(&self.circuit_keys.recv_key, &resp_frame.body)
+            .ok_or(StreamError::Circuit("StreamOpenAck decryption failed".into()))?;
+        let resp_msg = decode_stream_message(&plaintext)
+            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+
+        let send_credit = match resp_msg {
+            StreamMessage::OpenAck(ack) => {
+                if !ack.connected {
+                    return Err(StreamError::OpenRejected(
+                        ack.error.unwrap_or_else(|| "unknown error".into()),
+                    ));
+                }
+                ack.initial_receive_window.min(MAX_STREAM_WINDOW)
+            }
+            StreamMessage::Reset(reset) => {
+                return Err(StreamError::Reset(reset.reason));
+            }
+            other => {
+                return Err(StreamError::Circuit(format!(
+                    "expected StreamOpenAck, got {other:?}"
+                )));
+            }
+        };
+
+        // Create shared state for this stream.
+        let shared = Arc::new(Mutex::new(StreamShared {
+            state: StreamState::Established,
+            send_credit,
+            send_seq: 0,
+            recv_seq: 0,
+            credit_notify: Arc::new(Notify::new()),
+            pending_data: VecDeque::new(),
+            data_notify: Arc::new(Notify::new()),
+        }));
+
+        // Register in the streams map.
+        self.streams.lock().await.insert(stream_id, Arc::clone(&shared));
+
+        // If this is the first stream and we haven't spawned the background
+        // reader yet, do so now.
+        if self.reader_handle.is_none() {
+            let reader_link = Arc::clone(&self.link);
+            let reader_keys = CircuitKeys {
+                send_key: self.circuit_keys.send_key,
+                recv_key: self.circuit_keys.recv_key,
+            };
+            let reader_gateway = self.gateway_node_id;
+            let reader_client = self.client_node_id;
+            let reader_fid = self.fid;
+            let reader_streams = Arc::clone(&self.streams);
+            self.reader_handle = Some(tokio::spawn(async move {
+                background_reader_multiplexed(
+                    reader_link,
+                    reader_keys,
+                    reader_gateway,
+                    reader_client,
+                    reader_fid,
+                    reader_streams,
+                )
+                .await;
+            }));
+        }
+
+        // Create the StreamHandle. Unlike the standalone StreamHandle::open,
+        // this one shares the link and doesn't own a background reader.
+        // We need a lightweight handle that delegates to the shared state.
+        Ok(StreamHandle::from_multiplexed(
+            stream_id,
+            Arc::clone(&self.link),
+            self.circuit_keys.send_key,
+            self.gateway_node_id,
+            self.client_node_id,
+            self.fid,
+            Arc::clone(&self.next_frame_seq),
+            shared,
+            None, // No individual reader handle — the circuit owns it.
+        ))
+    }
+
+    /// Close the circuit (terminates all streams).
+    pub async fn close(&mut self) {
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for MultiplexedCircuit {
+    fn drop(&mut self) {
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Background reader for multiplexed circuits — dispatches inbound frames
+/// to the correct stream via `stream_id`.
+async fn background_reader_multiplexed(
+    link: Arc<AsyncLink>,
+    circuit_keys: CircuitKeys,
+    gateway_node_id: [u8; 32],
+    client_node_id: [u8; 32],
+    fid: [u8; 8],
+    streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
+) {
+    loop {
+        let frame = match link.recv_frame().await {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+
+        // Validate outer frame.
+        if let Err(_) = validate_frame(&frame, &gateway_node_id, &client_node_id, &fid) {
+            // Mark all streams as reset.
+            let streams_map = streams.lock().await;
+            for (_, shared) in streams_map.iter() {
+                let mut s = shared.lock().await;
+                s.state = StreamState::Reset;
+                s.credit_notify.notify_one();
+                s.data_notify.notify_one();
+            }
+            break;
+        }
+
+        // Decrypt.
+        let plaintext = match decrypt_circuit_payload(&circuit_keys.recv_key, &frame.body) {
+            Some(p) => p,
+            None => {
+                let streams_map = streams.lock().await;
+                for (_, shared) in streams_map.iter() {
+                    let mut s = shared.lock().await;
+                    s.state = StreamState::Reset;
+                    s.credit_notify.notify_one();
+                    s.data_notify.notify_one();
+                }
+                break;
+            }
+        };
+
+        // Decode.
+        let msg = match decode_stream_message(&plaintext) {
+            Ok(m) => m,
+            Err(_) => {
+                let streams_map = streams.lock().await;
+                for (_, shared) in streams_map.iter() {
+                    let mut s = shared.lock().await;
+                    s.state = StreamState::Reset;
+                    s.credit_notify.notify_one();
+                    s.data_notify.notify_one();
+                }
+                break;
+            }
+        };
+
+        // Extract stream_id and dispatch.
+        let stream_id = match &msg {
+            StreamMessage::Data(d) => Some(d.stream_id),
+            StreamMessage::WindowUpdate(w) => Some(w.stream_id),
+            StreamMessage::HalfClose(h) => Some(h.stream_id),
+            StreamMessage::Close(c) => Some(c.stream_id),
+            StreamMessage::Reset(r) => Some(r.stream_id),
+            StreamMessage::Open(_) | StreamMessage::OpenAck(_) => None,
+        };
+
+        if let Some(sid) = stream_id {
+            let shared = {
+                let streams_map = streams.lock().await;
+                streams_map.get(&sid).cloned()
+            };
+            if let Some(shared) = shared {
+                let mut s = shared.lock().await;
+                match &msg {
+                    StreamMessage::Data(data) => {
+                        if data.direction == StreamDirection::GatewayToClient
+                            && data.sequence == s.recv_seq
+                        {
+                            s.recv_seq += 1;
+                            s.pending_data.push_back(data.data.clone());
+                            s.data_notify.notify_one();
+                        } else {
+                            // Protocol violation — reset this stream.
+                            s.state = StreamState::Reset;
+                            s.credit_notify.notify_one();
+                            s.data_notify.notify_one();
+                        }
+                    }
+                    StreamMessage::WindowUpdate(update) => {
+                        s.send_credit = s
+                            .send_credit
+                            .saturating_add(update.additional_credit)
+                            .min(MAX_STREAM_WINDOW);
+                        s.credit_notify.notify_one();
+                    }
+                    StreamMessage::HalfClose(hc) => {
+                        if hc.direction == StreamDirection::GatewayToClient {
+                            s.state = match s.state {
+                                StreamState::Established => StreamState::HalfClosedRemote,
+                                StreamState::HalfClosedLocal => StreamState::Closed,
+                                other => other,
+                            };
+                            s.data_notify.notify_one();
+                        }
+                    }
+                    StreamMessage::Close(_) => {
+                        s.state = StreamState::Closed;
+                        s.data_notify.notify_one();
+                    }
+                    StreamMessage::Reset(_) => {
+                        s.state = StreamState::Reset;
+                        s.credit_notify.notify_one();
+                        s.data_notify.notify_one();
+                    }
+                    _ => {}
+                }
+            }
+            // If stream_id is not in the map, the frame is for a closed/unknown
+            // stream — ignore it (don't reset the entire circuit).
+        }
     }
 }
