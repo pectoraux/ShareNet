@@ -807,6 +807,13 @@ where
 /// ## CRITICAL: NOT a committed route
 ///
 /// Signed by the SOURCE only. Does NOT prove relays agreed.
+///
+/// ## N2.6: Service negotiation
+///
+/// For routes to an InternetGateway destination, `negotiated_service` MUST
+/// be `Some(NegotiatedServiceAgreement)`. A route cannot be committed merely
+/// because the destination advertises Gateway — the requested service must
+/// be permitted and supported. `commit_route()` enforces this.
 #[derive(Debug, Clone)]
 pub struct RouteProposal {
     pub protocol_version: u8,
@@ -814,6 +821,9 @@ pub struct RouteProposal {
     pub destination: [u8; 32],
     pub hop_node_ids: Vec<[u8; 32]>,
     pub service: ServiceAgreement,
+    /// N2.6: The negotiated service agreement (required for InternetGateway
+    /// destinations). `None` for non-gateway routes or legacy compatibility.
+    pub negotiated_service: Option<crate::node::service::NegotiatedServiceAgreement>,
     pub timestamp: u64,
     pub expiry: u64,
     pub nonce: [u8; 16],
@@ -836,6 +846,32 @@ impl RouteProposal {
         service: ServiceAgreement,
         expiry: u64,
     ) -> Result<Self, RouteSerializationError> {
+        Self::from_validated_path_inner(path, source_secret_key, source_public_key, service, None, expiry)
+    }
+
+    /// N2.6: Create and sign a `RouteProposal` with a negotiated service
+    /// agreement. For routes to an InternetGateway destination, this is
+    /// REQUIRED — `commit_route()` will reject a gateway route without
+    /// a `NegotiatedServiceAgreement`.
+    pub fn from_validated_path_with_negotiation(
+        path: &ValidatedPath,
+        source_secret_key: &[u8; 32],
+        source_public_key: &[u8; 32],
+        service: ServiceAgreement,
+        negotiated: crate::node::service::NegotiatedServiceAgreement,
+        expiry: u64,
+    ) -> Result<Self, RouteSerializationError> {
+        Self::from_validated_path_inner(path, source_secret_key, source_public_key, service, Some(negotiated), expiry)
+    }
+
+    fn from_validated_path_inner(
+        path: &ValidatedPath,
+        source_secret_key: &[u8; 32],
+        source_public_key: &[u8; 32],
+        service: ServiceAgreement,
+        negotiated: Option<crate::node::service::NegotiatedServiceAgreement>,
+        expiry: u64,
+    ) -> Result<Self, RouteSerializationError> {
         let now = now_unix();
         let mut nonce = [0u8; 16];
         // P0: fail-closed on RNG failure. Do NOT discard the error with `let _ =`.
@@ -850,6 +886,7 @@ impl RouteProposal {
             destination,
             hop_node_ids,
             service,
+            negotiated_service: negotiated,
             timestamp: now,
             expiry,
             nonce,
@@ -859,6 +896,13 @@ impl RouteProposal {
         let preimage = proposal.preimage_bytes()?;
         proposal.source_signature = ed25519_sign(source_secret_key, &preimage);
         Ok(proposal)
+    }
+
+    /// N2.6: Returns true if this proposal has a valid negotiated service
+    /// agreement (required for InternetGateway destinations).
+    #[must_use]
+    pub fn has_negotiated_service(&self) -> bool {
+        self.negotiated_service.is_some()
     }
 
     fn preimage(&self) -> CborValue {
@@ -1096,6 +1140,15 @@ pub enum CommitError {
     /// `commit_route()` fails closed and returns this error. No `CommittedRoute`
     /// is produced.
     CommitmentEncodingFailed,
+    /// N2.6: the route destination is an InternetGateway but the proposal
+    /// does not carry a `NegotiatedServiceAgreement`. A route cannot be
+    /// committed merely because the destination advertises Gateway — the
+    /// requested service must be permitted and supported.
+    ServiceNegotiationRequired { destination: [u8; 32] },
+    /// N2.6: the proposal carries a `NegotiatedServiceAgreement` but the
+    /// negotiation is invalid (the requirement was not satisfied by the
+    /// offer/policy/capacity at commit time).
+    ServiceNegotiationInvalid { destination: [u8; 32], reason: String },
 }
 
 impl std::fmt::Display for CommitError {
@@ -1119,8 +1172,43 @@ impl std::fmt::Display for CommitError {
             Self::EmptyPath => write!(f, "validated path is empty"),
             Self::DuplicateAcceptance { participant } => write!(f, "duplicate acceptance from {}", hex_short(participant)),
             Self::CommitmentEncodingFailed => write!(f, "canonical CBOR encoding of commitment preimage failed"),
+            Self::ServiceNegotiationRequired { destination } => write!(f, "service negotiation required for InternetGateway destination {} — a route cannot be committed without a NegotiatedServiceAgreement", hex_short(destination)),
+            Self::ServiceNegotiationInvalid { destination, reason } => write!(f, "service negotiation invalid for destination {}: {reason}", hex_short(destination)),
         }
     }
+}
+
+/// N2.6: Negotiate service for a validated path to an InternetGateway
+/// destination.
+///
+/// This is the integration point between route discovery and service
+/// negotiation. The pipeline is:
+///
+/// ```text
+/// route candidate (ValidatedPath)
+///     ↓
+/// ServiceRequirement (what the client needs)
+///     ↓
+/// CapabilityOffer + PolicyConstraint + CapacityConstraint (from gateway)
+///     ↓
+/// NegotiatedServiceAgreement (matched + signed terms)
+///     ↓
+/// RouteProposal::from_validated_path_with_negotiation()
+///     ↓
+/// commit_route()
+/// ```
+///
+/// Returns `None` if the requirement is not satisfied by the offer/policy/
+/// capacity. A route to an InternetGateway cannot be committed without a
+/// valid `NegotiatedServiceAgreement`.
+#[must_use]
+pub fn negotiate_service(
+    requirement: crate::node::service::ServiceRequirement,
+    offer: crate::node::service::CapabilityOffer,
+    policy: crate::node::service::PolicyConstraint,
+    capacity: crate::node::service::CapacityConstraint,
+) -> Option<crate::node::service::NegotiatedServiceAgreement> {
+    crate::node::service::NegotiatedServiceAgreement::negotiate(requirement, offer, policy, capacity)
 }
 
 /// Commit a route proposal into a `CommittedRoute`.
@@ -1207,6 +1295,41 @@ pub fn commit_route(
                         participant: hop.node_id,
                         role: RouteRole::Relay,
                         capability: if has_gateway { Capability::Gateway } else { Capability::Client },
+                    });
+                }
+            }
+        }
+    }
+
+    // 4b. N2.6: Service negotiation enforcement.
+    //     If the destination is an InternetGateway (the last hop has
+    //     RouteRole::Gateway), the proposal MUST carry a
+    //     NegotiatedServiceAgreement. A route cannot be committed merely
+    //     because the destination advertises Gateway — the requested
+    //     service must be permitted and supported.
+    let has_gateway_destination = validated_path.hops()
+        .last()
+        .map(|h| h.role == RouteRole::Gateway)
+        .unwrap_or(false);
+
+    if has_gateway_destination {
+        match &proposal.negotiated_service {
+            None => {
+                return Err(CommitError::ServiceNegotiationRequired {
+                    destination: proposal.destination,
+                });
+            }
+            Some(negotiated) => {
+                // Verify the negotiation is still valid: re-check that the
+                // requirement is satisfied by the offer/policy/capacity.
+                if !negotiated.requirement.is_satisfied_by(
+                    &negotiated.offer,
+                    &negotiated.policy,
+                    &negotiated.capacity,
+                ) {
+                    return Err(CommitError::ServiceNegotiationInvalid {
+                        destination: proposal.destination,
+                        reason: "negotiated service agreement no longer satisfies the requirement".to_string(),
                     });
                 }
             }

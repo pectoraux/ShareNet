@@ -47,6 +47,11 @@ use snp_node::node::{
     establish_distributed_circuit, prepare_circuit_setup, validate_path,
     verify_dh_proof,
 };
+// N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+use snp_node::node::route_discovery::negotiate_service;
+use snp_node::node::service::{
+    ServiceRequirement, CapabilityOffer, PolicyConstraint, CapacityConstraint,
+};
 use std::collections::HashMap;
 
 fn fresh_keypair(label: &[u8]) -> ([u8; 32], [u8; 32]) {
@@ -188,9 +193,17 @@ fn setup() -> TestSetup {
     let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
     let validated_path = validate_path(&exec, &discovered).unwrap();
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    ).expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated_path, &source_sk, &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     ).unwrap();
     let hash = proposal.proposal_hash().unwrap();

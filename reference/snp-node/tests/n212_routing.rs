@@ -14,6 +14,10 @@ use snp_node::node::{
     NextHopDiscovery, NodeAdvertisement, RouteAcceptance, RouteProposal, RouteRole,
     ServiceAgreement, TopologyGraph, TransportEndpoint, ValidatedPath,
     assemble_progressive_path, commit_route, discover_path, validate_path,
+    negotiate_service,
+};
+use snp_node::node::service::{
+    ServiceRequirement, CapabilityOffer, PolicyConstraint, CapacityConstraint,
 };
 use std::collections::HashMap;
 
@@ -101,9 +105,17 @@ fn build_validated_path(topo: &TestTopology) -> ValidatedPath {
 fn build_proposal_and_path(topo: &TestTopology) -> (RouteProposal, ValidatedPath) {
     let path = build_validated_path(topo);
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    ).expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &path, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     ).unwrap();
     (proposal, path)

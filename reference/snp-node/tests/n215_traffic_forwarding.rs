@@ -47,6 +47,11 @@ use snp_node::node::{
     TrafficError, TransportEndpoint, UnwrappedPacket,
     validate_path, wrap_packet_for_testing, wrap_packet_v1_for_testing,
 };
+// N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+use snp_node::node::route_discovery::negotiate_service;
+use snp_node::node::service::{
+    ServiceRequirement, CapabilityOffer, PolicyConstraint, CapacityConstraint,
+};
 
 // N2.4: Test helper that wraps wrap_packet_for_testing with the default flow_id,
 // so existing N2.3 tests don't need to change their call signature.
@@ -150,9 +155,17 @@ fn setup() -> TestSetup {
     let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
     let validated_path = validate_path(&exec, &discovered).unwrap();
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    ).expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated_path, &source_sk, &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     ).unwrap();
     let hash = proposal.proposal_hash().unwrap();
@@ -794,9 +807,17 @@ fn setup_three_hop() -> ThreeHopSetup {
     let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
     let validated_path = validate_path(&exec, &discovered).unwrap();
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    ).expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated_path, &source_sk, &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     ).unwrap();
     let hash = proposal.proposal_hash().unwrap();

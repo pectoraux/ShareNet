@@ -17,6 +17,9 @@
 
 use snp_crypto::{derive_node_id, derive_public_key, sha256, x25519_static_keypair};
 use snp_node::node::*;
+use snp_node::node::service::{
+    ServiceRequirement, CapabilityOffer, PolicyConstraint, CapacityConstraint,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_unix() -> u64 {
@@ -110,9 +113,17 @@ fn build_validated_path(topo: &TestTopology) -> ValidatedPath {
 fn build_proposal_and_path(topo: &TestTopology) -> (RouteProposal, ValidatedPath) {
     let path = build_validated_path(topo);
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    ).expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &path, &topo.source_sk, &topo.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     ).unwrap();
     (proposal, path)

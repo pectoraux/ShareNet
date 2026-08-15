@@ -160,6 +160,7 @@ pub use route_discovery::{
     DiscoveredPath, ValidatedPath, AuthenticatedHop, PathError, RouteRole, ServiceAgreement,
     LinkAttestation, LinkEvidence, NextHopCandidate, NextHopDiscovery, RouteSerializationError,
     commit_route, discover_path, validate_path, assemble_progressive_path,
+    negotiate_service, // N2.6: service negotiation integration point
     ROUTE_MAX_HOPS as N212_ROUTE_MAX_HOPS, ROUTE_MAX_LIFETIME_SECS,
 };
 pub use circuit_handshake::{

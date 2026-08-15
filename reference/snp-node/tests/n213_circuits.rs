@@ -26,6 +26,11 @@ use snp_node::node::{
     Link as Link_, LinkKey, NodeAdvertisement, RouteAcceptance, RouteProposal, RouteRole,
     ServiceAgreement, TopologyGraph, TransportEndpoint, ValidatedPath,
 };
+// N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+use snp_node::node::route_discovery::negotiate_service;
+use snp_node::node::service::{
+    ServiceRequirement, CapabilityOffer, PolicyConstraint, CapacityConstraint,
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -257,11 +262,20 @@ fn setup() -> TestSetup {
     let validated_path = validate_path(&exec, &discovered).expect("path validation");
 
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    )
+    .expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated_path,
         &source_sk,
         &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     )
     .expect("proposal");
@@ -543,11 +557,20 @@ fn stale_route_rejected() {
     // route, then sleep past its expiry.
     let now = now_unix();
     let short_expiry = now + 1;
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    )
+    .expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &ts.validated_path,
         &ts.source_sk,
         &ts.source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         short_expiry,
     )
     .expect("proposal");
@@ -770,11 +793,20 @@ fn intermediate_relay_missing_circuit_key_rejected() {
     let validated = validate_path(&exec, &discovered).expect("validation");
 
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    )
+    .expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated,
         &source_sk,
         &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     )
     .unwrap();
@@ -978,11 +1010,20 @@ fn relay_derives_same_forwarding_key() {
     let discovered = discover_path(&exec, &source_id, &gateway_id).unwrap();
     let validated = validate_path(&exec, &discovered).unwrap();
     let now = now_unix();
-    let proposal = RouteProposal::from_validated_path(
+    // N2.6: Gateway routes MUST carry a NegotiatedServiceAgreement.
+    let negotiated = negotiate_service(
+        ServiceRequirement::internet_gateway(),
+        CapabilityOffer::internet_gateway(),
+        PolicyConstraint::wildcard(),
+        CapacityConstraint::default(),
+    )
+    .expect("negotiation must succeed for default gateway offer");
+    let proposal = RouteProposal::from_validated_path_with_negotiation(
         &validated,
         &source_sk,
         &source_pk,
         ServiceAgreement::new("internet-transit".to_string(), vec![]),
+        negotiated,
         now + 3600,
     )
     .unwrap();
