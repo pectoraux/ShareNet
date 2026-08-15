@@ -105,6 +105,8 @@ pub use bridge::{
 };
 #[cfg(feature = "circuit-upstream")]
 pub use bridge::ShareNetCircuitUpstreamModeA;
+#[cfg(feature = "circuit-upstream")]
+pub use bridge::ShareNetCircuitUpstreamModeB;
 pub use dns::{
     intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,

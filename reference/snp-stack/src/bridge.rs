@@ -776,6 +776,229 @@ mod circuit_upstream {
 #[cfg(feature = "circuit-upstream")]
 pub use circuit_upstream::ShareNetCircuitUpstreamModeA;
 
+// ─── ShareNetCircuitUpstreamModeB (Mode B / raw TCP, behind feature flag) ──
+
+#[cfg(feature = "circuit-upstream")]
+mod circuit_upstream_mode_b {
+    use super::{AsyncUpstream, BridgeError};
+    use snp_crypto::{X25519PubKey, X25519Secret};
+    use snp_gateway::stream::InternetEndpoint;
+    use snp_node::node::stream_client::{StreamError, StreamHandle};
+    use snp_node::node::{Node, Route};
+
+    /// **N2.2.5 Phase 4 — Mode B / raw TCP circuit adapter.**
+    ///
+    /// This is a thin `AsyncUpstream` wrapper around [`StreamHandle`]. It
+    /// provides genuine bidirectional raw TCP byte stream transport over
+    /// the ShareNet circuit — no HTTP parsing, no request buffering, no
+    /// application-awareness.
+    ///
+    /// ## Architecture
+    ///
+    /// ```text
+    /// TcpFlowBridge
+    ///     ↓
+    /// AsyncUpstream (trait — unchanged)
+    ///     ↓
+    /// ShareNetCircuitUpstreamModeB (this struct)
+    ///     ↓
+    /// StreamHandle (from Phase 3)
+    ///     ↓
+    /// Mode-B circuit (StreamOpen → StreamData ↔ → HalfClose/Close/Reset)
+    ///     ↓
+    /// Gateway → real TCP socket → Internet
+    /// ```
+    ///
+    /// ## What this proves
+    ///
+    /// Unlike Mode A (which buffers HTTP requests and fetches URLs), Mode B
+    /// is a true transparent TCP byte stream. It works for:
+    ///
+    /// - HTTPS (TLS over TCP)
+    /// - SSH
+    /// - WebSockets
+    /// - Database protocols
+    /// - Any TCP-based protocol
+    ///
+    /// The application sees a normal TCP connection; it does not know
+    /// ShareNet exists.
+    ///
+    /// ## What this does NOT know about
+    ///
+    /// - TUN
+    /// - smoltcp
+    /// - TCP packet parsing
+    /// - Discovery
+    /// - Route construction
+    /// - Gateway selection
+    ///
+    /// It receives a pre-built `StreamHandle` (from `StreamHandle::open()`)
+    /// and simply passes bytes through.
+    pub struct ShareNetCircuitUpstreamModeB {
+        /// The Mode B stream handle (owns the circuit link + background reader).
+        handle: StreamHandle,
+    }
+
+    impl std::fmt::Debug for ShareNetCircuitUpstreamModeB {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ShareNetCircuitUpstreamModeB")
+                .field("stream_id", &self.handle.stream_id())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ShareNetCircuitUpstreamModeB {
+        /// Create a new Mode B upstream by opening a stream to the given
+        /// destination.
+        ///
+        /// This internally:
+        /// 1. Establishes the circuit (SNP-IK + fresh ephemeral X25519).
+        /// 2. Sends `StreamOpen` with the destination endpoint.
+        /// 3. Receives `StreamOpenAck`.
+        /// 4. Spawns the background reader task.
+        ///
+        /// # Arguments
+        /// * `node` — The client node (identity + secret keys).
+        /// * `route` — The route to the gateway (from discovery).
+        /// * `client_x25519_secret` — The client's static X25519 secret.
+        /// * `client_x25519_public` — The client's static X25519 public.
+        /// * `destination` — The TCP endpoint to connect to (IP + port).
+        ///
+        /// # Errors
+        /// Returns [`BridgeError`] if the stream cannot be opened.
+        pub async fn open(
+            node: &Node,
+            route: &Route,
+            client_x25519_secret: &X25519Secret,
+            client_x25519_public: &X25519PubKey,
+            destination: InternetEndpoint,
+        ) -> Result<Self, BridgeError> {
+            let handle = StreamHandle::open(
+                node,
+                route,
+                client_x25519_secret,
+                client_x25519_public,
+                destination,
+            )
+            .await
+            .map_err(stream_err_to_bridge)?;
+            Ok(Self { handle })
+        }
+
+        /// Returns the stream ID.
+        #[must_use]
+        pub fn stream_id(&self) -> u64 {
+            self.handle.stream_id()
+        }
+
+        /// Returns the current stream state.
+        #[must_use]
+        pub async fn state(&self) -> snp_gateway::stream::StreamState {
+            self.handle.state().await
+        }
+    }
+
+    /// Map a [`StreamError`] to a [`BridgeError`].
+    fn stream_err_to_bridge(e: StreamError) -> BridgeError {
+        match e {
+            StreamError::Closed => BridgeError::Closed,
+            StreamError::Reset(_) => BridgeError::Closed,
+            StreamError::WindowExhaustedTerminated => BridgeError::Closed,
+            StreamError::InvalidState(_) => BridgeError::SmolTcp("invalid stream state".into()),
+            StreamError::Circuit(msg) => BridgeError::SmolTcp(format!("circuit: {msg}")),
+            StreamError::Cbor(msg) => BridgeError::SmolTcp(format!("cbor: {msg}")),
+            StreamError::OpenRejected(msg) => {
+                BridgeError::SmolTcp(format!("stream open rejected: {msg}"))
+            }
+            StreamError::FrameValidation(msg) => {
+                BridgeError::SmolTcp(format!("frame validation: {msg}"))
+            }
+            StreamError::ReaderTerminated(msg) => {
+                BridgeError::SmolTcp(format!("reader terminated: {msg}"))
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncUpstream for ShareNetCircuitUpstreamModeB {
+        async fn send(&mut self, data: &[u8]) -> Result<usize, BridgeError> {
+            self.handle.send(data).await.map_err(stream_err_to_bridge)
+        }
+
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+            self.handle.recv().await.map_err(stream_err_to_bridge)
+        }
+
+        async fn close(&mut self) {
+            let _ = self.handle.close().await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn stream_error_mapping() {
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::Closed),
+                BridgeError::Closed
+            ));
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::Reset(
+                    snp_gateway::stream::StreamResetReason::ApplicationReset
+                )),
+                BridgeError::Closed
+            ));
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::Circuit("test".into())),
+                BridgeError::SmolTcp(_)
+            ));
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::OpenRejected("test".into())),
+                BridgeError::SmolTcp(_)
+            ));
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::FrameValidation("test".into())),
+                BridgeError::SmolTcp(_)
+            ));
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::ReaderTerminated("test".into())),
+                BridgeError::SmolTcp(_)
+            ));
+        }
+
+        #[test]
+        fn window_exhausted_maps_to_closed() {
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::WindowExhaustedTerminated),
+                BridgeError::Closed
+            ));
+        }
+
+        #[test]
+        fn invalid_state_maps_to_smoltcp() {
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::InvalidState(
+                    snp_gateway::stream::StreamState::Reset
+                )),
+                BridgeError::SmolTcp(_)
+            ));
+        }
+
+        #[test]
+        fn cbor_error_maps_to_smoltcp() {
+            assert!(matches!(
+                stream_err_to_bridge(StreamError::Cbor("test".into())),
+                BridgeError::SmolTcp(_)
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "circuit-upstream")]
+pub use circuit_upstream_mode_b::ShareNetCircuitUpstreamModeB;
+
 #[cfg(test)]
 mod tests {
     use super::*;
