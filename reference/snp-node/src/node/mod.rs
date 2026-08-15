@@ -111,6 +111,7 @@ pub mod async_node;
 pub mod identity;
 pub mod gateway;
 pub mod gateway_stream;
+pub mod stream_client;
 pub mod circuit;
 pub mod session;
 pub mod descriptor;
