@@ -124,6 +124,9 @@ pub mod circuit_handshake;
 pub mod distributed_circuit;
 pub mod traffic;
 pub mod capability;
+pub mod evidence; // N2.5-T3: evidence-class separation
+pub mod service;  // N2.5-T4: service/capability negotiation
+pub mod gateway_service; // N2.5-T5: gateway service state model
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
