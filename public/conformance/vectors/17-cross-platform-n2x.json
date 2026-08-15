@@ -1,0 +1,477 @@
+{
+  "frozen_at_commit": "d766b60",
+  "generated_by": "snp-node gen_n32_vectors",
+  "protocol_version": "3.2",
+  "suites": {
+    "capability-model": "NodeCapability → ProtocolCapability bridge mappings",
+    "circuit-lifecycle": "CircuitLifecycleState transitions (valid + invalid)",
+    "contribution": "ContributionProof + CivicPoint computation (sub-linear + diversity-weighted)",
+    "evidence-model": "EvidenceLevel classifications (language-independent)",
+    "gateway-service": "GatewayPolicy + CapacityClaim + Measurement evidence levels + destination matching"
+  },
+  "vectors": [
+    {
+      "description": "EvidenceLevel::Authenticated classification",
+      "expected": {
+        "display_string": "authenticated",
+        "is_routing_evidence": true,
+        "is_untrusted": false
+      },
+      "id": "evidence-level-Authenticated",
+      "input": {
+        "evidence_level": "Authenticated"
+      },
+      "protocol_version": "3.2",
+      "suite": "evidence-model"
+    },
+    {
+      "description": "EvidenceLevel::Observed classification",
+      "expected": {
+        "display_string": "observed",
+        "is_routing_evidence": true,
+        "is_untrusted": false
+      },
+      "id": "evidence-level-Observed",
+      "input": {
+        "evidence_level": "Observed"
+      },
+      "protocol_version": "3.2",
+      "suite": "evidence-model"
+    },
+    {
+      "description": "EvidenceLevel::Reported classification",
+      "expected": {
+        "display_string": "reported",
+        "is_routing_evidence": false,
+        "is_untrusted": true
+      },
+      "id": "evidence-level-Reported",
+      "input": {
+        "evidence_level": "Reported"
+      },
+      "protocol_version": "3.2",
+      "suite": "evidence-model"
+    },
+    {
+      "description": "EvidenceLevel::Derived classification",
+      "expected": {
+        "display_string": "derived",
+        "is_routing_evidence": false,
+        "is_untrusted": false
+      },
+      "id": "evidence-level-Derived",
+      "input": {
+        "evidence_level": "Derived"
+      },
+      "protocol_version": "3.2",
+      "suite": "evidence-model"
+    },
+    {
+      "description": "EvidenceLevel::Inferred classification",
+      "expected": {
+        "display_string": "inferred",
+        "is_routing_evidence": false,
+        "is_untrusted": true
+      },
+      "id": "evidence-level-Inferred",
+      "input": {
+        "evidence_level": "Inferred"
+      },
+      "protocol_version": "3.2",
+      "suite": "evidence-model"
+    },
+    {
+      "description": "GatewayPolicy evidence level is Authenticated",
+      "expected": {
+        "capacity_evidence_level": "Reported",
+        "measurement_evidence_level": "Observed",
+        "policy_evidence_level": "Authenticated"
+      },
+      "id": "gateway-policy-evidence-level",
+      "input": {},
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayPolicy.destination_allowed(\"example.com\") with allowed=[]",
+      "expected": {
+        "allowed": true
+      },
+      "id": "gateway-policy-dest-wildcard-allows-all",
+      "input": {
+        "allowed_destinations": [],
+        "destination": "example.com"
+      },
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayPolicy.destination_allowed(\"www.example.com\") with allowed=[\"*.example.com\"]",
+      "expected": {
+        "allowed": true
+      },
+      "id": "gateway-policy-dest-glob-suffix-match",
+      "input": {
+        "allowed_destinations": [
+          "*.example.com"
+        ],
+        "destination": "www.example.com"
+      },
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayPolicy.destination_allowed(\"evil.com\") with allowed=[\"*.example.com\"]",
+      "expected": {
+        "allowed": false
+      },
+      "id": "gateway-policy-dest-glob-suffix-no-match",
+      "input": {
+        "allowed_destinations": [
+          "*.example.com"
+        ],
+        "destination": "evil.com"
+      },
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayPolicy.destination_allowed(\"example.com\") with allowed=[\"example.com\"]",
+      "expected": {
+        "allowed": true
+      },
+      "id": "gateway-policy-dest-exact-match",
+      "input": {
+        "allowed_destinations": [
+          "example.com"
+        ],
+        "destination": "example.com"
+      },
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayPolicy.destination_allowed(\"evil.com\") with allowed=[\"example.com\"]",
+      "expected": {
+        "allowed": false
+      },
+      "id": "gateway-policy-dest-exact-no-match",
+      "input": {
+        "allowed_destinations": [
+          "example.com"
+        ],
+        "destination": "evil.com"
+      },
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "GatewayCapacityClaim is a ReportedMetric (untrusted)",
+      "expected": {
+        "evidence_level": "Reported",
+        "is_untrusted": true
+      },
+      "id": "gateway-capacity-claim-evidence",
+      "input": {},
+      "protocol_version": "3.2",
+      "suite": "gateway-service"
+    },
+    {
+      "description": "Frozen ContributionProof: 1 receipt, 1 MiB, 1 client",
+      "expected": {
+        "all_receipts_verify": true,
+        "distinct_clients": 1,
+        "evidence_level": "Authenticated",
+        "proof_verifies": true,
+        "total_bytes": 1048576
+      },
+      "id": "contribution-proof-v1",
+      "input": {
+        "contributor_node_id_hex": "56e6cd54e3c25585f02dbe3b2d78b361546df466f66c5a8d481417502d53ae43",
+        "distinct_clients": 1,
+        "receipts_count": 1,
+        "total_bytes": 1048576
+      },
+      "protocol_version": "3.2",
+      "suite": "contribution"
+    },
+    {
+      "description": "Civic Points: 1 MiB, 1 client → 20 points (100 × log₂(2) × 0.2)",
+      "expected": {
+        "credited_points": 20,
+        "diversity_factor": 0.2,
+        "formula": "base_rate × log₂(1 + MiB) × diversity_factor",
+        "log2_factor": 1.0,
+        "raw_points": 20.0
+      },
+      "id": "civic-points-1mib-1client",
+      "input": {
+        "base_rate": 100.0,
+        "bytes": 1048576,
+        "distinct_clients": 1
+      },
+      "protocol_version": "3.2",
+      "suite": "contribution"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Setup → Active",
+      "expected": {
+        "valid_transition": true
+      },
+      "id": "circuit-transition-setup-to-active",
+      "input": {
+        "from_state": "Setup",
+        "to_state": "Active"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Active → Active",
+      "expected": {
+        "valid_transition": true
+      },
+      "id": "circuit-transition-active-to-rotating-to-active",
+      "input": {
+        "from_state": "Active",
+        "to_state": "Active"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Active → Expired",
+      "expected": {
+        "valid_transition": true
+      },
+      "id": "circuit-transition-active-to-expired",
+      "input": {
+        "from_state": "Active",
+        "to_state": "Expired"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Active → TornDown",
+      "expected": {
+        "valid_transition": true
+      },
+      "id": "circuit-transition-active-to-torndown",
+      "input": {
+        "from_state": "Active",
+        "to_state": "TornDown"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Setup → Expired",
+      "expected": {
+        "valid_transition": false
+      },
+      "id": "circuit-transition-setup-to-expired",
+      "input": {
+        "from_state": "Setup",
+        "to_state": "Expired"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: TornDown → Active",
+      "expected": {
+        "valid_transition": false
+      },
+      "id": "circuit-transition-torndown-to-active",
+      "input": {
+        "from_state": "TornDown",
+        "to_state": "Active"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "CircuitLifecycleState transition: Expired → Active",
+      "expected": {
+        "valid_transition": false
+      },
+      "id": "circuit-transition-expired-to-active",
+      "input": {
+        "from_state": "Expired",
+        "to_state": "Active"
+      },
+      "protocol_version": "3.2",
+      "suite": "circuit-lifecycle"
+    },
+    {
+      "description": "Capability::Client → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": false,
+        "protocol_capability_byte": null
+      },
+      "id": "capability-bridge-Client",
+      "input": {
+        "capability_variant": "Client"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Relay → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 0
+      },
+      "id": "capability-bridge-Relay",
+      "input": {
+        "capability_variant": "Relay"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Gateway → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 5
+      },
+      "id": "capability-bridge-Gateway",
+      "input": {
+        "capability_variant": "Gateway"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::MeshRelay → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 0
+      },
+      "id": "capability-bridge-MeshRelay",
+      "input": {
+        "capability_variant": "MeshRelay"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::InternetGateway → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 5
+      },
+      "id": "capability-bridge-InternetGateway",
+      "input": {
+        "capability_variant": "InternetGateway"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::ContentSeed → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 3
+      },
+      "id": "capability-bridge-ContentSeed",
+      "input": {
+        "capability_variant": "ContentSeed"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Storage → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 4
+      },
+      "id": "capability-bridge-Storage",
+      "input": {
+        "capability_variant": "Storage"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Discovery → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 1
+      },
+      "id": "capability-bridge-Discovery",
+      "input": {
+        "capability_variant": "Discovery"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Sync → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 2
+      },
+      "id": "capability-bridge-Sync",
+      "input": {
+        "capability_variant": "Sync"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::Compute → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 6
+      },
+      "id": "capability-bridge-Compute",
+      "input": {
+        "capability_variant": "Compute"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::CryptoRelay → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 0
+      },
+      "id": "capability-bridge-CryptoRelay",
+      "input": {
+        "capability_variant": "CryptoRelay"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::CryptoGateway → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": true,
+        "protocol_capability_byte": 5
+      },
+      "id": "capability-bridge-CryptoGateway",
+      "input": {
+        "capability_variant": "CryptoGateway"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    },
+    {
+      "description": "Capability::PaymentRelay → ProtocolCapability bridge",
+      "expected": {
+        "has_protocol_counterpart": false,
+        "protocol_capability_byte": null
+      },
+      "id": "capability-bridge-PaymentRelay",
+      "input": {
+        "capability_variant": "PaymentRelay"
+      },
+      "protocol_version": "3.2",
+      "suite": "capability-model"
+    }
+  ]
+}
