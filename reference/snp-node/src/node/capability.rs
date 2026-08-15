@@ -78,12 +78,45 @@ pub enum CapabilitySerializationError {
     /// CBOR encoding failed.
     #[error("CBOR encoding failed: {0}")]
     CborEncode(String),
+    /// P1 #4 rev5: Semantic validation failed during construction.
+    #[error("semantic validation failed: {0}")]
+    Semantic(String),
 }
 
 type SerResult<T> = Result<T, CapabilitySerializationError>;
 
 fn try_encode(value: &CborValue) -> SerResult<Vec<u8>> {
     encode(value).map_err(|e| CapabilitySerializationError::CborEncode(e.to_string()))
+}
+
+// ─── Semantic validation error (P1 #4 rev5) ────────────────────────────────
+
+/// P1 #4 rev5: Structural/semantic validation errors.
+/// Cryptographic validity does NOT imply semantic validity. A governance-signed
+/// but malformed authority must not enter authoritative state merely because
+/// its signature is valid.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SemanticError {
+    #[error("valid_from must be < valid_until")]
+    InvalidValidityWindow,
+    #[error("issued_at must be <= valid_from")]
+    IssuedAfterValidFrom,
+    #[error("authority_version must be > 0")]
+    InvalidAuthorityVersion,
+    #[error("revocation_version must be > 0")]
+    InvalidRevocationVersion,
+    #[error("authority_version in revocation must be > 0")]
+    InvalidRevocationAuthorityVersion,
+    #[error("configuration_version must be > 0")]
+    InvalidVersion,
+    #[error("validity_start must be < validity_end")]
+    InvalidAuthorizationWindow,
+    #[error("authorization lifetime exceeds authority lifetime")]
+    AuthorizationExceedsAuthority,
+    #[error("capabilities_authorized must not be empty")]
+    EmptyCapabilities,
+    #[error("scope contains invalid characters or structure")]
+    InvalidScopeStructure,
 }
 
 // ─── Capability taxonomy ───────────────────────────────────────────────────
@@ -200,12 +233,15 @@ pub struct GovernanceTrustAnchor {
 }
 
 impl GovernanceTrustAnchor {
+    /// P0 #2 rev5: Returns `SerResult` — no `expect()` in security-critical
+    /// serialization.
+    /// P1 #4 rev5: Also validates semantic invariants on construction.
     pub fn new(
         governance_secret: &SecretKey,
         configuration_version: u64,
         valid_from: u64,
         valid_until: u64,
-    ) -> Self {
+    ) -> SerResult<Self> {
         let governance_public_key = derive_public_key(governance_secret);
         let governance_id = sha256(&governance_public_key);
         let preimage = Self::preimage_bytes(
@@ -214,39 +250,43 @@ impl GovernanceTrustAnchor {
             configuration_version,
             valid_from,
             valid_until,
-        );
+        )?;
         let governance_signature = ed25519_sign(governance_secret, &preimage);
-        Self {
+        let anchor = Self {
             governance_public_key,
             governance_id,
             configuration_version,
             valid_from,
             valid_until,
             governance_signature,
-        }
+        };
+        anchor.validate_semantic()
+            .map_err(|e| CapabilitySerializationError::Semantic(e.to_string()))?;
+        Ok(anchor)
     }
 
+    /// P0 #2 rev5: Propagates `SerResult` — no `expect()`.
     fn preimage_bytes(
         governance_public_key: &PublicKey,
         governance_id: &[u8; 32],
         configuration_version: u64,
         valid_from: u64,
         valid_until: u64,
-    ) -> Vec<u8> {
+    ) -> SerResult<Vec<u8>> {
         let cbor = try_encode(&CborValue::Array(vec![
             CborValue::ByteString(governance_public_key.to_vec()),
             CborValue::ByteString(governance_id.to_vec()),
             CborValue::UnsignedInt(configuration_version),
             CborValue::UnsignedInt(valid_from),
             CborValue::UnsignedInt(valid_until),
-        ]))
-        .expect("internal: CBOR encoding of well-formed governance anchor data cannot fail");
+        ]))?;
         let mut preimage = GOVERNANCE_ANCHOR_CONTEXT.to_vec();
         preimage.extend_from_slice(&cbor);
-        preimage
+        Ok(preimage)
     }
 
-    pub fn canonical_preimage(&self) -> Vec<u8> {
+    /// P0 #2 rev5: Returns `SerResult` — no `expect()`.
+    pub fn canonical_preimage(&self) -> SerResult<Vec<u8>> {
         Self::preimage_bytes(
             &self.governance_public_key,
             &self.governance_id,
@@ -256,16 +296,31 @@ impl GovernanceTrustAnchor {
         )
     }
 
+    /// P0 #2 rev5: Fail-closed on serialization error (returns `false`).
     pub fn verify_self_signature(&self) -> bool {
-        ed25519_verify(
-            &self.governance_public_key,
-            &self.canonical_preimage(),
-            &self.governance_signature,
-        )
+        match self.canonical_preimage() {
+            Ok(preimage) => ed25519_verify(
+                &self.governance_public_key,
+                &preimage,
+                &self.governance_signature,
+            ),
+            Err(_) => false,
+        }
     }
 
     pub fn is_valid_at(&self, now: u64) -> bool {
         now >= self.valid_from && now < self.valid_until
+    }
+
+    /// P1 #4 rev5: Structural validity check.
+    pub fn validate_semantic(&self) -> Result<(), SemanticError> {
+        if self.valid_from >= self.valid_until {
+            return Err(SemanticError::InvalidValidityWindow);
+        }
+        if self.configuration_version == 0 {
+            return Err(SemanticError::InvalidVersion);
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +356,7 @@ pub struct IssuerAuthority {
 impl IssuerAuthority {
     /// Create a new IssuerAuthority. The issuer_public_key is derived from
     /// the issuer_secret, and issuer_id is computed as NodeId(issuer_public_key).
+    /// P1 #4 rev5: Validates semantic invariants on construction.
     pub fn new(
         governance_secret: &SecretKey,
         issuer_secret: &SecretKey,
@@ -325,9 +381,31 @@ impl IssuerAuthority {
             status: IssuerStatus::Active,
             governance_signature: [0u8; 64],
         };
+        auth.validate_semantic()
+            .map_err(|e| CapabilitySerializationError::Semantic(e.to_string()))?;
         let preimage = auth.canonical_preimage()?;
         auth.governance_signature = ed25519_sign(governance_secret, &preimage);
         Ok(auth)
+    }
+
+    /// P1 #4 rev5: Structural/semantic validity check.
+    /// Validates: valid_from < valid_until, issued_at <= valid_from,
+    /// authority_version > 0, non-empty capabilities, structurally valid scope.
+    pub fn validate_semantic(&self) -> Result<(), SemanticError> {
+        if self.valid_from >= self.valid_until {
+            return Err(SemanticError::InvalidValidityWindow);
+        }
+        if self.issued_at > self.valid_from {
+            return Err(SemanticError::IssuedAfterValidFrom);
+        }
+        if self.authority_version == 0 {
+            return Err(SemanticError::InvalidAuthorityVersion);
+        }
+        if self.capabilities_authorized.is_empty() {
+            return Err(SemanticError::EmptyCapabilities);
+        }
+        validate_scope_structure(&self.maximum_scope)?;
+        Ok(())
     }
 
     /// P0 #1: Verify that issuer_id == NodeId(issuer_public_key).
@@ -435,9 +513,25 @@ impl CapabilityAuthorization {
             nonce,
             issuer_signature: [0u8; 64],
         };
+        auth.validate_semantic()
+            .map_err(|e| CapabilitySerializationError::Semantic(e.to_string()))?;
         let preimage = auth.canonical_preimage()?;
         auth.issuer_signature = ed25519_sign(issuer_secret, &preimage);
         Ok(auth)
+    }
+
+    /// P1 #4 rev5: Structural/semantic validity check.
+    /// Validates: validity_start < validity_end, authority_version > 0,
+    /// structurally valid scope.
+    pub fn validate_semantic(&self) -> Result<(), SemanticError> {
+        if self.validity_start >= self.validity_end {
+            return Err(SemanticError::InvalidAuthorizationWindow);
+        }
+        if self.issuer_authority_version == 0 {
+            return Err(SemanticError::InvalidAuthorityVersion);
+        }
+        validate_scope_structure(&self.scope)?;
+        Ok(())
     }
 
     pub fn canonical_preimage(&self) -> SerResult<Vec<u8>> {
@@ -502,9 +596,23 @@ impl GovernanceIssuerRevocation {
             nonce,
             governance_signature: [0u8; 64],
         };
+        rev.validate_semantic()
+            .map_err(|e| CapabilitySerializationError::Semantic(e.to_string()))?;
         let preimage = rev.canonical_preimage()?;
         rev.governance_signature = ed25519_sign(governance_secret, &preimage);
         Ok(rev)
+    }
+
+    /// P1 #4 rev5: Structural/semantic validity check.
+    /// Validates: authority_version > 0, revocation_version > 0.
+    pub fn validate_semantic(&self) -> Result<(), SemanticError> {
+        if self.authority_version == 0 {
+            return Err(SemanticError::InvalidRevocationAuthorityVersion);
+        }
+        if self.revocation_version == 0 {
+            return Err(SemanticError::InvalidRevocationVersion);
+        }
+        Ok(())
     }
 
     pub fn canonical_preimage(&self) -> SerResult<Vec<u8>> {
@@ -581,6 +689,7 @@ pub struct SubjectCapabilityRevocation {
 impl SubjectCapabilityRevocation {
     /// P0 #2 rev4: `issuer_authority_version` and `issuer_authority_digest`
     /// are now required and are covered by the issuer signature.
+    /// P1 #4 rev5: Validates semantic invariants on construction.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         issuer_secret: &SecretKey,
@@ -604,9 +713,23 @@ impl SubjectCapabilityRevocation {
             nonce,
             issuer_signature: [0u8; 64],
         };
+        rev.validate_semantic()
+            .map_err(|e| CapabilitySerializationError::Semantic(e.to_string()))?;
         let preimage = rev.canonical_preimage()?;
         rev.issuer_signature = ed25519_sign(issuer_secret, &preimage);
         Ok(rev)
+    }
+
+    /// P1 #4 rev5: Structural/semantic validity check.
+    /// Validates: issuer_authority_version > 0, revocation_version > 0.
+    pub fn validate_semantic(&self) -> Result<(), SemanticError> {
+        if self.issuer_authority_version == 0 {
+            return Err(SemanticError::InvalidRevocationAuthorityVersion);
+        }
+        if self.revocation_version == 0 {
+            return Err(SemanticError::InvalidRevocationVersion);
+        }
+        Ok(())
     }
 
     pub fn canonical_preimage(&self) -> SerResult<Vec<u8>> {
@@ -681,10 +804,28 @@ fn scope_to_cbor(scope: &AuthScope) -> CborValue {
     ])
 }
 
+/// P1 #4 rev5: Validate the structural well-formedness of an AuthScope.
+/// Checks that all strings are non-empty and contain no control characters
+/// (which could be used to forge misleading scope entries).
+fn validate_scope_structure(scope: &AuthScope) -> Result<(), SemanticError> {
+    for s in scope.destinations.iter().chain(scope.protocols.iter()).chain(scope.constraints.iter()) {
+        if s.is_empty() {
+            return Err(SemanticError::InvalidScopeStructure);
+        }
+        if s.chars().any(|c| c.is_control()) {
+            return Err(SemanticError::InvalidScopeStructure);
+        }
+    }
+    Ok(())
+}
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AuthorizationVerifyError {
+    /// P0 #1 rev5: Store is in FailedClosed state — verification is rejected.
+    #[error("store not operational (failed-closed): {0}")]
+    StoreNotOperational(String),
     #[error("step 0: authority status is not Active")]
     AuthorityStatusNotActive,
     #[error("step 1: issuer signature invalid")]
@@ -733,16 +874,35 @@ pub enum ScopeEvaluationResult {
 
 // ─── AuthorityStateStore ───────────────────────────────────────────────────
 
+/// P0 #1 rev5: The persistence state of the store.
+/// After a post-rename durability failure, the store enters `FailedClosed`
+/// and rejects ALL further capability operations until restart/recovery.
+/// This is because disk may already contain the NEW generation while
+/// the durability barrier (parent directory fsync) is uncertain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistenceState {
+    /// Normal operation: commits succeed, verification/acceptance allowed.
+    Operational,
+    /// P0 #1 rev5: A post-rename durability failure occurred. The NEW
+    /// generation may be on disk, but the directory metadata is not
+    /// guaranteed to be durable. All further operations are rejected until
+    /// the store is restarted (re-opened from the persistence file).
+    FailedClosed { reason: String },
+}
+
 /// Persistent state for the authority chain.
 /// P0 #2: Real file-based persistence with atomic commit and fail-closed load.
 /// P0 #2 rev3: Persists complete signed objects, not just version floors.
 /// P0 #3: Transactional mutations — clone → mutate → persist → swap.
 /// P0 #3 rev4: Durable persistence (fsync temp + rename + fsync parent dir).
+/// P0 #1 rev5: Commit-point model — rename is the commit point; a post-rename
+///             fsync failure enters `FailedClosed`, not a silent rollback.
 /// P0 #1 rev3: Verifies cryptographic signatures before acceptance.
 /// P0 #2 rev4: Subject revocation bound to exact authority version + digest.
 /// P0 #4 rev3: Subject revocation acceptance resolves issuer authority.
 /// P1 #4 rev4: load() validates crypto provenance + equivocation into a
 ///             candidate; live store replaced only after entire file validates.
+/// P1 #4 rev5: load() also validates semantic invariants.
 /// P1 #5 rev4: Fail closed on malformed persisted entries/fields.
 /// P1 #7: This is the single authoritative state — VerificationContext queries it.
 #[derive(Debug, Clone)]
@@ -767,6 +927,11 @@ pub struct AuthorityStateStore {
     subj_revocation_digests: HashMap<([u8; 32], [u8; 32], u8, u64, u64), [u8; 32]>,
     subject_revocations: HashMap<([u8; 32], [u8; 32], u8, u64), SubjectCapabilityRevocation>,
 
+    /// P0 #1 rev5: The persistence state. After a post-rename durability
+    /// failure, this becomes `FailedClosed` and all further operations are
+    /// rejected until restart/recovery.
+    pub persistence_state: PersistenceState,
+
     // Persistence path (None = in-memory only). pub for testing.
     pub path: Option<PathBuf>,
 }
@@ -786,6 +951,20 @@ pub enum StoreError {
     /// P0 #3 rev4: durability barrier (fsync) failure.
     #[error("durability barrier failure: {0}")]
     Durability(String),
+    /// P0 #1 rev5: Post-rename durability uncertainty. The rename succeeded
+    /// (NEW generation is committed on disk), but a subsequent durability
+    /// barrier (parent directory fsync) failed. The store MUST enter
+    /// `FailedClosed` — it cannot claim durable state is unchanged.
+    #[error("post-commit durability uncertainty: {0}")]
+    PostCommitDurabilityUncertain(String),
+    /// P1 #3 rev5: The platform cannot provide the durability guarantee
+    /// required for security-state persistence (e.g. non-Unix without
+    /// directory fsync). Fail closed rather than silently succeeding.
+    #[error("unsupported platform for durable persistence: {0}")]
+    UnsupportedPlatform(String),
+    /// P1 #4 rev5: A persisted record failed semantic validation on load.
+    #[error("semantic validation failure on load: {0}")]
+    SemanticValidation(String),
 }
 
 /// Helper: extract a fixed-size byte array from a CborValue, or error.
@@ -842,7 +1021,28 @@ impl AuthorityStateStore {
             highest_subj_revocation_version: HashMap::new(),
             subj_revocation_digests: HashMap::new(),
             subject_revocations: HashMap::new(),
+            persistence_state: PersistenceState::Operational,
             path: None,
+        }
+    }
+
+    /// P0 #1 rev5: Returns true if the store is operational (not FailedClosed).
+    pub fn is_operational(&self) -> bool {
+        matches!(self.persistence_state, PersistenceState::Operational)
+    }
+
+    /// P0 #1 rev5: Returns a reference to the persistence state for inspection.
+    pub fn persistence_state(&self) -> &PersistenceState {
+        &self.persistence_state
+    }
+
+    /// P0 #1 rev5: Reject all operations if the store is FailedClosed.
+    fn ensure_operational(&self) -> Result<(), AuthorityStateError> {
+        match &self.persistence_state {
+            PersistenceState::Operational => Ok(()),
+            PersistenceState::FailedClosed { reason } => Err(
+                AuthorityStateError::StoreFailedClosed { reason: reason.clone() },
+            ),
         }
     }
 
@@ -967,6 +1167,9 @@ impl AuthorityStateStore {
                 continue;
             }
             let authority = decode_authority_from_cbor(obj)?;
+            // P1 #4 rev5: Validate semantic invariants on load.
+            authority.validate_semantic()
+                .map_err(|e| StoreError::SemanticValidation(e.to_string()))?;
             if !authority.verify_issuer_identity_binding() {
                 return Err(StoreError::Format(
                     "persisted authority: issuer identity binding invalid".into(),
@@ -987,6 +1190,9 @@ impl AuthorityStateStore {
                 continue;
             }
             let revocation = decode_gov_revocation_from_cbor(obj)?;
+            // P1 #4 rev5: Validate semantic invariants on load.
+            revocation.validate_semantic()
+                .map_err(|e| StoreError::SemanticValidation(e.to_string()))?;
             if !revocation.verify_governance_signature(&gov_pk) {
                 return Err(StoreError::Format(
                     "persisted governance revocation: signature invalid".into(),
@@ -1003,6 +1209,9 @@ impl AuthorityStateStore {
                 continue;
             }
             let revocation = decode_subj_revocation_from_cbor(obj)?;
+            // P1 #4 rev5: Validate semantic invariants on load.
+            revocation.validate_semantic()
+                .map_err(|e| StoreError::SemanticValidation(e.to_string()))?;
 
             let authority = candidate
                 .authorities
@@ -1048,10 +1257,26 @@ impl AuthorityStateStore {
     /// P0 #2 rev3: Serializes complete signed objects.
     /// P0 #3 rev4: Durability sequence:
     ///     write temp → fsync temp → atomic rename → fsync parent directory
-    /// Any step failure returns an error; the caller (transactional_apply)
-    /// guarantees that live memory is not swapped in on failure.
+    /// P0 #1 rev5: Commit-point model — the RENAME is the commit point.
+    ///     - Pre-rename failures (temp create/write/fsync) return a normal
+    ///       `StoreError`; the caller (transactional_apply) does NOT swap
+    ///       memory, so old state remains authoritative.
+    ///     - Post-rename failures (parent directory fsync) return
+    ///       `StoreError::PostCommitDurabilityUncertain`; the caller MUST swap
+    ///       memory to the candidate (disk has the NEW generation) AND mark
+    ///       the store `FailedClosed`.
     fn commit(&self) -> Result<(), StoreError> {
         let path = self.path.as_ref().ok_or_else(|| StoreError::Io("no path set".into()))?;
+
+        // P1 #3 rev5: Verify the platform supports the durability guarantee
+        // BEFORE attempting any I/O. On unsupported platforms, fail closed
+        // rather than silently reporting a successful security-state commit.
+        if !Self::platform_supports_durable_fsync() {
+            return Err(StoreError::UnsupportedPlatform(
+                "durable authority-state persistence requires Unix directory fsync; \
+                 this platform cannot provide the durability guarantee".into(),
+            ));
+        }
 
         let mut data = Vec::new();
         data.extend_from_slice(STORE_MAGIC);
@@ -1093,17 +1318,17 @@ impl AuthorityStateStore {
             data.extend_from_slice(&encoded);
         }
 
-        // ── P0 #3 rev4: durable persistence sequence ──
+        // ── P0 #1 rev5: durable persistence sequence with commit-point model ──
         let tmp_path = path.with_extension("tmp");
 
-        // 1. Write temp file.
+        // 1. Write temp file. (PRE-RENAME: failure → rollback OK)
         let mut tmp_file = fs::File::create(&tmp_path)
             .map_err(|e| StoreError::Io(format!("temp create: {e}")))?;
         tmp_file
             .write_all(&data)
             .map_err(|e| StoreError::Io(format!("temp write: {e}")))?;
 
-        // 2. fsync temp file data (durability of the data itself).
+        // 2. fsync temp file data (durability of the data itself). (PRE-RENAME)
         tmp_file
             .sync_all()
             .map_err(|e| StoreError::Durability(format!("fsync temp: {e}")))?;
@@ -1111,23 +1336,37 @@ impl AuthorityStateStore {
         // Close the temp handle BEFORE rename (Windows requires it; harmless on Unix).
         drop(tmp_file);
 
-        // 3. Atomic rename.
+        // 3. Atomic rename. THIS IS THE COMMIT POINT.
+        //    After this succeeds, the NEW generation is committed on disk.
+        //    Any failure here is a pre-commit failure (old state remains).
         fs::rename(&tmp_path, path)
             .map_err(|e| StoreError::Io(format!("rename: {e}")))?;
 
         // 4. fsync the parent directory so the rename is durable across power loss.
-        //    On Linux, opening a directory read-only and calling fsync() syncs its
-        //    metadata (including directory entries). This is the reference platform
-        //    durability barrier. If the parent cannot be fsynced, the durability
-        //    guarantee cannot be made — fail closed.
+        //    P0 #1 rev5: If this fails, the NEW generation is already on disk
+        //    (rename succeeded), but the directory metadata durability is
+        //    uncertain. Return PostCommitDurabilityUncertain so the caller
+        //    enters FailedClosed — do NOT claim durable state is unchanged.
         if let Some(parent) = path.parent() {
-            Self::fsync_dir(parent)?;
+            Self::fsync_dir(parent).map_err(|e| match e {
+                StoreError::UnsupportedPlatform(msg) => {
+                    StoreError::PostCommitDurabilityUncertain(msg)
+                }
+                StoreError::Durability(msg) => {
+                    StoreError::PostCommitDurabilityUncertain(msg)
+                }
+                other => other,
+            })?;
         }
-        // If there is no parent (e.g. a bare filename), the rename target lives in
-        // the CWD; document that the parent-fsync step is skipped. This is only
-        // reachable for unusual paths and is not the configured reference layout.
 
         Ok(())
+    }
+
+    /// P1 #3 rev5: Returns true if the platform supports the directory-fsync
+    /// durability guarantee required for security-state persistence.
+    /// The reference implementation scopes durable persistence to Unix.
+    fn platform_supports_durable_fsync() -> bool {
+        cfg!(unix)
     }
 
     /// P0 #3 rev4: fsync a directory's metadata (durability barrier for renames).
@@ -1141,13 +1380,16 @@ impl AuthorityStateStore {
         Ok(())
     }
 
-    /// P0 #3 rev4: Non-Unix fallback. Document that directory fsync is not
-    /// available; the rename itself is atomic but its metadata durability
-    /// across power loss is not guaranteed on this platform.
+    /// P1 #3 rev5: Non-Unix platforms cannot provide the directory-fsync
+    /// durability guarantee. Fail closed with `UnsupportedPlatform` rather
+    /// than silently returning Ok(()). The reference implementation declares
+    /// durable authority-state persistence Unix-only for I1.
     #[cfg(not(unix))]
     fn fsync_dir(_dir: &Path) -> Result<(), StoreError> {
-        // Best-effort: directory fsync is not available via std on this platform.
-        Ok(())
+        Err(StoreError::UnsupportedPlatform(
+            "directory fsync is not available on this platform; \
+             durable authority-state persistence is Unix-only".into(),
+        ))
     }
 
     // ─── P0 #3: Transactional mutation helper ──────────────────────────────
@@ -1156,10 +1398,18 @@ impl AuthorityStateStore {
     /// P0 #3 rev4: Returns the closure's value so acceptance methods can return
     /// their classify result. On persistence failure, memory is unchanged
     /// (the `?` returns before the swap).
+    /// P0 #1 rev5: Commit-point model — if `commit()` returns
+    /// `PostCommitDurabilityUncertain` (rename succeeded but parent fsync
+    /// failed), memory IS swapped to the candidate (disk has the NEW
+    /// generation), but the store enters `FailedClosed`. All further
+    /// operations are rejected until restart/recovery.
     fn transactional_apply<T, F>(&mut self, f: F) -> Result<T, AuthorityStateError>
     where
         F: FnOnce(&mut Self) -> Result<T, AuthorityStateError>,
     {
+        // P0 #1 rev5: Reject all operations if the store is FailedClosed.
+        self.ensure_operational()?;
+
         // Clone the current state (shallow — HashMaps clone their entries).
         let mut candidate = self.clone();
 
@@ -1168,9 +1418,24 @@ impl AuthorityStateStore {
 
         // If persistent, durably commit the candidate first.
         if candidate.path.is_some() {
-            candidate
-                .commit()
-                .map_err(|e| AuthorityStateError::PersistenceError(e.to_string()))?;
+            match candidate.commit() {
+                Ok(()) => {}
+                Err(StoreError::PostCommitDurabilityUncertain(reason)) => {
+                    // P0 #1 rev5: Rename succeeded → NEW generation is committed
+                    // on disk. Memory MUST switch to the candidate (disk and
+                    // memory agree on the NEW state), but the store enters
+                    // FailedClosed because the durability barrier is uncertain.
+                    candidate.persistence_state = PersistenceState::FailedClosed {
+                        reason: reason.clone(),
+                    };
+                    *self = candidate;
+                    return Err(AuthorityStateError::PersistenceUncertain { reason });
+                }
+                Err(e) => {
+                    // Pre-rename failure: old memory remains authoritative.
+                    return Err(AuthorityStateError::PersistenceError(e.to_string()));
+                }
+            }
         }
 
         // Swap: replace self with the committed candidate.
@@ -1485,11 +1750,19 @@ impl AuthorityStateStore {
     // ─── P0 #1 rev3: Authority acceptance with signature verification ─────
 
     /// P0 #1 rev3: Accept an IssuerAuthority.
-    /// Verifies: issuer identity binding + governance signature BEFORE acceptance.
+    /// Verifies: semantic invariants + issuer identity binding + governance signature
+    /// BEFORE acceptance.
     pub fn try_accept_authority(
         &mut self,
         authority: &IssuerAuthority,
     ) -> Result<AuthorityAcceptResult, AuthorityStateError> {
+        // P0 #1 rev5: Reject if store is FailedClosed.
+        self.ensure_operational()?;
+
+        // P1 #4 rev5: Validate semantic invariants.
+        authority.validate_semantic()
+            .map_err(|e| AuthorityStateError::SemanticError(e.to_string()))?;
+
         // P0 #1: Verify issuer identity binding.
         if !authority.verify_issuer_identity_binding() {
             return Err(AuthorityStateError::IssuerIdentityBindingInvalid);
@@ -1517,6 +1790,13 @@ impl AuthorityStateStore {
         &mut self,
         revocation: &GovernanceIssuerRevocation,
     ) -> Result<RevocationAcceptResult, AuthorityStateError> {
+        // P0 #1 rev5: Reject if store is FailedClosed.
+        self.ensure_operational()?;
+
+        // P1 #4 rev5: Validate semantic invariants.
+        revocation.validate_semantic()
+            .map_err(|e| AuthorityStateError::SemanticError(e.to_string()))?;
+
         // P0 #1 rev3: Verify governance signature BEFORE acceptance.
         let gov_pk = self.governance_public_key
             .ok_or(AuthorityStateError::GovernanceKeyNotSet)?;
@@ -1546,6 +1826,13 @@ impl AuthorityStateStore {
         &mut self,
         revocation: &SubjectCapabilityRevocation,
     ) -> Result<RevocationAcceptResult, AuthorityStateError> {
+        // P0 #1 rev5: Reject if store is FailedClosed.
+        self.ensure_operational()?;
+
+        // P1 #4 rev5: Validate semantic invariants.
+        revocation.validate_semantic()
+            .map_err(|e| AuthorityStateError::SemanticError(e.to_string()))?;
+
         // P0 #2 rev4: Resolve the EXACT authority version declared by the revocation.
         let authority = self
             .authorities
@@ -1827,6 +2114,16 @@ pub enum AuthorityStateError {
     SerializationError(String),
     #[error("persistence error: {0}")]
     PersistenceError(String),
+    /// P0 #1 rev5: Post-rename durability uncertainty. The store has entered
+    /// `FailedClosed`; all further operations are rejected until restart.
+    #[error("persistence uncertainty (store failed-closed): {reason}")]
+    PersistenceUncertain { reason: String },
+    /// P0 #1 rev5: Store is in FailedClosed state. All operations rejected.
+    #[error("store failed-closed: {reason}")]
+    StoreFailedClosed { reason: String },
+    /// P1 #4 rev5: Semantic validation failure.
+    #[error("semantic validation error: {0}")]
+    SemanticError(String),
 }
 
 // ─── P1 #7: Unified VerificationContext backed by AuthorityStateStore ───────
@@ -1878,6 +2175,15 @@ impl VerificationContext {
         auth: &CapabilityAuthorization,
         now: u64,
     ) -> Result<(), AuthorizationVerifyError> {
+        // P0 #1 rev5: Reject verification if the store is FailedClosed.
+        if !self.store.is_operational() {
+            let reason = match &self.store.persistence_state {
+                PersistenceState::FailedClosed { reason } => reason.clone(),
+                PersistenceState::Operational => String::new(),
+            };
+            return Err(AuthorizationVerifyError::StoreNotOperational(reason));
+        }
+
         // Step 2: Resolve the authority by issuer_id + version.
         let authority = self
             .store
