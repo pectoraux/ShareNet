@@ -31,7 +31,7 @@ use snp_gateway::{is_private_ip_str, validate_port, GatewayError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream as TokioTcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc::UnboundedSender, Mutex, Semaphore};
 
 /// Maximum number of concurrent streams per gateway.
 pub const MAX_STREAMS_PER_GATEWAY: usize = 256;
@@ -73,6 +73,19 @@ struct StreamEntry {
     /// The semaphore permit held by this stream. Released when the stream
     /// is removed, freeing the slot for a new stream.
     _permit: tokio::sync::OwnedSemaphorePermit,
+    /// **N2.3.9** — Optional write channel for multiplexed mode.
+    ///
+    /// When set, `handle_stream_data` queues data to this channel instead
+    /// of writing to TCP inline. A per-stream writer task drains the channel
+    /// and writes to TCP. This prevents head-of-line blocking: if one
+    /// stream's TCP write stalls, other streams continue processing.
+    ///
+    /// The channel is unbounded — growth is bounded by flow control:
+    /// `handle_stream_data` consumes `client_credit` but does NOT send
+    /// `WindowUpdate`. The writer task sends `WindowUpdate` only after
+    /// the data is written to TCP. If the writer stalls, credit exhausts
+    /// and the client stops sending.
+    write_tx: Mutex<Option<UnboundedSender<Vec<u8>>>>,
 }
 
 /// Shared mutable state for a stream — protected by its own mutex,
@@ -270,6 +283,7 @@ impl GatewayStreamTable {
             destination: open.destination.clone(),
             created_at: now,
             _permit: permit,
+            write_tx: Mutex::new(None),
         });
 
         {
@@ -289,10 +303,17 @@ impl GatewayStreamTable {
     /// the TCP socket's WRITE half.
     ///
     /// Takes the WRITE lock, not the read lock. Does NOT block reads.
+    ///
+    /// **N2.3.9** — When a write channel is set (multiplexed mode), data is
+    /// queued to the per-stream writer task instead of writing inline. This
+    /// prevents head-of-line blocking. The caller should NOT send
+    /// `WindowUpdate` — the writer task sends it after the TCP write succeeds.
+    ///
+    /// Returns the new `client_credit` (bytes the client can still send).
     pub async fn handle_stream_data(
         &self,
         data: StreamData,
-    ) -> Result<(), GatewayError> {
+    ) -> Result<u64, GatewayError> {
         // Look up the stream (table lock held briefly).
         let stream = {
             let streams = self.streams.lock().await;
@@ -308,7 +329,7 @@ impl GatewayStreamTable {
         };
 
         // Validate direction and sequence (shared state lock — brief).
-        {
+        let new_credit = {
             let mut shared = stream.state.lock().await;
             if data.direction != StreamDirection::ClientToGateway {
                 return Err(GatewayError::MalformedRequest(format!(
@@ -340,9 +361,24 @@ impl GatewayStreamTable {
             shared.recv_seq += 1;
             shared.client_credit -= data.data.len() as u64;
             shared.last_activity = Instant::now();
+            shared.client_credit
+        };
+
+        // N2.3.9: If a write channel is set, queue the data to the per-stream
+        // writer task. This avoids blocking the main loop on TCP writes.
+        let write_tx = {
+            let tx_guard = stream.write_tx.lock().await;
+            tx_guard.clone()
+        };
+        if let Some(tx) = write_tx {
+            // Queue the data. The channel is unbounded, so this never blocks.
+            // Growth is bounded by flow control: we consumed client_credit
+            // but the writer task sends WindowUpdate only after writing.
+            let _ = tx.send(data.data);
+            return Ok(new_credit);
         }
 
-        // Write to the TCP socket (write lock — does NOT block reads).
+        // Fallback: no write channel — write directly to TCP (non-multiplexed mode).
         let mut write_guard = stream.write_half.lock().await;
         if let Some(write_half) = write_guard.as_mut() {
             write_half
@@ -351,7 +387,44 @@ impl GatewayStreamTable {
                 .map_err(|e| GatewayError::Upstream(format!("TCP write: {e}")))?;
         }
 
+        Ok(new_credit)
+    }
+
+    /// **N2.3.9** — Set the write channel for a stream (multiplexed mode).
+    ///
+    /// When set, `handle_stream_data` queues data to this channel instead of
+    /// writing to TCP inline. A per-stream writer task drains the channel.
+    pub async fn set_write_channel(
+        &self,
+        stream_id: StreamId,
+        tx: UnboundedSender<Vec<u8>>,
+    ) -> Result<(), GatewayError> {
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams
+                .get(&stream_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::MalformedRequest(format!(
+                        "set_write_channel: unknown stream_id {stream_id}"
+                    ))
+                })?
+        };
+        let mut tx_guard = stream.write_tx.lock().await;
+        *tx_guard = Some(tx);
         Ok(())
+    }
+
+    /// **N2.3.9** — Returns the client_credit for a stream (bytes the client
+    /// can still send). Used by the main loop to decide whether to send a
+    /// `WindowUpdate` in non-multiplexed mode.
+    pub async fn client_credit(&self, stream_id: StreamId) -> Option<u64> {
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams.get(&stream_id).cloned()?
+        };
+        let shared = stream.state.lock().await;
+        Some(shared.client_credit)
     }
 
     /// Process a `StreamWindowUpdate` — replenish the gateway's send credit.
@@ -504,7 +577,14 @@ impl GatewayStreamTable {
         };
 
         if let Some(stream) = stream {
-            // Shut down both halves.
+            // N2.3.9: Clear the write channel first — this closes the channel
+            // and signals the per-stream writer task to drain remaining data
+            // and exit.
+            {
+                let mut tx_guard = stream.write_tx.lock().await;
+                *tx_guard = None;
+            }
+            // Shut down the write half.
             {
                 let mut write_guard = stream.write_half.lock().await;
                 if let Some(write_half) = write_guard.as_mut() {
@@ -527,6 +607,11 @@ impl GatewayStreamTable {
         };
 
         if let Some(stream) = stream {
+            // N2.3.9: Clear the write channel — signals the writer task to exit.
+            {
+                let mut tx_guard = stream.write_tx.lock().await;
+                *tx_guard = None;
+            }
             {
                 let mut write_guard = stream.write_half.lock().await;
                 if let Some(write_half) = write_guard.as_mut() {
@@ -603,6 +688,99 @@ impl GatewayStreamTable {
         Some(shared.state)
     }
 
+    /// **N2.3.9** — Write queued data to the stream's TCP socket.
+    ///
+    /// Used by the per-stream writer task. Acquires the `write_half` lock
+    /// and calls `write_all`. Returns an error if the stream doesn't exist,
+    /// is closed/reset, or the TCP write fails.
+    pub async fn write_to_tcp(
+        &self,
+        stream_id: StreamId,
+        data: &[u8],
+    ) -> Result<(), GatewayError> {
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams
+                .get(&stream_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::MalformedRequest(format!(
+                        "write_to_tcp: unknown stream_id {stream_id}"
+                    ))
+                })?
+        };
+
+        // Check state — don't write to a closed/reset stream.
+        {
+            let shared = stream.state.lock().await;
+            if shared.state == StreamState::Closed || shared.state == StreamState::Reset {
+                return Err(GatewayError::Upstream(format!(
+                    "stream {stream_id} is {:?}",
+                    shared.state
+                )));
+            }
+        }
+
+        // Write to TCP (write lock — does NOT block reads).
+        let mut write_guard = stream.write_half.lock().await;
+        if let Some(write_half) = write_guard.as_mut() {
+            write_half
+                .write_all(data)
+                .await
+                .map_err(|e| GatewayError::Upstream(format!("TCP write: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// **N2.3.9** — Shut down the write half of a stream's TCP socket.
+    ///
+    /// Used by the per-stream writer task when the stream is closing.
+    /// Sends a TCP FIN for a clean half-close.
+    pub async fn shutdown_write(&self, stream_id: StreamId) -> Result<(), GatewayError> {
+        let stream = {
+            let streams = self.streams.lock().await;
+            streams
+                .get(&stream_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::MalformedRequest(format!(
+                        "shutdown_write: unknown stream_id {stream_id}"
+                    ))
+                })?
+        };
+        let mut write_guard = stream.write_half.lock().await;
+        if let Some(write_half) = write_guard.as_mut() {
+            let _ = write_half.shutdown().await;
+        }
+        Ok(())
+    }
+
+    /// **N2.3.9** — Replenish the gateway's `client_credit` after data has been
+    /// written to TCP.
+    ///
+    /// This is called by the per-stream writer task after a successful
+    /// `write_to_tcp`. It restores the credit that was consumed by
+    /// `handle_stream_data`, allowing the gateway to accept more data from
+    /// the client.
+    ///
+    /// Without this, the gateway's `client_credit` would monotonically
+    /// decrease, and after `DEFAULT_RECEIVE_WINDOW` bytes, all further
+    /// `StreamData` would be rejected with "credit exceeded".
+    pub async fn replenish_client_credit(&self, stream_id: StreamId, amount: u64) {
+        let stream = {
+            let streams = self.streams.lock().await;
+            match streams.get(&stream_id) {
+                Some(s) => Arc::clone(s),
+                None => return,
+            }
+        };
+        let mut shared = stream.state.lock().await;
+        shared.client_credit = shared
+            .client_credit
+            .saturating_add(amount)
+            .min(MAX_STREAM_WINDOW);
+    }
+
     /// Returns the gateway_credit for a stream (for testing).
     pub async fn gateway_credit(&self, stream_id: StreamId) -> Option<u64> {
         let stream = {
@@ -638,6 +816,11 @@ impl GatewayStreamTable {
                 let mut streams = self.streams.lock().await;
                 streams.remove(id)
             } {
+                // N2.3.9: Clear write channel to unblock the writer task.
+                {
+                    let mut tx_guard = stream_arc.write_tx.lock().await;
+                    *tx_guard = None;
+                }
                 let mut write_guard = stream_arc.write_half.lock().await;
                 if let Some(write_half) = write_guard.as_mut() {
                     let _ = write_half.shutdown().await;
@@ -678,6 +861,7 @@ impl GatewayStreamTable {
             },
             created_at: now,
             _permit: permit,
+            write_tx: Mutex::new(None),
         });
         let mut streams = self.streams.lock().await;
         streams.insert(stream_id, entry);

@@ -109,7 +109,41 @@ struct StreamShared {
     pending_data: VecDeque<Vec<u8>>,
     /// Notify the recv() path when data arrives.
     data_notify: Arc<Notify>,
+    /// **N2.3.9** — Bytes consumed by recv() since the last WindowUpdate was
+    /// sent to the gateway. When this exceeds `WINDOW_UPDATE_THRESHOLD`, a
+    /// WindowUpdate is sent to replenish the gateway's `gateway_credit`.
+    /// This implements credit-based flow control for the gateway→client
+    /// direction.
+    gateway_credit_consumed: u64,
+    /// **N2.3.9** — Total bytes currently buffered in `pending_data`.
+    /// Used by the background reader to decide whether to send an eager
+    /// WindowUpdate (preventing deadlock when the client sends without
+    /// calling recv()).
+    pending_data_total: u64,
+    /// **N2.3.9** — Accumulated credit for eager WindowUpdate from the
+    /// background reader. When this exceeds `EAGER_WINDOW_UPDATE_THRESHOLD`,
+    /// a WindowUpdate is sent to the gateway. This rate-limits eager
+    /// WindowUpdates to avoid overhead on small transfers.
+    eager_credit_pending: u64,
 }
+
+/// **N2.3.9** — Threshold for sending WindowUpdate from client to gateway.
+/// When the client has consumed this many bytes via recv(), it sends a
+/// WindowUpdate to replenish the gateway's send credit.
+const WINDOW_UPDATE_THRESHOLD: u64 = 32 * 1024;
+
+/// **N2.3.9** — Maximum bytes of pending data before the background reader
+/// stops sending eager WindowUpdates. When `pending_data_total` exceeds this,
+/// the gateway's `gateway_credit` will exhaust, and the gateway stops reading
+/// from TCP. This prevents unbounded growth of `pending_data`.
+const PENDING_DATA_HIGH_WATERMARK: u64 = 128 * 1024;
+
+/// **N2.3.9** — Threshold for eager WindowUpdate from the background reader.
+/// The background reader accumulates credit and sends a WindowUpdate when
+/// this threshold is reached AND `pending_data_total` is below the high
+/// watermark. This rate-limits eager WindowUpdates to avoid per-message
+/// overhead on small transfers.
+const EAGER_WINDOW_UPDATE_THRESHOLD: u64 = 16 * 1024;
 
 /// A handle to an open Mode B stream.
 ///
@@ -358,6 +392,9 @@ impl StreamHandle {
             credit_notify: Arc::new(Notify::new()),
             pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
+            gateway_credit_consumed: 0,
+            pending_data_total: 0,
+            eager_credit_pending: 0,
         }));
 
         // 7. Spawn the background reader task.
@@ -492,26 +529,53 @@ impl StreamHandle {
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, StreamError> {
         loop {
             // Check for pending data.
-            {
+            let data_to_return = {
                 let mut shared = self.shared.lock().await;
                 if let Some(data) = shared.pending_data.pop_front() {
-                    return Ok(Some(data));
-                }
-                if shared.state == StreamState::Closed {
+                    // N2.3.9: Track consumed bytes for flow control.
+                    shared.gateway_credit_consumed += data.len() as u64;
+                    shared.pending_data_total = shared.pending_data_total.saturating_sub(data.len() as u64);
+                    Some(data)
+                } else if shared.state == StreamState::Closed {
                     return Ok(None);
-                }
-                if shared.state == StreamState::Reset {
+                } else if shared.state == StreamState::Reset {
                     return Err(StreamError::Reset(StreamResetReason::ApplicationReset));
-                }
-                if shared.state == StreamState::HalfClosedRemote
+                } else if shared.state == StreamState::HalfClosedRemote
                     || shared.state == StreamState::HalfClosedLocal
                 {
-                    // Check again — there might be pending data before the
-                    // half-close.
                     if shared.pending_data.is_empty() {
                         return Ok(None);
                     }
+                    None
+                } else {
+                    None
                 }
+            };
+
+            if let Some(data) = data_to_return {
+                // N2.3.9: Check if we should send a WindowUpdate to the gateway.
+                let credit_to_replenish = {
+                    let mut shared = self.shared.lock().await;
+                    if shared.gateway_credit_consumed >= WINDOW_UPDATE_THRESHOLD {
+                        let credit = shared.gateway_credit_consumed;
+                        shared.gateway_credit_consumed = 0;
+                        Some(credit)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(credit) = credit_to_replenish {
+                    // Send WindowUpdate to the gateway.
+                    let msg = StreamMessage::WindowUpdate(StreamWindowUpdate {
+                        stream_id: self.stream_id,
+                        additional_credit: credit,
+                    });
+                    // Ignore errors — the stream might be closing.
+                    let _ = self.send_message(&msg).await;
+                }
+
+                return Ok(Some(data));
             }
 
             // Wait for the background reader to deliver data or change state.
@@ -1017,6 +1081,9 @@ mod tests {
             credit_notify: Arc::new(Notify::new()),
             pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
+            gateway_credit_consumed: 0,
+            pending_data_total: 0,
+            eager_credit_pending: 0,
         }));
 
         // Simulate a WindowUpdate arriving.
@@ -1046,6 +1113,9 @@ mod tests {
             credit_notify: Arc::new(Notify::new()),
             pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
+            gateway_credit_consumed: 0,
+            pending_data_total: 0,
+            eager_credit_pending: 0,
         }));
 
         // Simulate a HalfClose(remote) arriving.
@@ -1071,6 +1141,9 @@ mod tests {
             credit_notify: Arc::new(Notify::new()),
             pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
+            gateway_credit_consumed: 0,
+            pending_data_total: 0,
+            eager_credit_pending: 0,
         }));
 
         // Simulate a Reset arriving.
@@ -1297,6 +1370,9 @@ impl MultiplexedCircuit {
             credit_notify: Arc::new(Notify::new()),
             pending_data: VecDeque::new(),
             data_notify: Arc::new(Notify::new()),
+            gateway_credit_consumed: 0,
+            pending_data_total: 0,
+            eager_credit_pending: 0,
         }));
 
         // Register in the streams map BEFORE sending (so the background reader
@@ -1461,6 +1537,7 @@ impl MultiplexedCircuit {
             let reader_client = self.client_node_id;
             let reader_fid = self.fid;
             let reader_streams = Arc::clone(&self.streams);
+            let reader_seq = Arc::clone(&self.frame_seq);
             self.reader_handle = Some(tokio::spawn(async move {
                 background_reader_multiplexed(
                     reader_link,
@@ -1469,6 +1546,7 @@ impl MultiplexedCircuit {
                     reader_client,
                     reader_fid,
                     reader_streams,
+                    reader_seq,
                 )
                 .await;
             }));
@@ -1492,6 +1570,17 @@ impl MultiplexedCircuit {
 
     /// Close the circuit (terminates all streams).
     pub async fn close(&mut self) {
+        // N2.3.9: Mark ALL streams as Closed so that any pending
+        // send()/recv() calls wake up and return an error.
+        let streams_map = self.streams.lock().await;
+        for (_, shared) in streams_map.iter() {
+            let mut s = shared.lock().await;
+            s.state = StreamState::Closed;
+            s.credit_notify.notify_one();
+            s.data_notify.notify_one();
+        }
+        drop(streams_map);
+        // Abort the background reader task.
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
         }
@@ -1506,8 +1595,54 @@ impl Drop for MultiplexedCircuit {
     }
 }
 
+/// **N2.3.9** — Send a WindowUpdate message from the background reader to the
+/// gateway. This is used for eager credit replenishment (preventing deadlock
+/// when the client sends without calling recv()).
+async fn send_window_update_to_gateway(
+    link: &Arc<AsyncLink>,
+    send_key: &snp_crypto::SymmetricKey,
+    gateway_node_id: [u8; 32],
+    client_node_id: [u8; 32],
+    fid: [u8; 8],
+    frame_seq: &Arc<CircuitFrameSequencer>,
+    stream_id: StreamId,
+    additional_credit: u64,
+) -> Result<(), StreamError> {
+    let msg = StreamMessage::WindowUpdate(StreamWindowUpdate {
+        stream_id,
+        additional_credit,
+    });
+    let cbor = encode_stream_message(&msg).map_err(|e| StreamError::Cbor(e.to_string()))?;
+    let sealed = encrypt_circuit_payload(send_key, &cbor);
+    let seq = frame_seq
+        .allocate()
+        .await
+        .ok_or_else(|| StreamError::Circuit("frame sequence exhausted".into()))?;
+    let frame = Frame {
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: gateway_node_id,
+        src: client_node_id,
+        ttl: FRAME_TTL_MAX,
+        fid,
+        seq,
+        body: sealed,
+    };
+    link.send_frame(&frame)
+        .await
+        .map_err(|e| StreamError::Circuit(e.to_string()))?;
+    Ok(())
+}
+
 /// Background reader for multiplexed circuits — dispatches inbound frames
 /// to the correct stream via `stream_id`.
+///
+/// **N2.3.9** — Also sends eager WindowUpdates to the gateway when data
+/// arrives and `pending_data_total` is below the high watermark. This
+/// prevents deadlock when the client sends without calling recv() —
+/// without eager WindowUpdates, the gateway's `gateway_credit` would
+/// exhaust, the TCP reader would stop, the echo server would block, and
+/// the client's `send()` would block (cascading deadlock).
 async fn background_reader_multiplexed(
     link: Arc<AsyncLink>,
     circuit_keys: CircuitKeys,
@@ -1515,11 +1650,25 @@ async fn background_reader_multiplexed(
     client_node_id: [u8; 32],
     fid: [u8; 8],
     streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
+    frame_seq: Arc<CircuitFrameSequencer>,
 ) {
     loop {
         let frame = match link.recv_frame().await {
             Ok(f) => f,
-            Err(_) => break,
+            Err(_) => {
+                // N2.3.9: Link error — mark ALL streams as Closed so that
+                // any pending send()/recv() calls wake up and return an
+                // error. Without this, streams remain in Established state
+                // and recv() hangs forever after circuit teardown.
+                let streams_map = streams.lock().await;
+                for (_, shared) in streams_map.iter() {
+                    let mut s = shared.lock().await;
+                    s.state = StreamState::Closed;
+                    s.credit_notify.notify_one();
+                    s.data_notify.notify_one();
+                }
+                break;
+            }
         };
 
         // Validate outer frame.
@@ -1601,7 +1750,34 @@ async fn background_reader_multiplexed(
                         {
                             s.recv_seq += 1;
                             s.pending_data.push_back(data.data.clone());
+                            s.pending_data_total += data.data.len() as u64;
+                            s.eager_credit_pending += data.data.len() as u64;
                             s.data_notify.notify_one();
+
+                            // N2.3.9: Eager WindowUpdate — rate-limited.
+                            // Only send when:
+                            // 1. pending_data_total is below the high watermark
+                            //    (don't replenish if the client isn't consuming).
+                            // 2. eager_credit_pending exceeds the threshold
+                            //    (avoid per-message overhead on small transfers).
+                            if s.pending_data_total < PENDING_DATA_HIGH_WATERMARK
+                                && s.eager_credit_pending >= EAGER_WINDOW_UPDATE_THRESHOLD
+                            {
+                                let credit_to_replenish = s.eager_credit_pending;
+                                s.eager_credit_pending = 0;
+                                drop(s); // Release lock before sending.
+                                let _ = send_window_update_to_gateway(
+                                    &link,
+                                    &circuit_keys.send_key,
+                                    gateway_node_id,
+                                    client_node_id,
+                                    fid,
+                                    &frame_seq,
+                                    sid,
+                                    credit_to_replenish,
+                                )
+                                .await;
+                            }
                         } else {
                             // Protocol violation — reset this stream.
                             s.state = StreamState::Reset;

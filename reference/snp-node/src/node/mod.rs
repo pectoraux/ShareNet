@@ -123,6 +123,7 @@ pub mod topology;
 pub mod route_engine;
 pub mod route_discovery_protocol;
 pub mod tcp_route_transport;
+pub mod transport_metrics;
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};

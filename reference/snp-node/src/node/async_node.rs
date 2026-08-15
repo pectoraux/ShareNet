@@ -2622,7 +2622,44 @@ pub async fn serve_gateway_mode_b(
                         };
                         match &msg {
                             snp_gateway::stream::StreamMessage::Data(data) => {
-                                if let Err(_) = stream_table.handle_stream_data(data.clone()).await { break; }
+                                // N2.3.9: After writing to TCP, replenish
+                                // client_credit and send WindowUpdate to
+                                // replenish the client's send_credit.
+                                match stream_table.handle_stream_data(data.clone()).await {
+                                    Ok(_) => {
+                                        // Replenish gateway's client_credit.
+                                        stream_table
+                                            .replenish_client_credit(
+                                                data.stream_id,
+                                                data.data.len() as u64,
+                                            )
+                                            .await;
+                                        // Send WindowUpdate.
+                                        let update = snp_gateway::stream::StreamMessage::WindowUpdate(
+                                            snp_gateway::stream::StreamWindowUpdate {
+                                                stream_id: data.stream_id,
+                                                additional_credit: data.data.len() as u64,
+                                            },
+                                        );
+                                        let cbor = match snp_gateway::stream::encode_stream_message(&update) {
+                                            Ok(c) => c,
+                                            Err(_) => break,
+                                        };
+                                        let sealed = snp_link::encrypt_circuit_payload(
+                                            &response_keys.send_key, &cbor,
+                                        );
+                                        if next_gateway_frame_seq == u32::MAX { break; }
+                                        let frame = Frame {
+                                            v: FRAME_VERSION, cls: b'B', dst: first_frame.src,
+                                            src: gateway_node_id, ttl: FRAME_TTL_MAX,
+                                            fid: first_frame.fid, seq: next_gateway_frame_seq,
+                                            body: sealed,
+                                        };
+                                        next_gateway_frame_seq += 1;
+                                        if let Err(_) = link.send_frame(&frame).await { break; }
+                                    }
+                                    Err(_) => break,
+                                }
                             }
                             snp_gateway::stream::StreamMessage::WindowUpdate(wu) => {
                                 let _ = stream_table.handle_window_update(wu.clone()).await;
@@ -2791,14 +2828,45 @@ pub async fn serve_gateway_mode_b_multiplexed(
         return Ok(());
     }
 
-    eprintln!("[gateway-mode-b-mux {}] stream {} established (first)", super::hex_short(&gateway_node_id), first_stream_id);
-
-    // Spawn the first stream's TCP reader task.
-    let mut tcp_reader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    spawn_tcp_reader(
-        first_stream_id, stream_table.clone(), outbound_tx.clone(),
-        &mut tcp_reader_handles,
+    // N2.3.9: Check if the first stream was actually established (not rejected).
+    let first_established = matches!(
+        &ack_msg,
+        snp_gateway::stream::StreamMessage::OpenAck(ack) if ack.connected
     );
+
+    let mut tcp_reader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut tcp_writer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut active_stream_ids: Vec<snp_gateway::stream::StreamId>;
+
+    if first_established {
+        eprintln!("[gateway-mode-b-mux {}] stream {} established (first)", super::hex_short(&gateway_node_id), first_stream_id);
+
+        // N2.3.9: Spawn the first stream's TCP reader task.
+        spawn_tcp_reader(
+            first_stream_id, stream_table.clone(), outbound_tx.clone(),
+            &mut tcp_reader_handles,
+        );
+
+        // N2.3.9: Spawn the first stream's TCP writer task.
+        // The writer task drains the write channel and writes to TCP. It sends
+        // WindowUpdate after each successful write, implementing credit-based
+        // flow control for the client→gateway direction. This prevents
+        // head-of-line blocking: if one stream's TCP write stalls, other
+        // streams continue processing.
+        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let _ = stream_table.set_write_channel(first_stream_id, write_tx).await;
+        spawn_tcp_writer(
+            first_stream_id,
+            stream_table.clone(),
+            write_rx,
+            outbound_tx.clone(),
+            &mut tcp_writer_handles,
+        );
+        active_stream_ids = vec![first_stream_id];
+    } else {
+        // First stream was rejected — wait for the client to open another.
+        active_stream_ids = Vec::new();
+    }
 
     // Spawn the circuit writer task.
     let writer_link = Arc::clone(&link);
@@ -2835,7 +2903,6 @@ pub async fn serve_gateway_mode_b_multiplexed(
     // Main circuit reader loop — continuously reads from the circuit and
     // dispatches to the stream table. This is the ONLY task that calls
     // link.recv_frame().
-    let mut active_stream_ids: Vec<snp_gateway::stream::StreamId> = vec![first_stream_id];
 
     loop {
         let frame = match link.recv_frame().await {
@@ -2889,12 +2956,30 @@ pub async fn serve_gateway_mode_b_multiplexed(
                 };
                 let _ = outbound_tx.send(ack_msg);
                 if !active_stream_ids.contains(&sid) {
-                    active_stream_ids.push(sid);
-                    spawn_tcp_reader(sid, stream_table.clone(), outbound_tx.clone(), &mut tcp_reader_handles);
-                    eprintln!("[gateway-mode-b-mux {}] stream {} established (multiplexed)", super::hex_short(&gateway_node_id), sid);
+                    // Check if the stream was actually established (not rejected).
+                    let established = stream_table.stream_state(sid).await
+                        == Some(snp_gateway::stream::StreamState::Established);
+                    if established {
+                        active_stream_ids.push(sid);
+                        spawn_tcp_reader(sid, stream_table.clone(), outbound_tx.clone(), &mut tcp_reader_handles);
+                        // N2.3.9: Spawn the per-stream TCP writer task.
+                        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        let _ = stream_table.set_write_channel(sid, write_tx).await;
+                        spawn_tcp_writer(
+                            sid,
+                            stream_table.clone(),
+                            write_rx,
+                            outbound_tx.clone(),
+                            &mut tcp_writer_handles,
+                        );
+                        eprintln!("[gateway-mode-b-mux {}] stream {} established (multiplexed)", super::hex_short(&gateway_node_id), sid);
+                    }
                 }
             }
             snp_gateway::stream::StreamMessage::Data(data) => {
+                // N2.3.9: handle_stream_data queues data to the per-stream
+                // write channel (non-blocking). The writer task writes to
+                // TCP and sends WindowUpdate. No WindowUpdate here.
                 if let Err(_) = stream_table.handle_stream_data(data.clone()).await {
                     let sid = data.stream_id;
                     let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
@@ -2925,11 +3010,10 @@ pub async fn serve_gateway_mode_b_multiplexed(
             }
         }
 
-        // Check if all streams are closed.
-        if active_stream_ids.is_empty() {
-            eprintln!("[gateway-mode-b-mux {}] all streams closed — circuit done", super::hex_short(&gateway_node_id));
-            break;
-        }
+        // N2.3.9: Do NOT terminate the circuit when all streams are closed.
+        // The client may open new streams on the same circuit. The circuit
+        // stays alive until the link breaks or the gateway is shut down.
+        // The `active_stream_ids` list is only used for cleanup on termination.
     }
 
     // Clean up.
@@ -2937,6 +3021,9 @@ pub async fn serve_gateway_mode_b_multiplexed(
         let _ = stream_table.handle_close(snp_gateway::stream::StreamClose { stream_id: sid }).await;
     }
     for handle in tcp_reader_handles {
+        handle.abort();
+    }
+    for handle in tcp_writer_handles {
         handle.abort();
     }
     writer_handle.abort();
@@ -2988,6 +3075,109 @@ fn spawn_tcp_reader(
                             reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
                         },
                     ).await;
+                    break;
+                }
+            }
+        }
+    });
+    handles.push(handle);
+}
+
+/// **N2.3.9** — Spawn a per-stream TCP writer task.
+///
+/// This task drains the write channel (data queued by `handle_stream_data`)
+/// and writes each chunk to the TCP socket. After each successful write, it
+/// sends a `StreamWindowUpdate` to the client, replenishing the client's
+/// `send_credit`. This implements credit-based flow control for the
+/// client→gateway direction.
+///
+/// ## Why this exists
+///
+/// Without a per-stream writer task, `handle_stream_data` writes to TCP
+/// inline (in the main loop). If one stream's TCP write stalls (remote server
+/// stopped reading), the main loop blocks, and ALL streams stall. This is
+/// head-of-line blocking.
+///
+/// With the writer task, each stream's TCP write happens in its own task.
+/// If one stream's write stalls, only that stream's writer task blocks —
+/// the main loop continues processing other streams.
+///
+/// ## Flow control
+///
+/// `handle_stream_data` consumes `client_credit` but does NOT send
+/// `WindowUpdate`. This task sends `WindowUpdate` only after the data is
+/// written to TCP. If the write stalls, no `WindowUpdate` is sent, and the
+/// client's `send_credit` exhausts. The client stops sending. The write
+/// channel stops growing (bounded by the initial credit window).
+fn spawn_tcp_writer(
+    stream_id: snp_gateway::stream::StreamId,
+    stream_table: super::gateway_stream::GatewayStreamTable,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<snp_gateway::stream::StreamMessage>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let handle = tokio::spawn(async move {
+        loop {
+            // Receive data from the write channel.
+            match write_rx.recv().await {
+                Some(data) => {
+                    // Check stream state — don't write to a closed/reset stream.
+                    match stream_table.stream_state(stream_id).await {
+                        Some(snp_gateway::stream::StreamState::Closed)
+                        | Some(snp_gateway::stream::StreamState::Reset) => break,
+                        None => break, // Stream removed.
+                        _ => {}
+                    }
+
+                    // Write to TCP.
+                    match stream_table.write_to_tcp(stream_id, &data).await {
+                        Ok(()) => {
+                            // N2.3.9: Replenish the gateway's client_credit
+                            // (the data is no longer buffered — it's been
+                            // written to TCP). Without this, client_credit
+                            // would monotonically decrease and the gateway
+                            // would reject all data after DEFAULT_RECEIVE_WINDOW.
+                            stream_table
+                                .replenish_client_credit(stream_id, data.len() as u64)
+                                .await;
+
+                            // N2.3.9: Send WindowUpdate to replenish the
+                            // client's send_credit. This is the key flow
+                            // control mechanism: the client can send more
+                            // data only after the gateway has written the
+                            // previous data to TCP.
+                            let update = snp_gateway::stream::StreamMessage::WindowUpdate(
+                                snp_gateway::stream::StreamWindowUpdate {
+                                    stream_id,
+                                    additional_credit: data.len() as u64,
+                                },
+                            );
+                            if outbound_tx.send(update).is_err() {
+                                break; // Circuit writer closed.
+                            }
+                        }
+                        Err(_) => {
+                            // TCP write error — send Reset to client.
+                            let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
+                                snp_gateway::stream::StreamReset {
+                                    stream_id,
+                                    reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                                },
+                            ));
+                            let _ = stream_table.handle_reset(
+                                snp_gateway::stream::StreamReset {
+                                    stream_id,
+                                    reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                                },
+                            ).await;
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    // Channel closed — stream is being closed/reset.
+                    // Attempt a clean shutdown of the write half.
+                    let _ = stream_table.shutdown_write(stream_id).await;
                     break;
                 }
             }
