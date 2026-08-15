@@ -180,6 +180,13 @@ pub struct StreamHandle {
     /// Handle to the background reader task (to abort on close).
     /// None for multiplexed streams (the circuit owns the reader).
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// **N2.3.9** — Optional transport metrics. When set, the stream records
+    /// bytes sent/received, window blocks, and credit updates on real events.
+    metrics: Option<Arc<super::transport_metrics::TransportMetrics>>,
+    /// **N2.3.9** — Optional reference to the circuit's streams map (for
+    /// multiplexed streams). When set, `close()` and `reset()` remove the
+    /// stream's entry from the map, keeping `stream_count()` accurate.
+    streams_map: Option<Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>>,
 }
 
 /// **N2.3.8** — Circuit-level frame sequence allocator.
@@ -429,6 +436,8 @@ impl StreamHandle {
             frame_seq: Arc::new(CircuitFrameSequencer::new(2)), // 1 was used for StreamOpen
             shared,
             reader_handle: Some(reader_handle),
+            metrics: None,
+            streams_map: None,
         })
     }
 
@@ -463,6 +472,11 @@ impl StreamHandle {
             }
 
             if credit == 0 {
+                // N2.3.9: Record window block event + measure blocked duration.
+                let block_start = std::time::Instant::now();
+                if let Some(m) = &self.metrics {
+                    m.window_block();
+                }
                 // Wait for the background reader to replenish credit.
                 //
                 // Race safety: `send_credit` is the authoritative state. The
@@ -481,6 +495,10 @@ impl StreamHandle {
                     shared.credit_notify.clone()
                 };
                 notify.notified().await;
+                // N2.3.9: Record how long we were blocked.
+                if let Some(m) = &self.metrics {
+                    m.record_send_blocked(block_start.elapsed());
+                }
                 continue; // Re-check credit (and state) after wakeup.
             }
 
@@ -510,6 +528,11 @@ impl StreamHandle {
                 data: chunk.to_vec(),
             });
             self.send_message(&msg).await?;
+
+            // N2.3.9: Record bytes sent in metrics.
+            if let Some(m) = &self.metrics {
+                m.bytes_sent(chunk_size as u64);
+            }
 
             total_sent += chunk_size;
             remaining = &remaining[chunk_size..];
@@ -573,6 +596,15 @@ impl StreamHandle {
                     });
                     // Ignore errors — the stream might be closing.
                     let _ = self.send_message(&msg).await;
+                    // N2.3.9: Record credit update sent in metrics.
+                    if let Some(m) = &self.metrics {
+                        m.credit_update_sent();
+                    }
+                }
+
+                // N2.3.9: Record bytes received in metrics.
+                if let Some(m) = &self.metrics {
+                    m.bytes_received(data.len() as u64);
                 }
 
                 return Ok(Some(data));
@@ -634,6 +666,10 @@ impl StreamHandle {
         });
         let _ = self.send_message(&msg).await;
         self.shared.lock().await.state = StreamState::Closed;
+        // N2.3.9: Remove from the circuit's streams map (if multiplexed).
+        if let Some(map) = &self.streams_map {
+            map.lock().await.remove(&self.stream_id);
+        }
         self.abort_reader();
         Ok(())
     }
@@ -656,6 +692,10 @@ impl StreamHandle {
         });
         let _ = self.send_message(&msg).await;
         self.shared.lock().await.state = StreamState::Reset;
+        // N2.3.9: Remove from the circuit's streams map (if multiplexed).
+        if let Some(map) = &self.streams_map {
+            map.lock().await.remove(&self.stream_id);
+        }
         self.abort_reader();
         Ok(())
     }
@@ -727,6 +767,8 @@ impl StreamHandle {
         frame_seq: Arc<CircuitFrameSequencer>,
         shared: Arc<Mutex<StreamShared>>,
         reader_handle: Option<tokio::task::JoinHandle<()>>,
+        metrics: Option<Arc<super::transport_metrics::TransportMetrics>>,
+        streams_map: Option<Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>>,
     ) -> Self {
         Self {
             link,
@@ -741,7 +783,15 @@ impl StreamHandle {
             frame_seq,
             shared,
             reader_handle,
+            metrics,
+            streams_map,
         }
+    }
+
+    /// **N2.3.9** — Set the transport metrics on this stream handle.
+    /// When set, send/recv/credit events are recorded.
+    pub fn set_metrics(&mut self, metrics: Arc<super::transport_metrics::TransportMetrics>) {
+        self.metrics = Some(metrics);
     }
 }
 
@@ -1239,6 +1289,9 @@ pub struct MultiplexedCircuit {
     streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
     /// Background reader task handle.
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// **N2.3.9** — Optional transport metrics. Shared with all streams and
+    /// the background reader. None = metrics disabled.
+    metrics: Option<Arc<super::transport_metrics::TransportMetrics>>,
 }
 
 impl std::fmt::Debug for MultiplexedCircuit {
@@ -1319,9 +1372,32 @@ impl MultiplexedCircuit {
             frame_seq: Arc::new(CircuitFrameSequencer::new(1)),
             streams: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
+            metrics: None,
         };
 
         Ok(circuit)
+    }
+
+    /// **N2.3.9** — Attach transport metrics to this circuit.
+    /// All streams opened on this circuit will record events to these metrics.
+    /// Must be called before `open_stream`.
+    pub fn set_metrics(&mut self, metrics: Arc<super::transport_metrics::TransportMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// **N2.3.9** — Returns the number of registered streams on this circuit.
+    /// Used by tests to verify that streams are cleaned up after close.
+    /// A stream is "registered" from the moment `open_stream` is called
+    /// until the stream is closed/reset. The background reader dispatches
+    /// by `stream_id` using this map.
+    pub async fn stream_count(&self) -> usize {
+        self.streams.lock().await.len()
+    }
+
+    /// **N2.3.9** — Returns a clone of the metrics Arc (if set).
+    /// Used by the background reader to record credit_update_received.
+    fn metrics_clone(&self) -> Option<Arc<super::transport_metrics::TransportMetrics>> {
+        self.metrics.clone()
     }
 
     /// Open a new stream on this circuit.
@@ -1538,6 +1614,7 @@ impl MultiplexedCircuit {
             let reader_fid = self.fid;
             let reader_streams = Arc::clone(&self.streams);
             let reader_seq = Arc::clone(&self.frame_seq);
+            let reader_metrics = self.metrics_clone();
             self.reader_handle = Some(tokio::spawn(async move {
                 background_reader_multiplexed(
                     reader_link,
@@ -1547,6 +1624,7 @@ impl MultiplexedCircuit {
                     reader_fid,
                     reader_streams,
                     reader_seq,
+                    reader_metrics,
                 )
                 .await;
             }));
@@ -1565,6 +1643,8 @@ impl MultiplexedCircuit {
             Arc::clone(&self.frame_seq),
             shared,
             None, // No individual reader handle — the circuit owns it.
+            self.metrics_clone(),
+            Some(Arc::clone(&self.streams)), // N2.3.9: for cleanup on close/reset
         ))
     }
 
@@ -1651,6 +1731,7 @@ async fn background_reader_multiplexed(
     fid: [u8; 8],
     streams: Arc<Mutex<HashMap<StreamId, Arc<Mutex<StreamShared>>>>>,
     frame_seq: Arc<CircuitFrameSequencer>,
+    metrics: Option<Arc<super::transport_metrics::TransportMetrics>>,
 ) {
     loop {
         let frame = match link.recv_frame().await {
@@ -1791,6 +1872,10 @@ async fn background_reader_multiplexed(
                             .saturating_add(update.additional_credit)
                             .min(MAX_STREAM_WINDOW);
                         s.credit_notify.notify_one();
+                        // N2.3.9: Record credit update received in metrics.
+                        if let Some(m) = &metrics {
+                            m.credit_update_received();
+                        }
                     }
                     StreamMessage::HalfClose(hc) => {
                         if hc.direction == StreamDirection::GatewayToClient {
@@ -1805,11 +1890,18 @@ async fn background_reader_multiplexed(
                     StreamMessage::Close(_) => {
                         s.state = StreamState::Closed;
                         s.data_notify.notify_one();
+                        // N2.3.9: Remove from the streams map so stream_count()
+                        // reflects actual active streams. Drop the lock first.
+                        drop(s);
+                        streams.lock().await.remove(&sid);
                     }
                     StreamMessage::Reset(_) => {
                         s.state = StreamState::Reset;
                         s.credit_notify.notify_one();
                         s.data_notify.notify_one();
+                        // N2.3.9: Remove from the streams map.
+                        drop(s);
+                        streams.lock().await.remove(&sid);
                     }
                     _ => {}
                 }

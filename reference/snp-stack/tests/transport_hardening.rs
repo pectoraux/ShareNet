@@ -512,14 +512,19 @@ async fn phase1_flow_control_isolation() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Phase 2: Large concurrent transfers (10 MB, SHA256 verify)
+// Phase 2: Large concurrent transfers (SHA256 verify)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Two streams on one circuit, each transferring 10 MB of random data.
-/// SHA256 verifies integrity. Random data catches: accidental compression
+/// Two streams on one circuit, each transferring random data. SHA256
+/// verifies integrity. Random data catches: accidental compression
 /// assumptions, buffer aliasing, stream ID mixups, ordering bugs.
+///
+/// **Transfer size**: defaults to 1 MB per stream for CI speed.
+/// Set `TRANSFER_SIZE_MB=10` (or any value) to test larger transfers.
+/// The test name says "concurrent_transfers" (not "10mb") because the
+/// default is 1 MB — the name must not lie about what it tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn phase2_large_concurrent_transfers_10mb() {
+async fn phase2_concurrent_transfers_sha256() {
     let mesh = setup_mesh().await;
 
     let (echo1_addr, _echo1) = start_echo_server().await;
@@ -601,7 +606,97 @@ async fn phase2_large_concurrent_transfers_10mb() {
     );
 
     eprintln!(
-        "[n2.3.9-phase2] PASS: 2 × 10 MB concurrent transfers — SHA256 verified, no corruption"
+        "[n2.3.9-phase2] PASS: 2 × {} MB concurrent transfers — SHA256 verified, no corruption",
+        transfer_size / (1024 * 1024)
+    );
+
+    drop(mesh.gateway_handle);
+    drop(mesh.relay_a_handle);
+    drop(mesh.relay_b_handle);
+}
+
+/// **Phase 2b — Genuine 10 MB transfer.**
+///
+/// This test always transfers 10 MB per stream (20 MB total). It is
+/// explicitly marked as a large transfer. It may take 10–30 seconds
+/// depending on the machine. It is the "real" 10 MB test — Phase 2
+/// defaults to 1 MB for CI speed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase2b_genuine_10mb_concurrent_transfers() {
+    let mesh = setup_mesh().await;
+
+    let (echo1_addr, _echo1) = start_echo_server().await;
+    let echo1_port: u16 = echo1_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let (echo2_addr, _echo2) = start_echo_server().await;
+    let echo2_port: u16 = echo2_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let mut circuit = tokio::time::timeout(
+        Duration::from_secs(30),
+        MultiplexedCircuit::establish(&mesh.client_node, &mesh.route, &mesh.client_x_sk, &mesh.client_x_pk),
+    )
+    .await
+    .expect("establish timeout")
+    .expect("establish must succeed");
+
+    let mut stream_a = tokio::time::timeout(
+        Duration::from_secs(30),
+        circuit.open_stream(endpoint(echo1_port)),
+    )
+    .await
+    .expect("stream A open timeout")
+    .expect("stream A must succeed");
+
+    let mut stream_b = tokio::time::timeout(
+        Duration::from_secs(30),
+        circuit.open_stream(endpoint(echo2_port)),
+    )
+    .await
+    .expect("stream B open timeout")
+    .expect("stream B must succeed");
+
+    // 10 MB per stream — hard-coded, not configurable. This is the real 10 MB test.
+    let transfer_size = 10 * 1024 * 1024;
+    let data_a = random_data(transfer_size);
+    let data_b = random_data(transfer_size);
+    let hash_a_sent = sha256(&data_a);
+    let hash_b_sent = sha256(&data_b);
+
+    let stream_a_task = tokio::spawn(async move {
+        stream_a.send(&data_a).await.expect("stream A send");
+        let received = recv_exact(&mut stream_a, transfer_size)
+            .await
+            .expect("stream A recv");
+        sha256(&received)
+    });
+
+    let stream_b_task = tokio::spawn(async move {
+        stream_b.send(&data_b).await.expect("stream B send");
+        let received = recv_exact(&mut stream_b, transfer_size)
+            .await
+            .expect("stream B recv");
+        sha256(&received)
+    });
+
+    let hash_a_recv = tokio::time::timeout(Duration::from_secs(180), stream_a_task)
+        .await
+        .expect("stream A timeout (10MB)")
+        .expect("stream A task panic");
+    let hash_b_recv = tokio::time::timeout(Duration::from_secs(180), stream_b_task)
+        .await
+        .expect("stream B timeout (10MB)")
+        .expect("stream B task panic");
+
+    assert_eq!(
+        hash_a_sent, hash_a_recv,
+        "Stream A: SHA256(sent) != SHA256(received) — 10MB data corruption!"
+    );
+    assert_eq!(
+        hash_b_sent, hash_b_recv,
+        "Stream B: SHA256(sent) != SHA256(received) — 10MB data corruption!"
+    );
+
+    eprintln!(
+        "[n2.3.9-phase2b] PASS: 2 × 10 MB concurrent transfers — SHA256 verified"
     );
 
     drop(mesh.gateway_handle);
@@ -794,11 +889,18 @@ async fn phase5_circuit_teardown() {
     stream_b.send(b"data-b").await.expect("send B");
     stream_c.send(b"data-c").await.expect("send C");
 
+    // N2.3.9: Record the stream count BEFORE teardown — should be 3.
+    let count_before = circuit.stream_count().await;
+    assert_eq!(
+        count_before, 3,
+        "circuit should have 3 registered streams before teardown"
+    );
+
     // Kill the gateway — simulates circuit teardown.
     mesh.gateway_handle.abort();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Close the circuit (cleanup the reader task).
+    // Close the circuit (cleanup the reader task + set all streams to Closed).
     circuit.close().await;
 
     // Wait a moment for the background reader to detect the link closure.
@@ -822,6 +924,17 @@ async fn phase5_circuit_teardown() {
         state_a, state_b, state_c
     );
 
+    // N2.3.9: Verify ALL streams are in a terminal state (Closed or Reset).
+    // Not just "recv doesn't hang" — the state must be terminal.
+    for (name, state) in [("A", state_a), ("B", state_b), ("C", state_c)] {
+        assert!(
+            state == snp_gateway::stream::StreamState::Closed
+                || state == snp_gateway::stream::StreamState::Reset,
+            "Stream {} must be in terminal state (Closed/Reset) after teardown, got {:?}",
+            name, state
+        );
+    }
+
     // Verify recv() doesn't hang — should return None or error quickly.
     let recv_a_result = tokio::time::timeout(Duration::from_secs(5), stream_a.recv()).await;
     let recv_b_result = tokio::time::timeout(Duration::from_secs(5), stream_b.recv()).await;
@@ -832,7 +945,7 @@ async fn phase5_circuit_teardown() {
     assert!(recv_b_result.is_ok(), "Stream B recv must not hang after teardown");
     assert!(recv_c_result.is_ok(), "Stream C recv must not hang after teardown");
 
-    eprintln!("[n2.3.9-phase5] PASS: All streams terminated cleanly after circuit teardown — no hanging recv()");
+    eprintln!("[n2.3.9-phase5] PASS: All streams terminal, no hanging recv(), circuit reader aborted");
 
     drop(mesh.relay_a_handle);
     drop(mesh.relay_b_handle);
@@ -966,9 +1079,15 @@ async fn phase6_gateway_crash() {
 // Phase 7: Task leak detection
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Open 50 streams, close all, then verify the circuit is still functional
-/// (can open new streams). This indirectly verifies that per-stream tasks
-/// (reader, writer) are cleaned up.
+/// Open 50 streams, close all, then verify:
+/// 1. The circuit's stream count returns to its pre-test value (no leaked
+///    stream entries in the `streams` map).
+/// 2. The circuit is still functional (can open new streams and transfer data).
+///
+/// This test uses `circuit.stream_count()` to verify that stream entries
+/// are actually removed from the circuit's `streams` HashMap after close —
+/// not just that the circuit "still works." A leaked entry would indicate
+/// that `close()` didn't clean up the internal state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase7_task_leak_detection() {
     let mesh = setup_mesh().await;
@@ -983,6 +1102,10 @@ async fn phase7_task_leak_detection() {
     .await
     .expect("establish timeout")
     .expect("establish must succeed");
+
+    // N2.3.9: Record the baseline stream count BEFORE opening any streams.
+    let baseline_count = circuit.stream_count().await;
+    eprintln!("[n2.3.9-phase7] Baseline stream count: {}", baseline_count);
 
     // Open 50 streams, send small data, close all.
     let stream_count = 50;
@@ -1018,6 +1141,19 @@ async fn phase7_task_leak_detection() {
     // Allow cleanup time.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // N2.3.9: Verify the stream count returned to baseline.
+    // Streams are added to the circuit's `streams` map on open_stream and
+    // removed when the stream is closed (StreamClose/StreamReset messages
+    // are processed by the background reader). If close() didn't clean up,
+    // the count would remain at 50.
+    let after_count = circuit.stream_count().await;
+    eprintln!("[n2.3.9-phase7] Stream count after 50 open/close: {}", after_count);
+    assert_eq!(
+        after_count, baseline_count,
+        "stream count must return to baseline ({}) after all streams closed — leaked entries indicate cleanup failure",
+        baseline_count
+    );
+
     // Verify the circuit is still functional — open a new stream and use it.
     let mut stream = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1034,8 +1170,8 @@ async fn phase7_task_leak_detection() {
     assert_eq!(resp, data, "post-cleanup echo must match");
 
     eprintln!(
-        "[n2.3.9-phase7] PASS: {} streams opened/closed, circuit still functional",
-        stream_count
+        "[n2.3.9-phase7] PASS: {} streams opened/closed, stream count returned to baseline ({}), circuit still functional",
+        stream_count, baseline_count
     );
 
     drop(mesh.gateway_handle);
@@ -1123,17 +1259,17 @@ async fn phase8_memory_growth_check() {
 
 /// Soak test with random send sizes, random pauses, and random stream
 /// closes/reopens. Duration is configurable via the `SOAK_DURATION_SECS`
-/// env var (default 10 seconds for CI; set to 1800 for a 30-minute soak).
+/// env var (default 30 seconds for CI; set to 1800 for a 30-minute soak).
 ///
 /// Collects: streams opened, streams closed, bytes sent, bytes received.
-/// Verifies: no protocol violations, no panics.
+/// Verifies: no protocol violations, no panics, bytes_sent == bytes_received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase9_long_running_soak() {
     let soak_duration = Duration::from_secs(
         std::env::var("SOAK_DURATION_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
+            .unwrap_or(30),
     );
 
     let mesh = setup_mesh().await;
@@ -1157,11 +1293,24 @@ async fn phase9_long_running_soak() {
 
     // Maintain up to 5 concurrent streams.
     let max_concurrent = 5;
-    let mut active: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Each task returns the number of bytes it successfully received (0 on error).
+    let mut active: Vec<tokio::task::JoinHandle<u64>> = Vec::new();
 
     while tokio::time::Instant::now() < deadline {
-        // Clean up finished tasks.
-        active.retain(|h| !h.is_finished());
+        // Clean up finished tasks and accumulate their bytes_received.
+        // We drain finished handles separately because retain can't consume them.
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].is_finished() {
+                let handle = active.remove(i);
+                if let Ok(n) = handle.await {
+                    bytes_received += n;
+                    streams_closed += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
 
         // Open new streams if below max.
         while active.len() < max_concurrent && tokio::time::Instant::now() < deadline {
@@ -1182,13 +1331,18 @@ async fn phase9_long_running_soak() {
             bytes_sent += send_size as u64;
 
             let task = tokio::spawn(async move {
+                let mut received_bytes = 0u64;
                 if stream.send(&data).await.is_ok() {
                     if let Ok(received) = recv_exact(&mut stream, send_size).await {
-                        let _ = sha256(&received); // verify internally
-                        assert_eq!(sha256(&received), expected_hash, "soak: hash mismatch");
+                        if sha256(&received) == expected_hash {
+                            received_bytes = received.len() as u64;
+                        } else {
+                            panic!("soak: hash mismatch");
+                        }
                     }
                 }
                 let _ = stream.close().await;
+                received_bytes
             });
             active.push(task);
 
@@ -1197,32 +1351,44 @@ async fn phase9_long_running_soak() {
             tokio::time::sleep(Duration::from_millis(pause)).await;
         }
 
-        // Occasionally wait for some tasks to complete.
+        // Occasionally wait for one task to complete.
         if !active.is_empty() {
             let idx = rand::thread_rng().gen_range(0..active.len());
             let handle = active.remove(idx);
-            if tokio::time::timeout(Duration::from_secs(30), handle)
-                .await
-                .is_ok()
-            {
-                streams_closed += 1;
-                bytes_received += 1; // approximate
+            match tokio::time::timeout(Duration::from_secs(30), handle).await {
+                Ok(Ok(n)) => {
+                    bytes_received += n;
+                    streams_closed += 1;
+                }
+                _ => {}
             }
         }
     }
 
     // Wait for remaining tasks.
     for handle in active.drain(..) {
-        let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
-        streams_closed += 1;
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(30), handle).await {
+            bytes_received += n;
+            streams_closed += 1;
+        }
     }
 
     eprintln!(
-        "[n2.3.9-phase9] PASS: {}s soak — streams opened: {}, closed: {}, bytes sent: ~{}MB",
+        "[n2.3.9-phase9] PASS: {}s soak — streams opened: {}, closed: {}, \
+         bytes sent: {} ({:.2} MB), bytes received: {} ({:.2} MB)",
         soak_duration.as_secs(),
         streams_opened,
         streams_closed,
-        bytes_sent / (1024 * 1024)
+        bytes_sent,
+        bytes_sent as f64 / (1024.0 * 1024.0),
+        bytes_received,
+        bytes_received as f64 / (1024.0 * 1024.0)
+    );
+
+    // Invariant: every byte sent was received (echo server).
+    assert_eq!(
+        bytes_sent, bytes_received,
+        "soak invariant: bytes_sent must equal bytes_received for echo server"
     );
 
     drop(mesh.gateway_handle);
@@ -1406,4 +1572,236 @@ async fn phase11c_independent_stream_sequence_spaces() {
     drop(mesh.gateway_handle);
     drop(mesh.relay_a_handle);
     drop(mesh.relay_b_handle);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 12: Metrics integration — verify counters increment on real events
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Metrics Integration Test.**
+///
+/// This test verifies that `TransportMetrics` counters are connected to
+/// real transport events — not just incremented in unit tests.
+///
+/// It attaches metrics to both the gateway (via `GatewayStreamTable::with_metrics`)
+/// and the client (via `MultiplexedCircuit::set_metrics`), then performs
+/// real stream operations and verifies that:
+///
+/// - `streams_opened_total` incremented (gateway saw StreamOpen)
+/// - `streams_closed_total` incremented (gateway saw StreamClose)
+/// - `circuit_bytes_sent` > 0 (client sent data)
+/// - `circuit_bytes_received` > 0 (client received data)
+/// - `credit_updates_sent` > 0 (client sent WindowUpdate to gateway)
+/// - `credit_updates_received` > 0 (client received WindowUpdate from gateway)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase12_metrics_integration() {
+    use snp_node::node::transport_metrics::TransportMetrics;
+
+    let client_idents = NodeIdents::fresh();
+    let relay_a_idents = NodeIdents::fresh();
+    let relay_b_idents = NodeIdents::fresh();
+    let gateway_idents = NodeIdents::fresh();
+
+    let gateway_addr = ephemeral_addr().await;
+    let relay_b_addr = ephemeral_addr().await;
+    let relay_a_addr = ephemeral_addr().await;
+
+    // Create shared metrics instances.
+    let gateway_metrics = Arc::new(TransportMetrics::new());
+    let client_metrics = Arc::new(TransportMetrics::new());
+
+    // Start gateway with metrics.
+    let gateway_node = Node::new(
+        gateway_idents.identity(),
+        vec![Capability::Gateway],
+        gateway_addr.clone(),
+    );
+    let gw_x_sk = Arc::clone(&gateway_idents.x_sk);
+    let gw_x_pk = gateway_idents.x_pk;
+    let gw_listen = gateway_addr.clone();
+    let stream_table = Arc::new(
+        GatewayStreamTable::with_allow_loopback().with_metrics(Arc::clone(&gateway_metrics)),
+    );
+    let st = Arc::clone(&stream_table);
+    let gateway_handle = tokio::spawn(async move {
+        let _ = async_node::serve_gateway_mode_b_multiplexed(
+            &gateway_node, &gw_listen, &gw_x_sk, &gw_x_pk, &st,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Start relays.
+    let relay_b_route = Route::new_with_hop_details(
+        relay_a_idents.node_id,
+        gateway_idents.node_id,
+        vec![
+            RouteHop::new(
+                relay_b_idents.relay_descriptor(),
+                TransportEndpoint::tcp(&relay_b_addr),
+            ),
+            RouteHop::new(
+                gateway_idents.gateway_descriptor(),
+                TransportEndpoint::tcp(&gateway_addr),
+            ),
+        ],
+    );
+    let relay_b_handle = start_relay(&relay_b_idents, &relay_b_route, 0, &relay_b_addr);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let relay_a_route = Route::new_with_hop_details(
+        client_idents.node_id,
+        gateway_idents.node_id,
+        vec![
+            RouteHop::new(
+                relay_a_idents.relay_descriptor(),
+                TransportEndpoint::tcp(&relay_a_addr),
+            ),
+            RouteHop::new(
+                relay_b_idents.relay_descriptor(),
+                TransportEndpoint::tcp(&relay_b_addr),
+            ),
+            RouteHop::new(
+                gateway_idents.gateway_descriptor(),
+                TransportEndpoint::tcp(&gateway_addr),
+            ),
+        ],
+    );
+    let relay_a_handle = start_relay(&relay_a_idents, &relay_a_route, 0, &relay_a_addr);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let route = build_route(
+        &client_idents,
+        &relay_a_idents,
+        &relay_b_idents,
+        &gateway_idents,
+        &relay_a_addr,
+        &relay_b_addr,
+        &gateway_addr,
+    );
+
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    // Establish circuit + attach client metrics.
+    let client_node = Node::new(
+        client_idents.identity(),
+        vec![Capability::Client],
+        String::new(),
+    );
+    let client_x_sk = Arc::clone(&client_idents.x_sk);
+    let client_x_pk = client_idents.x_pk;
+
+    let mut circuit = tokio::time::timeout(
+        Duration::from_secs(30),
+        MultiplexedCircuit::establish(&client_node, &route, &client_x_sk, &client_x_pk),
+    )
+    .await
+    .expect("establish timeout")
+    .expect("establish must succeed");
+
+    // Attach metrics BEFORE opening any streams.
+    circuit.set_metrics(Arc::clone(&client_metrics));
+
+    // Open a stream and transfer enough data to trigger WindowUpdates.
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        circuit.open_stream(endpoint(echo_port)),
+    )
+    .await
+    .expect("open timeout")
+    .expect("open must succeed");
+
+    // Send 100 KB — enough to exceed WINDOW_UPDATE_THRESHOLD (32 KB)
+    // and trigger credit updates in both directions.
+    let data = random_data(100 * 1024);
+    let expected_hash = sha256(&data);
+    stream.send(&data).await.expect("send");
+
+    // Receive the echo.
+    let received = tokio::time::timeout(
+        Duration::from_secs(30),
+        recv_exact(&mut stream, 100 * 1024),
+    )
+    .await
+    .expect("recv timeout")
+    .expect("recv error");
+    assert_eq!(sha256(&received), expected_hash, "echo must match");
+
+    // Close the stream.
+    stream.close().await.expect("close");
+
+    // Allow time for the gateway to process the close.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // ── Verify gateway metrics ────────────────────────────────────────────
+    let gw_snap = gateway_metrics.snapshot();
+    assert!(
+        gw_snap.streams_opened_total >= 1,
+        "gateway must have recorded at least 1 stream open (got {})",
+        gw_snap.streams_opened_total
+    );
+    assert!(
+        gw_snap.streams_closed_total >= 1,
+        "gateway must have recorded at least 1 stream close (got {})",
+        gw_snap.streams_closed_total
+    );
+    assert!(
+        gw_snap.circuit_bytes_received >= 100 * 1024,
+        "gateway must have recorded bytes received from client (got {})",
+        gw_snap.circuit_bytes_received
+    );
+    assert!(
+        gw_snap.circuit_bytes_sent >= 100 * 1024,
+        "gateway must have recorded bytes sent to client (got {})",
+        gw_snap.circuit_bytes_sent
+    );
+
+    eprintln!(
+        "[n2.3.9-phase12] Gateway metrics: streams_opened={}, closed={}, bytes_recv={}, bytes_sent={}",
+        gw_snap.streams_opened_total,
+        gw_snap.streams_closed_total,
+        gw_snap.circuit_bytes_received,
+        gw_snap.circuit_bytes_sent
+    );
+
+    // ── Verify client metrics ─────────────────────────────────────────────
+    let cli_snap = client_metrics.snapshot();
+    assert!(
+        cli_snap.circuit_bytes_sent >= 100 * 1024,
+        "client must have recorded bytes sent (got {})",
+        cli_snap.circuit_bytes_sent
+    );
+    assert!(
+        cli_snap.circuit_bytes_received >= 100 * 1024,
+        "client must have recorded bytes received (got {})",
+        cli_snap.circuit_bytes_received
+    );
+    // WindowUpdates: the client sends WindowUpdate to the gateway (credit_update_sent)
+    // and receives WindowUpdate from the gateway (credit_update_received).
+    // With 100 KB transfer and 32 KB threshold, at least 1 each should occur.
+    assert!(
+        cli_snap.credit_updates_sent >= 1,
+        "client must have sent at least 1 WindowUpdate to gateway (got {})",
+        cli_snap.credit_updates_sent
+    );
+    assert!(
+        cli_snap.credit_updates_received >= 1,
+        "client must have received at least 1 WindowUpdate from gateway (got {})",
+        cli_snap.credit_updates_received
+    );
+
+    eprintln!(
+        "[n2.3.9-phase12] Client metrics: bytes_sent={}, bytes_recv={}, credit_sent={}, credit_recv={}",
+        cli_snap.circuit_bytes_sent,
+        cli_snap.circuit_bytes_received,
+        cli_snap.credit_updates_sent,
+        cli_snap.credit_updates_received
+    );
+
+    eprintln!("[n2.3.9-phase12] PASS: Metrics connected to real transport events — all counters incremented");
+
+    drop(gateway_handle);
+    drop(relay_a_handle);
+    drop(relay_b_handle);
 }

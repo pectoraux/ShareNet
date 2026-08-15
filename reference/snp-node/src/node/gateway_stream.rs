@@ -33,6 +33,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc::UnboundedSender, Mutex, Semaphore};
 
+use super::transport_metrics::TransportMetrics;
+
 /// Maximum number of concurrent streams per gateway.
 pub const MAX_STREAMS_PER_GATEWAY: usize = 256;
 
@@ -128,6 +130,10 @@ pub struct GatewayStreamTable {
     /// Whether to allow loopback/private destinations. Production = false.
     /// Tests = true (so the test can connect to a local echo server).
     allow_loopback: bool,
+    /// **N2.3.9** — Optional transport metrics. When set, the table records
+    /// stream opens/closes/resets and byte counts on real transport events.
+    /// None = metrics disabled (default — backward compatible).
+    metrics: Option<Arc<TransportMetrics>>,
 }
 
 impl Default for GatewayStreamTable {
@@ -152,7 +158,18 @@ impl GatewayStreamTable {
             streams: Arc::new(Mutex::new(HashMap::new())),
             quota: Arc::new(Semaphore::new(max_streams)),
             allow_loopback: false,
+            metrics: None,
         }
+    }
+
+    /// **N2.3.9** — Attach transport metrics to this stream table.
+    ///
+    /// When set, the table records stream opens/closes/resets and byte
+    /// counts on real transport events. Returns `self` for chaining.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<TransportMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Create a table that allows loopback/private destinations.
@@ -169,6 +186,7 @@ impl GatewayStreamTable {
             streams: Arc::new(Mutex::new(HashMap::new())),
             quota: Arc::new(Semaphore::new(MAX_STREAMS_PER_GATEWAY)),
             allow_loopback: true,
+            metrics: None,
         }
     }
 
@@ -241,6 +259,10 @@ impl GatewayStreamTable {
         {
             Ok(Ok(socket)) => socket,
             Ok(Err(e)) => {
+                // N2.3.9: Record TCP connect failure in metrics.
+                if let Some(m) = &self.metrics {
+                    m.tcp_connect_failure();
+                }
                 return Ok(StreamOpenAck {
                     stream_id: open.stream_id,
                     initial_receive_window: 0,
@@ -249,6 +271,10 @@ impl GatewayStreamTable {
                 });
             }
             Err(_) => {
+                // N2.3.9: Record TCP connect failure (timeout) in metrics.
+                if let Some(m) = &self.metrics {
+                    m.tcp_connect_failure();
+                }
                 return Ok(StreamOpenAck {
                     stream_id: open.stream_id,
                     initial_receive_window: 0,
@@ -289,6 +315,11 @@ impl GatewayStreamTable {
         {
             let mut streams = self.streams.lock().await;
             streams.insert(open.stream_id, entry);
+        }
+
+        // N2.3.9: Record stream open in metrics.
+        if let Some(m) = &self.metrics {
+            m.stream_opened();
         }
 
         Ok(StreamOpenAck {
@@ -363,6 +394,11 @@ impl GatewayStreamTable {
             shared.last_activity = Instant::now();
             shared.client_credit
         };
+
+        // N2.3.9: Record bytes received from client in metrics.
+        if let Some(m) = &self.metrics {
+            m.bytes_received(data.data.len() as u64);
+        }
 
         // N2.3.9: If a write channel is set, queue the data to the per-stream
         // writer task. This avoids blocking the main loop on TCP writes.
@@ -525,6 +561,11 @@ impl GatewayStreamTable {
             shared.last_activity = Instant::now();
         }
 
+        // N2.3.9: Record bytes sent to client in metrics.
+        if let Some(m) = &self.metrics {
+            m.bytes_sent(n as u64);
+        }
+
         Ok(Some(StreamData {
             stream_id,
             direction: StreamDirection::GatewayToClient,
@@ -596,6 +637,10 @@ impl GatewayStreamTable {
             // The _permit is dropped when `stream` goes out of scope,
             // freeing the quota slot.
         }
+        // N2.3.9: Record stream close in metrics.
+        if let Some(m) = &self.metrics {
+            m.stream_closed();
+        }
         Ok(())
     }
 
@@ -620,6 +665,11 @@ impl GatewayStreamTable {
             }
             let mut shared = stream.state.lock().await;
             shared.state = StreamState::Reset;
+        }
+        // N2.3.9: Record stream reset in metrics.
+        if let Some(m) = &self.metrics {
+            m.stream_reset();
+            m.protocol_reset();
         }
         Ok(())
     }

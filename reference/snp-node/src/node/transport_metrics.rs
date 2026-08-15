@@ -73,6 +73,15 @@ pub struct TransportMetrics {
     tcp_connect_failures: AtomicU64,
     protocol_resets: AtomicU64,
     circuit_teardowns: AtomicU64,
+
+    // ── Latency ──────────────────────────────────────────────────────────
+    /// Total duration of all completed streams (in microseconds).
+    /// Divided by `streams_closed_total` + `streams_reset_total` gives
+    /// the average stream lifetime.
+    stream_duration_micros_total: AtomicU64,
+    /// Total time spent blocked on send credit exhaustion (in microseconds).
+    /// Measures how long send() calls waited for WindowUpdate.
+    send_blocked_micros_total: AtomicU64,
 }
 
 impl Default for TransportMetrics {
@@ -101,6 +110,8 @@ impl TransportMetrics {
             tcp_connect_failures: AtomicU64::new(0),
             protocol_resets: AtomicU64::new(0),
             circuit_teardowns: AtomicU64::new(0),
+            stream_duration_micros_total: AtomicU64::new(0),
+            send_blocked_micros_total: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +191,24 @@ impl TransportMetrics {
     /// Record a protocol violation reset.
     pub fn protocol_reset(&self) {
         self.protocol_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Latency metrics ──────────────────────────────────────────────────
+
+    /// Record the duration of a completed stream (in microseconds).
+    /// Called when a stream is closed or reset.
+    pub fn record_stream_duration(&self, duration: std::time::Duration) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        self.stream_duration_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Record time spent blocked on send credit exhaustion.
+    /// Called when send() wakes up after waiting for a WindowUpdate.
+    pub fn record_send_blocked(&self, duration: std::time::Duration) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        self.send_blocked_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
     }
 
     // ── Snapshot ─────────────────────────────────────────────────────────
@@ -274,6 +303,29 @@ impl TransportMetrics {
         self.circuit_teardowns.load(Ordering::Relaxed)
     }
 
+    /// Get total stream duration in microseconds (all completed streams).
+    #[must_use]
+    pub fn stream_duration_micros_total(&self) -> u64 {
+        self.stream_duration_micros_total.load(Ordering::Relaxed)
+    }
+
+    /// Get the average stream duration in microseconds.
+    /// Returns 0 if no streams have completed.
+    #[must_use]
+    pub fn avg_stream_duration_micros(&self) -> u64 {
+        let completed = self.streams_closed_total() + self.streams_reset_total();
+        if completed == 0 {
+            return 0;
+        }
+        self.stream_duration_micros_total() / completed
+    }
+
+    /// Get total time spent blocked on send credit (in microseconds).
+    #[must_use]
+    pub fn send_blocked_micros_total(&self) -> u64 {
+        self.send_blocked_micros_total.load(Ordering::Relaxed)
+    }
+
     /// Take a human-readable snapshot of all metrics.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -293,6 +345,9 @@ impl TransportMetrics {
             tcp_connect_failures: self.tcp_connect_failures(),
             protocol_resets: self.protocol_resets(),
             circuit_teardowns: self.circuit_teardowns(),
+            stream_duration_micros_total: self.stream_duration_micros_total(),
+            avg_stream_duration_micros: self.avg_stream_duration_micros(),
+            send_blocked_micros_total: self.send_blocked_micros_total(),
         }
     }
 }
@@ -315,6 +370,9 @@ pub struct MetricsSnapshot {
     pub tcp_connect_failures: u64,
     pub protocol_resets: u64,
     pub circuit_teardowns: u64,
+    pub stream_duration_micros_total: u64,
+    pub avg_stream_duration_micros: u64,
+    pub send_blocked_micros_total: u64,
 }
 
 impl std::fmt::Display for MetricsSnapshot {
@@ -357,6 +415,25 @@ impl std::fmt::Display for MetricsSnapshot {
         )?;
         writeln!(f, "  protocol_resets:         {}", self.protocol_resets)?;
         writeln!(f, "  circuit_teardowns:       {}", self.circuit_teardowns)?;
+        writeln!(f, "Latency:")?;
+        writeln!(
+            f,
+            "  stream_duration_total:   {} ({:.3}s)",
+            self.stream_duration_micros_total,
+            self.stream_duration_micros_total as f64 / 1_000_000.0
+        )?;
+        writeln!(
+            f,
+            "  avg_stream_duration:     {} ({:.3}ms)",
+            self.avg_stream_duration_micros,
+            self.avg_stream_duration_micros as f64 / 1000.0
+        )?;
+        writeln!(
+            f,
+            "  send_blocked_total:      {} ({:.3}s)",
+            self.send_blocked_micros_total,
+            self.send_blocked_micros_total as f64 / 1_000_000.0
+        )?;
         Ok(())
     }
 }
