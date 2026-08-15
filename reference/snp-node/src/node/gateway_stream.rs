@@ -143,7 +143,13 @@ impl GatewayStreamTable {
     }
 
     /// Create a table that allows loopback/private destinations.
-    /// **TEST ONLY** — production must never use this.
+    ///
+    /// **TEST ONLY — production must never use this.**
+    ///
+    /// This constructor is gated behind the `test-utils` Cargo feature.
+    /// Production builds (without `--features test-utils`) do not compile
+    /// this method — there is no callable API that disables SSRF/port policy.
+    #[cfg(feature = "test-utils")]
     #[must_use]
     pub fn with_allow_loopback() -> Self {
         Self {

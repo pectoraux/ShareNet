@@ -27,7 +27,7 @@ circuit-upstream = ["dep:snp-node", "dep:snp-gateway", "dep:snp-crypto", "dep:sn
 
 [dev-dependencies]
 tokio.workspace = true
-snp-node.workspace = true
+snp-node = { workspace = true, features = ["test-utils"] }
 snp-gateway.workspace = true
 snp-crypto.workspace = true
 snp-link.workspace = true

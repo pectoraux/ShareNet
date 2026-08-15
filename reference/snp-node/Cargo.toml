@@ -27,6 +27,10 @@ legacy-circuit-keys = []
 # testing where performing actual SNP-IK handshakes is impractical.
 # Enabling this feature also enables snp-link's test-support feature.
 test-support = ["snp-link/test-support"]
+# N2.2.5: Expose GatewayStreamTable::with_allow_loopback() for integration
+# tests that need to connect to a local echo server. This feature MUST NOT
+# be enabled in production builds — it disables SSRF and port policy.
+test-utils = []
 
 [[bin]]
 name = "snp-node"

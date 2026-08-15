@@ -202,8 +202,61 @@ async fn mode_b_end_to_end_raw_tcp_through_mesh() {
     );
 
     eprintln!(
-        "[mode-b-e2e] PASS: sent {} bytes → A→B→C→G → echo server → G→C→B→A → received {} bytes",
+        "[mode-b-e2e] PASS (small): sent {} bytes, received {} bytes",
         sent, data.len()
+    );
+
+    // ── Multi-frame test: send a payload large enough to require multiple
+    // StreamData frames (each capped at MAX_STREAM_DATA_PAYLOAD = 16*384).
+    // This exercises the outer (fid, seq) AEAD nonce uniqueness — the bug
+    // we fixed where every gateway→client frame used seq=0.
+    //
+    // We send 5 × MAX_STREAM_DATA_PAYLOAD + 1 bytes, which requires at
+    // least 6 StreamData frames from the gateway back to the client.
+    // Each frame must have a unique outer seq for AEAD nonce safety.
+    let large_size = 5 * snp_gateway::stream::MAX_STREAM_DATA_PAYLOAD + 1;
+    let large_data: Vec<u8> = (0..large_size).map(|i| (i % 256) as u8).collect();
+
+    let sent_large = upstream.send(&large_data).await.expect("large send must succeed");
+    assert_eq!(sent_large, large_size, "all large bytes must be sent");
+
+    // Receive the echo in chunks (the echo server may not send everything
+    // in one frame).
+    let mut received_large: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while received_large.len() < large_size {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "timeout: received {} of {} bytes",
+                received_large.len(),
+                large_size
+            );
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.recv(),
+        ).await {
+            Ok(Ok(Some(chunk))) => received_large.extend_from_slice(&chunk),
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("recv error during large transfer: {e}"),
+            Err(_) => continue,
+        }
+    }
+
+    assert_eq!(
+        received_large, large_data,
+        "large echo must match byte-for-byte — got {} bytes, expected {}",
+        received_large.len(),
+        large_data.len()
+    );
+
+    eprintln!(
+        "[mode-b-e2e] PASS (multi-frame): sent {} bytes ({} frames), received {} bytes — \
+         AEAD nonce/replay fix verified",
+        sent_large,
+        (large_size + snp_gateway::stream::MAX_STREAM_DATA_PAYLOAD - 1)
+            / snp_gateway::stream::MAX_STREAM_DATA_PAYLOAD,
+        received_large.len()
     );
 
     drop(gateway_handle);
