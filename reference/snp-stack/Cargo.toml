@@ -35,6 +35,10 @@ test-utils = []
 name = "runtime_migration"
 required-features = ["circuit-upstream", "test-utils"]
 
+[[test]]
+name = "circuit_lifecycle_tests"
+required-features = ["circuit-upstream", "test-utils"]
+
 [dev-dependencies]
 tokio.workspace = true
 snp-node = { workspace = true, features = ["test-utils"] }

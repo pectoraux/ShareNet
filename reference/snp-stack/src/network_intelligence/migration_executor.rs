@@ -135,6 +135,19 @@ impl MigrationExecutor {
         self.circuit_registry.active_circuit_mut()
     }
 
+    /// **N2.5-R.3.2** — Reap draining circuits.
+    ///
+    /// Lifecycle maintenance method. Closes draining circuits that have
+    /// zero active streams or whose drain timeout has expired.
+    ///
+    /// Should be called periodically by the runtime (e.g., after stream
+    /// operations or on a timer).
+    ///
+    /// Returns the circuit IDs that were closed.
+    pub async fn reap_draining(&mut self) -> Vec<CircuitId> {
+        self.circuit_registry.reap_draining().await
+    }
+
     /// **Production migration method.** Health verification is MANDATORY.
     ///
     /// This is the full migration transaction:

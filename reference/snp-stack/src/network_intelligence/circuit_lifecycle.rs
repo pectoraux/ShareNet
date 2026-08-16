@@ -51,7 +51,15 @@ pub type CircuitId = [u8; 8];
 /// The lifecycle state of a circuit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CircuitState {
-    /// The circuit is established but not yet health-checked or committed.
+    /// The circuit is established and health-verified, owned by the registry,
+    /// but has not yet been promoted to Active. The `MultiplexedCircuit`
+    /// is alive in the registry.
+    ///
+    /// In the current executor flow, `Candidate` is a brief transitional
+    /// state: the circuit is registered as Candidate immediately after
+    /// health check passes, then quickly promoted to Healthy and Active.
+    /// It exists to represent the window between "circuit is ready" and
+    /// "circuit is committed as active."
     Candidate,
     /// The circuit is established and health-verified, but not yet active.
     Healthy,
@@ -351,6 +359,64 @@ impl CircuitRegistry {
             self.mark_closed(id).await.ok();
         }
         expired
+    }
+
+    /// **N2.5-R.3.2** — Reap draining circuits.
+    ///
+    /// This is the lifecycle maintenance method. It should be called
+    /// periodically by the runtime (e.g., after stream operations or
+    /// on a timer).
+    ///
+    /// For each `Draining` circuit:
+    /// 1. Inspect its actual `MultiplexedCircuit::stream_count()`.
+    /// 2. If stream_count == 0: close the circuit and transition to `Closed`.
+    /// 3. If drain timeout has expired: close the circuit (terminating
+    ///    any remaining streams) and transition to `Closed`.
+    /// 4. Otherwise: leave it alive (existing streams continue).
+    ///
+    /// Returns the circuit IDs that were closed.
+    ///
+    /// ## Invariants
+    ///
+    /// - Only `Draining` circuits are eligible for closure.
+    /// - `Active` circuits are never closed by this method.
+    /// - `Candidate` circuits are never closed by this method.
+    /// - A draining circuit with active streams remains alive unless
+    ///   the drain timeout has expired.
+    pub async fn reap_draining(&mut self) -> Vec<CircuitId> {
+        let mut to_close = Vec::new();
+
+        // Collect IDs of circuits that need closing.
+        for (id, tracked) in &self.circuits {
+            if tracked.state != CircuitState::Draining {
+                continue;
+            }
+
+            // Check drain timeout first.
+            if tracked.is_drain_timeout_expired() {
+                to_close.push(*id);
+                continue;
+            }
+
+            // Check actual stream count.
+            if let Some(circuit) = &tracked.circuit {
+                let count = circuit.stream_count().await;
+                if count == 0 {
+                    to_close.push(*id);
+                }
+            } else {
+                // No circuit handle — shouldn't happen for Draining, but
+                // if it does, mark as closed.
+                to_close.push(*id);
+            }
+        }
+
+        // Actually close the circuits.
+        for id in &to_close {
+            self.mark_closed(id).await.ok();
+        }
+
+        to_close
     }
 
     /// Returns the number of tracked circuits (all states).
