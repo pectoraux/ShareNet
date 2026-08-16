@@ -75,7 +75,10 @@ pub use observations::{MovingAverage, ObservationStore, PeerId, PeerObservation}
 #[cfg(feature = "circuit-upstream")]
 pub use circuit_lifecycle::{CircuitId, CircuitRegistry, CircuitState};
 #[cfg(feature = "circuit-upstream")]
-pub use migration_executor::{MigrationExecutor, MigrationFailureReason, MigrationOutcome};
+pub use migration_executor::{
+    FailureMonitor, FailureMonitorConfig, MigrationExecutor, MigrationFailureReason,
+    MigrationOutcome, RecoverySignal,
+};
 pub use route_observation::{
     route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,
 };

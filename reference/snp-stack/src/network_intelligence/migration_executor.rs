@@ -30,7 +30,7 @@ use super::circuit_lifecycle::{CircuitId, CircuitRegistry, CircuitState};
 use snp_crypto::{X25519PubKey, X25519Secret};
 use snp_node::node::stream_client::MultiplexedCircuit;
 use snp_node::node::{Node, Route};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The result of a migration attempt.
@@ -674,6 +674,202 @@ impl std::fmt::Debug for MigrationExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MigrationExecutor")
             .field("optimizer", &self.optimizer)
+            .finish_non_exhaustive()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.5-R.5 — Failure Detection Integration / Recovery Triggering
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **N2.5-R.5** — Configuration for the background failure monitor.
+#[derive(Debug, Clone)]
+pub struct FailureMonitorConfig {
+    /// How often to probe the active circuit (default: 30 seconds).
+    pub probe_interval: Duration,
+    /// How long to wait for a health probe before declaring failure
+    /// (default: 20 seconds).
+    pub probe_timeout: Duration,
+}
+
+impl Default for FailureMonitorConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+/// **N2.5-R.5** — A signal that the failure monitor uses to communicate
+/// with the runtime. When the monitor detects a failure, it sets this
+/// flag. The runtime (or a background task) checks the flag and invokes
+/// recovery.
+///
+/// This is NOT a callback — it is a simple shared flag that avoids
+/// complex async callback lifetimes. The runtime polls `should_recover()`
+/// and calls `recover_from_failure()` when it returns `true`.
+#[derive(Debug, Default)]
+pub struct RecoverySignal {
+    /// Set to `true` when the failure monitor detects a failure.
+    /// The runtime reads and clears this flag.
+    needs_recovery: Mutex<bool>,
+}
+
+impl RecoverySignal {
+    /// Create a new recovery signal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if recovery is needed (failure was detected).
+    /// Clears the flag.
+    pub fn should_recover(&self) -> bool {
+        let mut guard = self.needs_recovery.lock().unwrap();
+        let val = *guard;
+        *guard = false;
+        val
+    }
+
+    /// Set the recovery flag (called by the failure monitor).
+    fn signal_failure(&self) {
+        *self.needs_recovery.lock().unwrap() = true;
+    }
+
+    /// Check if recovery is needed without clearing the flag.
+    #[must_use]
+    pub fn peek(&self) -> bool {
+        *self.needs_recovery.lock().unwrap()
+    }
+}
+
+/// **N2.5-R.5** — Background failure monitor.
+///
+/// Spawns a tokio task that periodically probes the active circuit.
+/// When a probe fails, it sets the `RecoverySignal` flag. The runtime
+/// is expected to check the flag and invoke `recover_from_failure()`.
+///
+/// ## Architecture
+///
+/// ```text
+/// Background task:
+///   loop {
+///     sleep(probe_interval)
+///     probe active circuit (health check with timeout)
+///     if probe fails:
+///       recovery_signal.signal_failure()
+///       break  // monitor exits — runtime will restart it after recovery
+///   }
+///
+/// Runtime:
+///   loop {
+///     if recovery_signal.should_recover():
+///       recover_from_failure(...)
+///       restart failure monitor
+///   }
+/// ```
+///
+/// ## What this is NOT
+///
+/// - This is NOT transport-level failure detection. It is a periodic
+///   health probe.
+/// - This is NOT a callback system. The runtime must poll the signal.
+/// - The monitor does NOT perform recovery itself. It only signals.
+pub struct FailureMonitor {
+    /// Handle to the background probe task.
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shared recovery signal.
+    signal: Arc<RecoverySignal>,
+}
+
+impl FailureMonitor {
+    /// Create a new failure monitor (not yet started).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            task_handle: None,
+            signal: Arc::new(RecoverySignal::new()),
+        }
+    }
+
+    /// Returns a reference to the recovery signal.
+    #[must_use]
+    pub fn signal(&self) -> &Arc<RecoverySignal> {
+        &self.signal
+    }
+
+    /// Start the background failure monitor.
+    ///
+    /// Spawns a tokio task that periodically probes the active circuit.
+    /// When a probe fails, it sets the recovery signal and exits.
+    ///
+    /// # Arguments
+    /// * `executor` — The migration executor (shared via Arc<Mutex>).
+    /// * `health_endpoint` — The endpoint to probe.
+    /// * `config` — Monitor configuration.
+    pub fn start(
+        &mut self,
+        executor: Arc<tokio::sync::Mutex<MigrationExecutor>>,
+        health_endpoint: snp_gateway::stream::InternetEndpoint,
+        config: FailureMonitorConfig,
+    ) {
+        let signal = Arc::clone(&self.signal);
+
+        self.task_handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(config.probe_interval).await;
+
+                // Probe the active circuit.
+                let failed = {
+                    let mut exec = executor.lock().await;
+                    exec.detect_active_circuit_failure(
+                        health_endpoint.clone(),
+                        config.probe_timeout,
+                    )
+                    .await
+                };
+
+                if failed {
+                    eprintln!("[n2.5-r.5] failure monitor: active circuit failure detected");
+                    signal.signal_failure();
+                    break; // Exit — runtime will restart after recovery.
+                }
+            }
+        }));
+    }
+
+    /// Stop the background failure monitor.
+    pub fn stop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// Returns `true` if the monitor is running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.task_handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+impl Default for FailureMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for FailureMonitor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl std::fmt::Debug for FailureMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailureMonitor")
+            .field("is_running", &self.is_running())
+            .field("needs_recovery", &self.signal.peek())
             .finish_non_exhaustive()
     }
 }

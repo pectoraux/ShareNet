@@ -784,9 +784,17 @@ impl AdaptiveRouteOptimizer {
     }
 
     /// **N2.5-R.4.1** — Check if a route is currently quarantined.
+    ///
+    /// Returns `true` only if the route has a quarantine record AND the
+    /// quarantine has not expired. Expired entries are not pruned here
+    /// (that happens in `check()`), but this method correctly reports
+    /// `false` for expired quarantines.
     #[must_use]
     pub fn is_quarantined(&self, route_id: &RouteId) -> bool {
-        self.quarantined_routes.contains_key(route_id)
+        match self.quarantined_routes.get(route_id) {
+            Some(expiry) => *expiry > Instant::now(),
+            None => false,
+        }
     }
 
     /// **N2.5-R.4.1** — Remove expired quarantines.
