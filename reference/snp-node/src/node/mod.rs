@@ -134,6 +134,7 @@ pub mod circuit_lifecycle; // N3.1: circuit lifecycle + key rotation
 pub mod multi_process; // N3.3: multi-process network harness
 pub mod content_service; // N3.4: content re-integration
 pub mod external_crypto; // N3.5: external crypto bridge
+pub mod north_star; // N3.6: north-star demo
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
