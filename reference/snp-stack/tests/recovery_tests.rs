@@ -570,3 +570,304 @@ async fn recovery_failure_when_no_routes_available() {
 
     eprintln!("[n2.5-r.4] PASS: recovery_failure_when_no_routes_available");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.5-R.4.1 — Recovery route exclusion + quarantine tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Failed route is excluded from recovery candidates.**
+///
+/// After A fails and is quarantined, the optimizer's `check()` excludes
+/// A from the candidate set. Recovery selects B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_route_is_excluded_from_recovery() {
+    let mesh = setup_dual_mesh().await;
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    let hops_b = mesh.route_b.hops();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(30.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+
+    let routes = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    // Establish route A.
+    executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // Fail A.
+    executor.fail_active_circuit().unwrap();
+
+    // A should be quarantined.
+    use snp_stack::network_intelligence::route_id_from_hops;
+    let route_a_id = route_id_from_hops(&hops_a);
+    assert!(
+        executor.optimizer().is_quarantined(&route_a_id),
+        "failed route A should be quarantined"
+    );
+
+    // Wait for cooldown.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Recovery — should select B, not A.
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+
+    match &outcome {
+        MigrationOutcome::Success { .. } => {
+            assert_eq!(
+                executor.current_route(),
+                Some(hops_b.as_slice()),
+                "recovery should select B, not quarantined A"
+            );
+        }
+        _ => panic!("expected recovery Success with B, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.4.1] PASS: failed_route_is_excluded_from_recovery");
+    drop(mesh.handles);
+}
+
+/// **Recovery does not reselect the failed active route.**
+///
+/// Even if A has better observations, after failure + quarantine,
+/// A cannot be selected for recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_does_not_reselect_failed_active_route() {
+    let mesh = setup_dual_mesh().await;
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    let hops_b = mesh.route_b.hops();
+
+    // A has MUCH better observations than B — normally A would win.
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(10.0);
+        for _ in 0..20 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(100.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+
+    let routes = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    // Establish route A.
+    executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // Fail A.
+    executor.fail_active_circuit().unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Recovery — must select B, NOT A (A is quarantined even though it
+    // has better observations).
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+
+    match &outcome {
+        MigrationOutcome::Success { .. } => {
+            assert_ne!(
+                executor.current_route(),
+                Some(hops_a.as_slice()),
+                "recovery must NOT reselect quarantined route A"
+            );
+            assert_eq!(
+                executor.current_route(),
+                Some(hops_b.as_slice()),
+                "recovery should select B"
+            );
+        }
+        _ => panic!("expected recovery Success with B, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.4.1] PASS: recovery_does_not_reselect_failed_active_route");
+    drop(mesh.handles);
+}
+
+/// **Only failed route available → returns NoRoutes.**
+///
+/// If the only available route is quarantined, recovery returns NoRoutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_failed_route_available_returns_no_routes() {
+    let mesh = setup_dual_mesh().await;
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+    }
+
+    let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
+
+    // Establish route A.
+    executor.attempt_migration(
+        &[hops_a.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+
+    // Fail A.
+    executor.fail_active_circuit().unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Recovery with only A as candidate — A is quarantined, so NoRoutes.
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+
+    assert!(
+        matches!(outcome, MigrationOutcome::NoRoutes),
+        "recovery with only quarantined route should return NoRoutes, got {:?}",
+        outcome
+    );
+
+    eprintln!("[n2.5-r.4.1] PASS: only_failed_route_available_returns_no_routes");
+    drop(mesh.handles);
+}
+
+/// **Failed route can be reintroduced after explicit retry policy.**
+///
+/// After quarantining A and recovering to B, the runtime can explicitly
+/// reintroduce A (e.g., after a backoff period). A becomes eligible again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_route_can_be_reintroduced() {
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut opt = AdaptiveRouteOptimizer::new(
+        Arc::clone(&route_obs),
+        RouteScoringWeights::default(),
+        OptimizerConfig {
+            min_improvement_pct: 5.0,
+            cooldown: Duration::from_millis(10),
+            min_attempts_for_confidence: 10,
+        },
+    );
+
+    let hops_a = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+    let hops_b = vec![[1u8; 32], [4u8; 32], [5u8; 32], [3u8; 32]];
+
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(30.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+
+    use snp_stack::network_intelligence::route_id_from_hops;
+    let route_a_id = route_id_from_hops(&hops_a);
+
+    // Quarantine A.
+    opt.quarantine_route(route_a_id, Duration::from_secs(60));
+    assert!(opt.is_quarantined(&route_a_id));
+
+    // check() should not select A (only B is eligible).
+    let result = opt.check(&[hops_a.clone(), hops_b.clone()]);
+    match result {
+        snp_stack::network_intelligence::OptimizationResult::Migrate(d) => {
+            assert_eq!(d.target_route(), hops_b.as_slice(),
+                "should select B, not quarantined A");
+        }
+        _ => panic!("expected Migrate"),
+    }
+
+    // Explicitly reintroduce A.
+    opt.reintroduce_route(&route_a_id);
+    assert!(!opt.is_quarantined(&route_a_id));
+
+    eprintln!("[n2.5-r.4.1] PASS: failed_route_can_be_reintroduced");
+}
+
+/// **Epoch increments on fail_active_circuit.**
+///
+/// After failing the active circuit, the optimizer epoch increments,
+/// invalidating all prior decisions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fail_active_circuit_increments_epoch() {
+    let mesh = setup_dual_mesh().await;
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    let hops_b = mesh.route_b.hops();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(30.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+
+    let routes = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    // Establish route A.
+    executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+
+    let epoch_before = executor.epoch();
+
+    // Fail A.
+    executor.fail_active_circuit().unwrap();
+
+    let epoch_after = executor.epoch();
+    assert!(
+        epoch_after > epoch_before,
+        "epoch must increment after fail_active_circuit ({} → {})",
+        epoch_before, epoch_after
+    );
+
+    eprintln!("[n2.5-r.4.1] PASS: fail_active_circuit_increments_epoch");
+    drop(mesh.handles);
+}

@@ -571,34 +571,50 @@ impl MigrationExecutor {
         let active_id = self.circuit_registry.active_circuit_id()
             .ok_or_else(|| "no active circuit to fail".to_string())?;
 
+        // Get the route_id and hops BEFORE marking failed (they remain in the registry).
+        let route_id = self.circuit_registry.circuit_route_id(&active_id);
+        let hops = self.circuit_registry.circuit_hops(&active_id).map(|h| h.to_vec());
+
         // Mark the circuit as failed (closes and drops the MultiplexedCircuit).
         self.circuit_registry.mark_failed(&active_id)
             .map_err(|e| format!("failed to mark circuit {:?} as failed: {}", active_id, e))?;
 
         // Record failure in route observations for the failed route.
-        if let Some(route_id) = self.circuit_registry.circuit_route_id(&active_id) {
-            // We need the hops to record the failure. Get them from the registry.
-            if let Some(hops) = self.circuit_registry.circuit_hops(&active_id) {
-                self.record_route_failure(hops, "active circuit failure detected");
-            }
+        if let Some(ref hops) = hops {
+            self.record_route_failure(hops, "active circuit failure detected");
         }
 
-        // Reset the optimizer's current route so it will recommend a new one.
-        // N2.5-R.4: clear_current_route + fail_establishment.
+        // N2.5-R.4.1: Quarantine the failed route so it cannot be immediately
+        // reselected for recovery. Default quarantine: 60 seconds.
+        if let Some(rid) = route_id {
+            self.optimizer.quarantine_route(rid, Duration::from_secs(60));
+        }
+
+        // Reset the optimizer's current route and increment epoch.
+        // N2.5-R.4.1: clear_current_route now increments epoch.
         self.optimizer.clear_current_route();
         self.optimizer.fail_establishment();
 
-        eprintln!("[n2.5-r.4] active circuit {:?} marked as failed, optimizer reset", active_id);
+        eprintln!(
+            "[n2.5-r.4] active circuit {:?} marked as failed, optimizer reset, route quarantined",
+            active_id
+        );
         Ok(())
     }
 
-    /// **N2.5-R.4** — Automatic recovery from active-circuit failure.
+    /// **N2.5-R.4** — Recovery from active-circuit failure.
+    ///
+    /// **This is a caller-invoked recovery transaction, NOT an automatic
+    /// background monitor.** The runtime must call this method (or call
+    /// `detect_active_circuit_failure()` + `fail_active_circuit()` +
+    /// `attempt_migration()` manually) to initiate recovery.
     ///
     /// This is the full recovery transaction:
     ///
     /// 1. Detect active circuit failure (health probe).
-    /// 2. If failed: mark active circuit as Failed.
+    /// 2. If failed: mark active circuit as Failed + quarantine route.
     /// 3. Attempt migration to a new route (establish + health check + commit).
+    ///    The failed route is excluded from candidates by quarantine.
     ///
     /// If the active circuit is healthy, returns `NotNeeded`.
     /// If recovery succeeds, returns `Success`.

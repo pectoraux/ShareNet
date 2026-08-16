@@ -49,6 +49,7 @@ use super::observations::PeerId;
 use super::route_observation::{RouteId, RouteObservationStore, route_id_from_hops};
 use super::route_scoring::{RouteScore, RouteScoringWeights, compute_diversity_score};
 use super::diversity::{RouteCandidate, classify_routes, RouteDiversity};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -369,11 +370,16 @@ pub struct AdaptiveRouteOptimizer {
     current_route_id: Option<RouteId>,
     /// Monotonic counter for decision IDs.
     next_decision_id: u64,
-    /// The optimizer epoch. Increments on every successful commit.
-    /// All decisions from a previous epoch are invalid.
+    /// The optimizer epoch. Increments on every successful commit
+    /// or active-route failure. All decisions from a previous epoch
+    /// are invalid.
     epoch: u64,
     /// The currently outstanding decision (if any). Only one at a time.
     outstanding_decision: Option<OutstandingDecision>,
+    /// **N2.5-R.4.1** — Quarantined route IDs with their expiry time.
+    /// A quarantined route is excluded from candidate selection until
+    /// its quarantine expires. After expiry, the route can be retried.
+    quarantined_routes: HashMap<RouteId, Instant>,
 }
 
 /// Internal record of the outstanding decision.
@@ -409,6 +415,7 @@ impl AdaptiveRouteOptimizer {
             next_decision_id: 1,
             epoch: 0,
             outstanding_decision: None,
+            quarantined_routes: HashMap::new(),
         }
     }
 
@@ -443,6 +450,21 @@ impl AdaptiveRouteOptimizer {
             return OptimizationResult::NoRoutes;
         }
 
+        // N2.5-R.4.1: Filter out quarantined routes (expired quarantines
+        // are pruned first).
+        self.prune_expired_quarantines();
+        let eligible_candidates: Vec<&Vec<PeerId>> = candidates
+            .iter()
+            .filter(|hops| {
+                let rid = route_id_from_hops(hops);
+                !self.quarantined_routes.contains_key(&rid)
+            })
+            .collect();
+
+        if eligible_candidates.is_empty() {
+            return OptimizationResult::NoRoutes;
+        }
+
         // Check cooldown.
         if let Some(last) = self.last_migration {
             let elapsed = Instant::now().duration_since(last);
@@ -453,8 +475,9 @@ impl AdaptiveRouteOptimizer {
             }
         }
 
-        // Score all candidates.
-        let scores = self.score_routes(candidates);
+        // Score all eligible candidates.
+        let eligible_owned: Vec<Vec<PeerId>> = eligible_candidates.into_iter().cloned().collect();
+        let scores = self.score_routes(&eligible_owned);
 
         // Determine the current route's score.
         let current_hops = match &self.current_route {
@@ -733,9 +756,57 @@ impl AdaptiveRouteOptimizer {
     /// This is distinct from `fail_establishment()` (which only invalidates
     /// the outstanding decision) and from `commit_migration()` (which sets
     /// a new current route + cooldown).
+    /// **N2.5-R.4.1** — Clear the current route after active-circuit failure.
+    ///
+    /// Clears `current_route` and `current_route_id`, increments the epoch
+    /// (invalidating all prior decisions), and does NOT start cooldown.
+    /// The next `check()` will produce a cold-start (exploration) decision.
+    ///
+    /// The epoch increment ensures that any asynchronous decision created
+    /// under the previous active-route state becomes unambiguously stale.
     pub fn clear_current_route(&mut self) {
         self.current_route = None;
         self.current_route_id = None;
+        self.epoch += 1; // N2.5-R.4.1: increment epoch on failure.
+    }
+
+    /// **N2.5-R.4.1** — Quarantine a route after active-circuit failure.
+    ///
+    /// A quarantined route is excluded from candidate selection in `check()`
+    /// until the quarantine expires. After expiry, the route can be retried.
+    ///
+    /// # Arguments
+    /// * `route_id` — The RouteId to quarantine.
+    /// * `duration` — How long to quarantine the route.
+    pub fn quarantine_route(&mut self, route_id: RouteId, duration: Duration) {
+        let expiry = Instant::now() + duration;
+        self.quarantined_routes.insert(route_id, expiry);
+    }
+
+    /// **N2.5-R.4.1** — Check if a route is currently quarantined.
+    #[must_use]
+    pub fn is_quarantined(&self, route_id: &RouteId) -> bool {
+        self.quarantined_routes.contains_key(route_id)
+    }
+
+    /// **N2.5-R.4.1** — Remove expired quarantines.
+    fn prune_expired_quarantines(&mut self) {
+        let now = Instant::now();
+        self.quarantined_routes.retain(|_, expiry| *expiry > now);
+    }
+
+    /// **N2.5-R.4.1** — Returns the number of currently quarantined routes.
+    #[must_use]
+    pub fn quarantined_count(&self) -> usize {
+        self.quarantined_routes.len()
+    }
+
+    /// **N2.5-R.4.1** — Explicitly reintroduce a quarantined route.
+    ///
+    /// Removes the route from quarantine, allowing it to be selected
+    /// by `check()` again. This is used for explicit retry policies.
+    pub fn reintroduce_route(&mut self, route_id: &RouteId) {
+        self.quarantined_routes.remove(route_id);
     }
 
     /// A subsequent `check()` will produce a fresh decision with a new
