@@ -132,6 +132,7 @@ pub mod contribution; // N2.9: contribution proof loop
 pub mod route_recovery; // N3.0: route recovery
 pub mod circuit_lifecycle; // N3.1: circuit lifecycle + key rotation
 pub mod multi_process; // N3.3: multi-process network harness
+pub mod content_service; // N3.4: content re-integration
 
 // Re-export key types from submodules for convenience
 pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
