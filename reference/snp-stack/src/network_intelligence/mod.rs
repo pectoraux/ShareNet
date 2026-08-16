@@ -72,7 +72,8 @@ pub use route_observation::{
     route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,
 };
 pub use route_optimizer::{
-    AdaptiveRouteOptimizer, MigrationDecision, OptimizationResult, OptimizerConfig,
+    AdaptiveRouteOptimizer, EstablishedRoute, MigrationDecision, OptimizationResult,
+    OptimizerConfig,
 };
 pub use route_scoring::{compute_diversity_score, RouteScore, RouteScoringWeights};
 pub use scoring::{GatewayScore, ScoringWeights};

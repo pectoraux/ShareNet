@@ -42,7 +42,7 @@ fn make_route(hops: &[PeerId]) -> Vec<PeerId> {
 #[test]
 fn test_route_selection_picks_best() {
     let route_store = Arc::new(RwLock::new(RouteObservationStore::new()));
-    let optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
+    let mut optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
 
     let route1 = make_route(&[[1u8; 32], [2u8; 32], [3u8; 32], [10u8; 32]]); // A-B-C-G
     let route2 = make_route(&[[1u8; 32], [4u8; 32], [5u8; 32], [10u8; 32]]); // A-D-E-G
@@ -282,7 +282,7 @@ fn test_relay_failure_triggers_migration() {
 #[test]
 fn test_diversity_classification() {
     let route_store = Arc::new(RwLock::new(RouteObservationStore::new()));
-    let optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
+    let mut optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
 
     // 5 routes, all with different relays.
     let routes = vec![
@@ -464,7 +464,7 @@ fn test_custom_weights_change_route_selection() {
             for _ in 0..10 { s.get_or_create(&route2).record_success(); }
         }
 
-        let opt = AdaptiveRouteOptimizer::new(
+        let mut opt = AdaptiveRouteOptimizer::new(
             route_store,
             RouteScoringWeights::new(0.1, 0.7, 0.1, 0.1), // latency-heavy
             OptimizerConfig {
@@ -493,7 +493,7 @@ fn test_custom_weights_change_route_selection() {
             for _ in 0..10 { s.get_or_create(&route2).record_success(); }
         }
 
-        let opt = AdaptiveRouteOptimizer::new(
+        let mut opt = AdaptiveRouteOptimizer::new(
             route_store,
             RouteScoringWeights::new(0.7, 0.1, 0.1, 0.1), // reliability-heavy
             OptimizerConfig {
