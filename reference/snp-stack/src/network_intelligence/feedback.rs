@@ -52,6 +52,18 @@ pub enum CircuitFailureReason {
     Timeout,
     /// An unknown error.
     Unknown,
+    /// **N2.5.8** — A specific hop in the route failed. Includes the
+    /// failing peer's NodeId, its position in the hop sequence, and the
+    /// underlying reason. This enables route failure attribution — the
+    /// optimizer can penalize routes that include the failing peer.
+    HopFailure {
+        /// The NodeId of the failing peer.
+        peer_id: super::observations::PeerId,
+        /// The position of the failing peer in the route (0-indexed).
+        position: usize,
+        /// The underlying failure reason.
+        reason: Box<CircuitFailureReason>,
+    },
 }
 
 /// The result of a completed circuit. Fed back into the observation store.
@@ -186,6 +198,47 @@ impl CircuitResult {
         // Close the circuit (decrement active count) for the gateway.
         if matches!(self.outcome, CircuitOutcome::Success) {
             store.record_circuit_closed(&self.gateway_id);
+        }
+    }
+
+    /// **N2.5.8** — Apply this result to a [`RouteObservationStore`],
+    /// updating the route-level observation for the complete path.
+    ///
+    /// This is the route-level feedback entry point. It complements
+    /// [`apply_to`] (which updates peer-level observations) by recording
+    /// observations for the route as a whole.
+    ///
+    /// If `HopFailure` is present, the failing peer is also recorded
+    /// individually in the peer-level store (if provided).
+    ///
+    /// # Arguments
+    /// * `route_store` — The route observation store to update.
+    /// * `route_hops` — The full hop sequence (client, relays, gateway).
+    ///   This MUST match the hops used to create the `RouteObservation`.
+    /// * `peer_store` — Optional peer-level store for HopFailure attribution.
+    pub fn apply_to_route_store(
+        &self,
+        route_store: &mut super::route_observation::RouteObservationStore,
+        route_hops: &[super::observations::PeerId],
+        mut peer_store: Option<&mut ObservationStore>,
+    ) {
+        match &self.outcome {
+            CircuitOutcome::Success => {
+                route_store.record_success(route_hops);
+                if let Some(latency) = self.latency_ms {
+                    route_store.record_latency(route_hops, latency);
+                }
+            }
+            CircuitOutcome::Failed(reason) => {
+                route_store.record_failure(route_hops);
+
+                // N2.5.8: If this is a HopFailure, record the specific peer failure.
+                if let CircuitFailureReason::HopFailure { peer_id, .. } = reason {
+                    if let Some(ref mut peer_store) = peer_store {
+                        peer_store.record_circuit_failure(peer_id);
+                    }
+                }
+            }
         }
     }
 }

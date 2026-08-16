@@ -52,16 +52,28 @@
 //!    `snp-crypto`, `snp-frames`, or `snp-cbor`. It only uses `PeerId`
 //!    (a 32-byte array) and `Instant`/`Duration`.
 
+pub mod diversity;
 pub mod failover;
 pub mod feedback;
 pub mod health;
 pub mod observations;
+pub mod route_observation;
+pub mod route_optimizer;
+pub mod route_scoring;
 pub mod scoring;
 pub mod selector;
 
+pub use diversity::{are_independent, classify_routes, RouteCandidate, RouteDiversity};
 pub use failover::{FailoverResult, GatewayFailover};
 pub use feedback::{CircuitFailureReason, CircuitOutcome, CircuitResult};
 pub use health::{CircuitHealth, CircuitMonitor, HealthThresholds};
 pub use observations::{MovingAverage, ObservationStore, PeerId, PeerObservation};
+pub use route_observation::{
+    route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,
+};
+pub use route_optimizer::{
+    AdaptiveRouteOptimizer, OptimizationResult, OptimizerConfig,
+};
+pub use route_scoring::{compute_diversity_score, RouteScore, RouteScoringWeights};
 pub use scoring::{GatewayScore, ScoringWeights};
 pub use selector::{BestScoreSelector, SelectionResult};
