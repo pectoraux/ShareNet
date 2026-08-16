@@ -34,7 +34,22 @@ use super::observations::PeerId;
 use super::route_observation::RouteId;
 use snp_node::node::stream_client::MultiplexedCircuit;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// **N2.5-R.5.1** — A shared, lockable handle to a live `MultiplexedCircuit`.
+///
+/// The registry owns one `CircuitHandle` per live circuit. Cloning the
+/// `Arc` is cheap and does NOT hold any lock — callers lock the inner
+/// `tokio::sync::Mutex` only for as long as they need `&mut` access to the
+/// circuit (e.g. to `open_stream`).
+///
+/// This indirection is what allows the failure monitor to probe the active
+/// circuit **without** holding the `MigrationExecutor`-wide mutex over the
+/// network I/O: the monitor clones the `Arc` under a short executor lock,
+/// releases the executor lock, and only then locks the per-circuit mutex to
+/// perform the probe.
+pub type CircuitHandle = Arc<tokio::sync::Mutex<MultiplexedCircuit>>;
 
 /// A unique identifier for a circuit instance.
 ///
@@ -106,11 +121,15 @@ struct TrackedCircuit {
     draining_since: Option<Instant>,
     /// The drain timeout for this circuit.
     drain_timeout: Duration,
-    /// **N2.5-R.3.1** — The live `MultiplexedCircuit`, owned by the registry.
-    /// Present when the circuit is Candidate, Healthy, Active, or Draining.
-    /// `None` when the circuit is Closed or Failed (the circuit has been
-    /// closed/dropped).
-    circuit: Option<MultiplexedCircuit>,
+    /// **N2.5-R.3.1** — The live `MultiplexedCircuit`, owned by the registry
+    /// behind a shared, lockable handle. Present when the circuit is Candidate,
+    /// Healthy, Active, or Draining. `None` when the circuit is Closed or
+    /// Failed (the circuit has been closed/dropped).
+    ///
+    /// **N2.5-R.5.1** — The handle is an `Arc<tokio::sync::Mutex<…>>` so that
+    /// the failure monitor can clone the `Arc` (without holding any lock) and
+    /// probe the circuit independently of the executor-wide mutex.
+    circuit: Option<CircuitHandle>,
 }
 
 impl TrackedCircuit {
@@ -203,7 +222,9 @@ impl CircuitRegistry {
     ) -> CircuitId {
         let circuit_id = circuit.circuit_fid();
         let mut tracked = TrackedCircuit::new(circuit_id, route_id, hops, self.default_drain_timeout);
-        tracked.circuit = Some(circuit);
+        // **N2.5-R.5.1** — wrap the circuit in a shared, lockable handle so
+        // the failure monitor can probe it without the executor-wide mutex.
+        tracked.circuit = Some(Arc::new(tokio::sync::Mutex::new(circuit)));
         self.circuits.insert(circuit_id, tracked);
         circuit_id
     }
@@ -258,22 +279,21 @@ impl CircuitRegistry {
 
     /// Mark a circuit as failed (establishment or health check failed).
     ///
-    /// The circuit's `MultiplexedCircuit` is closed and dropped.
+    /// The circuit's `MultiplexedCircuit` is dropped from the registry. If
+    /// the failure monitor (or any other caller) still holds a clone of the
+    /// `CircuitHandle`, the underlying circuit stays alive until that last
+    /// clone is dropped — but it is no longer reachable through the registry.
     ///
     /// # Errors
     /// Returns `Err` if the circuit is not found.
     pub fn mark_failed(&mut self, circuit_id: &CircuitId) -> Result<(), String> {
         let circuit = self.circuits.get_mut(circuit_id)
             .ok_or_else(|| format!("circuit {:?} not found", circuit_id))?;
-        // Close and drop the circuit if it's still alive.
-        if let Some(mut c) = circuit.circuit.take() {
-            // Close the circuit properly — marks all streams closed.
-            // Since close() is async and we're in a sync context, we use
-            // tokio::task::block_in_place or just drop. The Drop impl
-            // aborts the background reader, which effectively closes
-            // the circuit.
-            drop(c);
-        }
+        // Drop the registry's handle. If this is the last clone, the circuit's
+        // `Drop` impl aborts the background reader, effectively closing it.
+        // If the monitor holds a clone (probe in flight), the circuit stays
+        // alive only until the probe ends and the monitor drops its clone.
+        circuit.circuit.take();
         circuit.transition(CircuitState::Failed);
 
         // N2.5-R.4: If this was the active circuit, clear the active ID.
@@ -296,8 +316,15 @@ impl CircuitRegistry {
         let circuit = self.circuits.get_mut(circuit_id)
             .ok_or_else(|| format!("circuit {:?} not found", circuit_id))?;
         // Close the circuit properly (marks all streams closed, aborts reader).
-        if let Some(mut c) = circuit.circuit.take() {
-            c.close().await;
+        // **N2.5-R.5.1** — lock the per-circuit handle and call `close()`
+        // explicitly, so the circuit is closed even if the monitor (or another
+        // caller) still holds a clone of the `Arc`.
+        if let Some(handle) = circuit.circuit.take() {
+            // If this is the last clone, just close directly. Otherwise lock
+            // and close so the close is observable regardless of outstanding
+            // clones held by the monitor.
+            let mut guard = handle.lock().await;
+            guard.close().await;
         }
         circuit.transition(CircuitState::Closed);
         Ok(())
@@ -309,13 +336,20 @@ impl CircuitRegistry {
         self.active_circuit_id
     }
 
-    /// Returns a mutable reference to the active circuit's `MultiplexedCircuit`.
+    /// Returns a shared, lockable handle to the active circuit's
+    /// `MultiplexedCircuit`.
     ///
-    /// New streams MUST be opened on the active circuit. Returns `None` if
-    /// there is no active circuit.
-    pub fn active_circuit_mut(&mut self) -> Option<&mut MultiplexedCircuit> {
+    /// **N2.5-R.5.1** — This returns a *cloned* `Arc` (a `CircuitHandle`)
+    /// and does NOT hold any lock. Callers lock the inner `tokio::sync::Mutex`
+    /// only for as long as they need `&mut` access (e.g. to `open_stream`).
+    /// This is what lets the failure monitor probe the active circuit without
+    /// holding the `MigrationExecutor`-wide mutex over the network I/O.
+    ///
+    /// Returns `None` if there is no active circuit.
+    #[must_use]
+    pub fn active_circuit(&self) -> Option<CircuitHandle> {
         let active_id = self.active_circuit_id?;
-        self.circuits.get_mut(&active_id).and_then(|c| c.circuit.as_mut())
+        self.circuits.get(&active_id).and_then(|c| c.circuit.clone())
     }
 
     /// Returns the state of a circuit.
@@ -407,8 +441,13 @@ impl CircuitRegistry {
             }
 
             // Check actual stream count.
-            if let Some(circuit) = &tracked.circuit {
-                let count = circuit.stream_count().await;
+            // **N2.5-R.5.1** — lock the per-circuit handle to read
+            // `stream_count`. This is a brief hold (no network I/O).
+            if let Some(handle) = &tracked.circuit {
+                let count = {
+                    let guard = handle.lock().await;
+                    guard.stream_count().await
+                };
                 if count == 0 {
                     to_close.push(*id);
                 }

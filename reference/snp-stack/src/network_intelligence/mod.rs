@@ -73,11 +73,11 @@ pub use feedback::{CircuitFailureReason, CircuitOutcome, CircuitResult};
 pub use health::{CircuitHealth, CircuitMonitor, HealthThresholds};
 pub use observations::{MovingAverage, ObservationStore, PeerId, PeerObservation};
 #[cfg(feature = "circuit-upstream")]
-pub use circuit_lifecycle::{CircuitId, CircuitRegistry, CircuitState};
+pub use circuit_lifecycle::{CircuitHandle, CircuitId, CircuitRegistry, CircuitState};
 #[cfg(feature = "circuit-upstream")]
 pub use migration_executor::{
     FailureMonitor, FailureMonitorConfig, MigrationExecutor, MigrationFailureReason,
-    MigrationOutcome, RecoverySignal,
+    MigrationOutcome, ProbeContext, RecoveryChannel, RecoveryRequest,
 };
 pub use route_observation::{
     route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,

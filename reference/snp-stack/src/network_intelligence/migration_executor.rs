@@ -20,12 +20,9 @@
 #![cfg(feature = "circuit-upstream")]
 
 use super::observations::PeerId;
-use super::route_observation::{RouteObservationStore, route_id_from_hops};
-use super::route_optimizer::{
-    AdaptiveRouteOptimizer, EstablishedRoute, MigrationDecision, OptimizationResult,
-};
-use super::feedback::{CircuitFailureReason, CircuitOutcome, CircuitResult};
-use super::circuit_lifecycle::{CircuitId, CircuitRegistry, CircuitState};
+use super::route_observation::{route_id_from_hops, RouteId, RouteObservationStore};
+use super::route_optimizer::{AdaptiveRouteOptimizer, EstablishedRoute, OptimizationResult};
+use super::circuit_lifecycle::{CircuitHandle, CircuitId, CircuitRegistry};
 
 use snp_crypto::{X25519PubKey, X25519Secret};
 use snp_node::node::stream_client::MultiplexedCircuit;
@@ -127,12 +124,24 @@ impl MigrationExecutor {
         &self.circuit_registry
     }
 
-    /// Returns a mutable reference to the active circuit (for opening streams).
+    /// Returns a shared, lockable handle to the active circuit.
+    ///
+    /// **N2.5-R.5.1** — Returns a *cloned* `CircuitHandle`
+    /// (`Arc<tokio::sync::Mutex<MultiplexedCircuit>>`) and does NOT hold any
+    /// lock. Callers lock the inner mutex only for as long as they need
+    /// `&mut` access (e.g. to `open_stream`):
+    ///
+    /// ```ignore
+    /// let handle = executor.active_circuit().unwrap();
+    /// let mut guard = handle.lock().await;
+    /// guard.open_stream(endpoint).await?;
+    /// ```
     ///
     /// New streams MUST be opened on the active circuit. Existing streams
     /// on draining circuits remain bound to their original circuit.
-    pub fn active_circuit(&mut self) -> Option<&mut MultiplexedCircuit> {
-        self.circuit_registry.active_circuit_mut()
+    #[must_use]
+    pub fn active_circuit(&self) -> Option<CircuitHandle> {
+        self.circuit_registry.active_circuit()
     }
 
     /// **N2.5-R.3.2** — Reap draining circuits.
@@ -468,12 +477,14 @@ impl MigrationExecutor {
         &mut self.optimizer
     }
 
-    /// **N2.5-R.4** — Detect whether the active circuit has failed.
+    /// **N2.5-R.4 / N2.5-R.5.1** — Detect whether the active circuit has
+    /// failed.
     ///
-    /// This method checks the active circuit's health by attempting a
-    /// lightweight stream operation. If the active circuit has failed
-    /// (relay dead, link broken, background reader terminated), this
-    /// returns `true`.
+    /// This is a synchronous, caller-invoked health probe used by
+    /// `recover_from_failure()`. It locks ONLY the per-circuit
+    /// `tokio::sync::Mutex` (via the `CircuitHandle`) for the duration of
+    /// the probe — it does NOT require `&mut self` and does NOT hold any
+    /// executor-wide state across the network I/O.
     ///
     /// Detection is based on attempting to open a stream to the given
     /// health endpoint. If the stream open fails or times out, the
@@ -483,11 +494,12 @@ impl MigrationExecutor {
     /// * `health_check_endpoint` — The endpoint to probe.
     /// * `timeout` — How long to wait before declaring failure.
     ///
-    /// Returns `true` if the active circuit has failed, `false` if it
-    /// is still healthy. Returns `false` if there is no active circuit
-    /// (nothing to detect).
+    /// Returns `true` if the active circuit has failed, `false` if it is
+    /// still healthy. Returns `false` if there is no active circuit
+    /// (nothing to detect), and `true` if there is an active circuit ID but
+    /// no live circuit handle (the registry is inconsistent).
     pub async fn detect_active_circuit_failure(
-        &mut self,
+        &self,
         health_check_endpoint: snp_gateway::stream::InternetEndpoint,
         timeout: Duration,
     ) -> bool {
@@ -496,58 +508,152 @@ impl MigrationExecutor {
             None => return false,
         };
 
-        // Try to open a stream and send/recv on the active circuit.
-        let circuit = match self.circuit_registry.active_circuit_mut() {
-            Some(c) => c,
+        // Clone the handle (cheap Arc clone — NO lock held by the registry).
+        let handle = match self.circuit_registry.active_circuit() {
+            Some(h) => h,
             None => return true,
         };
 
-        // Attempt a health probe with timeout.
-        // We inline the health check to avoid borrow issues.
-        let probe_result = tokio::time::timeout(
-            timeout,
-            async {
-                // Open a stream through the active circuit.
-                let mut stream = circuit
-                    .open_stream(health_check_endpoint)
-                    .await
-                    .map_err(|e| format!("stream open failed: {:?}", e))?;
+        // Probe the circuit. Only the per-circuit mutex is held over the I/O.
+        let failed = {
+            let mut guard = handle.lock().await;
+            probe_circuit_health(&mut guard, health_check_endpoint, timeout).await
+        };
 
-                let test_data = b"health-check-ping";
-                stream
-                    .send(test_data)
-                    .await
-                    .map_err(|e| format!("send failed: {:?}", e))?;
-
-                let recv_result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    stream.recv(),
-                )
-                .await;
-
-                match recv_result {
-                    Ok(Ok(Some(data))) => {
-                        if data.is_empty() {
-                            return Err("empty response".into());
-                        }
-                        let _ = stream.close().await;
-                        Ok(())
-                    }
-                    Ok(Ok(None)) => Err("stream closed".into()),
-                    Ok(Err(e)) => Err(format!("recv failed: {:?}", e)),
-                    Err(_) => Err("timeout".into()),
-                }
-            },
-        )
-        .await;
-
-        match probe_result {
-            Ok(Ok(())) => false,
-            Ok(Err(_)) | Err(_) => {
-                eprintln!("[n2.5-r.4] active circuit {:?} failure detected", active_id);
-                true
-            }
+        if failed {
+            eprintln!("[n2.5-r.4] active circuit {:?} failure detected", active_id);
         }
+        failed
+    }
+
+    /// **N2.5-R.5.1** — Capture the probe context for the currently-active
+    /// circuit, together with a cloned `CircuitHandle` that can be probed
+    /// **without** holding the executor-wide mutex.
+    ///
+    /// This is the short-lock capture step of the failure monitor:
+    ///
+    /// ```text
+    /// monitor:
+    ///   let (ctx, handle) = executor.lock().await.prepare_probe()?;
+    ///   // executor lock released here
+    ///   probe(handle)  // no executor lock held over the network I/O
+    /// ```
+    ///
+    /// Returns `None` if there is no active circuit to probe.
+    #[must_use]
+    pub fn prepare_probe(&self) -> Option<(ProbeContext, CircuitHandle)> {
+        let circuit_id = self.circuit_registry.active_circuit_id()?;
+        let route_id = self.circuit_registry.circuit_route_id(&circuit_id)?;
+        let handle = self.circuit_registry.active_circuit()?;
+        let epoch = self.epoch();
+        Some((
+            ProbeContext {
+                circuit_id,
+                route_id,
+                epoch,
+            },
+            handle,
+        ))
+    }
+
+    /// **N2.5-R.5.1** — Verify that a `RecoveryRequest` still matches the
+    /// currently-active circuit and the current optimizer epoch.
+    ///
+    /// This is the stale-signal guard. The failure monitor captures a
+    /// `ProbeContext` (circuit_id, route_id, epoch) at probe-start. If a
+    /// migration or a recovery completes between probe-start and the
+    /// runtime acting on the request, the active circuit and/or epoch will
+    /// have changed, and this method returns `false` — the request is stale
+    /// and MUST be discarded rather than acted upon.
+    ///
+    /// Returns `true` only if ALL of the following hold:
+    /// - There is an active circuit.
+    /// - `request.circuit_id` equals the active circuit's id.
+    /// - `request.route_id` equals the active circuit's route_id.
+    /// - `request.epoch` equals the current optimizer epoch.
+    #[must_use]
+    pub fn verify_recovery_request(&self, request: &RecoveryRequest) -> bool {
+        let Some(active_id) = self.circuit_registry.active_circuit_id() else {
+            return false;
+        };
+        let Some(active_route_id) = self.circuit_registry.circuit_route_id(&active_id) else {
+            return false;
+        };
+        active_id == request.circuit_id
+            && active_route_id == request.route_id
+            && self.epoch() == request.epoch
+    }
+
+    /// **N2.5-R.5.1** — Act on a `RecoveryRequest` emitted by the failure
+    /// monitor.
+    ///
+    /// This is the runtime side of the monitor→runtime contract:
+    ///
+    /// ```text
+    /// RecoveryRequest { circuit_id, route_id, epoch }
+    ///     ↓
+    /// runtime verifies it still matches ACTIVE (verify_recovery_request)
+    ///     ↓ match: fail_active_circuit() + attempt_migration()
+    ///     ↓ mismatch: stale — discard, no recovery
+    /// ```
+    ///
+    /// If the request is stale (the active circuit or epoch has changed
+    /// since the probe — e.g. a migration A→B completed while the monitor
+    /// was probing A), this returns `MigrationOutcome::NotNeeded` WITHOUT
+    /// touching the active circuit. The probed circuit is no longer active,
+    /// so its failure is not actionable.
+    ///
+    /// If the request is current, this performs the full recovery
+    /// transaction: mark the active circuit failed + quarantine its route +
+    /// attempt migration to a new (non-quarantined) route.
+    ///
+    /// # Arguments
+    /// * `request` — The recovery request from the monitor (provenance-bound).
+    /// * `candidates` — All candidate routes (hop sequences).
+    /// * `node` — The client node (identity + keys).
+    /// * `routes` — Map from hop sequence to `Route` object.
+    /// * `client_x25519_secret` / `client_x25519_public` — Client keys.
+    /// * `health_check_endpoint` — Endpoint for verifying the NEW circuit.
+    pub async fn handle_recovery_request(
+        &mut self,
+        request: &RecoveryRequest,
+        candidates: &[Vec<PeerId>],
+        node: &Node,
+        routes: &[(Vec<PeerId>, Route)],
+        client_x25519_secret: &X25519Secret,
+        client_x25519_public: &X25519PubKey,
+        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+    ) -> MigrationOutcome {
+        // 1. Verify the request still matches the active circuit + epoch.
+        if !self.verify_recovery_request(request) {
+            eprintln!(
+                "[n2.5-r.5.1] stale recovery request discarded \
+                 (request circuit={:?} epoch={}, active circuit={:?} epoch={})",
+                request.circuit_id,
+                request.epoch,
+                self.circuit_registry.active_circuit_id(),
+                self.epoch()
+            );
+            return MigrationOutcome::NotNeeded;
+        }
+
+        // 2. The probed circuit is still active and failed. Fail it.
+        if let Err(e) = self.fail_active_circuit() {
+            eprintln!("[n2.5-r.5.1] failed to mark active circuit as failed: {}", e);
+            // Continue anyway — try to establish a new circuit.
+        }
+
+        // 3. Attempt migration to a new route. The failed route is excluded
+        //    by quarantine (set in fail_active_circuit).
+        self.attempt_migration(
+            candidates,
+            node,
+            routes,
+            client_x25519_secret,
+            client_x25519_public,
+            health_check_endpoint,
+        )
+        .await
     }
 
     /// **N2.5-R.4** — Mark the active circuit as failed and trigger
@@ -679,10 +785,72 @@ impl std::fmt::Debug for MigrationExecutor {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// N2.5-R.5 — Failure Detection Integration / Recovery Triggering
+// N2.5-R.5 / N2.5-R.5.1 — Failure Detection Integration / Recovery Triggering
 // ════════════════════════════════════════════════════════════════════════════
 
-/// **N2.5-R.5** — Configuration for the background failure monitor.
+/// **N2.5-R.5.1** — Probe a circuit's health by opening a stream, sending a
+/// small test exchange, and waiting for the echo response.
+///
+/// This is the shared probe routine used by BOTH:
+/// - `MigrationExecutor::detect_active_circuit_failure()` (caller-invoked),
+/// - the background `FailureMonitor` task.
+///
+/// It takes `&mut MultiplexedCircuit` (the locked guard) and performs the
+/// network I/O. It does NOT touch the `MigrationExecutor` or
+/// `CircuitRegistry` — the caller is responsible for obtaining the
+/// `CircuitHandle` and locking it.
+///
+/// Returns `true` if the circuit has FAILED (probe error or timeout),
+/// `false` if it is still healthy.
+async fn probe_circuit_health(
+    circuit: &mut MultiplexedCircuit,
+    health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+    timeout: Duration,
+) -> bool {
+    let probe_result = tokio::time::timeout(
+        timeout,
+        async {
+            // Open a stream through the circuit.
+            let mut stream = circuit
+                .open_stream(health_check_endpoint)
+                .await
+                .map_err(|e| format!("stream open failed: {:?}", e))?;
+
+            let test_data = b"health-check-ping";
+            stream
+                .send(test_data)
+                .await
+                .map_err(|e| format!("send failed: {:?}", e))?;
+
+            let recv_result = tokio::time::timeout(
+                Duration::from_secs(10),
+                stream.recv(),
+            )
+            .await;
+
+            match recv_result {
+                Ok(Ok(Some(data))) => {
+                    if data.is_empty() {
+                        return Err("empty response".into());
+                    }
+                    let _ = stream.close().await;
+                    Ok(())
+                }
+                Ok(Ok(None)) => Err("stream closed".into()),
+                Ok(Err(e)) => Err(format!("recv failed: {:?}", e)),
+                Err(_) => Err("timeout".into()),
+            }
+        },
+    )
+    .await;
+
+    match probe_result {
+        Ok(Ok(())) => false,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+/// **N2.5-R.5.1** — Configuration for the background failure monitor.
 #[derive(Debug, Clone)]
 pub struct FailureMonitorConfig {
     /// How often to probe the active circuit (default: 30 seconds).
@@ -701,86 +869,197 @@ impl Default for FailureMonitorConfig {
     }
 }
 
-/// **N2.5-R.5** — A signal that the failure monitor uses to communicate
-/// with the runtime. When the monitor detects a failure, it sets this
-/// flag. The runtime (or a background task) checks the flag and invokes
-/// recovery.
+/// **N2.5-R.5.1** — The identity of the circuit being probed, captured at
+/// probe-start.
 ///
-/// This is NOT a callback — it is a simple shared flag that avoids
-/// complex async callback lifetimes. The runtime polls `should_recover()`
-/// and calls `recover_from_failure()` when it returns `true`.
-#[derive(Debug, Default)]
-pub struct RecoverySignal {
-    /// Set to `true` when the failure monitor detects a failure.
-    /// The runtime reads and clears this flag.
-    needs_recovery: Mutex<bool>,
+/// This binds a probe (and its result) to a SPECIFIC circuit instance, a
+/// SPECIFIC route, and a SPECIFIC optimizer epoch. Without this binding, a
+/// probe started against circuit A could be misattributed to circuit B if a
+/// migration A→B completes while the probe is in flight — exactly the
+/// stale-signal race that N2.5-R.5.1 fixes.
+///
+/// The `ProbeContext` is captured under a SHORT executor lock (no I/O) by
+/// `MigrationExecutor::prepare_probe()`. The probe itself then runs WITHOUT
+/// the executor lock. On failure, the context is promoted into a
+/// [`RecoveryRequest`] and handed to the runtime, which verifies it still
+/// matches the active circuit before recovering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeContext {
+    /// The circuit id (fid) of the circuit being probed.
+    pub circuit_id: CircuitId,
+    /// The route id of the circuit being probed.
+    pub route_id: RouteId,
+    /// The optimizer epoch at probe-start.
+    pub epoch: u64,
 }
 
-impl RecoverySignal {
-    /// Create a new recovery signal.
+/// **N2.5-R.5.1** — A recovery request carrying full failure provenance.
+///
+/// Emitted by the failure monitor when a probe fails. Unlike the previous
+/// boolean `RecoverySignal`, this carries the `circuit_id`, `route_id`, and
+/// `epoch` of the circuit that was actually probed. The runtime verifies
+/// (via `MigrationExecutor::verify_recovery_request()`) that this still
+/// matches the currently-active circuit before acting on it.
+///
+/// This eliminates the stale-signal race:
+///
+/// ```text
+/// A active (epoch N)
+///   ↓ monitor probes A (captures ProbeContext { A, route_A, N })
+/// A → B migration completes (epoch N+1, B active)
+///   ↓ probe of A fails
+/// RecoveryRequest { circuit_id: A, route_id: route_A, epoch: N }
+///   ↓ runtime: verify_recovery_request → A != active(B) → STALE → discard
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryRequest {
+    /// The circuit id that was probed and found failed.
+    pub circuit_id: CircuitId,
+    /// The route id of the failed circuit.
+    pub route_id: RouteId,
+    /// The optimizer epoch at probe-start.
+    pub epoch: u64,
+}
+
+impl From<ProbeContext> for RecoveryRequest {
+    fn from(ctx: ProbeContext) -> Self {
+        Self {
+            circuit_id: ctx.circuit_id,
+            route_id: ctx.route_id,
+            epoch: ctx.epoch,
+        }
+    }
+}
+
+/// **N2.5-R.5.1** — The shared channel through which the failure monitor
+/// delivers a `RecoveryRequest` to the runtime.
+///
+/// Replaces the boolean `RecoverySignal`: instead of a bare `needs_recovery`
+/// flag, the monitor deposits a provenance-bound `RecoveryRequest`. The
+/// runtime reads it with `take()` and verifies it against the active circuit
+/// before recovering.
+///
+/// This is NOT a callback — it is a simple shared cell that avoids complex
+/// async callback lifetimes. The runtime polls `take()` (or `peek()`) and
+/// calls `MigrationExecutor::handle_recovery_request()` when a request is
+/// present.
+#[derive(Debug, Default)]
+pub struct RecoveryChannel {
+    /// The pending recovery request, or `None` if no failure has been
+    /// detected since the last `take()`.
+    pending: Mutex<Option<RecoveryRequest>>,
+}
+
+impl RecoveryChannel {
+    /// Create a new (empty) recovery channel.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns `true` if recovery is needed (failure was detected).
-    /// Clears the flag.
-    pub fn should_recover(&self) -> bool {
-        let mut guard = self.needs_recovery.lock().unwrap();
-        let val = *guard;
-        *guard = false;
-        val
+    /// Read and clear the pending recovery request.
+    ///
+    /// Returns `Some(request)` if the monitor has detected a failure since
+    /// the last call, or `None` otherwise.
+    pub fn take(&self) -> Option<RecoveryRequest> {
+        self.pending.lock().unwrap().take()
     }
 
-    /// Set the recovery flag (called by the failure monitor).
-    fn signal_failure(&self) {
-        *self.needs_recovery.lock().unwrap() = true;
-    }
-
-    /// Check if recovery is needed without clearing the flag.
+    /// Returns `true` if a recovery request is pending, WITHOUT clearing it.
     #[must_use]
     pub fn peek(&self) -> bool {
-        *self.needs_recovery.lock().unwrap()
+        self.pending.lock().unwrap().is_some()
+    }
+
+    /// Returns a clone of the pending request without clearing it, if any.
+    /// Used by tests and diagnostics.
+    #[must_use]
+    pub fn peek_request(&self) -> Option<RecoveryRequest> {
+        *self.pending.lock().unwrap()
+    }
+
+    /// Deposit a recovery request (called by the failure monitor).
+    /// If a request is already pending, it is overwritten — the most recent
+    /// failure takes precedence.
+    fn emit(&self, request: RecoveryRequest) {
+        *self.pending.lock().unwrap() = Some(request);
+    }
+
+    /// **Test-only.** Deposit a recovery request directly, bypassing the
+    /// failure monitor. Used by unit tests to exercise
+    /// `verify_recovery_request` / `handle_recovery_request` against a
+    /// synthesized request.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn emit_for_test(&self, request: RecoveryRequest) {
+        self.emit(request);
     }
 }
 
-/// **N2.5-R.5** — Background failure monitor.
+/// **N2.5-R.5 / N2.5-R.5.1** — Background failure monitor.
 ///
-/// Spawns a tokio task that periodically probes the active circuit.
-/// When a probe fails, it sets the `RecoverySignal` flag. The runtime
-/// is expected to check the flag and invoke `recover_from_failure()`.
+/// Spawns a tokio task that periodically probes the active circuit. When a
+/// probe fails, it deposits a [`RecoveryRequest`] (carrying the
+/// `circuit_id`/`route_id`/`epoch` of the probed circuit) into the
+/// [`RecoveryChannel`] and exits. The runtime verifies the request still
+/// matches the active circuit before recovering.
 ///
-/// ## Architecture
+/// ## Architecture (N2.5-R.5.1)
 ///
 /// ```text
 /// Background task:
 ///   loop {
 ///     sleep(probe_interval)
-///     probe active circuit (health check with timeout)
-///     if probe fails:
-///       recovery_signal.signal_failure()
-///       break  // monitor exits — runtime will restart it after recovery
+///
+///     // 1. SHORT executor lock: capture ProbeContext + CircuitHandle.
+///     let probe = executor.lock().await.prepare_probe();
+///     // executor lock RELEASED here.
+///
+///     let Some((ctx, handle)) = probe else { continue };
+///
+///     // 2. Probe WITHOUT the executor lock — only the per-circuit
+///     //    tokio::sync::Mutex is held over the network I/O.
+///     let failed = {
+///       let mut guard = handle.lock().await;
+///       probe_circuit_health(&mut guard, endpoint, timeout).await
+///     };
+///
+///     // 3. On failure, deposit a provenance-bound RecoveryRequest.
+///     if failed {
+///       channel.emit(RecoveryRequest::from(ctx));
+///       break;  // exit — runtime restarts after recovery
+///     }
 ///   }
 ///
 /// Runtime:
 ///   loop {
-///     if recovery_signal.should_recover():
-///       recover_from_failure(...)
-///       restart failure monitor
+///     if let Some(req) = channel.take() {
+///       executor.handle_recovery_request(&req, ...).await  // verifies ACTIVE
+///       monitor.start(...)  // restart
+///     }
 ///   }
 /// ```
+///
+/// ## Invariants (N2.5-R.5.1)
+///
+/// - The monitor NEVER holds the `MigrationExecutor`-wide mutex over the
+///   network I/O. The executor lock is held only for the brief
+///   `prepare_probe()` capture.
+/// - The probe result is bound to the `ProbeContext` (circuit_id, route_id,
+///   epoch) captured at probe-start, so it cannot be misattributed to a
+///   different circuit after a migration.
+/// - `start()` is idempotent: at most one monitor task exists at any time.
 ///
 /// ## What this is NOT
 ///
 /// - This is NOT transport-level failure detection. It is a periodic
 ///   health probe.
-/// - This is NOT a callback system. The runtime must poll the signal.
-/// - The monitor does NOT perform recovery itself. It only signals.
+/// - This is NOT a callback system. The runtime must poll the channel.
+/// - The monitor does NOT perform recovery itself. It only requests it.
 pub struct FailureMonitor {
     /// Handle to the background probe task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Shared recovery signal.
-    signal: Arc<RecoverySignal>,
+    /// Shared recovery channel (carries provenance-bound requests).
+    channel: Arc<RecoveryChannel>,
 }
 
 impl FailureMonitor {
@@ -789,23 +1068,28 @@ impl FailureMonitor {
     pub fn new() -> Self {
         Self {
             task_handle: None,
-            signal: Arc::new(RecoverySignal::new()),
+            channel: Arc::new(RecoveryChannel::new()),
         }
     }
 
-    /// Returns a reference to the recovery signal.
+    /// Returns a reference to the recovery channel.
     #[must_use]
-    pub fn signal(&self) -> &Arc<RecoverySignal> {
-        &self.signal
+    pub fn channel(&self) -> &Arc<RecoveryChannel> {
+        &self.channel
     }
 
-    /// Start the background failure monitor.
+    /// **N2.5-R.5.1** — Start the background failure monitor (idempotent).
     ///
-    /// Spawns a tokio task that periodically probes the active circuit.
-    /// When a probe fails, it sets the recovery signal and exits.
+    /// If a monitor task is already running, this is a no-op — there is at
+    /// most one monitor task at any time. This prevents the race where a
+    /// second `start()` overwrites `task_handle` while the first task is
+    /// still alive (leaving an orphaned task probing in the background).
+    ///
+    /// If the previous task has finished (e.g. it detected a failure and
+    /// exited), it is cleaned up and a new task is spawned.
     ///
     /// # Arguments
-    /// * `executor` — The migration executor (shared via Arc<Mutex>).
+    /// * `executor` — The migration executor (shared via `Arc<Mutex>`).
     /// * `health_endpoint` — The endpoint to probe.
     /// * `config` — Monitor configuration.
     pub fn start(
@@ -814,26 +1098,49 @@ impl FailureMonitor {
         health_endpoint: snp_gateway::stream::InternetEndpoint,
         config: FailureMonitorConfig,
     ) {
-        let signal = Arc::clone(&self.signal);
+        // Idempotent: if a task is still running, do nothing.
+        if self.is_running() {
+            return;
+        }
+        // Clean up any finished handle before spawning a new one.
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort(); // no-op if already finished
+        }
+
+        let channel = Arc::clone(&self.channel);
 
         self.task_handle = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(config.probe_interval).await;
 
-                // Probe the active circuit.
-                let failed = {
-                    let mut exec = executor.lock().await;
-                    exec.detect_active_circuit_failure(
-                        health_endpoint.clone(),
-                        config.probe_timeout,
-                    )
-                    .await
+                // 1. SHORT executor lock: capture ProbeContext + CircuitHandle.
+                //    No network I/O happens under this lock.
+                let probe = {
+                    let exec = executor.lock().await;
+                    exec.prepare_probe()
+                }; // executor lock RELEASED here.
+
+                let Some((ctx, handle)) = probe else {
+                    // No active circuit to probe — nothing to do this cycle.
+                    continue;
                 };
 
+                // 2. Probe WITHOUT the executor lock. Only the per-circuit
+                //    tokio::sync::Mutex is held over the network I/O.
+                let failed = {
+                    let mut guard = handle.lock().await;
+                    probe_circuit_health(&mut guard, health_endpoint.clone(), config.probe_timeout)
+                        .await
+                };
+
+                // 3. On failure, deposit a provenance-bound RecoveryRequest.
                 if failed {
-                    eprintln!("[n2.5-r.5] failure monitor: active circuit failure detected");
-                    signal.signal_failure();
-                    break; // Exit — runtime will restart after recovery.
+                    eprintln!(
+                        "[n2.5-r.5.1] failure monitor: active circuit {:?} (route {:?}, epoch {}) failure detected",
+                        ctx.circuit_id, ctx.route_id, ctx.epoch
+                    );
+                    channel.emit(RecoveryRequest::from(ctx));
+                    break; // exit — runtime will restart after recovery
                 }
             }
         }));
@@ -869,7 +1176,7 @@ impl std::fmt::Debug for FailureMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FailureMonitor")
             .field("is_running", &self.is_running())
-            .field("needs_recovery", &self.signal.peek())
+            .field("has_pending_request", &self.channel.peek())
             .finish_non_exhaustive()
     }
 }

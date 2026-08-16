@@ -396,7 +396,8 @@ async fn new_streams_work_on_recovered_circuit() {
         "recovery should succeed, got {:?}", outcome);
 
     // Open a new stream on the recovered circuit.
-    let mut stream = executor.active_circuit().unwrap()
+    let circuit = executor.active_circuit().unwrap();
+    let mut stream = circuit.lock().await
         .open_stream(endpoint(echo_port)).await.unwrap();
     let data = b"recovery-stream-works";
     stream.send(data).await.unwrap();
@@ -490,9 +491,16 @@ async fn failed_circuit_streams_terminated() {
         endpoint(echo_port),
     ).await;
 
-    // Open a stream on A.
-    let mut stream = executor.active_circuit().unwrap()
-        .open_stream(endpoint(echo_port)).await.unwrap();
+    // Open a stream on A. The CircuitHandle is scoped here so that it is
+    // dropped before `fail_active_circuit()` — otherwise the test would keep
+    // an extra `Arc` clone alive and the circuit's `Drop` (reader abort)
+    // would not run when the registry drops its clone. The `StreamHandle`
+    // is independent of the `CircuitHandle` and survives the scope.
+    let mut stream = {
+        let circuit = executor.active_circuit().unwrap();
+        let mut guard = circuit.lock().await;
+        guard.open_stream(endpoint(echo_port)).await.unwrap()
+    };
     stream.send(b"test").await.unwrap();
 
     // Mark active circuit as failed.

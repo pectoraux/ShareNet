@@ -451,9 +451,11 @@ async fn planned_migration_existing_stream_survives() {
     assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit must exist after cold-start")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1 must succeed");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit must exist after cold-start");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1 must succeed")
+    };
 
     // Verify S1 works on A.
     assert_stream_echo_works(&mut s1, "S1-on-A").await;
@@ -559,9 +561,11 @@ async fn new_stream_after_migration_uses_new_circuit() {
         "active circuit must be a new circuit (B) after migration");
 
     // Open S2 on the active circuit (B).
-    let mut s2 = executor
-        .active_circuit().expect("active circuit must exist")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S2 must succeed");
+    let mut s2 = {
+        let circuit = executor.active_circuit().expect("active circuit must exist");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S2 must succeed")
+    };
 
     // S2 must work.
     assert_stream_echo_works(&mut s2, "S2-on-B").await;
@@ -615,9 +619,11 @@ async fn existing_and_new_streams_use_different_circuits() {
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit A")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit A");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1")
+    };
 
     // Degrade A.
     {
@@ -637,9 +643,11 @@ async fn existing_and_new_streams_use_different_circuits() {
     assert_eq!(executor.current_route(), Some(hops_b.as_slice()));
 
     // Open S2 on B (the new active circuit).
-    let mut s2 = executor
-        .active_circuit().expect("active circuit B")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S2");
+    let mut s2 = {
+        let circuit = executor.active_circuit().expect("active circuit B");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S2")
+    };
 
     // Both streams must work — S1 on A (Draining), S2 on B (Active).
     assert_stream_echo_works(&mut s1, "S1-on-A-draining").await;
@@ -695,9 +703,11 @@ async fn zero_stream_draining_circuit_closes() {
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit A")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit A");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1")
+    };
 
     // Migrate A→B.
     {
@@ -809,9 +819,11 @@ async fn drain_timeout_closes_active_stream() {
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit A")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit A");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1")
+    };
 
     // Verify S1 works before migration.
     assert_stream_echo_works(&mut s1, "S1-before-migration").await;
@@ -977,9 +989,11 @@ async fn failed_migration_preserves_existing_stream() {
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit A")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit A");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1")
+    };
 
     // Build a dead route and degrade A.
     let dead_route = build_dead_route(&mesh);
@@ -1142,9 +1156,11 @@ async fn health_failure_preserves_existing_stream() {
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Open S1 on A.
-    let mut s1 = executor
-        .active_circuit().expect("active circuit A")
-        .open_stream(echo_endpoint.clone()).await.expect("open_stream S1");
+    let mut s1 = {
+        let circuit = executor.active_circuit().expect("active circuit A");
+        let mut guard = circuit.lock().await;
+        guard.open_stream(echo_endpoint.clone()).await.expect("open_stream S1")
+    };
 
     // Degrade A.
     {
