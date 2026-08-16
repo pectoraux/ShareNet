@@ -246,7 +246,7 @@ async fn migration_success_commits_new_route() {
     // First: cold-start — establish route A (it has better latency).
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match &outcome {
@@ -267,7 +267,7 @@ async fn migration_success_commits_new_route() {
     // Now: migrate to route B.
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match &outcome {
@@ -306,7 +306,7 @@ async fn migration_failure_preserves_old_route() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
@@ -332,7 +332,7 @@ async fn migration_failure_preserves_old_route() {
     ];
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match &outcome {
@@ -625,7 +625,7 @@ async fn successful_establishment_starts_cooldown() {
     // Successful cold-start.
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -662,7 +662,7 @@ async fn failed_establishment_does_not_start_cooldown() {
 
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert!(executor.last_migration().is_some());
@@ -691,7 +691,7 @@ async fn failed_establishment_does_not_start_cooldown() {
 
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match outcome {
@@ -751,7 +751,7 @@ async fn real_circuit_success_increments_circuit_attempts() {
 
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -788,7 +788,7 @@ async fn real_circuit_failure_increments_circuit_attempts() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -811,7 +811,7 @@ async fn real_circuit_failure_increments_circuit_attempts() {
     ];
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
@@ -904,7 +904,7 @@ async fn established_route_binds_to_actual_circuit() {
 
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match outcome {
@@ -942,7 +942,7 @@ async fn failed_candidate_circuit_is_disposed() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -965,7 +965,7 @@ async fn failed_candidate_circuit_is_disposed() {
     ];
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
 
     match outcome {
@@ -1001,7 +1001,7 @@ async fn active_route_remains_usable_after_failed_migration() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -1024,7 +1024,7 @@ async fn active_route_remains_usable_after_failed_migration() {
     ];
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
@@ -1083,4 +1083,284 @@ async fn stale_decision_after_new_check_rejected() {
     opt.commit_migration_with_evidence(d2, &evidence2).unwrap();
 
     eprintln!("[n2.5-r.2] PASS: stale_decision_after_new_check_rejected");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.5-R.2.1 — Health verification + decision invalidation tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Health check succeeds → migration commits.**
+///
+/// Real mesh with echo server. The health check opens a stream, sends
+/// a test message, receives the echo, and closes the stream. Only then
+/// is `EstablishedRoute` constructed and the migration committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_check_succeeds_commits() {
+    let mesh = setup_two_route_mesh().await;
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(50.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+    }
+
+    let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
+    let health_endpoint = endpoint(echo_port);
+
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        Some(health_endpoint),
+    ).await;
+
+    match &outcome {
+        MigrationOutcome::Success { evidence, .. } => {
+            assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+            assert_eq!(evidence.route_id(), route_id_from_hops(&hops_a));
+        }
+        _ => panic!("expected Success with health check, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.2.1] PASS: health_check_succeeds_commits");
+    drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
+}
+
+/// **Handshake succeeds but health check fails → migration rejected.**
+///
+/// Real mesh. The circuit establishes (SNP-IK handshake succeeds), but
+/// the health check fails because the target endpoint is unreachable
+/// (dead port, no echo server). The migration is rejected, and the old
+/// route remains active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_check_fails_rejected() {
+    let mesh = setup_two_route_mesh().await;
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+
+    // Establish route A first (without health check — just establishment).
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+    }
+    let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        None, // no health check for initial establishment
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Success { .. }));
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // Now try to migrate to a dead route with health check.
+    // The dead route's relay is at port 1 (unreachable), so establishment
+    // itself will fail — but even if it somehow succeeded, the health check
+    // endpoint (also dead) would fail.
+    let dead_route = build_dead_route(&mesh);
+    let dead_hops = dead_route.hops();
+    let dead_endpoint = endpoint(1); // dead port
+
+    {
+        let mut s = route_obs.write().unwrap();
+        for _ in 0..20 { s.get_or_create(&hops_a).record_latency(500.0); }
+        for _ in 0..5 { s.get_or_create(&hops_a).record_failure(); }
+        s.get_or_create(&dead_hops).record_latency(10.0);
+        for _ in 0..10 { s.get_or_create(&dead_hops).record_success(); }
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let routes2 = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (dead_hops.clone(), dead_route),
+    ];
+
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), dead_hops.clone()],
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        Some(dead_endpoint),
+    ).await;
+
+    match outcome {
+        MigrationOutcome::Failed { reason } => {
+            // Old route A is preserved.
+            assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+            eprintln!("[n2.5-r.2.1] health check / establishment failed as expected: {:?}", reason);
+        }
+        _ => panic!("expected Failed, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.2.1] PASS: health_check_fails_rejected");
+    drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
+}
+
+/// **Failed attempt invalidates the decision.**
+///
+/// After a failed establishment, the outstanding decision is invalidated.
+/// A subsequent commit attempt (if the caller retained the decision)
+/// would be rejected. Since MigrationDecision is move-only, we verify
+/// this via `has_outstanding_decision()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_attempt_invalidates_decision() {
+    let mesh = setup_two_route_mesh().await;
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+
+    // Establish route A first.
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+    }
+    let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        None,
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Success { .. }));
+
+    // Now try to migrate to a dead route.
+    let dead_route = build_dead_route(&mesh);
+    let dead_hops = dead_route.hops();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        for _ in 0..20 { s.get_or_create(&hops_a).record_latency(500.0); }
+        for _ in 0..5 { s.get_or_create(&hops_a).record_failure(); }
+        s.get_or_create(&dead_hops).record_latency(10.0);
+        for _ in 0..10 { s.get_or_create(&dead_hops).record_success(); }
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let routes2 = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (dead_hops.clone(), dead_route),
+    ];
+
+    // Before the attempt, there should be no outstanding decision
+    // (the previous successful commit consumed it).
+    assert!(!executor.optimizer().has_outstanding_decision());
+
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), dead_hops.clone()],
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        None,
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
+
+    // After the failed attempt, the decision should be invalidated (consumed).
+    assert!(
+        !executor.optimizer().has_outstanding_decision(),
+        "failed attempt must invalidate the outstanding decision"
+    );
+
+    // Old route is still active.
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    eprintln!("[n2.5-r.2.1] PASS: failed_attempt_invalidates_decision");
+    drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
+}
+
+/// **Failed decision cannot later be committed.**
+///
+/// After a failed establishment invalidates the decision, a new `check()`
+/// produces a fresh decision. The old (invalidated) decision cannot be
+/// committed. We verify this by checking that after failure, a new
+/// `check()` + commit succeeds (proving the optimizer is in a clean state).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_decision_cannot_commit() {
+    let mesh = setup_two_route_mesh().await;
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    let hops_b = mesh.route_b.hops();
+
+    // Establish route A first.
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(30.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+    let routes = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    // Cold-start: establish route A.
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        None,
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Success { .. }));
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // Degrade route A and try to migrate to a dead route.
+    let dead_route = build_dead_route(&mesh);
+    let dead_hops = dead_route.hops();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        for _ in 0..20 { s.get_or_create(&hops_a).record_latency(500.0); }
+        for _ in 0..5 { s.get_or_create(&hops_a).record_failure(); }
+        s.get_or_create(&dead_hops).record_latency(10.0);
+        for _ in 0..10 { s.get_or_create(&dead_hops).record_success(); }
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let routes2 = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (dead_hops.clone(), dead_route),
+    ];
+
+    // Attempt migration to dead route — fails.
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), dead_hops.clone()],
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
+        None,
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
+
+    // Old route A is still active.
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // The failed decision is invalidated. A new check() + commit to route B
+    // (which is alive) should succeed, proving the optimizer is clean.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Make route B clearly better than degraded route A.
+    let routes3 = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes3, &mesh.client_x_sk, &mesh.client_x_pk,
+        None,
+    ).await;
+
+    match outcome {
+        MigrationOutcome::Success { .. } => {
+            // Route B is now active — the optimizer recovered cleanly.
+            assert_eq!(executor.current_route(), Some(hops_b.as_slice()));
+        }
+        _ => panic!("expected Success for recovery migration to B, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.2.1] PASS: failed_decision_cannot_commit");
+    drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
 }

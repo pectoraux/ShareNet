@@ -708,6 +708,37 @@ impl AdaptiveRouteOptimizer {
         self.epoch
     }
 
+    /// **N2.5-R.2.1** — Invalidate the outstanding decision after a failed
+    /// establishment attempt.
+    ///
+    /// This method is called by the `MigrationExecutor` when circuit
+    /// establishment or health verification fails. It marks the outstanding
+    /// decision as consumed (so it cannot be later committed) without
+    /// changing `current_route` or starting cooldown.
+    ///
+    /// After this call:
+    /// - The outstanding decision is invalidated (consumed = true).
+    /// - `current_route` is unchanged (old route remains active).
+    /// - `last_migration` is unchanged (no cooldown).
+    /// - `epoch` is unchanged (a new `check()` can produce a new decision
+    ///   in the same epoch, but the old decision_id is rejected).
+    ///
+    /// A subsequent `check()` will produce a fresh decision with a new
+    /// `decision_id`.
+    pub fn fail_establishment(&mut self) {
+        if let Some(ref mut od) = self.outstanding_decision {
+            od.consumed = true;
+        }
+    }
+
+    /// Returns `true` if there is an outstanding, unconsumed decision.
+    #[must_use]
+    pub fn has_outstanding_decision(&self) -> bool {
+        self.outstanding_decision
+            .as_ref()
+            .is_some_and(|od| !od.consumed)
+    }
+
     /// Classify all candidates into primary/backup/emergency tiers.
     #[must_use]
     pub fn classify(&self, candidates: &[Vec<PeerId>]) -> RouteDiversity {

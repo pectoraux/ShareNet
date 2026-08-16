@@ -106,9 +106,12 @@ impl MigrationExecutor {
     ///
     /// 1. `optimizer.check()` — get a migration decision.
     /// 2. If `Migrate`: establish the candidate circuit via real SNP-IK.
-    /// 3. On success: construct `EstablishedRoute` evidence.
-    /// 4. `commit_migration_with_evidence()` — validate + commit.
-    /// 5. On failure: record failure, preserve old route, no cooldown.
+    /// 3. On establishment success: perform minimal health verification
+    ///    (open a stream + send/recv a test exchange).
+    /// 4. On health success: construct `EstablishedRoute` evidence.
+    /// 5. `commit_migration_with_evidence()` — validate + commit.
+    /// 6. On any failure: invalidate decision, record failure, preserve
+    ///    old route, no cooldown.
     ///
     /// # Arguments
     /// * `candidates` — All candidate routes (hop sequences).
@@ -116,6 +119,8 @@ impl MigrationExecutor {
     /// * `routes` — Map from hop sequence to `Route` object (for establishment).
     /// * `client_x25519_secret` — The client's X25519 secret.
     /// * `client_x25519_public` — The client's X25519 public key.
+    /// * `health_check_endpoint` — The endpoint to connect to for health
+    ///   verification (typically an echo server).
     pub async fn attempt_migration(
         &mut self,
         candidates: &[Vec<PeerId>],
@@ -123,6 +128,7 @@ impl MigrationExecutor {
         routes: &[(Vec<PeerId>, Route)],
         client_x25519_secret: &X25519Secret,
         client_x25519_public: &X25519PubKey,
+        health_check_endpoint: Option<snp_gateway::stream::InternetEndpoint>,
     ) -> MigrationOutcome {
         // 1. Check if migration is recommended.
         let decision = match self.optimizer.check(candidates) {
@@ -142,6 +148,8 @@ impl MigrationExecutor {
         {
             Some((_, route)) => route.clone(),
             None => {
+                // Invalidate the decision — it can't be committed later.
+                self.optimizer.fail_establishment();
                 return MigrationOutcome::Failed {
                     reason: MigrationFailureReason::EstablishmentFailed(
                         "target route not found in routes map".into(),
@@ -151,7 +159,7 @@ impl MigrationExecutor {
         };
 
         // 3. Attempt real circuit establishment.
-        let circuit = match MultiplexedCircuit::establish(
+        let mut circuit = match MultiplexedCircuit::establish(
             node,
             &route,
             client_x25519_secret,
@@ -161,8 +169,9 @@ impl MigrationExecutor {
         {
             Ok(circuit) => circuit,
             Err(e) => {
-                // Establishment failed. Record failure in route observations.
+                // Establishment failed. Invalidate the decision, record failure.
                 // Do NOT start cooldown. Do NOT change current route.
+                self.optimizer.fail_establishment();
                 let failure_reason = format!("{:?}", e);
                 self.record_route_failure(&target_hops, &failure_reason);
                 return MigrationOutcome::Failed {
@@ -171,9 +180,36 @@ impl MigrationExecutor {
             }
         };
 
-        // 4. Construct EstablishedRoute evidence from the establishment result.
-        // The circuit's fid is the circuit_id. The route hops are the target_hops.
-        // The gateway_node_id and client_node_id come from the route/circuit.
+        // 4. N2.5-R.2.1 — Minimal health verification.
+        // Open a stream and send/receive a small test exchange through the
+        // candidate circuit. This proves end-to-end usability, not just
+        // link-level SNP-IK establishment.
+        //
+        // If no health_check_endpoint is provided, skip health verification
+        // (for tests that only want to verify establishment).
+        if let Some(endpoint) = health_check_endpoint {
+            match self.health_check(&mut circuit, endpoint).await {
+                Ok(()) => { /* Health check passed — circuit is usable. */ }
+                Err(e) => {
+                    // Health check failed. Invalidate the decision, record failure.
+                    // The circuit is discarded (dropped). Old route remains active.
+                    self.optimizer.fail_establishment();
+                    self.record_route_failure(&target_hops, &format!("health check failed: {}", e));
+                    return MigrationOutcome::Failed {
+                        reason: MigrationFailureReason::EstablishmentFailed(format!(
+                            "health check failed: {}", e
+                        )),
+                    };
+                }
+            }
+        }
+
+        // 5. Construct EstablishedRoute evidence from the establishment result.
+        // N2.5-R.2.1: EstablishedRoute now proves:
+        //   - SNP-IK handshake completed
+        //   - Identity verified
+        //   - Health check passed (if endpoint provided)
+        //   - Route identity bound to circuit
         let gateway_node_id = route.destination();
         let client_node_id = node.identity.node_id;
         let fid = circuit.circuit_fid();
@@ -185,17 +221,16 @@ impl MigrationExecutor {
             client_node_id,
         );
 
-        // 5. Verify evidence route_id matches decision.
+        // 6. Verify evidence route_id matches decision.
         if evidence.route_id() != to_route_id {
-            // This should never happen if the code is correct, but we check
-            // defensively.
+            self.optimizer.fail_establishment();
             self.record_route_failure(&target_hops, "route_id mismatch after establishment");
             return MigrationOutcome::Failed {
                 reason: MigrationFailureReason::RouteIdMismatch,
             };
         }
 
-        // 6. Commit the migration with evidence.
+        // 7. Commit the migration with evidence.
         match self
             .optimizer
             .commit_migration_with_evidence(decision, &evidence)
@@ -207,12 +242,64 @@ impl MigrationExecutor {
             }
             Err(e) => {
                 // Commit rejected — stale decision, wrong epoch, etc.
-                // The old route remains active (commit_migration didn't change state).
+                // fail_establishment is NOT needed here because commit_migration
+                // already marks the decision as consumed on failure.
                 self.record_route_failure(&target_hops, &format!("commit rejected: {}", e));
                 MigrationOutcome::Failed {
                     reason: MigrationFailureReason::CommitRejected(e),
                 }
             }
+        }
+    }
+
+    /// **N2.5-R.2.1** — Perform a minimal health check on the candidate circuit.
+    ///
+    /// Opens a stream to the given endpoint and sends/receives a small
+    /// test exchange. This proves the circuit is usable end-to-end, not
+    /// just that the SNP-IK handshake completed.
+    ///
+    /// # Errors
+    /// Returns an error message if the health check fails (stream open
+    /// failure, send failure, recv failure, or timeout).
+    async fn health_check(
+        &self,
+        circuit: &mut MultiplexedCircuit,
+        endpoint: snp_gateway::stream::InternetEndpoint,
+    ) -> Result<(), String> {
+        // Open a stream through the candidate circuit.
+        let mut stream = circuit
+            .open_stream(endpoint)
+            .await
+            .map_err(|e| format!("stream open failed: {:?}", e))?;
+
+        // Send a small test message.
+        let test_data = b"health-check-ping";
+        stream
+            .send(test_data)
+            .await
+            .map_err(|e| format!("send failed: {:?}", e))?;
+
+        // Wait for echo response (with timeout).
+        let recv_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.recv(),
+        )
+        .await;
+
+        match recv_result {
+            Ok(Ok(Some(data))) => {
+                // Verify we got data back (don't check content — echo server
+                // may coalesce or split).
+                if data.is_empty() {
+                    return Err("health check received empty response".into());
+                }
+                // Close the health-check stream.
+                let _ = stream.close().await;
+                Ok(())
+            }
+            Ok(Ok(None)) => Err("health check: stream closed before response".into()),
+            Ok(Err(e)) => Err(format!("health check recv failed: {:?}", e)),
+            Err(_) => Err("health check timed out (10s)".into()),
         }
     }
 
