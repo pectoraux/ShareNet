@@ -93,15 +93,20 @@ impl RouteScore {
     /// candidate set). A route with more unique hops gets a higher
     /// diversity score.
     ///
-    /// **N2.5-R cold-start fix:** The `total` is multiplied by a
-    /// `confidence` factor that depends on the number of observations.
-    /// Routes with 0 samples get confidence 0.0 (exploration only).
-    /// Routes with ≥10 samples get confidence 1.0 (full trust).
+    /// **N2.5-R.1 cold-start fix:** The `total` is multiplied by a
+    /// `confidence` factor based on `circuit_attempts` (NOT telemetry
+    /// `samples`). A route with 0 circuit attempts gets confidence 0.0
+    /// (exploration only). A route with ≥ `min_attempts` circuit attempts
+    /// gets confidence 1.0 (full trust).
+    ///
+    /// This prevents passive telemetry (latency, loss, throughput) from
+    /// inflating confidence without actual circuit establishment evidence.
     #[must_use]
     pub fn from_observation(
         obs: &RouteObservation,
         weights: &RouteScoringWeights,
         diversity_score: f64,
+        min_attempts: u32,
     ) -> Self {
         // ── Reliability ──────────────────────────────────────────────────
         let reliability_score = obs.reliability();
@@ -112,22 +117,17 @@ impl RouteScore {
 
         // ── Throughput ───────────────────────────────────────────────────
         // Higher throughput = higher score.
-        // score = throughput / (throughput + 1_000_000)
-        // This gives:
-        //   0 bps     → 0.0
-        //   1 MB/s    → 0.5
-        //   10 MB/s   → 0.91
         let throughput_score = obs.throughput().map_or(0.5, |t| t / (t + 1_000_000.0));
 
         // ── Diversity (computed externally) ──────────────────────────────
         let diversity_score = diversity_score.clamp(0.0, 1.0);
 
         // ── Confidence (cold-start) ──────────────────────────────────────
-        // confidence = min(samples / 10, 1.0)
-        // 0 samples  → 0.0 (exploration candidate, NOT production-eligible)
-        // 5 samples  → 0.5 (half trust)
-        // 10+ samples → 1.0 (full trust)
-        let confidence = (obs.samples as f64 / 10.0).min(1.0);
+        // N2.5-R.1: Confidence is based on circuit_attempts, NOT samples.
+        // Telemetry (latency, loss, throughput) does NOT create confidence.
+        // Only actual circuit establishments/failures do.
+        let min = min_attempts.max(1) as f64;
+        let confidence = (obs.circuit_attempts as f64 / min).min(1.0);
 
         // ── Total ────────────────────────────────────────────────────────
         let total_raw = weights.reliability * reliability_score
@@ -218,39 +218,69 @@ mod tests {
         // N2.5-R: Unmeasured routes get confidence 0.0 → total 0.0.
         let obs = RouteObservation::new(vec![[1u8; 32], [2u8; 32]]);
         let weights = RouteScoringWeights::default();
-        let score = RouteScore::from_observation(&obs, &weights, 1.0);
+        let score = RouteScore::from_observation(&obs, &weights, 1.0, 10);
         assert_eq!(score.confidence, 0.0, "unmeasured route must have confidence 0.0");
         assert_eq!(score.total, 0.0, "unmeasured route must have total 0.0");
+    }
+
+    #[test]
+    fn latency_samples_do_not_create_confidence() {
+        // N2.5-R.1: Telemetry samples must NOT create confidence.
+        let mut obs = RouteObservation::new(vec![[1u8; 32]]);
+        for _ in 0..20 {
+            obs.record_latency(50.0); // 20 latency samples
+        }
+        let weights = RouteScoringWeights::default();
+        let score = RouteScore::from_observation(&obs, &weights, 1.0, 10);
+        assert_eq!(
+            score.confidence, 0.0,
+            "latency samples must NOT create confidence (0 circuit attempts)"
+        );
+        assert_eq!(score.total, 0.0, "confidence 0.0 → total 0.0");
+    }
+
+    #[test]
+    fn circuit_attempts_create_confidence() {
+        let mut obs = RouteObservation::new(vec![[1u8; 32]]);
+        for _ in 0..10 {
+            obs.record_success();
+        }
+        let weights = RouteScoringWeights::default();
+        let score = RouteScore::from_observation(&obs, &weights, 1.0, 10);
+        assert_eq!(score.confidence, 1.0, "10 circuit attempts → confidence 1.0");
+        assert!(score.total > 0.0, "confidence 1.0 → total > 0.0");
     }
 
     #[test]
     fn low_latency_scores_higher() {
         let mut fast = RouteObservation::new(vec![[1u8; 32]]);
         fast.record_latency(10.0);
+        fast.record_success(); // Give both confidence
         let mut slow = RouteObservation::new(vec![[2u8; 32]]);
         slow.record_latency(500.0);
+        slow.record_success();
         let weights = RouteScoringWeights::default();
-        let fast_score = RouteScore::from_observation(&fast, &weights, 1.0);
-        let slow_score = RouteScore::from_observation(&slow, &weights, 1.0);
+        let fast_score = RouteScore::from_observation(&fast, &weights, 1.0, 10);
+        let slow_score = RouteScore::from_observation(&slow, &weights, 1.0, 10);
         assert!(fast_score.total > slow_score.total);
     }
 
     #[test]
     fn reliable_scores_higher_than_unreliable() {
         let mut good = RouteObservation::new(vec![[1u8; 32]]);
-        for _ in 0..10 {
+        for _ in 0..15 {
             good.record_success();
         }
         let mut bad = RouteObservation::new(vec![[2u8; 32]]);
-        for _ in 0..10 {
+        for _ in 0..15 {
             bad.record_success();
         }
         for _ in 0..5 {
             bad.record_failure();
         }
         let weights = RouteScoringWeights::default();
-        let good_score = RouteScore::from_observation(&good, &weights, 1.0);
-        let bad_score = RouteScore::from_observation(&bad, &weights, 1.0);
+        let good_score = RouteScore::from_observation(&good, &weights, 1.0, 10);
+        let bad_score = RouteScore::from_observation(&bad, &weights, 1.0, 10);
         assert!(good_score.total > bad_score.total);
     }
 
@@ -288,7 +318,7 @@ mod tests {
             worst.record_failure();
         }
         let weights = RouteScoringWeights::default();
-        let worst_score = RouteScore::from_observation(&worst, &weights, 0.0);
+        let worst_score = RouteScore::from_observation(&worst, &weights, 0.0, 10);
         assert!(worst_score.total >= 0.0 && worst_score.total <= 100.0);
 
         let mut best = RouteObservation::new(vec![[2u8; 32]]);
@@ -297,7 +327,7 @@ mod tests {
         for _ in 0..10 {
             best.record_success();
         }
-        let best_score = RouteScore::from_observation(&best, &weights, 1.0);
+        let best_score = RouteScore::from_observation(&best, &weights, 1.0, 10);
         assert!(best_score.total >= 0.0 && best_score.total <= 100.0);
         assert!(best_score.total > worst_score.total);
     }

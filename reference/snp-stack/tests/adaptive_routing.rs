@@ -42,7 +42,7 @@ fn make_route(hops: &[PeerId]) -> Vec<PeerId> {
 #[test]
 fn test_route_selection_picks_best() {
     let route_store = Arc::new(RwLock::new(RouteObservationStore::new()));
-    let mut optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
+    let optimizer = AdaptiveRouteOptimizer::with_defaults(Arc::clone(&route_store));
 
     let route1 = make_route(&[[1u8; 32], [2u8; 32], [3u8; 32], [10u8; 32]]); // A-B-C-G
     let route2 = make_route(&[[1u8; 32], [4u8; 32], [5u8; 32], [10u8; 32]]); // A-D-E-G
@@ -77,11 +77,11 @@ fn test_route_selection_picks_best() {
     let result = optimizer.check(&candidates);
 
     match result {
-        OptimizationResult::Migrate { to, to_score, .. } => {
+        OptimizationResult::Migrate(d) => {
             assert_eq!(
-                to, route2,
-                "Route 2 (A-D-E-G, 20ms, 0.1% loss) should be selected — got score {:.2}",
-                to_score
+                d.target_route(),
+                route2.as_slice(),
+                "Route 2 (A-D-E-G, 20ms, 0.1% loss) should be selected"
             );
         }
         _ => panic!("expected Migrate, got {:?}", result),
@@ -121,11 +121,26 @@ fn test_dynamic_degradation() {
         OptimizerConfig {
             min_improvement_pct: 5.0,
             cooldown: Duration::from_millis(10),
+            min_attempts_for_confidence: 10,
         },
     );
 
-    // Set route1 as the current route (it's the faster one).
-    optimizer.set_current_route(route1.clone());
+    // N2.5-R: set_current_route was removed. Establish route1 as the current
+    // route via cold-start check() + commit_migration(decision).
+    {
+        let initial = optimizer.check(&candidates);
+        match initial {
+            OptimizationResult::Migrate(d) => {
+                assert_eq!(
+                    d.target_route(),
+                    route1.as_slice(),
+                    "cold-start should pick route1 (the faster one)"
+                );
+                optimizer.commit_migration(d).unwrap();
+            }
+            _ => panic!("expected cold-start Migrate, got {:?}", initial),
+        }
+    }
 
     // Simulate degradation: route1 latency rises to 500ms + multiple failures.
     {
@@ -142,9 +157,17 @@ fn test_dynamic_degradation() {
 
     let result = optimizer.check(&candidates);
     match result {
-        OptimizationResult::Migrate { from, to, .. } => {
-            assert_eq!(from, route1, "should migrate from degraded route1");
-            assert_eq!(to, route2, "should migrate to route2");
+        OptimizationResult::Migrate(d) => {
+            assert_eq!(
+                d.source_route(),
+                route1.as_slice(),
+                "should migrate from degraded route1"
+            );
+            assert_eq!(
+                d.target_route(),
+                route2.as_slice(),
+                "should migrate to route2"
+            );
         }
         _ => panic!("expected Migrate after degradation, got {:?}", result),
     }
@@ -181,9 +204,27 @@ fn test_relay_failure_triggers_migration() {
         OptimizerConfig {
             min_improvement_pct: 5.0, // lower threshold for test
             cooldown: Duration::from_millis(10),
+            min_attempts_for_confidence: 10,
         },
     );
-    optimizer.set_current_route(route1.clone());
+
+    // N2.5-R: set_current_route was removed. Establish route1 as the current
+    // route via cold-start check() + commit_migration(decision). Route1 is
+    // slightly better at cold-start (50ms vs 55ms, both reliable).
+    {
+        let initial = optimizer.check(&[route1.clone(), route2.clone()]);
+        match initial {
+            OptimizationResult::Migrate(d) => {
+                assert_eq!(
+                    d.target_route(),
+                    route1.as_slice(),
+                    "cold-start should pick route1 (slightly lower latency)"
+                );
+                optimizer.commit_migration(d).unwrap();
+            }
+            _ => panic!("expected cold-start Migrate, got {:?}", initial),
+        }
+    }
 
     // Simulate relay B ([2;32]) failure via CircuitResult with HopFailure.
     // Record multiple failures to make route1 clearly worse than route2
@@ -207,9 +248,13 @@ fn test_relay_failure_triggers_migration() {
     let result = optimizer.check(&candidates);
 
     match result {
-        OptimizationResult::Migrate { from, to, .. } => {
-            assert_eq!(from, route1);
-            assert_eq!(to, route2, "should migrate to route2 after relay B failure");
+        OptimizationResult::Migrate(d) => {
+            assert_eq!(d.source_route(), route1.as_slice());
+            assert_eq!(
+                d.target_route(),
+                route2.as_slice(),
+                "should migrate to route2 after relay B failure"
+            );
         }
         _ => panic!("expected Migrate after relay failure, got {:?}", result),
     }
@@ -302,6 +347,7 @@ fn test_hysteresis_prevents_flapping() {
         OptimizerConfig {
             min_improvement_pct: 15.0,
             cooldown: Duration::from_millis(10),
+            min_attempts_for_confidence: 10,
         },
     );
 
@@ -317,14 +363,24 @@ fn test_hysteresis_prevents_flapping() {
         s.get_or_create(&route2).record_success();
     }
 
-    optimizer.set_current_route(route1.clone());
+    // N2.5-R: set_current_route was removed. Establish the initial route
+    // via cold-start check() + commit_migration(decision). Cold-start picks
+    // the best route (route2, slightly lower latency).
+    let initial = optimizer.check(&[route1.clone(), route2.clone()]);
+    if let OptimizationResult::Migrate(d) = initial {
+        optimizer.commit_migration(d).unwrap();
+    }
+
+    // Wait for cooldown to pass before checking for migration.
+    std::thread::sleep(Duration::from_millis(20));
 
     let candidates = vec![route1.clone(), route2.clone()];
     let result = optimizer.check(&candidates);
 
     assert!(
         matches!(result, OptimizationResult::NoMigration { .. }),
-        "should NOT migrate — route2 is only ~4% better (< 15% threshold)"
+        "should NOT migrate — scores are too similar (< 15% threshold), got {:?}",
+        result
     );
 
     eprintln!("[n2.5-hysteresis] PASS: No migration for marginal improvement");
@@ -408,17 +464,21 @@ fn test_custom_weights_change_route_selection() {
             for _ in 0..10 { s.get_or_create(&route2).record_success(); }
         }
 
-        let mut opt = AdaptiveRouteOptimizer::new(
+        let opt = AdaptiveRouteOptimizer::new(
             route_store,
             RouteScoringWeights::new(0.1, 0.7, 0.1, 0.1), // latency-heavy
             OptimizerConfig {
                 min_improvement_pct: 1.0,
                 cooldown: Duration::from_millis(1),
+                min_attempts_for_confidence: 10,
             },
         );
 
         let result = opt.check(&candidates);
-        assert!(matches!(result, OptimizationResult::Migrate { to, .. } if to == route1));
+        assert!(
+            matches!(result, OptimizationResult::Migrate(d) if d.target_route() == route1.as_slice()),
+            "latency-heavy weights should select route1"
+        );
     }
 
     // Reliability-weighted: route2 should win.
@@ -433,17 +493,21 @@ fn test_custom_weights_change_route_selection() {
             for _ in 0..10 { s.get_or_create(&route2).record_success(); }
         }
 
-        let mut opt = AdaptiveRouteOptimizer::new(
+        let opt = AdaptiveRouteOptimizer::new(
             route_store,
             RouteScoringWeights::new(0.7, 0.1, 0.1, 0.1), // reliability-heavy
             OptimizerConfig {
                 min_improvement_pct: 1.0,
                 cooldown: Duration::from_millis(1),
+                min_attempts_for_confidence: 10,
             },
         );
 
         let result = opt.check(&candidates);
-        assert!(matches!(result, OptimizationResult::Migrate { to, .. } if to == route2));
+        assert!(
+            matches!(result, OptimizationResult::Migrate(d) if d.target_route() == route2.as_slice()),
+            "reliability-heavy weights should select route2"
+        );
     }
 
     eprintln!("[n2.5-weights] PASS: Custom weights change route selection");
@@ -462,6 +526,7 @@ fn test_cooldown_blocks_rapid_migration() {
         OptimizerConfig {
             min_improvement_pct: 5.0,
             cooldown: Duration::from_secs(60), // long cooldown
+            min_attempts_for_confidence: 10,
         },
     );
 
@@ -474,13 +539,17 @@ fn test_cooldown_blocks_rapid_migration() {
         s.get_or_create(&route2).record_latency(10.0);
     }
 
-    // First migration: route1 → route2.
-    optimizer.set_current_route(route1.clone());
+    // N2.5-R: set_current_route was removed. Cold-start check() recommends the
+    // best route (route2). The caller must commit the migration — check() does
+    // NOT mutate optimizer state.
     let result = optimizer.check(&[route1.clone(), route2.clone()]);
-    assert!(matches!(result, OptimizationResult::Migrate { .. }));
-
-    // N2.5-R: Caller must commit the migration — check() does NOT.
-    optimizer.commit_migration(route2.clone());
+    assert!(
+        matches!(result, OptimizationResult::Migrate(_)),
+        "cold-start should recommend migration"
+    );
+    if let OptimizationResult::Migrate(d) = result {
+        optimizer.commit_migration(d).unwrap();
+    }
 
     // Now try to migrate again immediately — should be on cooldown.
     // Make route1 look better than route2 to trigger migration desire.

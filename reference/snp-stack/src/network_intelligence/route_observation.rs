@@ -31,20 +31,34 @@ pub type RouteId = [u8; 32];
 
 /// Compute a `RouteId` from a sequence of hops.
 ///
-/// Uses SHA-256 over the canonical encoding (position-prefixed hop NodeIds)
-/// to ensure collision resistance. Two routes with the same hops in the
-/// same order always produce the same `RouteId`; routes with different
-/// hops or different orderings produce different `RouteId`s (with
-/// overwhelming probability).
+/// Uses SHA-256 over a canonical encoding with:
+/// - Domain separator: `b"ShareNet/RouteId/v1"` (prevents cross-protocol
+///   collision if RouteIds are used in other contexts).
+/// - Hop count as u64 (prevents ambiguity about route length).
+/// - Each hop prefixed with its position as u32 (supports up to 4 billion
+///   hops, not just 256).
+///
+/// Two routes with the same hops in the same order always produce the
+/// same `RouteId`; routes with different hops or different orderings
+/// produce different `RouteId`s (with overwhelming probability).
 #[must_use]
 pub fn route_id_from_hops(hops: &[PeerId]) -> RouteId {
     let mut hasher = Sha256::new();
+
+    // Domain separator — prevents cross-protocol collision.
+    hasher.update(b"ShareNet/RouteId/v1");
+
+    // Hop count as u64 big-endian — prevents ambiguity about route length.
+    let hop_count = hops.len() as u64;
+    hasher.update(hop_count.to_be_bytes());
+
+    // Each hop: position (u32 big-endian) + 32-byte NodeId.
+    // u32 supports up to 4 billion hops (not just 256).
     for (pos, hop) in hops.iter().enumerate() {
-        // Prefix each hop with its position (1 byte) to make the hash
-        // order-dependent.
-        hasher.update([pos as u8]);
+        hasher.update((pos as u32).to_be_bytes());
         hasher.update(hop);
     }
+
     let result = hasher.finalize();
     let mut id = [0u8; 32];
     id.copy_from_slice(&result);
@@ -80,8 +94,19 @@ pub struct RouteObservation {
     pub last_success: Option<Instant>,
 
     // ── Metadata ────────────────────────────────────────────────────────
-    /// Number of samples collected.
+    /// Number of telemetry samples collected (latency, loss, throughput
+    /// measurements). This is NOT the same as circuit attempts — a single
+    /// circuit can produce many telemetry samples.
+    ///
+    /// **N2.5-R.1:** Confidence is based on `circuit_attempts`, NOT
+    /// `samples`. A route with 10 latency samples but 0 circuit attempts
+    /// has confidence 0.0.
     pub samples: u64,
+    /// **N2.5-R.1** — Total number of circuit attempts (successful +
+    /// failed). This is the authoritative count for confidence scoring.
+    /// Only actual circuit establishments/failures increment this —
+    /// passive telemetry (latency, loss, throughput) does NOT.
+    pub circuit_attempts: u64,
     /// When this observation was last updated.
     pub updated_at: Instant,
 }
@@ -102,38 +127,53 @@ impl RouteObservation {
             failed_circuits: 0,
             last_success: None,
             samples: 0,
+            circuit_attempts: 0,
             updated_at: now,
         }
     }
 
     /// Record a latency sample (milliseconds, end-to-end).
+    ///
+    /// **N2.5-R.1:** This does NOT increment `circuit_attempts` —
+    /// latency is a telemetry measurement, not a circuit attempt.
     pub fn record_latency(&mut self, latency_ms: f64) {
         self.latency_ms.update(latency_ms);
         self.touch();
     }
 
     /// Record a packet loss sample (0.0–1.0).
+    ///
+    /// **N2.5-R.1:** This does NOT increment `circuit_attempts`.
     pub fn record_packet_loss(&mut self, loss: f64) {
         self.packet_loss.update(loss.clamp(0.0, 1.0));
         self.touch();
     }
 
     /// Record a throughput sample (bytes/second).
+    ///
+    /// **N2.5-R.1:** This does NOT increment `circuit_attempts`.
     pub fn record_throughput(&mut self, bps: f64) {
         self.throughput_bps.update(bps);
         self.touch();
     }
 
     /// Record a successful circuit through this route.
+    ///
+    /// **N2.5-R.1:** This DOES increment `circuit_attempts` — a circuit
+    /// attempt is an independent route-level observation.
     pub fn record_success(&mut self) {
         self.successful_circuits += 1;
+        self.circuit_attempts += 1;
         self.last_success = Some(Instant::now());
         self.touch();
     }
 
     /// Record a failed circuit through this route.
+    ///
+    /// **N2.5-R.1:** This DOES increment `circuit_attempts`.
     pub fn record_failure(&mut self) {
         self.failed_circuits += 1;
+        self.circuit_attempts += 1;
         self.touch();
     }
 
@@ -164,6 +204,12 @@ impl RouteObservation {
     #[must_use]
     pub fn throughput(&self) -> Option<f64> {
         self.throughput_bps.value()
+    }
+
+    /// Returns the total number of circuit attempts (successful + failed).
+    #[must_use]
+    pub fn circuit_attempts(&self) -> u64 {
+        self.circuit_attempts
     }
 
     /// Returns the number of hops in this route.
