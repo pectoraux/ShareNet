@@ -1385,6 +1385,25 @@ impl MultiplexedCircuit {
         self.metrics = Some(metrics);
     }
 
+    /// **N2.5-R.2** — Returns the circuit's frame ID (unique per circuit).
+    /// Used by the migration executor to construct `EstablishedRoute` evidence.
+    #[must_use]
+    pub fn circuit_fid(&self) -> [u8; 8] {
+        self.fid
+    }
+
+    /// **N2.5-R.2** — Returns the gateway's NodeId.
+    #[must_use]
+    pub fn gateway_node_id(&self) -> [u8; 32] {
+        self.gateway_node_id
+    }
+
+    /// **N2.5-R.2** — Returns the client's NodeId.
+    #[must_use]
+    pub fn client_node_id(&self) -> [u8; 32] {
+        self.client_node_id
+    }
+
     /// **N2.3.9** — Returns the number of registered streams on this circuit.
     /// Used by tests to verify that streams are cleaned up after close.
     /// A stream is "registered" from the moment `open_stream` is called

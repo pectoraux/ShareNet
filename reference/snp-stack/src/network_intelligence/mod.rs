@@ -57,6 +57,8 @@ pub mod failover;
 pub mod feedback;
 pub mod health;
 pub mod observations;
+#[cfg(feature = "circuit-upstream")]
+pub mod migration_executor;
 pub mod route_observation;
 pub mod route_optimizer;
 pub mod route_scoring;
@@ -68,6 +70,8 @@ pub use failover::{FailoverResult, GatewayFailover};
 pub use feedback::{CircuitFailureReason, CircuitOutcome, CircuitResult};
 pub use health::{CircuitHealth, CircuitMonitor, HealthThresholds};
 pub use observations::{MovingAverage, ObservationStore, PeerId, PeerObservation};
+#[cfg(feature = "circuit-upstream")]
+pub use migration_executor::{MigrationExecutor, MigrationFailureReason, MigrationOutcome};
 pub use route_observation::{
     route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,
 };

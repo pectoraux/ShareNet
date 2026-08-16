@@ -25,6 +25,15 @@ default = []
 # ShareNet stack). This is a production feature — tests use MockUpstream
 # which doesn't need this.
 circuit-upstream = ["dep:snp-node", "dep:snp-gateway", "dep:snp-crypto", "dep:snp-link"]
+# N2.5-R.2 — Expose test-only helpers (e.g. `EstablishedRoute::test_with_route_id`,
+# `MigrationDecision::test_tampered_to_route_id`) for use in integration tests.
+# This feature MUST NOT be enabled in production builds — it bypasses the
+# "evidence cannot be fabricated" invariant for negative testing.
+test-utils = []
+
+[[test]]
+name = "runtime_migration"
+required-features = ["circuit-upstream", "test-utils"]
 
 [dev-dependencies]
 tokio.workspace = true

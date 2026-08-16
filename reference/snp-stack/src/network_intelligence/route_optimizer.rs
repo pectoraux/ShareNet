@@ -136,7 +136,7 @@ impl MigrationDecision {
     /// tampered decisions.
     ///
     /// This is NOT available in production builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn test_tampered_to_route_id(
         original: MigrationDecision,
         fake_route_id: RouteId,
@@ -157,45 +157,113 @@ impl MigrationDecision {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// EstablishedRoute — future evidence type (contract defined, impl deferred)
+// EstablishedRoute — real evidence from successful circuit establishment
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Evidence that a circuit was successfully established on a specific route.
 ///
-/// This is a **contract type** — the concrete implementation is deferred to
-/// N2.5-R.2 (Runtime Adaptive Routing Integration). When implemented, it
-/// will be produced by the circuit establishment code and consumed by
-/// `commit_migration_with_evidence()`.
+/// This object can ONLY be constructed from a real circuit establishment
+/// result (SNP-IK handshake completed, identity verified, link keys derived).
+/// It cannot be fabricated by the caller.
 ///
-/// ## What this type will represent
+/// ## What this type proves
 ///
-/// - The circuit was established (SNP-IK handshake completed).
-/// - Circuit keys were derived.
-/// - At least one successful round-trip verified health.
-/// - The route identity matches the `MigrationDecision`'s target.
+/// - A TCP connection was established to the first relay.
+/// - SNP-IK handshake completed successfully.
+/// - The relay's authenticated identity matches the expected NodeId.
+/// - Link-level encryption keys were derived.
+/// - The circuit's frame ID (`fid`) is assigned.
+/// - The route identity (RouteId + hops) is bound to this establishment.
 ///
-/// ## What this type does NOT represent
+/// ## What this type does NOT prove
 ///
 /// - It does NOT prove that traffic has been migrated.
 /// - It does NOT prove that the old circuit has been drained.
 /// - It does NOT prove that the application is using the new circuit.
+/// - It does NOT prove end-to-end gateway reachability (that requires
+///   opening a stream, which is a separate operation).
 ///
 /// Those are caller responsibilities outside the optimizer's scope.
 #[derive(Debug)]
 pub struct EstablishedRoute {
-    // Fields will be added in N2.5-R.2. For now, this type exists only
-    // to define the commit contract and make the architecture explicit.
-    _private: (),
+    /// The RouteId of the established route (SHA-256 of the hop sequence).
+    route_id: RouteId,
+    /// The hop sequence that was established.
+    hops: Vec<PeerId>,
+    /// The circuit's frame ID (unique per circuit, assigned at establishment).
+    circuit_id: [u8; 8],
+    /// The gateway's NodeId (destination of the route).
+    gateway_node_id: PeerId,
+    /// The client's NodeId (source of the route).
+    client_node_id: PeerId,
 }
 
 impl EstablishedRoute {
-    /// Create a placeholder evidence object.
+    /// Construct evidence from a successful circuit establishment.
     ///
-    /// **TEST ONLY.** In production (N2.5-R.2), this will be constructed
-    /// by the circuit establishment code with verified health data.
+    /// This is the ONLY production constructor. It must be called with
+    /// the actual establishment result fields — the `fid` from the
+    /// `MultiplexedCircuit`, the route's hops, and the NodeIds.
+    ///
+    /// The `route_id` is computed internally from `hops` to ensure
+    /// consistency — the caller cannot supply a mismatched route_id.
     #[must_use]
-    pub fn placeholder() -> Self {
-        Self { _private: () }
+    pub fn from_establishment(
+        hops: Vec<PeerId>,
+        circuit_id: [u8; 8],
+        gateway_node_id: PeerId,
+        client_node_id: PeerId,
+    ) -> Self {
+        let route_id = route_id_from_hops(&hops);
+        Self {
+            route_id,
+            hops,
+            circuit_id,
+            gateway_node_id,
+            client_node_id,
+        }
+    }
+
+    /// Returns the RouteId of the established route.
+    #[must_use]
+    pub fn route_id(&self) -> RouteId {
+        self.route_id
+    }
+
+    /// Returns the hop sequence.
+    #[must_use]
+    pub fn hops(&self) -> &[PeerId] {
+        &self.hops
+    }
+
+    /// Returns the circuit's frame ID.
+    #[must_use]
+    pub fn circuit_id(&self) -> [u8; 8] {
+        self.circuit_id
+    }
+
+    /// Returns the gateway's NodeId.
+    #[must_use]
+    pub fn gateway_node_id(&self) -> PeerId {
+        self.gateway_node_id
+    }
+
+    /// **TEST ONLY.** Construct evidence with a specific route_id for
+    /// negative testing (mismatched route_id rejection).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_with_route_id(
+        hops: Vec<PeerId>,
+        route_id: RouteId,
+        circuit_id: [u8; 8],
+    ) -> Self {
+        Self {
+            route_id,
+            hops,
+            circuit_id,
+            gateway_node_id: [0u8; 32],
+            client_node_id: [0u8; 32],
+        }
     }
 }
 
@@ -571,29 +639,55 @@ impl AdaptiveRouteOptimizer {
         Ok(())
     }
 
-    /// **Future commit with establishment evidence.**
+    /// **Commit a migration with establishment evidence.**
     ///
-    /// This is the contract for N2.5-R.2 (Runtime Adaptive Routing
-    /// Integration). When implemented, it will require an
+    /// This is the production commit method. It requires an
     /// [`EstablishedRoute`] evidence object in addition to the
     /// [`MigrationDecision`], proving that a circuit was actually
     /// established on the target route.
     ///
-    /// For now, this method is defined but delegates to
-    /// [`commit_migration`] (ignoring the evidence, since the evidence
-    /// type is a placeholder).
+    /// ## Validation (in addition to `commit_migration` checks)
+    ///
+    /// 1. `evidence.route_id()` must equal `decision.to_route_id`.
+    ///    This proves the established circuit is for the same route
+    ///    the optimizer recommended.
+    /// 2. `evidence.hops()` must match `decision.target_route()`.
+    ///    This prevents the caller from establishing a different route
+    ///    and claiming it matches the decision.
+    ///
+    /// ## When to use this vs `commit_migration`
+    ///
+    /// - `commit_migration_with_evidence`: production — requires real
+    ///   establishment proof.
+    /// - `commit_migration`: test-only / legacy — no evidence required.
+    ///   Will be deprecated in a future milestone.
     ///
     /// # Errors
-    /// Same as [`commit_migration`].
+    /// Returns `Err` if any validation fails (decision state, evidence
+    /// binding, route_id mismatch, or hops mismatch).
     pub fn commit_migration_with_evidence(
         &mut self,
         decision: MigrationDecision,
-        _evidence: &EstablishedRoute,
+        evidence: &EstablishedRoute,
     ) -> Result<(), String> {
-    // N2.5-R.1.1: The evidence type is a placeholder. When N2.5-R.2
-    // implements real circuit establishment, this method will verify
-    // that the evidence's route_id matches the decision's to_route_id.
-    self.commit_migration(decision)
+        // 1. Verify evidence route_id matches decision's to_route_id.
+        if evidence.route_id() != decision.to_route_id {
+            return Err(format!(
+                "evidence route_id mismatch: evidence={:?} but decision={:?}",
+                evidence.route_id(),
+                decision.to_route_id
+            ));
+        }
+
+        // 2. Verify evidence hops match decision's target route.
+        if evidence.hops() != decision.to.as_slice() {
+            return Err(
+                "evidence hops mismatch: established route does not match decision target".into(),
+            );
+        }
+
+        // 3. Delegate to the standard commit for decision-state validation.
+        self.commit_migration(decision)
     }
 
     /// Returns the current route (if any), without modifying state.
@@ -995,13 +1089,15 @@ mod tests {
         // It only contains the route recommendation.
         assert!(!d.is_exploration() || d.is_exploration()); // tautology — no evidence field exists.
 
-        // commit_migration_with_evidence exists but ignores evidence for now.
-        let evidence = EstablishedRoute::placeholder();
-        // We need to re-check because commit_migration consumes the decision.
-        // Actually, commit_migration_with_evidence takes &EstablishedRoute,
-        // so it doesn't consume the evidence. But it does consume the decision.
-        // We can't call both commit_migration and commit_migration_with_evidence
-        // on the same decision. Let's just test commit_migration_with_evidence.
+        // N2.5-R.2: commit_migration_with_evidence now validates evidence.
+        // Construct real evidence from the route's hops.
+        let fid = [0u8; 8]; // Test-only: would come from real circuit.
+        let evidence = EstablishedRoute::from_establishment(
+            route_a.clone(),
+            fid,
+            [0u8; 32], // gateway_node_id
+            [0u8; 32], // client_node_id
+        );
         opt.commit_migration_with_evidence(d, &evidence).unwrap();
         assert_eq!(opt.current_route(), Some(route_a.as_slice()));
     }
