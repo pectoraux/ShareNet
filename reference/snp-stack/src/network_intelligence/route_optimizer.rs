@@ -7,23 +7,35 @@
 //!
 //! ## N2.5-R.1.1 — Migration Decision State Integrity
 //!
-//! A [`MigrationDecision`] is a **state-bound, one-time token**:
+//! A [`MigrationDecision`] is a **move-only, state-bound decision object
+//! with runtime freshness validation**:
 //!
 //! - Each decision has a unique `decision_id` assigned by the optimizer.
 //! - Each decision carries the optimizer's `epoch` at creation time.
 //! - The optimizer tracks the single outstanding decision.
-//! - `commit_migration` rejects stale, replayed, wrong-source, or
+//! - `commit_migration` rejects stale, wrong-source, wrong-epoch, or
 //!   already-consumed decisions.
-//! - A decision can only be committed once.
+//! - `MigrationDecision` does NOT implement `Clone` — Rust move
+//!   semantics enforce compile-time single-use. Runtime validation
+//!   (decision_id, epoch, consumed flag) provides additional freshness
+//!   protection against stale or superseded decisions.
+//!
+//! ## `check()` is NOT pure
+//!
+//! `check()` does NOT mutate operational route state (`current_route`,
+//! `last_migration`). It DOES mutate the optimizer's decision-tracking
+//! state (`outstanding_decision`, `next_decision_id`) — this is
+//! intentional and necessary for the state-bound decision model.
 //!
 //! ```text
-//! check() → returns MigrationDecision (state-bound, unique id)
-//!     ↓
+//! check() → no operational route-state mutation
+//!         + creates/replaces outstanding decision
+//!         ↓
 //! circuit establishment happens outside optimizer
-//!     ↓
+//!         ↓
 //! commit_migration(decision) → validates id, epoch, from_route, consumed
-//!     ↓
-//! optimizer state updated only if all checks pass
+//!         ↓
+//! operational route state updated only if all checks pass
 //! ```
 //!
 //! **The decision token does NOT prove that a circuit was successfully
@@ -117,6 +129,30 @@ impl MigrationDecision {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// **TEST ONLY.** Construct a `MigrationDecision` with a deliberately
+    /// mismatched `to_route_id` to verify that `commit_migration` rejects
+    /// tampered decisions.
+    ///
+    /// This is NOT available in production builds.
+    #[cfg(test)]
+    pub fn test_tampered_to_route_id(
+        original: MigrationDecision,
+        fake_route_id: RouteId,
+    ) -> MigrationDecision {
+        MigrationDecision {
+            decision_id: original.decision_id,
+            epoch: original.epoch,
+            from: original.from,
+            from_route_id: original.from_route_id,
+            to: original.to,
+            to_route_id: fake_route_id,
+            from_score: original.from_score,
+            to_score: original.to_score,
+            improvement_pct: original.improvement_pct,
+            is_exploration: original.is_exploration,
+        }
     }
 }
 
@@ -320,10 +356,15 @@ impl AdaptiveRouteOptimizer {
 
     /// Check whether migration is recommended.
     ///
-    /// **This is a pure decision function — it does NOT mutate
-    /// `current_route` or `last_migration`.** It DOES update the
+    /// **This function does NOT mutate operational route state**
+    /// (`current_route`, `last_migration`). It DOES update the
     /// outstanding decision record (replacing any previous outstanding
-    /// decision), because only one decision can be valid at a time.
+    /// decision) and advance the decision ID counter, because only one
+    /// decision can be valid at a time.
+    ///
+    /// This is NOT a pure function — it mutates the optimizer's
+    /// decision-tracking state. It does not, however, change which
+    /// route is considered "active."
     ///
     /// If migration is recommended, the caller must:
     /// 1. Establish the new circuit using existing transport primitives.
@@ -859,10 +900,23 @@ mod tests {
             _ => panic!("expected Migrate"),
         };
 
-        // The decision's to_route_id matches the target hops (verified
-        // internally by commit_migration). We can't tamper with the
-        // private field, but we can verify commit succeeds (no mismatch).
-        opt.commit_migration(d).unwrap();
+        // Tamper: replace to_route_id with a fake value.
+        let fake_id = [0xFFu8; 32];
+        let tampered = MigrationDecision::test_tampered_to_route_id(d, fake_id);
+
+        // commit_migration must reject the tampered decision.
+        let result = opt.commit_migration(tampered);
+        assert!(
+            result.is_err(),
+            "tampered decision (mismatched to_route_id) must be rejected"
+        );
+        assert!(
+            result.unwrap_err().contains("route_id mismatch"),
+            "error must mention route_id mismatch"
+        );
+
+        // Optimizer state must be unchanged.
+        assert!(opt.current_route().is_none(), "rejected commit must not change state");
     }
 
     #[test]
