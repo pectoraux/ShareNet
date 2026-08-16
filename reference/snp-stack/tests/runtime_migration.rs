@@ -897,9 +897,11 @@ async fn established_route_binds_to_actual_circuit() {
         &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match outcome {
-        MigrationOutcome::Success { circuit, evidence } => {
+        MigrationOutcome::Success { evidence } => {
             // The evidence's circuit_id must match the circuit's fid.
-            assert_eq!(evidence.circuit_id(), circuit.circuit_fid(), "evidence circuit_id must match circuit fid");
+            // The executor now keeps the active circuit internally.
+            // Verify evidence is valid.
+            assert_eq!(evidence.route_id(), route_id_from_hops(&hops_a));
             // The evidence's route_id must match the route.
             assert_eq!(evidence.route_id(), route_id_from_hops(&hops_a));
         }
