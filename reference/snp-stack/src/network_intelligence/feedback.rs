@@ -83,6 +83,11 @@ pub struct CircuitResult {
     pub bytes_received: u64,
     /// The last measured latency (milliseconds), if any.
     pub latency_ms: Option<f64>,
+    /// **N2.5-R** — The full route hop sequence (client, relays, gateway).
+    /// Used for route-level feedback provenance. When set, this is the
+    /// authoritative route identity — callers must NOT separately supply
+    /// route_hops to `apply_to_route_store()`.
+    pub route_hops: Option<Vec<PeerId>>,
 }
 
 impl CircuitResult {
@@ -97,6 +102,7 @@ impl CircuitResult {
             bytes_sent: 0,
             bytes_received: 0,
             latency_ms: None,
+            route_hops: None,
         }
     }
 
@@ -111,6 +117,7 @@ impl CircuitResult {
             bytes_sent: 0,
             bytes_received: 0,
             latency_ms: None,
+            route_hops: None,
         }
     }
 
@@ -140,6 +147,16 @@ impl CircuitResult {
     #[must_use]
     pub fn with_latency(mut self, latency_ms: f64) -> Self {
         self.latency_ms = Some(latency_ms);
+        self
+    }
+
+    /// **N2.5-R** — Set the full route hop sequence for route-level
+    /// feedback provenance. When set, `apply_to_route_store()` uses
+    /// this as the authoritative route identity — the caller does NOT
+    /// need to separately supply route_hops.
+    #[must_use]
+    pub fn with_route_hops(mut self, route_hops: Vec<PeerId>) -> Self {
+        self.route_hops = Some(route_hops);
         self
     }
 
@@ -211,10 +228,16 @@ impl CircuitResult {
     /// If `HopFailure` is present, the failing peer is also recorded
     /// individually in the peer-level store (if provided).
     ///
+    /// **N2.5-R provenance fix:** If `self.route_hops` is set (via
+    /// [`with_route_hops`]), that is used as the authoritative route
+    /// identity and the `route_hops` parameter is IGNORED. This prevents
+    /// the caller from accidentally supplying mismatched hops.
+    ///
     /// # Arguments
     /// * `route_store` — The route observation store to update.
     /// * `route_hops` — The full hop sequence (client, relays, gateway).
-    ///   This MUST match the hops used to create the `RouteObservation`.
+    ///   Used ONLY if `self.route_hops` is None. If `self.route_hops` is
+    ///   set, it takes precedence.
     /// * `peer_store` — Optional peer-level store for HopFailure attribution.
     pub fn apply_to_route_store(
         &self,
@@ -222,15 +245,21 @@ impl CircuitResult {
         route_hops: &[super::observations::PeerId],
         mut peer_store: Option<&mut ObservationStore>,
     ) {
+        // N2.5-R: Use embedded route_hops if available (provenance fix).
+        let effective_hops: &[super::observations::PeerId] = self
+            .route_hops
+            .as_ref()
+            .map_or(route_hops, |h| h.as_slice());
+
         match &self.outcome {
             CircuitOutcome::Success => {
-                route_store.record_success(route_hops);
+                route_store.record_success(effective_hops);
                 if let Some(latency) = self.latency_ms {
-                    route_store.record_latency(route_hops, latency);
+                    route_store.record_latency(effective_hops, latency);
                 }
             }
             CircuitOutcome::Failed(reason) => {
-                route_store.record_failure(route_hops);
+                route_store.record_failure(effective_hops);
 
                 // N2.5.8: If this is a HopFailure, record the specific peer failure.
                 if let CircuitFailureReason::HopFailure { peer_id, .. } = reason {

@@ -16,39 +16,38 @@
 //! observation captures this.
 
 use super::observations::{MovingAverage, PeerId};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// A route identifier — the SHA-256-like hash of the hop sequence.
-/// In practice, we use a simple XOR-fold of the hop NodeIds for O(1)
-/// comparison. Two routes with the same hops in the same order have the
-/// same `RouteId`.
+/// A route identifier — the SHA-256 hash of the canonical encoding of the
+/// hop sequence. This is a cryptographic hash, so collisions are
+/// computationally infeasible (2^-128 birthday bound).
+///
+/// The canonical encoding is: for each hop, the 32-byte NodeId, prefixed
+/// by a 1-byte position counter. This ensures that two routes with the
+/// same hops in different orders produce different RouteIds.
 pub type RouteId = [u8; 32];
 
 /// Compute a `RouteId` from a sequence of hops.
 ///
-/// This uses a position-dependent hash (each hop is mixed with its
-/// position in the sequence) to ensure that two routes with the same
-/// hops in different orders produce different IDs. It is NOT a security
-/// primitive — it is only used for `HashMap` keying and equality comparison.
+/// Uses SHA-256 over the canonical encoding (position-prefixed hop NodeIds)
+/// to ensure collision resistance. Two routes with the same hops in the
+/// same order always produce the same `RouteId`; routes with different
+/// hops or different orderings produce different `RouteId`s (with
+/// overwhelming probability).
 #[must_use]
 pub fn route_id_from_hops(hops: &[PeerId]) -> RouteId {
-    let mut id = [0u8; 32];
+    let mut hasher = Sha256::new();
     for (pos, hop) in hops.iter().enumerate() {
-        // Mix the position into each byte to make the hash order-dependent.
-        let pos_byte = (pos as u8).wrapping_mul(31);
-        for (i, byte) in hop.iter().enumerate() {
-            id[i] = id[i]
-                .wrapping_add(*byte)
-                .wrapping_add(pos_byte)
-                .rotate_left((pos + i) as u32 % 8);
-        }
+        // Prefix each hop with its position (1 byte) to make the hash
+        // order-dependent.
+        hasher.update([pos as u8]);
+        hasher.update(hop);
     }
-    // Final mixing — spread entropy across all bytes.
-    for i in 0..32 {
-        id[i] = id[i].wrapping_add(id[(i + 7) % 32]);
-        id[i] = id[i].rotate_left(3);
-    }
+    let result = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&result);
     id
 }
 

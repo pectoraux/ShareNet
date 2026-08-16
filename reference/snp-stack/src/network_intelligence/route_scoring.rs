@@ -77,6 +77,10 @@ pub struct RouteScore {
     pub throughput_score: f64,
     /// Diversity subscore (0.0 = worst, 1.0 = best).
     pub diversity_score: f64,
+    /// **N2.5-R** — Confidence factor (0.0 = unmeasured, 1.0 = fully
+    /// measured). The `total` is multiplied by this factor, so routes
+    /// with no observations get score 0.0 (exploration only).
+    pub confidence: f64,
     /// The total weighted score, scaled to `[0.0, 100.0]`.
     pub total: f64,
 }
@@ -88,6 +92,11 @@ impl RouteScore {
     /// against a set of "known hops" (peers used by other routes in the
     /// candidate set). A route with more unique hops gets a higher
     /// diversity score.
+    ///
+    /// **N2.5-R cold-start fix:** The `total` is multiplied by a
+    /// `confidence` factor that depends on the number of observations.
+    /// Routes with 0 samples get confidence 0.0 (exploration only).
+    /// Routes with ≥10 samples get confidence 1.0 (full trust).
     #[must_use]
     pub fn from_observation(
         obs: &RouteObservation,
@@ -113,6 +122,13 @@ impl RouteScore {
         // ── Diversity (computed externally) ──────────────────────────────
         let diversity_score = diversity_score.clamp(0.0, 1.0);
 
+        // ── Confidence (cold-start) ──────────────────────────────────────
+        // confidence = min(samples / 10, 1.0)
+        // 0 samples  → 0.0 (exploration candidate, NOT production-eligible)
+        // 5 samples  → 0.5 (half trust)
+        // 10+ samples → 1.0 (full trust)
+        let confidence = (obs.samples as f64 / 10.0).min(1.0);
+
         // ── Total ────────────────────────────────────────────────────────
         let total_raw = weights.reliability * reliability_score
             + weights.latency * latency_score
@@ -121,7 +137,7 @@ impl RouteScore {
 
         let weight_sum = weights.sum();
         let total = if weight_sum > 0.0 {
-            (total_raw / weight_sum) * 100.0
+            (total_raw / weight_sum) * 100.0 * confidence
         } else {
             0.0
         };
@@ -131,6 +147,7 @@ impl RouteScore {
             latency_score,
             throughput_score,
             diversity_score,
+            confidence,
             total,
         }
     }
@@ -149,6 +166,7 @@ impl std::fmt::Display for RouteScore {
         writeln!(f, "  latency:      {:.3}", self.latency_score)?;
         writeln!(f, "  throughput:   {:.3}", self.throughput_score)?;
         writeln!(f, "  diversity:    {:.3}", self.diversity_score)?;
+        writeln!(f, "  confidence:   {:.3}", self.confidence)?;
         writeln!(f, "  total:        {:.2} / 100.0", self.total)?;
         write!(f, "}}")
     }
@@ -196,13 +214,13 @@ mod tests {
     use super::super::route_observation::RouteObservation;
 
     #[test]
-    fn empty_observation_scores_neutral() {
+    fn empty_observation_scores_zero_confidence() {
+        // N2.5-R: Unmeasured routes get confidence 0.0 → total 0.0.
         let obs = RouteObservation::new(vec![[1u8; 32], [2u8; 32]]);
         let weights = RouteScoringWeights::default();
         let score = RouteScore::from_observation(&obs, &weights, 1.0);
-        // With no data: reliability=1.0, latency=0.5, throughput=0.5, diversity=1.0
-        // total = (0.40*1.0 + 0.25*0.5 + 0.20*0.5 + 0.15*1.0) * 100 = 77.5
-        assert!((score.total - 77.5).abs() < 0.5, "got {}", score.total);
+        assert_eq!(score.confidence, 0.0, "unmeasured route must have confidence 0.0");
+        assert_eq!(score.total, 0.0, "unmeasured route must have total 0.0");
     }
 
     #[test]

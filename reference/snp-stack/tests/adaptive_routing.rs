@@ -166,13 +166,13 @@ fn test_relay_failure_triggers_migration() {
     let route1 = make_route(&[[1u8; 32], [2u8; 32], [3u8; 32], [10u8; 32]]); // A-B-C-G
     let route2 = make_route(&[[1u8; 32], [4u8; 32], [5u8; 32], [10u8; 32]]); // A-D-E-G
 
-    // Both routes start healthy. Route1 has slightly better latency.
+    // Both routes start healthy. Both need ≥10 samples for full confidence.
     {
         let mut s = route_store.write().unwrap();
         s.get_or_create(&route1).record_latency(50.0);
-        for _ in 0..5 { s.get_or_create(&route1).record_success(); }
+        for _ in 0..10 { s.get_or_create(&route1).record_success(); }
         s.get_or_create(&route2).record_latency(55.0);
-        for _ in 0..5 { s.get_or_create(&route2).record_success(); }
+        for _ in 0..10 { s.get_or_create(&route2).record_success(); }
     }
 
     let mut optimizer = AdaptiveRouteOptimizer::new(
@@ -186,8 +186,9 @@ fn test_relay_failure_triggers_migration() {
     optimizer.set_current_route(route1.clone());
 
     // Simulate relay B ([2;32]) failure via CircuitResult with HopFailure.
-    // Record multiple failures to make route1 clearly worse than route2.
-    for _ in 0..3 {
+    // Record multiple failures to make route1 clearly worse than route2
+    // (10 successes + 5 failures = 67% reliability vs 100%).
+    for _ in 0..5 {
         let failure = CircuitResult::failed(
             [10u8; 32], // gateway
             CircuitFailureReason::HopFailure {
@@ -477,6 +478,9 @@ fn test_cooldown_blocks_rapid_migration() {
     optimizer.set_current_route(route1.clone());
     let result = optimizer.check(&[route1.clone(), route2.clone()]);
     assert!(matches!(result, OptimizationResult::Migrate { .. }));
+
+    // N2.5-R: Caller must commit the migration — check() does NOT.
+    optimizer.commit_migration(route2.clone());
 
     // Now try to migrate again immediately — should be on cooldown.
     // Make route1 look better than route2 to trigger migration desire.

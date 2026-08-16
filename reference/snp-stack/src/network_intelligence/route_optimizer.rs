@@ -138,9 +138,21 @@ impl AdaptiveRouteOptimizer {
     /// Check whether migration is recommended. Scores all candidate routes
     /// and compares against the current route.
     ///
+    /// **This is a pure decision function — it does NOT mutate optimizer
+    /// state.** If migration is recommended, the caller must:
+    ///
+    /// 1. Establish the new circuit using existing transport primitives.
+    /// 2. Verify the new circuit is healthy.
+    /// 3. Call [`commit_migration`] to update the optimizer's state.
+    ///
+    /// If the caller does NOT commit, the optimizer's `current_route` and
+    /// `last_migration` remain unchanged — the next `check()` will still
+    /// compare against the old route. This prevents the optimizer from
+    /// believing a migration succeeded when it actually failed.
+    ///
     /// # Arguments
     /// * `candidates` — All candidate routes (hop sequences).
-    pub fn check(&mut self, candidates: &[Vec<PeerId>]) -> OptimizationResult {
+    pub fn check(&self, candidates: &[Vec<PeerId>]) -> OptimizationResult {
         if candidates.is_empty() {
             return OptimizationResult::NoRoutes;
         }
@@ -162,7 +174,7 @@ impl AdaptiveRouteOptimizer {
         let current_hops = match &self.current_route {
             Some(h) => h.clone(),
             None => {
-                // No current route — pick the best.
+                // No current route — recommend the best.
                 let best = scores
                     .iter()
                     .max_by(|a, b| {
@@ -172,17 +184,13 @@ impl AdaptiveRouteOptimizer {
                     })
                     .map(|(hops, score)| (hops.clone(), score.total));
                 return match best {
-                    Some((to, to_score)) => {
-                        self.current_route = Some(to.clone());
-                        self.last_migration = Some(Instant::now());
-                        OptimizationResult::Migrate {
-                            from: vec![],
-                            to,
-                            from_score: 0.0,
-                            to_score,
-                            improvement_pct: 100.0,
-                        }
-                    }
+                    Some((to, to_score)) => OptimizationResult::Migrate {
+                        from: vec![],
+                        to,
+                        from_score: 0.0,
+                        to_score,
+                        improvement_pct: 100.0,
+                    },
                     None => OptimizationResult::NoRoutes,
                 };
             }
@@ -209,8 +217,9 @@ impl AdaptiveRouteOptimizer {
                 let improvement_pct =
                     ((best_score.total - current_score_total) / current_score_total) * 100.0;
                 if improvement_pct >= self.config.min_improvement_pct {
-                    self.current_route = Some(best_hops.clone());
-                    self.last_migration = Some(Instant::now());
+                    // N2.5-R FIX: Do NOT mutate state here. Return the
+                    // recommendation. The caller must call commit_migration()
+                    // after the new circuit is successfully established.
                     return OptimizationResult::Migrate {
                         from: current_hops,
                         to: best_hops.clone(),
@@ -226,6 +235,35 @@ impl AdaptiveRouteOptimizer {
             current_score: current_score_total,
             best_alternative_score: best_alt_score,
         }
+    }
+
+    /// **Commit a migration after the new circuit has been successfully
+    /// established.**
+    ///
+    /// This is the ONLY method that updates `current_route` and
+    /// `last_migration`. The caller MUST call this only after:
+    ///
+    /// 1. The new circuit is established (SNP-IK handshake + circuit keys).
+    /// 2. The circuit is verified healthy (at least one successful round-trip).
+    /// 3. The old circuit is drained/closed (optional — depends on migration
+    ///    semantics).
+    ///
+    /// If the caller attempts to establish the recommended route and it
+    /// FAILS, the caller MUST NOT call this method — the optimizer's state
+    /// will remain on the old route, and the failure will be recorded via
+    /// `CircuitResult::apply_to_route_store()`.
+    ///
+    /// # Arguments
+    /// * `new_route` — The hops of the successfully-established new route.
+    pub fn commit_migration(&mut self, new_route: Vec<PeerId>) {
+        self.current_route = Some(new_route);
+        self.last_migration = Some(Instant::now());
+    }
+
+    /// Returns the current route (if any), without modifying state.
+    #[must_use]
+    pub fn current_route(&self) -> Option<&[PeerId]> {
+        self.current_route.as_deref()
     }
 
     /// Classify all candidates into primary/backup/emergency tiers.
@@ -293,18 +331,26 @@ mod tests {
 
     #[test]
     fn no_routes_returns_no_routes() {
-        let (mut opt, _) = make_optimizer();
+        let (opt, _) = make_optimizer();
         assert!(matches!(opt.check(&[]), OptimizationResult::NoRoutes));
     }
 
     #[test]
-    fn first_route_sets_current() {
+    fn check_recommends_but_does_not_commit() {
+        // N2.5-R: check() must NOT mutate current_route or last_migration.
         let (mut opt, store) = make_optimizer();
         let hops = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
         store.write().unwrap().get_or_create(&hops).record_latency(50.0);
 
         let result = opt.check(&[hops.clone()]);
-        assert!(matches!(result, OptimizationResult::Migrate { to, .. } if to == hops));
+        assert!(matches!(result, OptimizationResult::Migrate { ref to, .. } if to == &hops));
+
+        // N2.5-R: After check(), current_route should still be None.
+        assert!(opt.current_route().is_none(), "check() must NOT set current_route");
+
+        // After commit_migration(), current_route is set.
+        opt.commit_migration(hops.clone());
+        assert_eq!(opt.current_route(), Some(hops.as_slice()));
     }
 
     #[test]
@@ -380,6 +426,9 @@ mod tests {
         opt.set_current_route(a.clone());
         let result = opt.check(&[a.clone(), b.clone()]);
         assert!(matches!(result, OptimizationResult::Migrate { .. }));
+
+        // N2.5-R: Caller must commit the migration — check() does NOT.
+        opt.commit_migration(b.clone());
 
         // Now B is current. A is worse — no migration.
         // But what if we try to migrate back to a "better" route?

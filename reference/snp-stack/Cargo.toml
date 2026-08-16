@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 smoltcp.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
 
 [features]
 default = []
