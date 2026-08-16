@@ -244,10 +244,9 @@ async fn migration_success_commits_new_route() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone()), (hops_b.clone(), mesh.route_b.clone())];
 
     // First: cold-start — establish route A (it has better latency).
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match &outcome {
         MigrationOutcome::Success { .. } => {}
@@ -265,10 +264,9 @@ async fn migration_success_commits_new_route() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Now: migrate to route B.
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match &outcome {
         MigrationOutcome::Success { evidence, .. } => {
@@ -304,10 +302,9 @@ async fn migration_failure_preserves_old_route() {
     }
 
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
 
@@ -330,10 +327,9 @@ async fn migration_failure_preserves_old_route() {
         (hops_a.clone(), mesh.route_a.clone()),
         (dead_hops.clone(), dead_route),
     ];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match &outcome {
         MigrationOutcome::Failed { reason } => {
@@ -623,10 +619,9 @@ async fn successful_establishment_starts_cooldown() {
     let routes = vec![(hops_a.clone(), mesh.route_a.clone()), (hops_b.clone(), mesh.route_b.clone())];
 
     // Successful cold-start.
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Cooldown should be active.
@@ -660,10 +655,9 @@ async fn failed_establishment_does_not_start_cooldown() {
 
     let routes = vec![(hops_a.clone(), mesh.route_a.clone()), (hops_b.clone(), mesh.route_b.clone())];
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert!(executor.last_migration().is_some());
 
@@ -689,10 +683,9 @@ async fn failed_establishment_does_not_start_cooldown() {
         (dead_hops.clone(), dead_route),
     ];
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match outcome {
         MigrationOutcome::Failed { .. } => {
@@ -749,10 +742,9 @@ async fn real_circuit_success_increments_circuit_attempts() {
 
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // The executor should have recorded a success in route observations.
@@ -786,10 +778,9 @@ async fn real_circuit_failure_increments_circuit_attempts() {
         for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
     }
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Now try to migrate to a dead route.
@@ -809,10 +800,9 @@ async fn real_circuit_failure_increments_circuit_attempts() {
         (hops_a.clone(), mesh.route_a.clone()),
         (dead_hops.clone(), dead_route),
     ];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
     // The dead route should have a failure recorded.
@@ -902,10 +892,9 @@ async fn established_route_binds_to_actual_circuit() {
 
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match outcome {
         MigrationOutcome::Success { circuit, evidence } => {
@@ -940,10 +929,9 @@ async fn failed_candidate_circuit_is_disposed() {
         for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
     }
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Try to migrate to a dead route.
@@ -963,10 +951,9 @@ async fn failed_candidate_circuit_is_disposed() {
         (hops_a.clone(), mesh.route_a.clone()),
         (dead_hops.clone(), dead_route),
     ];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
 
     match outcome {
         MigrationOutcome::Failed { .. } => {
@@ -999,10 +986,9 @@ async fn active_route_remains_usable_after_failed_migration() {
         for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
     }
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
-        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
     // Try to migrate to a dead route (fails).
@@ -1022,10 +1008,9 @@ async fn active_route_remains_usable_after_failed_migration() {
         (hops_a.clone(), mesh.route_a.clone()),
         (dead_hops.clone(), dead_route),
     ];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
-        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk, None,
-    ).await;
+        &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,     ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
     // Route A is still active.
@@ -1116,7 +1101,7 @@ async fn health_check_succeeds_commits() {
     let outcome = executor.attempt_migration(
         &[hops_a.clone()],
         &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
-        Some(health_endpoint),
+        health_endpoint,
     ).await;
 
     match &outcome {
@@ -1152,10 +1137,9 @@ async fn health_check_fails_rejected() {
         for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
     }
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
         &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
-        None, // no health check for initial establishment
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
@@ -1185,7 +1169,7 @@ async fn health_check_fails_rejected() {
     let outcome = executor.attempt_migration(
         &[hops_a.clone(), dead_hops.clone()],
         &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
-        Some(dead_endpoint),
+        dead_endpoint,
     ).await;
 
     match outcome {
@@ -1222,10 +1206,9 @@ async fn failed_attempt_invalidates_decision() {
         for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
     }
     let routes = vec![(hops_a.clone(), mesh.route_a.clone())];
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone()],
         &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
-        None,
     ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
 
@@ -1251,11 +1234,10 @@ async fn failed_attempt_invalidates_decision() {
     // (the previous successful commit consumed it).
     assert!(!executor.optimizer().has_outstanding_decision());
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
         &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
-        None,
-    ).await;
+            ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
     // After the failed attempt, the decision should be invalidated (consumed).
@@ -1300,11 +1282,10 @@ async fn failed_decision_cannot_commit() {
     ];
 
     // Cold-start: establish route A.
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
         &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
-        None,
-    ).await;
+            ).await;
     assert!(matches!(outcome, MigrationOutcome::Success { .. }));
     assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
 
@@ -1327,11 +1308,10 @@ async fn failed_decision_cannot_commit() {
     ];
 
     // Attempt migration to dead route — fails.
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), dead_hops.clone()],
         &mesh.client_node, &routes2, &mesh.client_x_sk, &mesh.client_x_pk,
-        None,
-    ).await;
+            ).await;
     assert!(matches!(outcome, MigrationOutcome::Failed { .. }));
 
     // Old route A is still active.
@@ -1347,11 +1327,10 @@ async fn failed_decision_cannot_commit() {
         (hops_b.clone(), mesh.route_b.clone()),
     ];
 
-    let outcome = executor.attempt_migration(
+    let outcome = executor.attempt_migration_no_health(
         &[hops_a.clone(), hops_b.clone()],
         &mesh.client_node, &routes3, &mesh.client_x_sk, &mesh.client_x_pk,
-        None,
-    ).await;
+            ).await;
 
     match outcome {
         MigrationOutcome::Success { .. } => {
@@ -1362,5 +1341,99 @@ async fn failed_decision_cannot_commit() {
     }
 
     eprintln!("[n2.5-r.2.1] PASS: failed_decision_cannot_commit");
+    drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.5-R.2.1.1 — Mandatory health verification + real post-handshake failure
+// ════════════════════════════════════════════════════════════════════════════
+
+/// **Handshake succeeds, but health check fails → migration rejected.**
+///
+/// This test uses a HEALTHY route (relay + gateway alive, SNP-IK handshake
+/// succeeds), but the health-check endpoint is a DEAD port (nothing listens).
+/// The circuit establishes, the health check opens a stream to the dead
+/// endpoint, the gateway tries to connect, fails, and the stream errors.
+/// The migration is rejected, the old route is preserved, and the decision
+/// is invalidated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handshake_succeeds_health_fails_rejected() {
+    let mesh = setup_two_route_mesh().await;
+    let route_obs = Arc::new(RwLock::new(RouteObservationStore::new()));
+    let mut executor = make_executor(Arc::clone(&route_obs));
+
+    let hops_a = mesh.route_a.hops();
+    let hops_b = mesh.route_b.hops();
+
+    // Establish route A first (with health check — use echo server).
+    let (echo_addr, _echo) = start_echo_server().await;
+    let echo_port: u16 = echo_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    {
+        let mut s = route_obs.write().unwrap();
+        s.get_or_create(&hops_a).record_latency(20.0);
+        for _ in 0..10 { s.get_or_create(&hops_a).record_success(); }
+        s.get_or_create(&hops_b).record_latency(30.0);
+        for _ in 0..10 { s.get_or_create(&hops_b).record_success(); }
+    }
+
+    let routes = vec![
+        (hops_a.clone(), mesh.route_a.clone()),
+        (hops_b.clone(), mesh.route_b.clone()),
+    ];
+
+    // Cold-start with health check — succeeds.
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        endpoint(echo_port),
+    ).await;
+    assert!(matches!(outcome, MigrationOutcome::Success { .. }), "cold-start should succeed with health check");
+    assert_eq!(executor.current_route(), Some(hops_a.as_slice()));
+
+    // Degrade route A so route B becomes better.
+    {
+        let mut s = route_obs.write().unwrap();
+        for _ in 0..20 { s.get_or_create(&hops_a).record_latency(500.0); }
+        for _ in 0..5 { s.get_or_create(&hops_a).record_failure(); }
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Now attempt migration to route B with a DEAD health endpoint.
+    // Route B's relay and gateway are alive (handshake will succeed),
+    // but the health endpoint (port 1) is dead — the gateway will try
+    // to connect to it and fail, causing the stream to error.
+    let dead_health_endpoint = endpoint(1);
+
+    let outcome = executor.attempt_migration(
+        &[hops_a.clone(), hops_b.clone()],
+        &mesh.client_node, &routes, &mesh.client_x_sk, &mesh.client_x_pk,
+        dead_health_endpoint,
+    ).await;
+
+    match &outcome {
+        MigrationOutcome::Failed { reason } => {
+            // Old route A is preserved.
+            assert_eq!(
+                executor.current_route(),
+                Some(hops_a.as_slice()),
+                "old route A must remain active after health check failure"
+            );
+
+            // The decision should be invalidated.
+            assert!(
+                !executor.optimizer().has_outstanding_decision(),
+                "failed health check must invalidate the outstanding decision"
+            );
+
+            eprintln!("[n2.5-r.2.1.1] handshake succeeded, health check failed as expected: {:?}", reason);
+        }
+        MigrationOutcome::Success { .. } => {
+            panic!("migration should NOT succeed with dead health endpoint — health check must fail");
+        }
+        _ => panic!("expected Failed, got {:?}", outcome),
+    }
+
+    eprintln!("[n2.5-r.2.1.1] PASS: handshake_succeeds_health_fails_rejected");
     drop(mesh.gw); drop(mesh.ra); drop(mesh.rb);
 }

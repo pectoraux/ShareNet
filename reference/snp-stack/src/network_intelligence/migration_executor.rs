@@ -100,18 +100,24 @@ impl MigrationExecutor {
         }
     }
 
-    /// Attempt a route migration.
+    /// **Production migration method.** Health verification is MANDATORY.
     ///
     /// This is the full migration transaction:
     ///
     /// 1. `optimizer.check()` — get a migration decision.
     /// 2. If `Migrate`: establish the candidate circuit via real SNP-IK.
-    /// 3. On establishment success: perform minimal health verification
-    ///    (open a stream + send/recv a test exchange).
+    /// 3. On establishment success: perform mandatory health verification
+    ///    (open a stream + send/recv a test exchange through the candidate
+    ///    circuit to the health endpoint).
     /// 4. On health success: construct `EstablishedRoute` evidence.
     /// 5. `commit_migration_with_evidence()` — validate + commit.
     /// 6. On any failure: invalidate decision, record failure, preserve
     ///    old route, no cooldown.
+    ///
+    /// **N2.5-R.2.1.1:** Health verification is NOT optional. The
+    /// `health_check_endpoint` parameter is required. A separate
+    /// `attempt_migration_no_health()` method exists for test-only
+    /// low-level establishment verification.
     ///
     /// # Arguments
     /// * `candidates` — All candidate routes (hop sequences).
@@ -120,8 +126,60 @@ impl MigrationExecutor {
     /// * `client_x25519_secret` — The client's X25519 secret.
     /// * `client_x25519_public` — The client's X25519 public key.
     /// * `health_check_endpoint` — The endpoint to connect to for health
-    ///   verification (typically an echo server).
+    ///   verification. This endpoint must be reachable through the candidate
+    ///   circuit (typically an echo server).
     pub async fn attempt_migration(
+        &mut self,
+        candidates: &[Vec<PeerId>],
+        node: &Node,
+        routes: &[(Vec<PeerId>, Route)],
+        client_x25519_secret: &X25519Secret,
+        client_x25519_public: &X25519PubKey,
+        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+    ) -> MigrationOutcome {
+        self.attempt_migration_inner(
+            candidates,
+            node,
+            routes,
+            client_x25519_secret,
+            client_x25519_public,
+            Some(health_check_endpoint),
+        )
+        .await
+    }
+
+    /// **TEST ONLY.** Attempt migration without health verification.
+    ///
+    /// This method bypasses the mandatory health check. It is intended
+    /// ONLY for low-level establishment tests that do not have an echo
+    /// server available. Production code MUST use `attempt_migration()`
+    /// with a health endpoint.
+    ///
+    /// **Do NOT use this in production.** The resulting `EstablishedRoute`
+    /// does not prove circuit usability — only handshake completion.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn attempt_migration_no_health(
+        &mut self,
+        candidates: &[Vec<PeerId>],
+        node: &Node,
+        routes: &[(Vec<PeerId>, Route)],
+        client_x25519_secret: &X25519Secret,
+        client_x25519_public: &X25519PubKey,
+    ) -> MigrationOutcome {
+        self.attempt_migration_inner(
+            candidates,
+            node,
+            routes,
+            client_x25519_secret,
+            client_x25519_public,
+            None,
+        )
+        .await
+    }
+
+    /// Internal migration implementation. Shared by `attempt_migration`
+    /// (mandatory health) and `attempt_migration_no_health` (test-only).
+    async fn attempt_migration_inner(
         &mut self,
         candidates: &[Vec<PeerId>],
         node: &Node,
@@ -266,11 +324,16 @@ impl MigrationExecutor {
         circuit: &mut MultiplexedCircuit,
         endpoint: snp_gateway::stream::InternetEndpoint,
     ) -> Result<(), String> {
-        // Open a stream through the candidate circuit.
-        let mut stream = circuit
-            .open_stream(endpoint)
-            .await
-            .map_err(|e| format!("stream open failed: {:?}", e))?;
+        // Open a stream through the candidate circuit (with timeout).
+        // The gateway may take up to 15s to fail a TCP connect to a dead
+        // endpoint, so we wrap it in a 20s timeout.
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            circuit.open_stream(endpoint),
+        )
+        .await
+        .map_err(|_| "health check: stream open timed out (20s)".to_string())?
+        .map_err(|e| format!("stream open failed: {:?}", e))?;
 
         // Send a small test message.
         let test_data = b"health-check-ping";
