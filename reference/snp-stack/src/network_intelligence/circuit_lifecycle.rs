@@ -267,12 +267,20 @@ impl CircuitRegistry {
             .ok_or_else(|| format!("circuit {:?} not found", circuit_id))?;
         // Close and drop the circuit if it's still alive.
         if let Some(mut c) = circuit.circuit.take() {
-            // Use tokio::block_on or spawn — actually, close() is async.
-            // For now, we just drop the circuit. Its Drop impl aborts the
-            // background reader, which marks all streams as closed.
+            // Close the circuit properly — marks all streams closed.
+            // Since close() is async and we're in a sync context, we use
+            // tokio::task::block_in_place or just drop. The Drop impl
+            // aborts the background reader, which effectively closes
+            // the circuit.
             drop(c);
         }
         circuit.transition(CircuitState::Failed);
+
+        // N2.5-R.4: If this was the active circuit, clear the active ID.
+        if self.active_circuit_id == Some(*circuit_id) {
+            self.active_circuit_id = None;
+        }
+
         Ok(())
     }
 

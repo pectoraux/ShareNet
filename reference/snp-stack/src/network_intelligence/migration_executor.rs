@@ -467,6 +467,191 @@ impl MigrationExecutor {
     pub fn optimizer_mut(&mut self) -> &mut AdaptiveRouteOptimizer {
         &mut self.optimizer
     }
+
+    /// **N2.5-R.4** — Detect whether the active circuit has failed.
+    ///
+    /// This method checks the active circuit's health by attempting a
+    /// lightweight stream operation. If the active circuit has failed
+    /// (relay dead, link broken, background reader terminated), this
+    /// returns `true`.
+    ///
+    /// Detection is based on attempting to open a stream to the given
+    /// health endpoint. If the stream open fails or times out, the
+    /// circuit is considered failed.
+    ///
+    /// # Arguments
+    /// * `health_check_endpoint` — The endpoint to probe.
+    /// * `timeout` — How long to wait before declaring failure.
+    ///
+    /// Returns `true` if the active circuit has failed, `false` if it
+    /// is still healthy. Returns `false` if there is no active circuit
+    /// (nothing to detect).
+    pub async fn detect_active_circuit_failure(
+        &mut self,
+        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+        timeout: Duration,
+    ) -> bool {
+        let active_id = match self.circuit_registry.active_circuit_id() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Try to open a stream and send/recv on the active circuit.
+        let circuit = match self.circuit_registry.active_circuit_mut() {
+            Some(c) => c,
+            None => return true,
+        };
+
+        // Attempt a health probe with timeout.
+        // We inline the health check to avoid borrow issues.
+        let probe_result = tokio::time::timeout(
+            timeout,
+            async {
+                // Open a stream through the active circuit.
+                let mut stream = circuit
+                    .open_stream(health_check_endpoint)
+                    .await
+                    .map_err(|e| format!("stream open failed: {:?}", e))?;
+
+                let test_data = b"health-check-ping";
+                stream
+                    .send(test_data)
+                    .await
+                    .map_err(|e| format!("send failed: {:?}", e))?;
+
+                let recv_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    stream.recv(),
+                )
+                .await;
+
+                match recv_result {
+                    Ok(Ok(Some(data))) => {
+                        if data.is_empty() {
+                            return Err("empty response".into());
+                        }
+                        let _ = stream.close().await;
+                        Ok(())
+                    }
+                    Ok(Ok(None)) => Err("stream closed".into()),
+                    Ok(Err(e)) => Err(format!("recv failed: {:?}", e)),
+                    Err(_) => Err("timeout".into()),
+                }
+            },
+        )
+        .await;
+
+        match probe_result {
+            Ok(Ok(())) => false,
+            Ok(Err(_)) | Err(_) => {
+                eprintln!("[n2.5-r.4] active circuit {:?} failure detected", active_id);
+                true
+            }
+        }
+    }
+
+    /// **N2.5-R.4** — Mark the active circuit as failed and trigger
+    /// recovery.
+    ///
+    /// This should be called after `detect_active_circuit_failure()`
+    /// returns `true`. It:
+    ///
+    /// 1. Marks the active circuit as Failed in the registry (closes it).
+    /// 2. Records a failure in route observations.
+    /// 3. Resets the optimizer's current route (so it will recommend
+    ///    a new route on the next `check()`).
+    ///
+    /// After this call, the runtime should call `attempt_migration()`
+    /// with the available candidate routes to establish a new active
+    /// circuit.
+    ///
+    /// # Errors
+    /// Returns `Err` if there is no active circuit to fail.
+    pub fn fail_active_circuit(&mut self) -> Result<(), String> {
+        let active_id = self.circuit_registry.active_circuit_id()
+            .ok_or_else(|| "no active circuit to fail".to_string())?;
+
+        // Mark the circuit as failed (closes and drops the MultiplexedCircuit).
+        self.circuit_registry.mark_failed(&active_id)
+            .map_err(|e| format!("failed to mark circuit {:?} as failed: {}", active_id, e))?;
+
+        // Record failure in route observations for the failed route.
+        if let Some(route_id) = self.circuit_registry.circuit_route_id(&active_id) {
+            // We need the hops to record the failure. Get them from the registry.
+            if let Some(hops) = self.circuit_registry.circuit_hops(&active_id) {
+                self.record_route_failure(hops, "active circuit failure detected");
+            }
+        }
+
+        // Reset the optimizer's current route so it will recommend a new one.
+        // N2.5-R.4: clear_current_route + fail_establishment.
+        self.optimizer.clear_current_route();
+        self.optimizer.fail_establishment();
+
+        eprintln!("[n2.5-r.4] active circuit {:?} marked as failed, optimizer reset", active_id);
+        Ok(())
+    }
+
+    /// **N2.5-R.4** — Automatic recovery from active-circuit failure.
+    ///
+    /// This is the full recovery transaction:
+    ///
+    /// 1. Detect active circuit failure (health probe).
+    /// 2. If failed: mark active circuit as Failed.
+    /// 3. Attempt migration to a new route (establish + health check + commit).
+    ///
+    /// If the active circuit is healthy, returns `NotNeeded`.
+    /// If recovery succeeds, returns `Success`.
+    /// If recovery fails, returns `Failed` (old circuit is already Failed).
+    ///
+    /// # Arguments
+    /// * `candidates` — All candidate routes (hop sequences).
+    /// * `node` — The client node (identity + keys).
+    /// * `routes` — Map from hop sequence to `Route` object.
+    /// * `client_x25519_secret` — The client's X25519 secret.
+    /// * `client_x25519_public` — The client's X25519 public key.
+    /// * `health_check_endpoint` — Endpoint for health verification of
+    ///   both the old circuit (detection) and the new circuit (verification).
+    /// * `detection_timeout` — How long to wait before declaring the
+    ///   active circuit failed.
+    pub async fn recover_from_failure(
+        &mut self,
+        candidates: &[Vec<PeerId>],
+        node: &Node,
+        routes: &[(Vec<PeerId>, Route)],
+        client_x25519_secret: &X25519Secret,
+        client_x25519_public: &X25519PubKey,
+        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+        detection_timeout: Duration,
+    ) -> MigrationOutcome {
+        // 1. Detect active circuit failure.
+        let failed = self.detect_active_circuit_failure(
+            health_check_endpoint.clone(),
+            detection_timeout,
+        ).await;
+
+        if !failed {
+            return MigrationOutcome::NotNeeded;
+        }
+
+        // 2. Mark the active circuit as failed.
+        if let Err(e) = self.fail_active_circuit() {
+            eprintln!("[n2.5-r.4] failed to mark active circuit as failed: {}", e);
+            // Continue anyway — try to establish a new circuit.
+        }
+
+        // 3. Attempt migration to a new route.
+        // The optimizer's current_route has been reset, so check() will
+        // recommend the best available route as a cold-start (exploration).
+        self.attempt_migration(
+            candidates,
+            node,
+            routes,
+            client_x25519_secret,
+            client_x25519_public,
+            health_check_endpoint,
+        ).await
+    }
 }
 
 impl std::fmt::Debug for MigrationExecutor {

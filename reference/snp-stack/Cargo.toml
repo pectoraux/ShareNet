@@ -39,6 +39,10 @@ required-features = ["circuit-upstream", "test-utils"]
 name = "circuit_lifecycle_tests"
 required-features = ["circuit-upstream", "test-utils"]
 
+[[test]]
+name = "recovery_tests"
+required-features = ["circuit-upstream", "test-utils"]
+
 [dev-dependencies]
 tokio.workspace = true
 snp-node = { workspace = true, features = ["test-utils"] }

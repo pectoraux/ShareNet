@@ -723,6 +723,21 @@ impl AdaptiveRouteOptimizer {
     /// - `epoch` is unchanged (a new `check()` can produce a new decision
     ///   in the same epoch, but the old decision_id is rejected).
     ///
+    /// **N2.5-R.4** — Clear the current route (used after active-circuit failure).
+    ///
+    /// This clears `current_route` and `current_route_id` without starting
+    /// cooldown or incrementing epoch. The next `check()` will treat this
+    /// as a cold-start and recommend the best available route as an
+    /// exploration decision.
+    ///
+    /// This is distinct from `fail_establishment()` (which only invalidates
+    /// the outstanding decision) and from `commit_migration()` (which sets
+    /// a new current route + cooldown).
+    pub fn clear_current_route(&mut self) {
+        self.current_route = None;
+        self.current_route_id = None;
+    }
+
     /// A subsequent `check()` will produce a fresh decision with a new
     /// `decision_id`.
     pub fn fail_establishment(&mut self) {
