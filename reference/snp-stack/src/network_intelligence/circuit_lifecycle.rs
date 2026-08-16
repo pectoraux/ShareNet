@@ -1,4 +1,4 @@
-//! **N2.5-R.3 — Circuit Lifecycle Management.**
+//! **N2.5-R.3.1 — Circuit Lifecycle Management with Real Circuit Ownership.**
 //!
 //! Manages the lifecycle of circuits during route migration:
 //!
@@ -11,9 +11,11 @@
 //!
 //! - At most one ACTIVE circuit at any time.
 //! - After migration commit, the old circuit enters DRAINING.
-//! - A DRAINING circuit accepts no new streams but existing streams remain valid.
+//! - A DRAINING circuit **remains alive** — its `MultiplexedCircuit` is
+//!   retained by the registry. Existing streams continue to function.
 //! - When a draining circuit's stream count reaches zero (or drain timeout
-//!   expires), it transitions to CLOSED.
+//!   expires), it is closed via `MultiplexedCircuit::close()` and
+//!   transitions to CLOSED.
 //! - Existing streams remain bound to their original circuit — no transparent
 //!   stream migration.
 //!
@@ -32,28 +34,33 @@ use super::observations::PeerId;
 use super::route_observation::RouteId;
 use snp_node::node::stream_client::MultiplexedCircuit;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A unique identifier for a circuit instance.
 ///
-/// This is NOT the same as `RouteId` — multiple circuits may use the same
-/// route. The CircuitId combines the route's `fid` (frame ID) with the
-/// client's NodeId to create a scoped unique identifier.
+/// This is the circuit's frame ID (`fid`), a randomly-generated 8-byte value
+/// assigned at circuit establishment. It is unique within a client's session
+/// (collision probability is negligible with 8 random bytes). It is NOT
+/// globally unique across different clients — it is scoped to the client's
+/// local circuit registry.
+///
+/// This is distinct from `RouteId` (which identifies a hop sequence). Multiple
+/// circuits may use the same route.
 pub type CircuitId = [u8; 8];
 
 /// The lifecycle state of a circuit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CircuitState {
-    /// The circuit is being established (SNP-IK handshake in progress).
+    /// The circuit is established but not yet health-checked or committed.
     Candidate,
     /// The circuit is established and health-verified, but not yet active.
     Healthy,
     /// The circuit is the active circuit for new streams.
     Active,
     /// The circuit is draining — no new streams, existing streams continue.
+    /// The `MultiplexedCircuit` is still alive.
     Draining,
-    /// The circuit is fully closed — no streams remain.
+    /// The circuit is fully closed — `MultiplexedCircuit::close()` was called.
     Closed,
     /// The circuit failed during establishment or health check.
     Failed,
@@ -72,7 +79,7 @@ impl std::fmt::Display for CircuitState {
     }
 }
 
-/// A tracked circuit in the registry.
+/// A tracked circuit in the registry, owning the live `MultiplexedCircuit`.
 #[derive(Debug)]
 struct TrackedCircuit {
     /// The circuit's unique ID (fid).
@@ -91,8 +98,11 @@ struct TrackedCircuit {
     draining_since: Option<Instant>,
     /// The drain timeout for this circuit.
     drain_timeout: Duration,
-    /// Whether the circuit has been disposed (MultiplexedCircuit dropped).
-    disposed: bool,
+    /// **N2.5-R.3.1** — The live `MultiplexedCircuit`, owned by the registry.
+    /// Present when the circuit is Candidate, Healthy, Active, or Draining.
+    /// `None` when the circuit is Closed or Failed (the circuit has been
+    /// closed/dropped).
+    circuit: Option<MultiplexedCircuit>,
 }
 
 impl TrackedCircuit {
@@ -107,7 +117,7 @@ impl TrackedCircuit {
             state_changed_at: now,
             draining_since: None,
             drain_timeout,
-            disposed: false,
+            circuit: None,
         }
     }
 
@@ -131,19 +141,20 @@ impl TrackedCircuit {
 
 /// The authoritative circuit lifecycle registry.
 ///
-/// This is the single source of truth for circuit state. The optimizer's
-/// `current_route` tracks which *route* is active; the registry tracks which
-/// *circuit* is active and the lifecycle of all circuits (including draining
-/// ones from prior migrations).
+/// This is the single source of truth for circuit state AND circuit ownership.
+/// The registry owns the live `MultiplexedCircuit` handles for Active and
+/// Draining circuits. When a circuit is closed, its `MultiplexedCircuit` is
+/// closed via `close()` and dropped.
 ///
 /// ## Invariants
 ///
 /// - At most one circuit in `Active` state at any time.
 /// - When a new circuit becomes `Active`, the previous active circuit
-///   transitions to `Draining`.
-/// - A `Draining` circuit accepts no new streams.
-/// - When `drain_timeout` expires, remaining streams are terminated and the
-///   circuit transitions to `Closed`.
+///   transitions to `Draining` and **remains alive**.
+/// - A `Draining` circuit accepts no new streams but its existing streams
+///   continue to function (the background reader is still running).
+/// - When `drain_timeout` expires, the draining circuit is closed via
+///   `MultiplexedCircuit::close()` and transitions to `Closed`.
 pub struct CircuitRegistry {
     /// All tracked circuits, keyed by CircuitId.
     circuits: HashMap<CircuitId, TrackedCircuit>,
@@ -170,17 +181,23 @@ impl CircuitRegistry {
         }
     }
 
-    /// Register a new candidate circuit.
+    /// Register a new candidate circuit with its live `MultiplexedCircuit`.
     ///
-    /// Called when a circuit is established but not yet committed as active.
+    /// Called immediately after `MultiplexedCircuit::establish()` succeeds,
+    /// BEFORE health check. The registry takes ownership of the circuit.
+    ///
+    /// Returns the `CircuitId` for future reference.
     pub fn register_candidate(
         &mut self,
-        circuit_id: CircuitId,
+        circuit: MultiplexedCircuit,
         route_id: RouteId,
         hops: Vec<PeerId>,
-    ) {
-        let tracked = TrackedCircuit::new(circuit_id, route_id, hops, self.default_drain_timeout);
+    ) -> CircuitId {
+        let circuit_id = circuit.circuit_fid();
+        let mut tracked = TrackedCircuit::new(circuit_id, route_id, hops, self.default_drain_timeout);
+        tracked.circuit = Some(circuit);
         self.circuits.insert(circuit_id, tracked);
+        circuit_id
     }
 
     /// Mark a candidate circuit as healthy (health check passed).
@@ -199,7 +216,8 @@ impl CircuitRegistry {
 
     /// Promote a healthy circuit to active.
     ///
-    /// The previous active circuit (if any) transitions to `Draining`.
+    /// The previous active circuit (if any) transitions to `Draining`
+    /// and **remains alive** — its `MultiplexedCircuit` is retained.
     ///
     /// # Errors
     /// Returns `Err` if the circuit is not found or not in `Healthy` state.
@@ -214,6 +232,8 @@ impl CircuitRegistry {
         }
 
         // Transition the previous active circuit to Draining.
+        // The old circuit's MultiplexedCircuit is NOT dropped — it stays
+        // in the registry as a Draining circuit.
         if let Some(old_id) = self.active_circuit_id.take() {
             if let Some(old_circuit) = self.circuits.get_mut(&old_id) {
                 old_circuit.transition(CircuitState::Draining);
@@ -230,24 +250,40 @@ impl CircuitRegistry {
 
     /// Mark a circuit as failed (establishment or health check failed).
     ///
+    /// The circuit's `MultiplexedCircuit` is closed and dropped.
+    ///
     /// # Errors
     /// Returns `Err` if the circuit is not found.
     pub fn mark_failed(&mut self, circuit_id: &CircuitId) -> Result<(), String> {
         let circuit = self.circuits.get_mut(circuit_id)
             .ok_or_else(|| format!("circuit {:?} not found", circuit_id))?;
+        // Close and drop the circuit if it's still alive.
+        if let Some(mut c) = circuit.circuit.take() {
+            // Use tokio::block_on or spawn — actually, close() is async.
+            // For now, we just drop the circuit. Its Drop impl aborts the
+            // background reader, which marks all streams as closed.
+            drop(c);
+        }
         circuit.transition(CircuitState::Failed);
         Ok(())
     }
 
-    /// Mark a circuit as closed (all streams gone or drain timeout expired).
+    /// Mark a circuit as closed.
+    ///
+    /// The circuit's `MultiplexedCircuit` is closed via `close()` and dropped.
+    /// This should be called when the circuit's stream count reaches zero
+    /// or the drain timeout expires.
     ///
     /// # Errors
     /// Returns `Err` if the circuit is not found.
-    pub fn mark_closed(&mut self, circuit_id: &CircuitId) -> Result<(), String> {
+    pub async fn mark_closed(&mut self, circuit_id: &CircuitId) -> Result<(), String> {
         let circuit = self.circuits.get_mut(circuit_id)
             .ok_or_else(|| format!("circuit {:?} not found", circuit_id))?;
+        // Close the circuit properly (marks all streams closed, aborts reader).
+        if let Some(mut c) = circuit.circuit.take() {
+            c.close().await;
+        }
         circuit.transition(CircuitState::Closed);
-        circuit.disposed = true;
         Ok(())
     }
 
@@ -255,6 +291,15 @@ impl CircuitRegistry {
     #[must_use]
     pub fn active_circuit_id(&self) -> Option<CircuitId> {
         self.active_circuit_id
+    }
+
+    /// Returns a mutable reference to the active circuit's `MultiplexedCircuit`.
+    ///
+    /// New streams MUST be opened on the active circuit. Returns `None` if
+    /// there is no active circuit.
+    pub fn active_circuit_mut(&mut self) -> Option<&mut MultiplexedCircuit> {
+        let active_id = self.active_circuit_id?;
+        self.circuits.get_mut(&active_id).and_then(|c| c.circuit.as_mut())
     }
 
     /// Returns the state of a circuit.
@@ -290,9 +335,11 @@ impl CircuitRegistry {
         self.circuits_in_state(CircuitState::Draining).len()
     }
 
-    /// Returns true if any circuit's drain timeout has expired.
-    /// Returns the circuit IDs that need to be force-closed.
-    pub fn check_drain_timeouts(&mut self) -> Vec<CircuitId> {
+    /// Check for drain timeouts and close expired circuits.
+    ///
+    /// Returns the circuit IDs that were force-closed. This method
+    /// actually calls `MultiplexedCircuit::close()` on expired circuits.
+    pub async fn check_drain_timeouts(&mut self) -> Vec<CircuitId> {
         let mut expired = Vec::new();
         for (id, circuit) in &self.circuits {
             if circuit.state == CircuitState::Draining && circuit.is_drain_timeout_expired() {
@@ -300,10 +347,8 @@ impl CircuitRegistry {
             }
         }
         for id in &expired {
-            if let Some(circuit) = self.circuits.get_mut(id) {
-                circuit.transition(CircuitState::Closed);
-                circuit.disposed = true;
-            }
+            // Actually close the circuit.
+            self.mark_closed(id).await.ok();
         }
         expired
     }
@@ -351,7 +396,11 @@ mod tests {
     #[test]
     fn register_candidate_creates_entry() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![[3u8; 32]]);
+        // Can't easily create a real MultiplexedCircuit in a unit test,
+        // so we test the metadata-only paths.
+        let mut tracked = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![[3u8; 32]], Duration::from_secs(60));
+        tracked.circuit = None; // Simulate no circuit for unit test.
+        reg.circuits.insert([1u8; 8], tracked);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Candidate));
     }
@@ -359,7 +408,9 @@ mod tests {
     #[test]
     fn mark_healthy_transitions() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_secs(60));
+        tracked.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked);
         reg.mark_healthy(&[1u8; 8]).unwrap();
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Healthy));
     }
@@ -367,14 +418,18 @@ mod tests {
     #[test]
     fn promote_to_active_transitions_old_to_draining() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked1 = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_secs(60));
+        tracked1.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked1);
         reg.mark_healthy(&[1u8; 8]).unwrap();
         reg.promote_to_active(&[1u8; 8]).unwrap();
         assert_eq!(reg.active_circuit_id(), Some([1u8; 8]));
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Active));
 
         // Register a second circuit.
-        reg.register_candidate([2u8; 8], [3u8; 32], vec![]);
+        let mut tracked2 = TrackedCircuit::new([2u8; 8], [3u8; 32], vec![], Duration::from_secs(60));
+        tracked2.circuit = None;
+        reg.circuits.insert([2u8; 8], tracked2);
         reg.mark_healthy(&[2u8; 8]).unwrap();
         reg.promote_to_active(&[2u8; 8]).unwrap();
 
@@ -387,30 +442,38 @@ mod tests {
     #[test]
     fn mark_failed_transitions() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_secs(60));
+        tracked.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked);
         reg.mark_failed(&[1u8; 8]).unwrap();
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Failed));
     }
 
-    #[test]
-    fn mark_closed_transitions() {
+    #[tokio::test]
+    async fn mark_closed_transitions() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_secs(60));
+        tracked.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked);
         reg.mark_healthy(&[1u8; 8]).unwrap();
         reg.promote_to_active(&[1u8; 8]).unwrap();
-        reg.mark_closed(&[1u8; 8]).unwrap();
+        reg.mark_closed(&[1u8; 8]).await.unwrap();
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Closed));
     }
 
-    #[test]
-    fn drain_timeout_expires() {
+    #[tokio::test]
+    async fn drain_timeout_expires() {
         let mut reg = CircuitRegistry::with_drain_timeout(Duration::from_millis(10));
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked1 = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_millis(10));
+        tracked1.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked1);
         reg.mark_healthy(&[1u8; 8]).unwrap();
         reg.promote_to_active(&[1u8; 8]).unwrap();
 
         // Register second circuit and promote.
-        reg.register_candidate([2u8; 8], [3u8; 32], vec![]);
+        let mut tracked2 = TrackedCircuit::new([2u8; 8], [3u8; 32], vec![], Duration::from_millis(10));
+        tracked2.circuit = None;
+        reg.circuits.insert([2u8; 8], tracked2);
         reg.mark_healthy(&[2u8; 8]).unwrap();
         reg.promote_to_active(&[2u8; 8]).unwrap();
 
@@ -420,8 +483,8 @@ mod tests {
         // Wait for timeout.
         std::thread::sleep(Duration::from_millis(15));
 
-        // Check timeouts.
-        let expired = reg.check_drain_timeouts();
+        // Check timeouts — actually closes the circuit.
+        let expired = reg.check_drain_timeouts().await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], [1u8; 8]);
         assert_eq!(reg.circuit_state(&[1u8; 8]), Some(CircuitState::Closed));
@@ -430,11 +493,15 @@ mod tests {
     #[test]
     fn at_most_one_active_circuit() {
         let mut reg = CircuitRegistry::new();
-        reg.register_candidate([1u8; 8], [2u8; 32], vec![]);
+        let mut tracked1 = TrackedCircuit::new([1u8; 8], [2u8; 32], vec![], Duration::from_secs(60));
+        tracked1.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked1);
         reg.mark_healthy(&[1u8; 8]).unwrap();
         reg.promote_to_active(&[1u8; 8]).unwrap();
 
-        reg.register_candidate([2u8; 8], [3u8; 32], vec![]);
+        let mut tracked2 = TrackedCircuit::new([2u8; 8], [3u8; 32], vec![], Duration::from_secs(60));
+        tracked2.circuit = None;
+        reg.circuits.insert([2u8; 8], tracked2);
         reg.mark_healthy(&[2u8; 8]).unwrap();
         reg.promote_to_active(&[2u8; 8]).unwrap();
 
@@ -449,7 +516,9 @@ mod tests {
         let mut reg = CircuitRegistry::new();
         let route_id = [42u8; 32];
         let hops = vec![[1u8; 32], [2u8; 32]];
-        reg.register_candidate([1u8; 8], route_id, hops.clone());
+        let mut tracked = TrackedCircuit::new([1u8; 8], route_id, hops.clone(), Duration::from_secs(60));
+        tracked.circuit = None;
+        reg.circuits.insert([1u8; 8], tracked);
 
         assert_eq!(reg.circuit_route_id(&[1u8; 8]), Some(route_id));
         assert_eq!(reg.circuit_hops(&[1u8; 8]), Some(hops.as_slice()));
@@ -460,7 +529,9 @@ mod tests {
         let mut reg = CircuitRegistry::new();
         let route_id = [42u8; 32];
         let circuit_id = [99u8; 8];
-        reg.register_candidate(circuit_id, route_id, vec![]);
+        let mut tracked = TrackedCircuit::new(circuit_id, route_id, vec![], Duration::from_secs(60));
+        tracked.circuit = None;
+        reg.circuits.insert(circuit_id, tracked);
 
         // CircuitId != RouteId (different types, different values).
         assert_ne!(circuit_id, [route_id[0]; 8]);

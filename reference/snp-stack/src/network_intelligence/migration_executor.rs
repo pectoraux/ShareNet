@@ -89,10 +89,8 @@ pub struct MigrationExecutor {
     /// The route observation store (shared with optimizer).
     route_observations: Arc<std::sync::RwLock<RouteObservationStore>>,
     /// The circuit registry (authoritative circuit lifecycle owner).
+    /// Owns the live MultiplexedCircuit handles for Active and Draining circuits.
     circuit_registry: CircuitRegistry,
-    /// The currently active circuit (if any). This is the circuit that
-    /// new streams should use.
-    active_circuit: Option<MultiplexedCircuit>,
 }
 
 impl MigrationExecutor {
@@ -106,7 +104,6 @@ impl MigrationExecutor {
             optimizer,
             route_observations,
             circuit_registry: CircuitRegistry::new(),
-            active_circuit: None,
         }
     }
 
@@ -121,7 +118,6 @@ impl MigrationExecutor {
             optimizer,
             route_observations,
             circuit_registry: CircuitRegistry::with_drain_timeout(drain_timeout),
-            active_circuit: None,
         }
     }
 
@@ -136,7 +132,7 @@ impl MigrationExecutor {
     /// New streams MUST be opened on the active circuit. Existing streams
     /// on draining circuits remain bound to their original circuit.
     pub fn active_circuit(&mut self) -> Option<&mut MultiplexedCircuit> {
-        self.active_circuit.as_mut()
+        self.circuit_registry.active_circuit_mut()
     }
 
     /// **Production migration method.** Health verification is MANDATORY.
@@ -267,7 +263,6 @@ impl MigrationExecutor {
             Ok(circuit) => circuit,
             Err(e) => {
                 // Establishment failed. Invalidate the decision, record failure.
-                // Do NOT start cooldown. Do NOT change current route.
                 self.optimizer.fail_establishment();
                 let failure_reason = format!("{:?}", e);
                 self.record_route_failure(&target_hops, &failure_reason);
@@ -278,20 +273,16 @@ impl MigrationExecutor {
         };
 
         // 4. N2.5-R.2.1 — Minimal health verification.
-        // Open a stream and send/receive a small test exchange through the
-        // candidate circuit. This proves end-to-end usability, not just
-        // link-level SNP-IK establishment.
-        //
-        // If no health_check_endpoint is provided, skip health verification
-        // (for tests that only want to verify establishment).
+        // Performed on the circuit before it enters the registry.
+        // The health check opens a stream, sends data, and receives a response.
         if let Some(endpoint) = health_check_endpoint {
             match self.health_check(&mut circuit, endpoint).await {
-                Ok(()) => { /* Health check passed — circuit is usable. */ }
+                Ok(()) => { /* Health check passed. */ }
                 Err(e) => {
-                    // Health check failed. Invalidate the decision, record failure.
-                    // The circuit is discarded (dropped). Old route remains active.
                     self.optimizer.fail_establishment();
                     self.record_route_failure(&target_hops, &format!("health check failed: {}", e));
+                    // The circuit is dropped (disposed).
+                    drop(circuit);
                     return MigrationOutcome::Failed {
                         reason: MigrationFailureReason::EstablishmentFailed(format!(
                             "health check failed: {}", e
@@ -301,11 +292,16 @@ impl MigrationExecutor {
             }
         }
 
-        // 5. N2.5-R.3: Register the candidate circuit in the registry.
-        let fid = circuit.circuit_fid();
-        self.circuit_registry.register_candidate(fid, to_route_id, target_hops.clone());
+        // 5. N2.5-R.3.1: Register the circuit in the registry.
+        // The registry takes ownership of the MultiplexedCircuit.
+        // The circuit enters as Candidate (established + health-checked).
+        let fid = self.circuit_registry.register_candidate(
+            circuit,
+            to_route_id,
+            target_hops.clone(),
+        );
 
-        // 6. Construct EstablishedRoute evidence from the establishment result.
+        // 6. Construct EstablishedRoute evidence.
         let gateway_node_id = route.destination();
         let client_node_id = node.identity.node_id;
 
@@ -326,7 +322,7 @@ impl MigrationExecutor {
             };
         }
 
-        // 8. Mark the candidate as healthy in the registry.
+        // 8. Mark the candidate as healthy (established + health-checked).
         self.circuit_registry.mark_healthy(&fid).ok();
 
         // 9. Commit the migration with evidence.
@@ -335,47 +331,26 @@ impl MigrationExecutor {
             .commit_migration_with_evidence(decision, &evidence)
         {
             Ok(()) => {
-                // N2.5-R.3: Promote the new circuit to active.
+                // N2.5-R.3.1: Promote the new circuit to active.
                 // This transitions the old active circuit (if any) to Draining.
+                // The old circuit REMAINS ALIVE in the registry — its
+                // MultiplexedCircuit is retained, existing streams continue.
                 self.circuit_registry.promote_to_active(&fid).ok();
-
-                // N2.5-R.3: The old active circuit enters DRAINING.
-                // It is NOT closed — existing streams remain valid.
-                // The old circuit will be closed when:
-                // - all its streams close, OR
-                // - the drain timeout expires (check_drain_timeouts)
-                //
-                // We do NOT close the old circuit here. We replace the
-                // active_circuit reference. The old MultiplexedCircuit is
-                // dropped, which triggers its Drop impl (aborts background
-                // reader). Existing streams on the old circuit will lose
-                // their background reader.
-                //
-                // NOTE: This is a known limitation. True draining requires
-                // keeping the old circuit's MultiplexedCircuit alive (with
-                // its background reader running) until all streams close.
-                // The circuit registry tracks the lifecycle state correctly;
-                // the MultiplexedCircuit handle is what gets replaced.
-                // A future refinement could keep old circuits in a draining
-                // pool until their streams complete.
 
                 // Record success in route observations.
                 self.record_route_success(&target_hops);
 
-                // Replace the active circuit. The old circuit is dropped
-                // (its background reader is aborted).
-                self.active_circuit = Some(circuit);
-
-                // Return success with the evidence.
+                // Return success. The active circuit is available via
+                // `executor.active_circuit()`. The old circuit is alive
+                // in the registry in Draining state.
                 MigrationOutcome::Success { evidence }
             }
             Err(e) => {
                 // Commit rejected — stale decision, wrong epoch, etc.
-                // N2.5-R.3: Mark the candidate as failed and dispose it.
+                // N2.5-R.3.1: Mark the candidate as failed and dispose it.
+                // This drops the MultiplexedCircuit (disposing the circuit).
                 self.circuit_registry.mark_failed(&fid).ok();
                 self.record_route_failure(&target_hops, &format!("commit rejected: {}", e));
-                // The candidate circuit is dropped (disposed) when `circuit`
-                // goes out of scope.
                 MigrationOutcome::Failed {
                     reason: MigrationFailureReason::CommitRejected(e),
                 }
