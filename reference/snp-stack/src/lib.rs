@@ -102,6 +102,8 @@ pub mod tcp_engine;
 pub mod transport;
 #[cfg(all(feature = "circuit-upstream", target_os = "linux"))]
 pub mod tun_client;
+#[cfg(feature = "circuit-upstream")]
+pub mod n3a_client;
 
 pub use bridge::{
     AsyncUpstream, BridgeError, MockUpstream, TcpFlowBridge, Upstream,
@@ -112,6 +114,8 @@ pub use bridge::ShareNetCircuitUpstreamModeA;
 pub use bridge::ShareNetCircuitUpstreamModeB;
 #[cfg(all(feature = "circuit-upstream", target_os = "linux"))]
 pub use tun_client::{MultiplexedUpstream, TunClient, TunClientConfig, TunClientError};
+#[cfg(feature = "circuit-upstream")]
+pub use n3a_client::{N3AClient, N3AClientConfig, N3AError};
 pub use dns::{
     intercept_dns_query, is_dns_query, parse_dns_query, DnsError, DnsQclass, DnsQuestion,
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,
