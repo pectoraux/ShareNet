@@ -1098,26 +1098,40 @@ async fn handle_running(
                     let mut inner = inner.lock().unwrap();
                     inner.failure_streak = 0;
                     inner.last_successful_recovery = Some(Instant::now());
+                    // N2.5-R.6.2: Shutdown dominance — don't override Stopped.
+                    // (state stays Running if not shutting down, which is the
+                    // default initial state; if shutting down, leave it Stopped.)
+                    if inner.shutdown {
+                        inner.state = RecoveryControllerState::Stopped;
+                    }
                 }
                 MigrationOutcome::NoRoutes => {
                     eprintln!("[n2.5-r.6] no routes — entering Degraded");
                     let mut inner = inner.lock().unwrap();
-                    inner.state = RecoveryControllerState::Degraded {
-                        since: Instant::now(),
-                        last_attempt: Some(Instant::now()),
-                    };
-                    inner.record_event(RecoveryEventKind::RecoveryDegraded);
+                    if inner.shutdown {
+                        inner.state = RecoveryControllerState::Stopped;
+                    } else {
+                        inner.state = RecoveryControllerState::Degraded {
+                            since: Instant::now(),
+                            last_attempt: Some(Instant::now()),
+                        };
+                        inner.record_event(RecoveryEventKind::RecoveryDegraded);
+                    }
                 }
                 _ => {
                     eprintln!("[n2.5-r.6] initial establishment failed — entering Degraded");
                     let mut inner = inner.lock().unwrap();
                     inner.failure_streak += 1;
                     inner.last_failure = Some(Instant::now());
-                    inner.state = RecoveryControllerState::Degraded {
-                        since: Instant::now(),
-                        last_attempt: Some(Instant::now()),
-                    };
-                    inner.record_event(RecoveryEventKind::RecoveryDegraded);
+                    if inner.shutdown {
+                        inner.state = RecoveryControllerState::Stopped;
+                    } else {
+                        inner.state = RecoveryControllerState::Degraded {
+                            since: Instant::now(),
+                            last_attempt: Some(Instant::now()),
+                        };
+                        inner.record_event(RecoveryEventKind::RecoveryDegraded);
+                    }
                 }
             }
         }
@@ -1158,11 +1172,20 @@ async fn handle_recovering(
             let mut inner = inner.lock().unwrap();
             inner.failure_streak = 0;
             inner.last_successful_recovery = Some(Instant::now());
-            inner.state = RecoveryControllerState::Running;
-            inner.record_event(RecoveryEventKind::RecoverySucceeded {
-                attempt_id,
-                attempt_number,
-            });
+            // N2.5-R.6.2: Shutdown dominance — if stop() was called during
+            // recovery, the final state MUST be Stopped, not Running.
+            // The in-progress recovery was allowed to complete (graceful
+            // shutdown), but no new monitoring/recovery cycle begins.
+            if inner.shutdown {
+                eprintln!("[n2.5-r.6.2] shutdown dominance: recovery succeeded but controller is stopping → Stopped");
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                inner.state = RecoveryControllerState::Running;
+                inner.record_event(RecoveryEventKind::RecoverySucceeded {
+                    attempt_id,
+                    attempt_number,
+                });
+            }
         }
 
         MigrationOutcome::NoRoutes => {
@@ -1172,11 +1195,16 @@ async fn handle_recovering(
                 attempt_number, attempt_id
             );
             let mut inner = inner.lock().unwrap();
-            inner.state = RecoveryControllerState::Degraded {
-                since: Instant::now(),
-                last_attempt: Some(Instant::now()),
-            };
-            inner.record_event(RecoveryEventKind::RecoveryDegraded);
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                inner.state = RecoveryControllerState::Degraded {
+                    since: Instant::now(),
+                    last_attempt: Some(Instant::now()),
+                };
+                inner.record_event(RecoveryEventKind::RecoveryDegraded);
+            }
         }
 
         MigrationOutcome::Failed { reason } => {
@@ -1201,8 +1229,13 @@ async fn handle_recovering(
                 failure_streak: streak_after_failure,
             });
 
-            // Check if we should enter Degraded.
-            if config.retry_policy.should_degrade(streak_after_failure) {
+            // N2.5-R.6.2: Shutdown dominance — if stop() was called during
+            // recovery, the final state MUST be Stopped, not Backoff/Degraded.
+            if inner.shutdown {
+                eprintln!("[n2.5-r.6.2] shutdown dominance: recovery failed but controller is stopping → Stopped");
+                inner.state = RecoveryControllerState::Stopped;
+            } else if config.retry_policy.should_degrade(streak_after_failure) {
+                // Check if we should enter Degraded.
                 eprintln!(
                     "[n2.5-r.6] failure streak {} >= max_attempts {} → Degraded",
                     streak_after_failure, config.retry_policy.max_attempts_before_degraded
@@ -1243,11 +1276,16 @@ async fn handle_recovering(
             let mut inner = inner.lock().unwrap();
             inner.failure_streak += 1;
             inner.last_failure = Some(Instant::now());
-            let delay = config.retry_policy.delay_for(inner.failure_streak);
-            inner.state = RecoveryControllerState::Backoff {
-                until: Instant::now() + delay,
-                failure_streak: inner.failure_streak,
-            };
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                let delay = config.retry_policy.delay_for(inner.failure_streak);
+                inner.state = RecoveryControllerState::Backoff {
+                    until: Instant::now() + delay,
+                    failure_streak: inner.failure_streak,
+                };
+            }
         }
 
         MigrationOutcome::Cooldown { remaining } => {
@@ -1258,11 +1296,16 @@ async fn handle_recovering(
             );
             let mut inner = inner.lock().unwrap();
             // Don't increment failure_streak for cooldown — it's not a failure.
-            let delay = remaining.max(config.retry_policy.base_delay);
-            inner.state = RecoveryControllerState::Backoff {
-                until: Instant::now() + delay,
-                failure_streak: inner.failure_streak,
-            };
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                let delay = remaining.max(config.retry_policy.base_delay);
+                inner.state = RecoveryControllerState::Backoff {
+                    until: Instant::now() + delay,
+                    failure_streak: inner.failure_streak,
+                };
+            }
         }
     }
 }
@@ -1385,16 +1428,26 @@ async fn handle_degraded(
             let mut inner = inner.lock().unwrap();
             inner.failure_streak = 0;
             inner.last_successful_recovery = Some(Instant::now());
-            inner.state = RecoveryControllerState::Running;
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                inner.state = RecoveryControllerState::Running;
+            }
         }
         MigrationOutcome::NoRoutes => {
             // Still no routes — stay in Degraded.
             eprintln!("[n2.5-r.6] degraded: still NoRoutes");
             let mut inner = inner.lock().unwrap();
-            inner.state = RecoveryControllerState::Degraded {
-                since: Instant::now(),
-                last_attempt: Some(Instant::now()),
-            };
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                inner.state = RecoveryControllerState::Degraded {
+                    since: Instant::now(),
+                    last_attempt: Some(Instant::now()),
+                };
+            }
         }
         _ => {
             // Attempt failed — stay in Degraded (don't enter Backoff from Degraded).
@@ -1402,10 +1455,15 @@ async fn handle_degraded(
             let mut inner = inner.lock().unwrap();
             inner.failure_streak += 1;
             inner.last_failure = Some(Instant::now());
-            inner.state = RecoveryControllerState::Degraded {
-                since: Instant::now(),
-                last_attempt: Some(Instant::now()),
-            };
+            // N2.5-R.6.2: Shutdown dominance.
+            if inner.shutdown {
+                inner.state = RecoveryControllerState::Stopped;
+            } else {
+                inner.state = RecoveryControllerState::Degraded {
+                    since: Instant::now(),
+                    last_attempt: Some(Instant::now()),
+                };
+            }
         }
     }
 }

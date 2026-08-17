@@ -11,11 +11,27 @@
 //! 5. on failure: invalidate decision, record failure, preserve old route
 //! ```
 //!
-//! ## Atomic migration semantics
+//! ## Failure-aware commit with compensating rollback
 //!
-//! The active route remains unchanged until the new route has passed
-//! establishment AND the commit has succeeded. If establishment fails,
-//! the old route remains active and no cooldown is started.
+//! **N2.5-R.6.2** — The migration commit is NOT a true atomic transaction
+//! across the optimizer and circuit registry (they are separate state
+//! owners with no shared transaction boundary). Instead, the commit uses
+//! **failure-aware commit with compensating rollback**:
+//!
+//! - The active route remains unchanged until the new route has passed
+//!   establishment AND the commit has succeeded.
+//! - If establishment fails, the old route remains active and no cooldown
+//!   is started.
+//! - If the optimizer commit succeeds but registry promotion fails, the
+//!   optimizer state is rolled back via `clear_current_route()` (which
+//!   increments the epoch, invalidating the commit). This is a
+//!   **compensating action**, not a transaction rollback — the previous
+//!   route is NOT restored, but the inconsistent committed state is
+//!   invalidated.
+//!
+//! This is deliberately NOT described as "atomic" because the two
+//! authoritative state owners (optimizer + registry) do not share a
+//! transaction boundary.
 
 #![cfg(feature = "circuit-upstream")]
 
