@@ -21,7 +21,7 @@
 
 use super::observations::PeerId;
 use super::route_observation::{route_id_from_hops, RouteId, RouteObservationStore};
-use super::route_optimizer::{AdaptiveRouteOptimizer, EstablishedRoute, OptimizationResult};
+use super::route_optimizer::{AdaptiveRouteOptimizer, EstablishedRoute, MigrationDecision, OptimizationResult};
 use super::circuit_lifecycle::{CircuitHandle, CircuitId, CircuitRegistry};
 
 use snp_crypto::{X25519PubKey, X25519Secret};
@@ -66,6 +66,135 @@ pub enum MigrationFailureReason {
     StaleDecision,
     /// The commit was rejected by the optimizer.
     CommitRejected(String),
+    /// **N2.5-R.6** — The circuit was established but the health check failed.
+    /// The SNP-IK handshake completed, but opening a stream / sending /
+    /// receiving through the circuit failed. This is distinct from
+    /// `EstablishmentFailed` (which means the handshake itself failed).
+    HealthCheckFailed(String),
+}
+
+/// **N2.5-R.6** — A migration plan produced by `begin_migration()` (Phase 1).
+///
+/// Contains the decision and route information needed to establish a
+/// candidate circuit. The `MigrationDecision` inside is move-only — it
+/// is consumed by `commit_established()` (Phase 3).
+///
+/// This type exists so that the `RecoveryController` can split migration
+/// into three phases that each hold the executor lock only briefly:
+///
+/// ```text
+/// Phase 1 (short lock): begin_migration() → MigrationBegin
+/// Phase 2 (NO lock):    establish_candidate(plan) → EstablishedCandidate
+/// Phase 3 (short lock): commit_established(plan, candidate) → MigrationOutcome
+/// ```
+#[derive(Debug)]
+pub struct MigrationPlan {
+    /// The move-only migration decision from the optimizer.
+    pub decision: MigrationDecision,
+    /// The resolved Route object for establishment.
+    pub route: Route,
+    /// The target hop sequence.
+    pub target_hops: Vec<PeerId>,
+    /// The target route_id (SHA-256 of target_hops).
+    pub to_route_id: RouteId,
+}
+
+/// **N2.5-R.6** — Result of Phase 1 (`begin_migration()`).
+#[derive(Debug)]
+pub enum MigrationBegin {
+    /// A migration is recommended; establish this plan.
+    Migrate(MigrationPlan),
+    /// No migration needed (optimizer returned NoMigration).
+    NotNeeded,
+    /// The optimizer is on cooldown.
+    Cooldown {
+        /// Time remaining.
+        remaining: Duration,
+    },
+    /// No routes are available (all quarantined or none provided).
+    NoRoutes,
+}
+
+/// **N2.5-R.6** — A candidate circuit that has been established AND
+/// health-checked (Phase 2 result). Ready to be committed (Phase 3).
+#[derive(Debug)]
+pub struct EstablishedCandidate {
+    /// The live, health-checked circuit.
+    pub circuit: MultiplexedCircuit,
+    /// The target hop sequence.
+    pub target_hops: Vec<PeerId>,
+    /// The target route_id.
+    pub to_route_id: RouteId,
+    /// The gateway's NodeId (for evidence).
+    pub gateway_node_id: [u8; 32],
+    /// The client's NodeId (for evidence).
+    pub client_node_id: [u8; 32],
+}
+
+/// **N2.5-R.6** — Phase 2: Establish + health-check a candidate circuit.
+///
+/// This is a **free function** — it does NOT touch the `MigrationExecutor`
+/// or `CircuitRegistry`. It can be called WITHOUT holding the executor
+/// lock, which is the key to the R.5.1/R.6 invariant: the executor-wide
+/// mutex is never held over network I/O.
+///
+/// Performs:
+/// 1. `MultiplexedCircuit::establish()` — real SNP-IK handshake (slow).
+/// 2. `probe_circuit_health()` — open stream + send/recv (slow).
+///
+/// # Arguments
+/// * `plan` — The migration plan from `begin_migration()`.
+/// * `node` — The client node.
+/// * `client_x25519_secret` / `client_x25519_public` — Client keys.
+/// * `health_check_endpoint` — Endpoint for health verification.
+///   Pass `None` for test-only establishment without health check.
+///
+/// # Errors
+/// Returns `MigrationFailureReason::EstablishmentFailed` if the SNP-IK
+/// handshake fails, or `MigrationFailureReason::HealthCheckFailed` if
+/// the circuit was established but the health check failed.
+pub async fn establish_candidate(
+    plan: &MigrationPlan,
+    node: &Node,
+    client_x25519_secret: &X25519Secret,
+    client_x25519_public: &X25519PubKey,
+    health_check_endpoint: Option<snp_gateway::stream::InternetEndpoint>,
+) -> Result<EstablishedCandidate, MigrationFailureReason> {
+    // 1. Establish the circuit (real SNP-IK handshake).
+    let mut circuit = match MultiplexedCircuit::establish(
+        node,
+        &plan.route,
+        client_x25519_secret,
+        client_x25519_public,
+    )
+    .await
+    {
+        Ok(circuit) => circuit,
+        Err(e) => {
+            return Err(MigrationFailureReason::EstablishmentFailed(format!("{:?}", e)));
+        }
+    };
+
+    // 2. Health check (if endpoint provided).
+    if let Some(endpoint) = health_check_endpoint {
+        let failed = probe_circuit_health(&mut circuit, endpoint, Duration::from_secs(20)).await;
+        if failed {
+            // Circuit established but health check failed — dispose it.
+            drop(circuit);
+            return Err(MigrationFailureReason::HealthCheckFailed(
+                "health check failed (stream open/send/recv or timeout)".into(),
+            ));
+        }
+    }
+
+    // 3. Construct the established candidate.
+    Ok(EstablishedCandidate {
+        circuit,
+        target_hops: plan.target_hops.clone(),
+        to_route_id: plan.to_route_id,
+        gateway_node_id: plan.route.destination(),
+        client_node_id: node.identity.node_id,
+    })
 }
 
 /// The migration executor.
@@ -232,6 +361,151 @@ impl MigrationExecutor {
             None,
         )
         .await
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // N2.5-R.6 — Phased Migration API
+    // ───────────────────────────────────────────────────────────────────────
+    //
+    // The RecoveryController needs to perform migration WITHOUT holding the
+    // executor-wide mutex over the slow network I/O (establishment + health
+    // check can take seconds). These methods split the migration into three
+    // phases:
+    //
+    //   Phase 1 (short lock): begin_migration() → MigrationBegin
+    //   Phase 2 (NO lock):    establish_candidate(plan) → EstablishedCandidate
+    //   Phase 3 (short lock): commit_established(plan, candidate) → MigrationOutcome
+    //
+    // `attempt_migration()` (above) remains as a convenience wrapper that
+    // calls all three phases with `&mut self` held throughout — suitable
+    // for callers that already own the executor directly.
+
+    /// **N2.5-R.6** — Phase 1: Get a migration decision + resolve the route.
+    ///
+    /// This is the fast, synchronous phase: it calls `optimizer.check()`,
+    /// resolves the `Route` object, and returns a `MigrationPlan` that
+    /// can be established without touching the executor.
+    ///
+    /// **No network I/O occurs here.** The caller should release the
+    /// executor lock immediately after this call.
+    ///
+    /// # Arguments
+    /// * `candidates` — All candidate routes (hop sequences).
+    /// * `routes` — Map from hop sequence to `Route` object.
+    #[must_use]
+    pub fn begin_migration(
+        &mut self,
+        candidates: &[Vec<PeerId>],
+        routes: &[(Vec<PeerId>, Route)],
+    ) -> MigrationBegin {
+        let decision = match self.optimizer.check(candidates) {
+            OptimizationResult::Migrate(d) => d,
+            OptimizationResult::NoMigration { .. } => return MigrationBegin::NotNeeded,
+            OptimizationResult::NoRoutes => return MigrationBegin::NoRoutes,
+            OptimizationResult::Cooldown { remaining } => {
+                return MigrationBegin::Cooldown { remaining };
+            }
+        };
+
+        let target_hops = decision.target_route().to_vec();
+        let to_route_id = route_id_from_hops(&target_hops);
+
+        let route = match routes.iter().find(|(hops, _)| hops.as_slice() == target_hops.as_slice())
+        {
+            Some((_, route)) => route.clone(),
+            None => {
+                self.optimizer.fail_establishment();
+                return MigrationBegin::NotNeeded;
+            }
+        };
+
+        MigrationBegin::Migrate(MigrationPlan {
+            decision,
+            route,
+            target_hops,
+            to_route_id,
+        })
+    }
+
+    /// **N2.5-R.6** — Phase 3: Register + commit + promote an established
+    /// candidate circuit.
+    ///
+    /// This is the fast, synchronous phase: it registers the circuit in
+    /// the `CircuitRegistry`, constructs `EstablishedRoute` evidence,
+    /// commits the migration via `commit_migration_with_evidence()`, and
+    /// promotes the new circuit to Active.
+    ///
+    /// **No network I/O occurs here.** The caller should release the
+    /// executor lock immediately after this call.
+    ///
+    /// If `candidate_result` is `Err`, this method records the failure
+    /// (invalidates the decision, records route failure) and returns
+    /// `MigrationOutcome::Failed` — the caller does NOT need to separately
+    /// call `fail_establishment()`.
+    ///
+    /// # Arguments
+    /// * `plan` — The migration plan from `begin_migration()` (consumed).
+    /// * `candidate_result` — The result of `establish_candidate()` (Phase 2).
+    pub fn commit_established(
+        &mut self,
+        plan: MigrationPlan,
+        candidate_result: Result<EstablishedCandidate, MigrationFailureReason>,
+    ) -> MigrationOutcome {
+        let candidate = match candidate_result {
+            Ok(c) => c,
+            Err(reason) => {
+                self.optimizer.fail_establishment();
+                self.record_route_failure(&plan.target_hops, &format!("{:?}", reason));
+                return MigrationOutcome::Failed { reason };
+            }
+        };
+
+        // Register the circuit in the registry.
+        let fid = self.circuit_registry.register_candidate(
+            candidate.circuit,
+            candidate.to_route_id,
+            candidate.target_hops.clone(),
+        );
+
+        // Construct EstablishedRoute evidence.
+        let evidence = EstablishedRoute::from_establishment(
+            candidate.target_hops.clone(),
+            fid,
+            candidate.gateway_node_id,
+            candidate.client_node_id,
+        );
+
+        // Verify evidence route_id matches the plan.
+        if evidence.route_id() != plan.to_route_id {
+            self.optimizer.fail_establishment();
+            self.circuit_registry.mark_failed(&fid).ok();
+            self.record_route_failure(&candidate.target_hops, "route_id mismatch after establishment");
+            return MigrationOutcome::Failed {
+                reason: MigrationFailureReason::RouteIdMismatch,
+            };
+        }
+
+        // Mark the candidate as healthy.
+        self.circuit_registry.mark_healthy(&fid).ok();
+
+        // Commit the migration with evidence.
+        match self
+            .optimizer
+            .commit_migration_with_evidence(plan.decision, &evidence)
+        {
+            Ok(()) => {
+                self.circuit_registry.promote_to_active(&fid).ok();
+                self.record_route_success(&candidate.target_hops);
+                MigrationOutcome::Success { evidence }
+            }
+            Err(e) => {
+                self.circuit_registry.mark_failed(&fid).ok();
+                self.record_route_failure(&candidate.target_hops, &format!("commit rejected: {}", e));
+                MigrationOutcome::Failed {
+                    reason: MigrationFailureReason::CommitRejected(e),
+                }
+            }
+        }
     }
 
     /// Internal migration implementation. Shared by `attempt_migration`
@@ -936,18 +1210,41 @@ impl From<ProbeContext> for RecoveryRequest {
 ///
 /// Replaces the boolean `RecoverySignal`: instead of a bare `needs_recovery`
 /// flag, the monitor deposits a provenance-bound `RecoveryRequest`. The
-/// runtime reads it with `take()` and verifies it against the active circuit
+/// runtime reads it with `take()` (or `take_async()` for the
+/// `RecoveryController`) and verifies it against the active circuit
 /// before recovering.
 ///
 /// This is NOT a callback — it is a simple shared cell that avoids complex
 /// async callback lifetimes. The runtime polls `take()` (or `peek()`) and
 /// calls `MigrationExecutor::handle_recovery_request()` when a request is
 /// present.
-#[derive(Debug, Default)]
+///
+/// **N2.5-R.6** — `take_async()` uses `tokio::sync::Notify` so the
+/// `RecoveryController` can wait without busy-polling (requirement: no
+/// 100% CPU polling).
 pub struct RecoveryChannel {
     /// The pending recovery request, or `None` if no failure has been
     /// detected since the last `take()`.
     pending: Mutex<Option<RecoveryRequest>>,
+    /// Notified when a request is deposited (for `take_async()`).
+    notify: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for RecoveryChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryChannel")
+            .field("has_pending", &self.peek())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RecoveryChannel {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 impl RecoveryChannel {
@@ -963,6 +1260,23 @@ impl RecoveryChannel {
     /// the last call, or `None` otherwise.
     pub fn take(&self) -> Option<RecoveryRequest> {
         self.pending.lock().unwrap().take()
+    }
+
+    /// **N2.5-R.6** — Asynchronously wait for and consume a recovery request.
+    ///
+    /// If a request is pending, returns it immediately. Otherwise, waits
+    /// until the monitor deposits one (via `emit()`). Uses
+    /// `tokio::sync::Notify` internally — no busy-polling.
+    ///
+    /// This is the method the `RecoveryController` uses in its RUNNING
+    /// state to wait for failure detection without consuming CPU.
+    pub async fn take_async(&self) -> RecoveryRequest {
+        loop {
+            if let Some(req) = self.take() {
+                return req;
+            }
+            self.notify.notified().await;
+        }
     }
 
     /// Returns `true` if a recovery request is pending, WITHOUT clearing it.
@@ -983,6 +1297,7 @@ impl RecoveryChannel {
     /// failure takes precedence.
     fn emit(&self, request: RecoveryRequest) {
         *self.pending.lock().unwrap() = Some(request);
+        self.notify.notify_one();
     }
 
     /// **Test-only.** Deposit a recovery request directly, bypassing the

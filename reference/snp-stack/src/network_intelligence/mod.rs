@@ -61,6 +61,8 @@ pub mod observations;
 pub mod circuit_lifecycle;
 #[cfg(feature = "circuit-upstream")]
 pub mod migration_executor;
+#[cfg(feature = "circuit-upstream")]
+pub mod recovery_controller;
 pub mod route_observation;
 pub mod route_optimizer;
 pub mod route_scoring;
@@ -76,8 +78,14 @@ pub use observations::{MovingAverage, ObservationStore, PeerId, PeerObservation}
 pub use circuit_lifecycle::{CircuitHandle, CircuitId, CircuitRegistry, CircuitState};
 #[cfg(feature = "circuit-upstream")]
 pub use migration_executor::{
-    FailureMonitor, FailureMonitorConfig, MigrationExecutor, MigrationFailureReason,
-    MigrationOutcome, ProbeContext, RecoveryChannel, RecoveryRequest,
+    establish_candidate, EstablishedCandidate, FailureMonitor, FailureMonitorConfig,
+    MigrationBegin, MigrationExecutor, MigrationFailureReason, MigrationOutcome, MigrationPlan,
+    ProbeContext, RecoveryChannel, RecoveryRequest,
+};
+#[cfg(feature = "circuit-upstream")]
+pub use recovery_controller::{
+    FailureClassification, RecoveryAttemptId, RecoveryController, RecoveryControllerConfig,
+    RecoveryControllerState, RecoveryEvent, RecoveryEventKind, RetryPolicy,
 };
 pub use route_observation::{
     route_id_from_hops, RouteId, RouteObservation, RouteObservationStore,
