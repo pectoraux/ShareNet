@@ -200,16 +200,20 @@ pub struct EstablishedRoute {
 }
 
 impl EstablishedRoute {
-    /// Construct evidence from a successful circuit establishment.
+    /// **N2.5-R.6.1** — Construct evidence from a successful circuit establishment.
     ///
-    /// This is the ONLY production constructor. It must be called with
-    /// the actual establishment result fields — the `fid` from the
-    /// `MultiplexedCircuit`, the route's hops, and the NodeIds.
+    /// This is `pub(crate)` — it is NOT part of the public API. External
+    /// callers cannot construct `EstablishedRoute` from arbitrary fields.
+    ///
+    /// The only production path to create `EstablishedRoute` is via
+    /// `EstablishedCandidate::into_evidence()`, which consumes a real
+    /// `MultiplexedCircuit` and extracts `circuit_fid()` from it. This
+    /// makes fabrication structurally impossible.
     ///
     /// The `route_id` is computed internally from `hops` to ensure
     /// consistency — the caller cannot supply a mismatched route_id.
     #[must_use]
-    pub fn from_establishment(
+    pub(crate) fn from_establishment(
         hops: Vec<PeerId>,
         circuit_id: [u8; 8],
         gateway_node_id: PeerId,
@@ -265,6 +269,30 @@ impl EstablishedRoute {
             gateway_node_id: [0u8; 32],
             client_node_id: [0u8; 32],
         }
+    }
+
+    /// **TEST ONLY.** Construct evidence from raw fields, mirroring the
+    /// production `from_establishment()` constructor.
+    ///
+    /// This is gated behind `#[cfg(any(test, feature = "test-utils"))]` —
+    /// it does NOT exist in production builds. The production path is
+    /// `EstablishedCandidate::into_evidence()`, which consumes a real
+    /// `MultiplexedCircuit` and extracts `circuit_fid()` from it.
+    ///
+    /// Tests use this to construct evidence with specific values (e.g.
+    /// to test that `commit_migration_with_evidence()` rejects evidence
+    /// whose hops don't match the decision's target route).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_from_establishment(
+        hops: Vec<PeerId>,
+        circuit_id: [u8; 8],
+        gateway_node_id: PeerId,
+        client_node_id: PeerId,
+    ) -> Self {
+        // Delegate to the pub(crate) constructor — this is safe because
+        // test_utils is gated and does not exist in production.
+        Self::from_establishment(hops, circuit_id, gateway_node_id, client_node_id)
     }
 }
 
@@ -586,22 +614,76 @@ impl AdaptiveRouteOptimizer {
         }
     }
 
-    /// **Commit a migration after the new circuit has been successfully
-    /// established.**
+    /// **N2.5-R.6.1** — Commit a migration WITHOUT establishment evidence.
     ///
-    /// This is the ONLY method that updates `current_route` and
-    /// `last_migration`. It validates the [`MigrationDecision`] token
-    /// against the optimizer's internal state:
+    /// **TEST ONLY.** This method is gated behind `#[cfg(any(test, feature = "test-utils"))]`.
+    /// In production builds, it does not exist — the only production commit
+    /// path is `commit_migration_with_evidence()`, which requires an
+    /// `EstablishedRoute` proving real circuit establishment.
     ///
-    /// 1. **Decision ID**: must match the currently outstanding decision.
-    /// 2. **Epoch**: must match the optimizer's current epoch.
-    /// 3. **From route**: must match the optimizer's current route.
-    /// 4. **Consumed**: the decision must not have been already consumed.
-    /// 5. **Route ID**: the target RouteId must match the target hops.
+    /// This method validates the decision token against the optimizer's
+    /// internal state but does NOT verify that a circuit was actually
+    /// established. It exists for low-level optimizer unit tests that
+    /// don't have a real circuit.
     ///
     /// # Errors
     /// Returns `Err` with a description if any validation fails.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_migration(&mut self, decision: MigrationDecision) -> Result<(), String> {
+        // N2.5-R.6.1: Delegate to the private internal commit. This method
+        // exists ONLY for test-only access — in production builds it is
+        // not compiled.
+        self.commit_migration_internal(decision)
+    }
+
+    /// **Commit a migration with establishment evidence.**
+    ///
+    /// This is the ONLY production commit path. It requires an
+    /// [`EstablishedRoute`] evidence object proving that a circuit was
+    /// actually established on the target route.
+    ///
+    /// **N2.5-R.6.1** — This method no longer delegates to the test-only
+    /// `commit_migration()`. It calls the private `commit_migration_internal()`
+    /// directly, so there is no production path that bypasses evidence.
+    ///
+    /// # Errors
+    /// Returns `Err` if evidence validation or decision-state validation fails.
+    pub fn commit_migration_with_evidence(
+        &mut self,
+        decision: MigrationDecision,
+        evidence: &EstablishedRoute,
+    ) -> Result<(), String> {
+        // 1. Verify evidence route_id matches decision's to_route_id.
+        if evidence.route_id() != decision.to_route_id {
+            return Err(format!(
+                "evidence route_id mismatch: evidence={:?} but decision={:?}",
+                evidence.route_id(),
+                decision.to_route_id
+            ));
+        }
+
+        // 2. Verify evidence hops match decision's target route.
+        if evidence.hops() != decision.to.as_slice() {
+            return Err(
+                "evidence hops mismatch: established route does not match decision target".into(),
+            );
+        }
+
+        // 3. Delegate to the internal commit for decision-state validation.
+        // N2.5-R.6.1: This does NOT go through the test-only commit_migration().
+        self.commit_migration_internal(decision)
+    }
+
+    /// **N2.5-R.6.1** — Internal commit logic (private).
+    ///
+    /// Validates the decision token and performs the state transition
+    /// (updates `current_route`, `last_migration`, `epoch`, marks decision
+    /// consumed). This is called by both `commit_migration_with_evidence()`
+    /// (production) and `commit_migration()` (test-only).
+    ///
+    /// Making this private ensures there is no public path to commit a
+    /// migration without going through one of the two public methods.
+    fn commit_migration_internal(&mut self, decision: MigrationDecision) -> Result<(), String> {
         // 1. Verify target route_id matches the hops (tamper detection).
         let actual_to_id = route_id_from_hops(&decision.to);
         if actual_to_id != decision.to_route_id {
@@ -660,57 +742,6 @@ impl AdaptiveRouteOptimizer {
         }
 
         Ok(())
-    }
-
-    /// **Commit a migration with establishment evidence.**
-    ///
-    /// This is the production commit method. It requires an
-    /// [`EstablishedRoute`] evidence object in addition to the
-    /// [`MigrationDecision`], proving that a circuit was actually
-    /// established on the target route.
-    ///
-    /// ## Validation (in addition to `commit_migration` checks)
-    ///
-    /// 1. `evidence.route_id()` must equal `decision.to_route_id`.
-    ///    This proves the established circuit is for the same route
-    ///    the optimizer recommended.
-    /// 2. `evidence.hops()` must match `decision.target_route()`.
-    ///    This prevents the caller from establishing a different route
-    ///    and claiming it matches the decision.
-    ///
-    /// ## When to use this vs `commit_migration`
-    ///
-    /// - `commit_migration_with_evidence`: production — requires real
-    ///   establishment proof.
-    /// - `commit_migration`: test-only / legacy — no evidence required.
-    ///   Will be deprecated in a future milestone.
-    ///
-    /// # Errors
-    /// Returns `Err` if any validation fails (decision state, evidence
-    /// binding, route_id mismatch, or hops mismatch).
-    pub fn commit_migration_with_evidence(
-        &mut self,
-        decision: MigrationDecision,
-        evidence: &EstablishedRoute,
-    ) -> Result<(), String> {
-        // 1. Verify evidence route_id matches decision's to_route_id.
-        if evidence.route_id() != decision.to_route_id {
-            return Err(format!(
-                "evidence route_id mismatch: evidence={:?} but decision={:?}",
-                evidence.route_id(),
-                decision.to_route_id
-            ));
-        }
-
-        // 2. Verify evidence hops match decision's target route.
-        if evidence.hops() != decision.to.as_slice() {
-            return Err(
-                "evidence hops mismatch: established route does not match decision target".into(),
-            );
-        }
-
-        // 3. Delegate to the standard commit for decision-state validation.
-        self.commit_migration(decision)
     }
 
     /// Returns the current route (if any), without modifying state.

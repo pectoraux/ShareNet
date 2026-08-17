@@ -266,14 +266,24 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// Compute the backoff delay for a given failure streak.
     ///
-    /// - `failure_streak = 0` → `base_delay` (first failure).
-    /// - `failure_streak = 1` → `base_delay * 2`.
+    /// **N2.5-R.6.1** — Canonical contract:
+    ///
+    /// - `failure_streak = 0` → `base_delay` (no multiplication).
     /// - `failure_streak = N` → `min(base_delay * 2^N, max_delay)`.
     ///
-    /// If `jitter` is enabled, the result is in `[delay/2, delay]`.
+    /// The controller calls `delay_for(inner.failure_streak)` AFTER
+    /// incrementing the streak, so:
+    /// - First failure: streak becomes 1 → `base_delay * 2`.
+    /// - Second failure: streak becomes 2 → `base_delay * 4`.
+    ///
+    /// If `jitter` is enabled, the result is in `[bounded/2, bounded]`,
+    /// using `getrandom` for real entropy (not `Instant::now().elapsed()`
+    /// which was near-zero and effectively deterministic).
+    ///
+    /// For deterministic test behavior, set `jitter: false`.
     #[must_use]
     pub fn delay_for(&self, failure_streak: u32) -> Duration {
-        // Exponential: base * 2^streak
+        // Exponential: base * 2^streak (streak=0 → base, no multiplication)
         let exp_delay = if failure_streak == 0 {
             self.base_delay
         } else {
@@ -289,20 +299,40 @@ impl RetryPolicy {
             return bounded;
         }
 
+        // N2.5-R.6.1: Use getrandom for real entropy.
+        // This prevents synchronized retry storms across independent
+        // controllers that might fail at the same time.
+        let mut rand_bytes = [0u8; 8];
+        // getrandom should never fail on a properly seeded system, but
+        // if it does, fall back to the non-jittered delay.
+        if getrandom::getrandom(&mut rand_bytes).is_err() {
+            return bounded;
+        }
+        let rand_u64 = u64::from_le_bytes(rand_bytes);
+
         // Bounded jitter: [bounded/2, bounded]
-        // Use a simple PRNG seeded from the current time + streak.
-        // This avoids an external rand dependency while providing
-        // reasonable entropy for jitter purposes.
-        let seed = Instant::now()
-            .elapsed()
-            .as_nanos()
-            .wrapping_add(failure_streak as u128 * 0x9E3779B97F4A7C15)
-            .wrapping_mul(0xBF58476D1CE4E5B9);
-        let mixed = (seed ^ (seed >> 27)) as u64;
         let half = bounded / 2;
         let half_nanos = half.as_nanos().max(1) as u64;
-        let jitter_nanos = mixed % half_nanos;
+        let jitter_nanos = rand_u64 % half_nanos;
         half + Duration::from_nanos(jitter_nanos)
+    }
+
+    /// **N2.5-R.6.1** — Compute the backoff delay deterministically (no jitter).
+    ///
+    /// This is the canonical non-jittered delay: `min(base * 2^streak, max)`.
+    /// Used by tests that need deterministic timing, and available as a
+    /// fallback when jitter is disabled.
+    #[must_use]
+    pub fn delay_for_deterministic(&self, failure_streak: u32) -> Duration {
+        let exp_delay = if failure_streak == 0 {
+            self.base_delay
+        } else {
+            let exp = 2u32.saturating_pow(failure_streak);
+            self.base_delay
+                .checked_mul(exp)
+                .unwrap_or(self.max_delay)
+        };
+        exp_delay.min(self.max_delay)
     }
 
     /// Returns `true` if the given failure streak warrants entering DEGRADED.
@@ -465,6 +495,15 @@ struct ControllerInner {
     events: Vec<RecoveryEvent>,
     /// Whether the controller should stop (no new recovery attempts).
     shutdown: bool,
+    /// **N2.5-R.6.1** — Notify used to wake up the controller task when
+    /// `shutdown` is set. The task races `take_async()` against
+    /// `shutdown_notify.notified()` in its RUNNING state so that `stop()`
+    /// can break it out of the wait without aborting the task.
+    ///
+    /// This is `Arc<Notify>` (not bare `Notify`) so that the controller
+    /// task can hold its own clone and call `.notified().await` on it
+    /// without locking `inner`.
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ControllerInner {
@@ -478,6 +517,7 @@ impl ControllerInner {
             next_attempt_id: 1,
             events: Vec::new(),
             shutdown: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -673,6 +713,12 @@ impl RecoveryController {
         let executor = Arc::clone(&self.executor);
         let inner = Arc::clone(&self.inner);
         let config = self.config.clone();
+        // N2.5-R.6.1: Clone the shutdown_notify so the task can race
+        // `take_async()` against `notified()` in `handle_running()` and
+        // `tokio::time::sleep` against `notified()` in `handle_backoff()` /
+        // `handle_degraded()`. This lets `stop()` wake the task without
+        // aborting it.
+        let shutdown_notify = Arc::clone(&inner.lock().unwrap().shutdown_notify);
 
         // Move the monitor out of self — the task owns it.
         let monitor = {
@@ -690,6 +736,7 @@ impl RecoveryController {
                 executor,
                 monitor,
                 inner,
+                shutdown_notify,
                 config,
                 candidates,
                 node,
@@ -703,27 +750,63 @@ impl RecoveryController {
 
     /// **N2.5-R.6** — Stop the controller.
     ///
-    /// Sets the shutdown flag and aborts the monitor. The controller task
-    /// will exit after its current iteration. An in-progress recovery
-    /// attempt is allowed to finish (not cancelled) — `stop()` prevents
-    /// NEW recovery attempts but does not abort one already in flight.
+    /// **N2.5-R.6.1** — Graceful shutdown: `stop()` sets a shutdown flag
+    /// and notifies the controller task via `shutdown_notify`. The task
+    /// will exit at the next state transition (or immediately if it is
+    /// blocked in `take_async()`).
+    ///
+    /// In-progress recovery (establishment I/O) is **allowed to complete** —
+    /// `stop()` does NOT abort the task. After the in-progress recovery
+    /// finishes, the task checks the shutdown flag and exits without
+    /// starting a new cycle.
+    ///
+    /// To wait for the task to finish, call `join()` after `stop()`.
     ///
     /// After `stop()`, the controller enters `Stopped` state.
     pub fn stop(&mut self) {
-        {
+        let shutdown_notify = {
             let mut inner = self.inner.lock().unwrap();
             inner.shutdown = true;
             inner.state = RecoveryControllerState::Stopped;
             inner.record_event(RecoveryEventKind::RecoveryStopped);
-        }
+            Arc::clone(&inner.shutdown_notify)
+        };
         // Stop the monitor (if any is held in self.monitor — the task's
-        // monitor is dropped when the task is aborted below).
+        // monitor is owned by the task and will be dropped when the task
+        // exits gracefully).
         if let Ok(mut monitor) = self.monitor.try_lock() {
             monitor.stop();
         }
-        // Abort the controller task.
+        // N2.5-R.6.1: Wake up the controller task if it is blocked in
+        // `take_async()` (RUNNING state) so it can observe the shutdown
+        // flag and exit. We use `notify_one()` on the shutdown_notify
+        // AND `wake()` on the recovery channel — both are necessary
+        // because the task might be waiting on either, depending on the
+        // state.
+        shutdown_notify.notify_one();
+        // Wake up `take_async()` in case the task is blocked there.
+        // The channel is shared between the monitor and the task — calling
+        // `wake()` does NOT deposit a request, it just notifies the wait.
+        self.channel.wake();
+    }
+
+    /// **N2.5-R.6.1** — Wait for the controller task to finish (graceful
+    /// shutdown).
+    ///
+    /// After calling `stop()`, call `join()` to block until the controller
+    /// task has exited. This is useful for tests that need to assert the
+    /// task has fully terminated.
+    ///
+    /// If the task is in the middle of recovery (establishment I/O),
+    /// `join()` will block until that recovery completes (success or
+    /// failure) and the task exits.
+    ///
+    /// This is a no-op if the task has already exited or was never started.
+    pub async fn join(&mut self) {
         if let Some(handle) = self.task_handle.take() {
-            handle.abort();
+            // Wait for the task to finish. Ignore join errors (panics are
+            // already logged by tokio).
+            let _ = handle.await;
         }
     }
 }
@@ -756,6 +839,7 @@ async fn controller_task(
     executor: Arc<tokio::sync::Mutex<MigrationExecutor>>,
     mut monitor: FailureMonitor,
     inner: Arc<Mutex<ControllerInner>>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
     config: RecoveryControllerConfig,
     candidates: Vec<Vec<PeerId>>,
     node: Node,
@@ -779,6 +863,7 @@ async fn controller_task(
                     &executor,
                     &mut monitor,
                     &inner,
+                    &shutdown_notify,
                     &config,
                     &candidates,
                     &node,
@@ -830,13 +915,14 @@ async fn controller_task(
             }
 
             RecoveryControllerState::Backoff { until, failure_streak } => {
-                handle_backoff(&inner, until, failure_streak, &config).await;
+                handle_backoff(&inner, &shutdown_notify, until, failure_streak, &config).await;
             }
 
             RecoveryControllerState::Degraded { since, last_attempt } => {
                 handle_degraded(
                     &executor,
                     &inner,
+                    &shutdown_notify,
                     &config,
                     &candidates,
                     &node,
@@ -870,6 +956,7 @@ async fn handle_running(
     executor: &Arc<tokio::sync::Mutex<MigrationExecutor>>,
     monitor: &mut FailureMonitor,
     inner: &Arc<Mutex<ControllerInner>>,
+    shutdown_notify: &Arc<tokio::sync::Notify>,
     config: &RecoveryControllerConfig,
     candidates: &[Vec<PeerId>],
     node: &Node,
@@ -898,13 +985,29 @@ async fn handle_running(
                 );
             }
 
-            // Wait for a recovery request (non-busy, uses Notify).
-            let request = monitor.channel().take_async().await;
+            // N2.5-R.6.1: Wait for a recovery request OR a shutdown signal.
+            // We use `biased` so that if `stop()` is called while a request
+            // is also pending, we prefer to exit (don't start a new recovery).
+            // The `shutdown_notify.notified()` future is stored as a permit
+            // by `stop()`, so even if the task is currently blocked in
+            // `take_async()`, the `select!` will be re-polled and pick the
+            // shutdown branch.
+            let request = tokio::select! {
+                biased;
+                _ = shutdown_notify.notified() => {
+                    // Shutdown signaled — exit gracefully without starting
+                    // a new recovery. The monitor will be stopped by the
+                    // outer task cleanup.
+                    monitor.stop();
+                    return;
+                }
+                req = monitor.channel().take_async() => req,
+            };
 
             // Stop the monitor — it has exited or we need to stop it.
             monitor.stop();
 
-            // Check shutdown.
+            // Check shutdown (in case stop() was called during processing).
             if inner.lock().unwrap().shutdown {
                 return;
             }
@@ -962,6 +1065,10 @@ async fn handle_running(
         None => {
             // No active circuit — try initial establishment, or enter Degraded.
             eprintln!("[n2.5-r.6] no active circuit — attempting initial establishment");
+            // N2.5-R.6.1: Check shutdown before starting initial establishment.
+            if inner.lock().unwrap().shutdown {
+                return;
+            }
             let (attempt_id, attempt_number) = {
                 let mut inner = inner.lock().unwrap();
                 inner.next_attempt()
@@ -1163,6 +1270,7 @@ async fn handle_recovering(
 /// **BACKOFF** — Wait until the backoff expires, then retry.
 async fn handle_backoff(
     inner: &Arc<Mutex<ControllerInner>>,
+    shutdown_notify: &Arc<tokio::sync::Notify>,
     until: Instant,
     failure_streak: u32,
     config: &RecoveryControllerConfig,
@@ -1174,7 +1282,17 @@ async fn handle_backoff(
             "[n2.5-r.6] backoff: waiting {:?} (streak={})",
             remaining, failure_streak
         );
-        tokio::time::sleep(remaining).await;
+        // N2.5-R.6.1: Race the sleep against shutdown_notify so that
+        // `stop()` during backoff wakes us up immediately rather than
+        // waiting for the full backoff to expire.
+        tokio::select! {
+            biased;
+            _ = shutdown_notify.notified() => {
+                // Shutdown signaled — exit gracefully.
+                return;
+            }
+            _ = tokio::time::sleep(remaining) => {}
+        }
     }
 
     // Check shutdown.
@@ -1206,6 +1324,7 @@ async fn handle_backoff(
 async fn handle_degraded(
     executor: &Arc<tokio::sync::Mutex<MigrationExecutor>>,
     inner: &Arc<Mutex<ControllerInner>>,
+    shutdown_notify: &Arc<tokio::sync::Notify>,
     config: &RecoveryControllerConfig,
     candidates: &[Vec<PeerId>],
     node: &Node,
@@ -1219,7 +1338,16 @@ async fn handle_degraded(
         "[n2.5-r.6] degraded: waiting {:?} before retry",
         config.degraded_retry_interval
     );
-    tokio::time::sleep(config.degraded_retry_interval).await;
+    // N2.5-R.6.1: Race the sleep against shutdown_notify so that `stop()`
+    // during DEGRADED wakes us up immediately.
+    tokio::select! {
+        biased;
+        _ = shutdown_notify.notified() => {
+            // Shutdown signaled — exit gracefully.
+            return;
+        }
+        _ = tokio::time::sleep(config.degraded_retry_interval) => {}
+    }
 
     // Check shutdown.
     if inner.lock().unwrap().shutdown {

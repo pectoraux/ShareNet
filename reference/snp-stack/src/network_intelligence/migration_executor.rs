@@ -117,10 +117,17 @@ pub enum MigrationBegin {
 
 /// **N2.5-R.6** — A candidate circuit that has been established AND
 /// health-checked (Phase 2 result). Ready to be committed (Phase 3).
+///
+/// **N2.5-R.6.1** — The `circuit` field is `pub(crate)`. External code
+/// cannot access the raw `MultiplexedCircuit`. The only way to produce
+/// `EstablishedRoute` evidence is via `into_evidence()`, which consumes
+/// the real circuit and extracts `circuit_fid()` from it — making
+/// fabrication structurally impossible.
 #[derive(Debug)]
 pub struct EstablishedCandidate {
-    /// The live, health-checked circuit.
-    pub circuit: MultiplexedCircuit,
+    /// The live, health-checked circuit. `pub(crate)` — not accessible
+    /// externally.
+    pub(crate) circuit: MultiplexedCircuit,
     /// The target hop sequence.
     pub target_hops: Vec<PeerId>,
     /// The target route_id.
@@ -129,6 +136,29 @@ pub struct EstablishedCandidate {
     pub gateway_node_id: [u8; 32],
     /// The client's NodeId (for evidence).
     pub client_node_id: [u8; 32],
+}
+
+impl EstablishedCandidate {
+    /// **N2.5-R.6.1** — Produce `EstablishedRoute` evidence by consuming
+    /// the real `MultiplexedCircuit`.
+    ///
+    /// This is the ONLY production path to create `EstablishedRoute`. It
+    /// extracts `circuit_fid()` from the actual circuit object — callers
+    /// cannot supply an arbitrary `circuit_id`. This makes fabrication
+    /// structurally impossible.
+    ///
+    /// The circuit is moved out and registered in the `CircuitRegistry`
+    /// by `commit_established()` after this method is called.
+    #[must_use]
+    pub(crate) fn into_evidence(self) -> EstablishedRoute {
+        let circuit_id = self.circuit.circuit_fid();
+        EstablishedRoute::from_establishment(
+            self.target_hops,
+            circuit_id,
+            self.gateway_node_id,
+            self.client_node_id,
+        )
+    }
 }
 
 /// **N2.5-R.6** — Phase 2: Establish + health-check a candidate circuit.
@@ -286,53 +316,23 @@ impl MigrationExecutor {
         self.circuit_registry.reap_draining().await
     }
 
-    /// **Production migration method.** Health verification is MANDATORY.
+    /// **N2.5-R.6.1** — The production recovery methods (`attempt_migration`,
+    /// `begin_migration`, `commit_established`, `detect_active_circuit_failure`,
+    /// `prepare_probe`, `verify_recovery_request`, `handle_recovery_request`,
+    /// `fail_active_circuit`, `recover_from_failure`) are defined in a
+    /// cfg-gated macro at the bottom of this file.
     ///
-    /// This is the full migration transaction:
+    /// In production builds (no `test-utils`), they are `pub(crate)` — only
+    /// accessible to `RecoveryController` within this crate. External code
+    /// with a clone of `Arc<Mutex<MigrationExecutor>>` CANNOT call them.
     ///
-    /// 1. `optimizer.check()` — get a migration decision.
-    /// 2. If `Migrate`: establish the candidate circuit via real SNP-IK.
-    /// 3. On establishment success: perform mandatory health verification
-    ///    (open a stream + send/recv a test exchange through the candidate
-    ///    circuit to the health endpoint).
-    /// 4. On health success: construct `EstablishedRoute` evidence.
-    /// 5. `commit_migration_with_evidence()` — validate + commit.
-    /// 6. On any failure: invalidate decision, record failure, preserve
-    ///    old route, no cooldown.
+    /// In tests (with `test-utils`), they are `pub` — accessible from
+    /// integration tests.
     ///
-    /// **N2.5-R.2.1.1:** Health verification is NOT optional. The
-    /// `health_check_endpoint` parameter is required. A separate
-    /// `attempt_migration_no_health()` method exists for test-only
-    /// low-level establishment verification.
-    ///
-    /// # Arguments
-    /// * `candidates` — All candidate routes (hop sequences).
-    /// * `node` — The client node (identity + keys).
-    /// * `routes` — Map from hop sequence to `Route` object (for establishment).
-    /// * `client_x25519_secret` — The client's X25519 secret.
-    /// * `client_x25519_public` — The client's X25519 public key.
-    /// * `health_check_endpoint` — The endpoint to connect to for health
-    ///   verification. This endpoint must be reachable through the candidate
-    ///   circuit (typically an echo server).
-    pub async fn attempt_migration(
-        &mut self,
-        candidates: &[Vec<PeerId>],
-        node: &Node,
-        routes: &[(Vec<PeerId>, Route)],
-        client_x25519_secret: &X25519Secret,
-        client_x25519_public: &X25519PubKey,
-        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
-    ) -> MigrationOutcome {
-        self.attempt_migration_inner(
-            candidates,
-            node,
-            routes,
-            client_x25519_secret,
-            client_x25519_public,
-            Some(health_check_endpoint),
-        )
-        .await
-    }
+    /// Only query methods (`active_circuit`, `current_route`, `epoch`,
+    /// `last_migration`, `circuit_registry`, `optimizer`, `optimizer_mut`,
+    /// `reap_draining`) and the test-only `attempt_migration_no_health`
+    /// remain in this impl block.
 
     /// **TEST ONLY.** Attempt migration without health verification.
     ///
@@ -379,134 +379,6 @@ impl MigrationExecutor {
     // `attempt_migration()` (above) remains as a convenience wrapper that
     // calls all three phases with `&mut self` held throughout — suitable
     // for callers that already own the executor directly.
-
-    /// **N2.5-R.6** — Phase 1: Get a migration decision + resolve the route.
-    ///
-    /// This is the fast, synchronous phase: it calls `optimizer.check()`,
-    /// resolves the `Route` object, and returns a `MigrationPlan` that
-    /// can be established without touching the executor.
-    ///
-    /// **No network I/O occurs here.** The caller should release the
-    /// executor lock immediately after this call.
-    ///
-    /// # Arguments
-    /// * `candidates` — All candidate routes (hop sequences).
-    /// * `routes` — Map from hop sequence to `Route` object.
-    #[must_use]
-    pub fn begin_migration(
-        &mut self,
-        candidates: &[Vec<PeerId>],
-        routes: &[(Vec<PeerId>, Route)],
-    ) -> MigrationBegin {
-        let decision = match self.optimizer.check(candidates) {
-            OptimizationResult::Migrate(d) => d,
-            OptimizationResult::NoMigration { .. } => return MigrationBegin::NotNeeded,
-            OptimizationResult::NoRoutes => return MigrationBegin::NoRoutes,
-            OptimizationResult::Cooldown { remaining } => {
-                return MigrationBegin::Cooldown { remaining };
-            }
-        };
-
-        let target_hops = decision.target_route().to_vec();
-        let to_route_id = route_id_from_hops(&target_hops);
-
-        let route = match routes.iter().find(|(hops, _)| hops.as_slice() == target_hops.as_slice())
-        {
-            Some((_, route)) => route.clone(),
-            None => {
-                self.optimizer.fail_establishment();
-                return MigrationBegin::NotNeeded;
-            }
-        };
-
-        MigrationBegin::Migrate(MigrationPlan {
-            decision,
-            route,
-            target_hops,
-            to_route_id,
-        })
-    }
-
-    /// **N2.5-R.6** — Phase 3: Register + commit + promote an established
-    /// candidate circuit.
-    ///
-    /// This is the fast, synchronous phase: it registers the circuit in
-    /// the `CircuitRegistry`, constructs `EstablishedRoute` evidence,
-    /// commits the migration via `commit_migration_with_evidence()`, and
-    /// promotes the new circuit to Active.
-    ///
-    /// **No network I/O occurs here.** The caller should release the
-    /// executor lock immediately after this call.
-    ///
-    /// If `candidate_result` is `Err`, this method records the failure
-    /// (invalidates the decision, records route failure) and returns
-    /// `MigrationOutcome::Failed` — the caller does NOT need to separately
-    /// call `fail_establishment()`.
-    ///
-    /// # Arguments
-    /// * `plan` — The migration plan from `begin_migration()` (consumed).
-    /// * `candidate_result` — The result of `establish_candidate()` (Phase 2).
-    pub fn commit_established(
-        &mut self,
-        plan: MigrationPlan,
-        candidate_result: Result<EstablishedCandidate, MigrationFailureReason>,
-    ) -> MigrationOutcome {
-        let candidate = match candidate_result {
-            Ok(c) => c,
-            Err(reason) => {
-                self.optimizer.fail_establishment();
-                self.record_route_failure(&plan.target_hops, &format!("{:?}", reason));
-                return MigrationOutcome::Failed { reason };
-            }
-        };
-
-        // Register the circuit in the registry.
-        let fid = self.circuit_registry.register_candidate(
-            candidate.circuit,
-            candidate.to_route_id,
-            candidate.target_hops.clone(),
-        );
-
-        // Construct EstablishedRoute evidence.
-        let evidence = EstablishedRoute::from_establishment(
-            candidate.target_hops.clone(),
-            fid,
-            candidate.gateway_node_id,
-            candidate.client_node_id,
-        );
-
-        // Verify evidence route_id matches the plan.
-        if evidence.route_id() != plan.to_route_id {
-            self.optimizer.fail_establishment();
-            self.circuit_registry.mark_failed(&fid).ok();
-            self.record_route_failure(&candidate.target_hops, "route_id mismatch after establishment");
-            return MigrationOutcome::Failed {
-                reason: MigrationFailureReason::RouteIdMismatch,
-            };
-        }
-
-        // Mark the candidate as healthy.
-        self.circuit_registry.mark_healthy(&fid).ok();
-
-        // Commit the migration with evidence.
-        match self
-            .optimizer
-            .commit_migration_with_evidence(plan.decision, &evidence)
-        {
-            Ok(()) => {
-                self.circuit_registry.promote_to_active(&fid).ok();
-                self.record_route_success(&candidate.target_hops);
-                MigrationOutcome::Success { evidence }
-            }
-            Err(e) => {
-                self.circuit_registry.mark_failed(&fid).ok();
-                self.record_route_failure(&candidate.target_hops, &format!("commit rejected: {}", e));
-                MigrationOutcome::Failed {
-                    reason: MigrationFailureReason::CommitRejected(e),
-                }
-            }
-        }
-    }
 
     /// Internal migration implementation. Shared by `attempt_migration`
     /// (mandatory health) and `attempt_migration_no_health` (test-only).
@@ -611,7 +483,10 @@ impl MigrationExecutor {
         // 7. Verify evidence route_id matches decision.
         if evidence.route_id() != to_route_id {
             self.optimizer.fail_establishment();
-            self.circuit_registry.mark_failed(&fid).ok();
+            // N2.5-R.6.1: Don't discard the error.
+            if let Err(e) = self.circuit_registry.mark_failed(&fid) {
+                eprintln!("[n2.5-r.6.1] failed to mark circuit {:?} as failed during rollback: {}", fid, e);
+            }
             self.record_route_failure(&target_hops, "route_id mismatch after establishment");
             return MigrationOutcome::Failed {
                 reason: MigrationFailureReason::RouteIdMismatch,
@@ -619,7 +494,15 @@ impl MigrationExecutor {
         }
 
         // 8. Mark the candidate as healthy (established + health-checked).
-        self.circuit_registry.mark_healthy(&fid).ok();
+        // N2.5-R.6.1: Don't discard the error.
+        if let Err(e) = self.circuit_registry.mark_healthy(&fid) {
+            self.optimizer.fail_establishment();
+            self.circuit_registry.mark_failed(&fid).ok();
+            self.record_route_failure(&target_hops, &format!("mark_healthy failed: {}", e));
+            return MigrationOutcome::Failed {
+                reason: MigrationFailureReason::CommitRejected(format!("mark_healthy failed: {}", e)),
+            };
+        }
 
         // 9. Commit the migration with evidence.
         match self
@@ -628,10 +511,23 @@ impl MigrationExecutor {
         {
             Ok(()) => {
                 // N2.5-R.3.1: Promote the new circuit to active.
-                // This transitions the old active circuit (if any) to Draining.
-                // The old circuit REMAINS ALIVE in the registry — its
-                // MultiplexedCircuit is retained, existing streams continue.
-                self.circuit_registry.promote_to_active(&fid).ok();
+                // N2.5-R.6.1: Don't discard the promote error — rollback on failure.
+                if let Err(e) = self.circuit_registry.promote_to_active(&fid) {
+                    eprintln!(
+                        "[n2.5-r.6.1] CRITICAL: optimizer committed but promote failed: {}. \
+                         Rolling back optimizer state.",
+                        e
+                    );
+                    self.circuit_registry.mark_failed(&fid).ok();
+                    self.optimizer.clear_current_route();
+                    self.optimizer.fail_establishment();
+                    self.record_route_failure(&target_hops, &format!("promote failed after commit: {}", e));
+                    return MigrationOutcome::Failed {
+                        reason: MigrationFailureReason::CommitRejected(
+                            format!("promote failed after commit: {}", e),
+                        ),
+                    };
+                }
 
                 // Record success in route observations.
                 self.record_route_success(&target_hops);
@@ -643,9 +539,13 @@ impl MigrationExecutor {
             }
             Err(e) => {
                 // Commit rejected — stale decision, wrong epoch, etc.
-                // N2.5-R.3.1: Mark the candidate as failed and dispose it.
-                // This drops the MultiplexedCircuit (disposing the circuit).
-                self.circuit_registry.mark_failed(&fid).ok();
+                // N2.5-R.6.1: Don't discard the error.
+                if let Err(mark_err) = self.circuit_registry.mark_failed(&fid) {
+                    eprintln!(
+                        "[n2.5-r.6.1] failed to mark circuit {:?} as failed during rollback: {}",
+                        fid, mark_err
+                    );
+                }
                 self.record_route_failure(&target_hops, &format!("commit rejected: {}", e));
                 MigrationOutcome::Failed {
                     reason: MigrationFailureReason::CommitRejected(e),
@@ -751,303 +651,6 @@ impl MigrationExecutor {
         &mut self.optimizer
     }
 
-    /// **N2.5-R.4 / N2.5-R.5.1** — Detect whether the active circuit has
-    /// failed.
-    ///
-    /// This is a synchronous, caller-invoked health probe used by
-    /// `recover_from_failure()`. It locks ONLY the per-circuit
-    /// `tokio::sync::Mutex` (via the `CircuitHandle`) for the duration of
-    /// the probe — it does NOT require `&mut self` and does NOT hold any
-    /// executor-wide state across the network I/O.
-    ///
-    /// Detection is based on attempting to open a stream to the given
-    /// health endpoint. If the stream open fails or times out, the
-    /// circuit is considered failed.
-    ///
-    /// # Arguments
-    /// * `health_check_endpoint` — The endpoint to probe.
-    /// * `timeout` — How long to wait before declaring failure.
-    ///
-    /// Returns `true` if the active circuit has failed, `false` if it is
-    /// still healthy. Returns `false` if there is no active circuit
-    /// (nothing to detect), and `true` if there is an active circuit ID but
-    /// no live circuit handle (the registry is inconsistent).
-    pub async fn detect_active_circuit_failure(
-        &self,
-        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
-        timeout: Duration,
-    ) -> bool {
-        let active_id = match self.circuit_registry.active_circuit_id() {
-            Some(id) => id,
-            None => return false,
-        };
-
-        // Clone the handle (cheap Arc clone — NO lock held by the registry).
-        let handle = match self.circuit_registry.active_circuit() {
-            Some(h) => h,
-            None => return true,
-        };
-
-        // Probe the circuit. Only the per-circuit mutex is held over the I/O.
-        let failed = {
-            let mut guard = handle.lock().await;
-            probe_circuit_health(&mut guard, health_check_endpoint, timeout).await
-        };
-
-        if failed {
-            eprintln!("[n2.5-r.4] active circuit {:?} failure detected", active_id);
-        }
-        failed
-    }
-
-    /// **N2.5-R.5.1** — Capture the probe context for the currently-active
-    /// circuit, together with a cloned `CircuitHandle` that can be probed
-    /// **without** holding the executor-wide mutex.
-    ///
-    /// This is the short-lock capture step of the failure monitor:
-    ///
-    /// ```text
-    /// monitor:
-    ///   let (ctx, handle) = executor.lock().await.prepare_probe()?;
-    ///   // executor lock released here
-    ///   probe(handle)  // no executor lock held over the network I/O
-    /// ```
-    ///
-    /// Returns `None` if there is no active circuit to probe.
-    #[must_use]
-    pub fn prepare_probe(&self) -> Option<(ProbeContext, CircuitHandle)> {
-        let circuit_id = self.circuit_registry.active_circuit_id()?;
-        let route_id = self.circuit_registry.circuit_route_id(&circuit_id)?;
-        let handle = self.circuit_registry.active_circuit()?;
-        let epoch = self.epoch();
-        Some((
-            ProbeContext {
-                circuit_id,
-                route_id,
-                epoch,
-            },
-            handle,
-        ))
-    }
-
-    /// **N2.5-R.5.1** — Verify that a `RecoveryRequest` still matches the
-    /// currently-active circuit and the current optimizer epoch.
-    ///
-    /// This is the stale-signal guard. The failure monitor captures a
-    /// `ProbeContext` (circuit_id, route_id, epoch) at probe-start. If a
-    /// migration or a recovery completes between probe-start and the
-    /// runtime acting on the request, the active circuit and/or epoch will
-    /// have changed, and this method returns `false` — the request is stale
-    /// and MUST be discarded rather than acted upon.
-    ///
-    /// Returns `true` only if ALL of the following hold:
-    /// - There is an active circuit.
-    /// - `request.circuit_id` equals the active circuit's id.
-    /// - `request.route_id` equals the active circuit's route_id.
-    /// - `request.epoch` equals the current optimizer epoch.
-    #[must_use]
-    pub fn verify_recovery_request(&self, request: &RecoveryRequest) -> bool {
-        let Some(active_id) = self.circuit_registry.active_circuit_id() else {
-            return false;
-        };
-        let Some(active_route_id) = self.circuit_registry.circuit_route_id(&active_id) else {
-            return false;
-        };
-        active_id == request.circuit_id
-            && active_route_id == request.route_id
-            && self.epoch() == request.epoch
-    }
-
-    /// **N2.5-R.5.1** — Act on a `RecoveryRequest` emitted by the failure
-    /// monitor.
-    ///
-    /// This is the runtime side of the monitor→runtime contract:
-    ///
-    /// ```text
-    /// RecoveryRequest { circuit_id, route_id, epoch }
-    ///     ↓
-    /// runtime verifies it still matches ACTIVE (verify_recovery_request)
-    ///     ↓ match: fail_active_circuit() + attempt_migration()
-    ///     ↓ mismatch: stale — discard, no recovery
-    /// ```
-    ///
-    /// If the request is stale (the active circuit or epoch has changed
-    /// since the probe — e.g. a migration A→B completed while the monitor
-    /// was probing A), this returns `MigrationOutcome::NotNeeded` WITHOUT
-    /// touching the active circuit. The probed circuit is no longer active,
-    /// so its failure is not actionable.
-    ///
-    /// If the request is current, this performs the full recovery
-    /// transaction: mark the active circuit failed + quarantine its route +
-    /// attempt migration to a new (non-quarantined) route.
-    ///
-    /// # Arguments
-    /// * `request` — The recovery request from the monitor (provenance-bound).
-    /// * `candidates` — All candidate routes (hop sequences).
-    /// * `node` — The client node (identity + keys).
-    /// * `routes` — Map from hop sequence to `Route` object.
-    /// * `client_x25519_secret` / `client_x25519_public` — Client keys.
-    /// * `health_check_endpoint` — Endpoint for verifying the NEW circuit.
-    pub async fn handle_recovery_request(
-        &mut self,
-        request: &RecoveryRequest,
-        candidates: &[Vec<PeerId>],
-        node: &Node,
-        routes: &[(Vec<PeerId>, Route)],
-        client_x25519_secret: &X25519Secret,
-        client_x25519_public: &X25519PubKey,
-        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
-    ) -> MigrationOutcome {
-        // 1. Verify the request still matches the active circuit + epoch.
-        if !self.verify_recovery_request(request) {
-            eprintln!(
-                "[n2.5-r.5.1] stale recovery request discarded \
-                 (request circuit={:?} epoch={}, active circuit={:?} epoch={})",
-                request.circuit_id,
-                request.epoch,
-                self.circuit_registry.active_circuit_id(),
-                self.epoch()
-            );
-            return MigrationOutcome::NotNeeded;
-        }
-
-        // 2. The probed circuit is still active and failed. Fail it.
-        if let Err(e) = self.fail_active_circuit() {
-            eprintln!("[n2.5-r.5.1] failed to mark active circuit as failed: {}", e);
-            // Continue anyway — try to establish a new circuit.
-        }
-
-        // 3. Attempt migration to a new route. The failed route is excluded
-        //    by quarantine (set in fail_active_circuit).
-        self.attempt_migration(
-            candidates,
-            node,
-            routes,
-            client_x25519_secret,
-            client_x25519_public,
-            health_check_endpoint,
-        )
-        .await
-    }
-
-    /// **N2.5-R.4** — Mark the active circuit as failed and trigger
-    /// recovery.
-    ///
-    /// This should be called after `detect_active_circuit_failure()`
-    /// returns `true`. It:
-    ///
-    /// 1. Marks the active circuit as Failed in the registry (closes it).
-    /// 2. Records a failure in route observations.
-    /// 3. Resets the optimizer's current route (so it will recommend
-    ///    a new route on the next `check()`).
-    ///
-    /// After this call, the runtime should call `attempt_migration()`
-    /// with the available candidate routes to establish a new active
-    /// circuit.
-    ///
-    /// # Errors
-    /// Returns `Err` if there is no active circuit to fail.
-    pub fn fail_active_circuit(&mut self) -> Result<(), String> {
-        let active_id = self.circuit_registry.active_circuit_id()
-            .ok_or_else(|| "no active circuit to fail".to_string())?;
-
-        // Get the route_id and hops BEFORE marking failed (they remain in the registry).
-        let route_id = self.circuit_registry.circuit_route_id(&active_id);
-        let hops = self.circuit_registry.circuit_hops(&active_id).map(|h| h.to_vec());
-
-        // Mark the circuit as failed (closes and drops the MultiplexedCircuit).
-        self.circuit_registry.mark_failed(&active_id)
-            .map_err(|e| format!("failed to mark circuit {:?} as failed: {}", active_id, e))?;
-
-        // Record failure in route observations for the failed route.
-        if let Some(ref hops) = hops {
-            self.record_route_failure(hops, "active circuit failure detected");
-        }
-
-        // N2.5-R.4.1: Quarantine the failed route so it cannot be immediately
-        // reselected for recovery. Default quarantine: 60 seconds.
-        if let Some(rid) = route_id {
-            self.optimizer.quarantine_route(rid, Duration::from_secs(60));
-        }
-
-        // Reset the optimizer's current route and increment epoch.
-        // N2.5-R.4.1: clear_current_route now increments epoch.
-        self.optimizer.clear_current_route();
-        self.optimizer.fail_establishment();
-
-        eprintln!(
-            "[n2.5-r.4] active circuit {:?} marked as failed, optimizer reset, route quarantined",
-            active_id
-        );
-        Ok(())
-    }
-
-    /// **N2.5-R.4** — Recovery from active-circuit failure.
-    ///
-    /// **This is a caller-invoked recovery transaction, NOT an automatic
-    /// background monitor.** The runtime must call this method (or call
-    /// `detect_active_circuit_failure()` + `fail_active_circuit()` +
-    /// `attempt_migration()` manually) to initiate recovery.
-    ///
-    /// This is the full recovery transaction:
-    ///
-    /// 1. Detect active circuit failure (health probe).
-    /// 2. If failed: mark active circuit as Failed + quarantine route.
-    /// 3. Attempt migration to a new route (establish + health check + commit).
-    ///    The failed route is excluded from candidates by quarantine.
-    ///
-    /// If the active circuit is healthy, returns `NotNeeded`.
-    /// If recovery succeeds, returns `Success`.
-    /// If recovery fails, returns `Failed` (old circuit is already Failed).
-    ///
-    /// # Arguments
-    /// * `candidates` — All candidate routes (hop sequences).
-    /// * `node` — The client node (identity + keys).
-    /// * `routes` — Map from hop sequence to `Route` object.
-    /// * `client_x25519_secret` — The client's X25519 secret.
-    /// * `client_x25519_public` — The client's X25519 public key.
-    /// * `health_check_endpoint` — Endpoint for health verification of
-    ///   both the old circuit (detection) and the new circuit (verification).
-    /// * `detection_timeout` — How long to wait before declaring the
-    ///   active circuit failed.
-    pub async fn recover_from_failure(
-        &mut self,
-        candidates: &[Vec<PeerId>],
-        node: &Node,
-        routes: &[(Vec<PeerId>, Route)],
-        client_x25519_secret: &X25519Secret,
-        client_x25519_public: &X25519PubKey,
-        health_check_endpoint: snp_gateway::stream::InternetEndpoint,
-        detection_timeout: Duration,
-    ) -> MigrationOutcome {
-        // 1. Detect active circuit failure.
-        let failed = self.detect_active_circuit_failure(
-            health_check_endpoint.clone(),
-            detection_timeout,
-        ).await;
-
-        if !failed {
-            return MigrationOutcome::NotNeeded;
-        }
-
-        // 2. Mark the active circuit as failed.
-        if let Err(e) = self.fail_active_circuit() {
-            eprintln!("[n2.5-r.4] failed to mark active circuit as failed: {}", e);
-            // Continue anyway — try to establish a new circuit.
-        }
-
-        // 3. Attempt migration to a new route.
-        // The optimizer's current_route has been reset, so check() will
-        // recommend the best available route as a cold-start (exploration).
-        self.attempt_migration(
-            candidates,
-            node,
-            routes,
-            client_x25519_secret,
-            client_x25519_public,
-            health_check_endpoint,
-        ).await
-    }
 }
 
 impl std::fmt::Debug for MigrationExecutor {
@@ -1279,6 +882,21 @@ impl RecoveryChannel {
         }
     }
 
+    /// **N2.5-R.6.1** — Wake up any task waiting on `take_async()`.
+    ///
+    /// Used by `RecoveryController::stop()` to break the controller task
+    /// out of `take_async()` so it can observe the shutdown flag and exit
+    /// gracefully. In-progress recovery (establishment I/O) is NOT
+    /// cancelled — `stop()` only prevents NEW recovery attempts from
+    /// starting.
+    ///
+    /// This does NOT deposit a recovery request. The woken task will
+    /// re-check `take()` (returns `None`), then check the shutdown flag
+    /// and exit.
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+
     /// Returns `true` if a recovery request is pending, WITHOUT clearing it.
     #[must_use]
     pub fn peek(&self) -> bool {
@@ -1495,3 +1113,516 @@ impl std::fmt::Debug for FailureMonitor {
             .finish_non_exhaustive()
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// N2.5-R.6.1 — Recovery API visibility gating
+// ════════════════════════════════════════════════════════════════════════════
+//
+// In production (without `test-utils`), recovery methods are `pub(crate)` —
+// only accessible within the crate (by `RecoveryController`). External code
+// cannot call `attempt_migration()`, `fail_active_circuit()`, etc.
+//
+// In tests (with `test-utils`), they are `pub` — accessible from integration
+// tests.
+//
+// This is achieved via a macro that generates the impl block with the
+// specified visibility, instantiated twice with cfg gates. The `pub(crate)`
+// instantiation is compiled for production builds; the `pub` instantiation
+// is compiled for tests and `test-utils` feature builds.
+
+macro_rules! impl_recovery_api {
+    ($vis:vis) => {
+        impl MigrationExecutor {
+            /// **Production migration method.** Health verification is MANDATORY.
+            ///
+            /// This is the full migration transaction:
+            ///
+            /// 1. `optimizer.check()` — get a migration decision.
+            /// 2. If `Migrate`: establish the candidate circuit via real SNP-IK.
+            /// 3. On establishment success: perform mandatory health verification
+            ///    (open a stream + send/recv a test exchange through the candidate
+            ///    circuit to the health endpoint).
+            /// 4. On health success: construct `EstablishedRoute` evidence.
+            /// 5. `commit_migration_with_evidence()` — validate + commit.
+            /// 6. On any failure: invalidate decision, record failure, preserve
+            ///    old route, no cooldown.
+            ///
+            /// **N2.5-R.2.1.1:** Health verification is NOT optional. The
+            /// `health_check_endpoint` parameter is required. A separate
+            /// `attempt_migration_no_health()` method exists for test-only
+            /// low-level establishment verification.
+            $vis async fn attempt_migration(
+                &mut self,
+                candidates: &[Vec<PeerId>],
+                node: &Node,
+                routes: &[(Vec<PeerId>, Route)],
+                client_x25519_secret: &X25519Secret,
+                client_x25519_public: &X25519PubKey,
+                health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+            ) -> MigrationOutcome {
+                self.attempt_migration_inner(
+                    candidates,
+                    node,
+                    routes,
+                    client_x25519_secret,
+                    client_x25519_public,
+                    Some(health_check_endpoint),
+                )
+                .await
+            }
+
+            /// **N2.5-R.6** — Phase 1: Get a migration decision + resolve the route.
+            ///
+            /// This is the fast, synchronous phase: it calls `optimizer.check()`,
+            /// resolves the `Route` object, and returns a `MigrationPlan` that
+            /// can be established without touching the executor.
+            ///
+            /// **No network I/O occurs here.** The caller should release the
+            /// executor lock immediately after this call.
+            #[must_use]
+            $vis fn begin_migration(
+                &mut self,
+                candidates: &[Vec<PeerId>],
+                routes: &[(Vec<PeerId>, Route)],
+            ) -> MigrationBegin {
+                let decision = match self.optimizer.check(candidates) {
+                    OptimizationResult::Migrate(d) => d,
+                    OptimizationResult::NoMigration { .. } => return MigrationBegin::NotNeeded,
+                    OptimizationResult::NoRoutes => return MigrationBegin::NoRoutes,
+                    OptimizationResult::Cooldown { remaining } => {
+                        return MigrationBegin::Cooldown { remaining };
+                    }
+                };
+
+                let target_hops = decision.target_route().to_vec();
+                let to_route_id = route_id_from_hops(&target_hops);
+
+                let route = match routes.iter().find(|(hops, _)| hops.as_slice() == target_hops.as_slice())
+                {
+                    Some((_, route)) => route.clone(),
+                    None => {
+                        self.optimizer.fail_establishment();
+                        return MigrationBegin::NotNeeded;
+                    }
+                };
+
+                MigrationBegin::Migrate(MigrationPlan {
+                    decision,
+                    route,
+                    target_hops,
+                    to_route_id,
+                })
+            }
+
+            /// **N2.5-R.6** — Phase 3: Register + commit + promote an established
+            /// candidate circuit.
+            ///
+            /// This is the fast, synchronous phase: it registers the circuit in
+            /// the `CircuitRegistry`, constructs `EstablishedRoute` evidence,
+            /// commits the migration via `commit_migration_with_evidence()`, and
+            /// promotes the new circuit to Active.
+            ///
+            /// **No network I/O occurs here.** The caller should release the
+            /// executor lock immediately after this call.
+            ///
+            /// If `candidate_result` is `Err`, this method records the failure
+            /// (invalidates the decision, records route failure) and returns
+            /// `MigrationOutcome::Failed` — the caller does NOT need to separately
+            /// call `fail_establishment()`.
+            $vis fn commit_established(
+                &mut self,
+                plan: MigrationPlan,
+                candidate_result: Result<EstablishedCandidate, MigrationFailureReason>,
+            ) -> MigrationOutcome {
+                let candidate = match candidate_result {
+                    Ok(c) => c,
+                    Err(reason) => {
+                        self.optimizer.fail_establishment();
+                        self.record_route_failure(&plan.target_hops, &format!("{:?}", reason));
+                        return MigrationOutcome::Failed { reason };
+                    }
+                };
+
+                // N2.5-R.6.1: Register the circuit FIRST. register_candidate() calls
+                // circuit.circuit_fid() internally — the returned `fid` is guaranteed
+                // to come from the real MultiplexedCircuit. The registry takes
+                // ownership of the circuit.
+                let fid = self.circuit_registry.register_candidate(
+                    candidate.circuit,
+                    candidate.to_route_id,
+                    candidate.target_hops.clone(),
+                );
+
+                // N2.5-R.6.1: Construct evidence using the fid from the registry.
+                // from_establishment() is pub(crate) — external callers cannot
+                // construct EstablishedRoute. The circuit_id in the evidence came
+                // from the real circuit via register_candidate().
+                let evidence = EstablishedRoute::from_establishment(
+                    candidate.target_hops.clone(),
+                    fid,
+                    candidate.gateway_node_id,
+                    candidate.client_node_id,
+                );
+
+                // Verify evidence route_id matches the plan.
+                if evidence.route_id() != plan.to_route_id {
+                    self.optimizer.fail_establishment();
+                    // N2.5-R.6.1: Don't discard the error — handle it.
+                    if let Err(e) = self.circuit_registry.mark_failed(&fid) {
+                        eprintln!("[n2.5-r.6.1] failed to mark circuit {:?} as failed during rollback: {}", fid, e);
+                    }
+                    self.record_route_failure(&candidate.target_hops, "route_id mismatch after establishment");
+                    return MigrationOutcome::Failed {
+                        reason: MigrationFailureReason::RouteIdMismatch,
+                    };
+                }
+
+                // N2.5-R.6.1: Mark healthy — don't discard the error.
+                if let Err(e) = self.circuit_registry.mark_healthy(&fid) {
+                    // Can't proceed without healthy state.
+                    self.optimizer.fail_establishment();
+                    self.circuit_registry.mark_failed(&fid).ok();
+                    self.record_route_failure(&candidate.target_hops, &format!("mark_healthy failed: {}", e));
+                    return MigrationOutcome::Failed {
+                        reason: MigrationFailureReason::CommitRejected(format!("mark_healthy failed: {}", e)),
+                    };
+                }
+
+                // N2.5-R.6.1: Commit the migration with evidence. This is the
+                // critical state transition. If it succeeds, we MUST promote the
+                // circuit to active — if promotion fails, we must roll back the
+                // optimizer state.
+                match self
+                    .optimizer
+                    .commit_migration_with_evidence(plan.decision, &evidence)
+                {
+                    Ok(()) => {
+                        // N2.5-R.6.1: Don't discard the promote error. If promote
+                        // fails after a successful optimizer commit, we have a
+                        // state inconsistency. Roll back the optimizer by clearing
+                        // the current route (which increments epoch, invalidating
+                        // the commit).
+                        if let Err(e) = self.circuit_registry.promote_to_active(&fid) {
+                            eprintln!(
+                                "[n2.5-r.6.1] CRITICAL: optimizer committed but promote failed: {}. \
+                                 Rolling back optimizer state.",
+                                e
+                            );
+                            // Roll back: mark the circuit as failed and clear the
+                            // optimizer's current route.
+                            self.circuit_registry.mark_failed(&fid).ok();
+                            self.optimizer.clear_current_route();
+                            self.optimizer.fail_establishment();
+                            self.record_route_failure(
+                                &candidate.target_hops,
+                                &format!("promote failed after commit: {}", e),
+                            );
+                            return MigrationOutcome::Failed {
+                                reason: MigrationFailureReason::CommitRejected(
+                                    format!("promote failed after commit: {}", e),
+                                ),
+                            };
+                        }
+                        self.record_route_success(&candidate.target_hops);
+                        MigrationOutcome::Success { evidence }
+                    }
+                    Err(e) => {
+                        // Optimizer commit failed — mark the circuit as failed.
+                        // N2.5-R.6.1: Don't discard the error.
+                        if let Err(mark_err) = self.circuit_registry.mark_failed(&fid) {
+                            eprintln!(
+                                "[n2.5-r.6.1] failed to mark circuit {:?} as failed during rollback: {}",
+                                fid, mark_err
+                            );
+                        }
+                        self.record_route_failure(&candidate.target_hops, &format!("commit rejected: {}", e));
+                        MigrationOutcome::Failed {
+                            reason: MigrationFailureReason::CommitRejected(e),
+                        }
+                    }
+                }
+            }
+
+            /// **N2.5-R.4 / N2.5-R.5.1** — Detect whether the active circuit has
+            /// failed.
+            ///
+            /// This is a synchronous, caller-invoked health probe used by
+            /// `recover_from_failure()`. It locks ONLY the per-circuit
+            /// `tokio::sync::Mutex` (via the `CircuitHandle`) for the duration of
+            /// the probe — it does NOT require `&mut self` and does NOT hold any
+            /// executor-wide state across the network I/O.
+            ///
+            /// Detection is based on attempting to open a stream to the given
+            /// health endpoint. If the stream open fails or times out, the
+            /// circuit is considered failed.
+            ///
+            /// Returns `true` if the active circuit has failed, `false` if it is
+            /// still healthy. Returns `false` if there is no active circuit
+            /// (nothing to detect), and `true` if there is an active circuit ID but
+            /// no live circuit handle (the registry is inconsistent).
+            $vis async fn detect_active_circuit_failure(
+                &self,
+                health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+                timeout: Duration,
+            ) -> bool {
+                let active_id = match self.circuit_registry.active_circuit_id() {
+                    Some(id) => id,
+                    None => return false,
+                };
+
+                // Clone the handle (cheap Arc clone — NO lock held by the registry).
+                let handle = match self.circuit_registry.active_circuit() {
+                    Some(h) => h,
+                    None => return true,
+                };
+
+                // Probe the circuit. Only the per-circuit mutex is held over the I/O.
+                let failed = {
+                    let mut guard = handle.lock().await;
+                    probe_circuit_health(&mut guard, health_check_endpoint, timeout).await
+                };
+
+                if failed {
+                    eprintln!("[n2.5-r.4] active circuit {:?} failure detected", active_id);
+                }
+                failed
+            }
+
+            /// **N2.5-R.5.1** — Capture the probe context for the currently-active
+            /// circuit, together with a cloned `CircuitHandle` that can be probed
+            /// **without** holding the executor-wide mutex.
+            ///
+            /// This is the short-lock capture step of the failure monitor:
+            ///
+            /// ```text
+            /// monitor:
+            ///   let (ctx, handle) = executor.lock().await.prepare_probe()?;
+            ///   // executor lock released here
+            ///   probe(handle)  // no executor lock held over the network I/O
+            /// ```
+            ///
+            /// Returns `None` if there is no active circuit to probe.
+            #[must_use]
+            $vis fn prepare_probe(&self) -> Option<(ProbeContext, CircuitHandle)> {
+                let circuit_id = self.circuit_registry.active_circuit_id()?;
+                let route_id = self.circuit_registry.circuit_route_id(&circuit_id)?;
+                let handle = self.circuit_registry.active_circuit()?;
+                let epoch = self.epoch();
+                Some((
+                    ProbeContext {
+                        circuit_id,
+                        route_id,
+                        epoch,
+                    },
+                    handle,
+                ))
+            }
+
+            /// **N2.5-R.5.1** — Verify that a `RecoveryRequest` still matches the
+            /// currently-active circuit and the current optimizer epoch.
+            ///
+            /// This is the stale-signal guard. The failure monitor captures a
+            /// `ProbeContext` (circuit_id, route_id, epoch) at probe-start. If a
+            /// migration or a recovery completes between probe-start and the
+            /// runtime acting on the request, the active circuit and/or epoch will
+            /// have changed, and this method returns `false` — the request is stale
+            /// and MUST be discarded rather than acted upon.
+            ///
+            /// Returns `true` only if ALL of the following hold:
+            /// - There is an active circuit.
+            /// - `request.circuit_id` equals the active circuit's id.
+            /// - `request.route_id` equals the active circuit's route_id.
+            /// - `request.epoch` equals the current optimizer epoch.
+            #[must_use]
+            $vis fn verify_recovery_request(&self, request: &RecoveryRequest) -> bool {
+                let Some(active_id) = self.circuit_registry.active_circuit_id() else {
+                    return false;
+                };
+                let Some(active_route_id) = self.circuit_registry.circuit_route_id(&active_id) else {
+                    return false;
+                };
+                active_id == request.circuit_id
+                    && active_route_id == request.route_id
+                    && self.epoch() == request.epoch
+            }
+
+            /// **N2.5-R.5.1** — Act on a `RecoveryRequest` emitted by the failure
+            /// monitor.
+            ///
+            /// This is the runtime side of the monitor→runtime contract:
+            ///
+            /// ```text
+            /// RecoveryRequest { circuit_id, route_id, epoch }
+            ///     ↓
+            /// runtime verifies it still matches ACTIVE (verify_recovery_request)
+            ///     ↓ match: fail_active_circuit() + attempt_migration()
+            ///     ↓ mismatch: stale — discard, no recovery
+            /// ```
+            ///
+            /// If the request is stale (the active circuit or epoch has changed
+            /// since the probe — e.g. a migration A→B completed while the monitor
+            /// was probing A), this returns `MigrationOutcome::NotNeeded` WITHOUT
+            /// touching the active circuit. The probed circuit is no longer active,
+            /// so its failure is not actionable.
+            ///
+            /// If the request is current, this performs the full recovery
+            /// transaction: mark the active circuit failed + quarantine its route +
+            /// attempt migration to a new (non-quarantined) route.
+            $vis async fn handle_recovery_request(
+                &mut self,
+                request: &RecoveryRequest,
+                candidates: &[Vec<PeerId>],
+                node: &Node,
+                routes: &[(Vec<PeerId>, Route)],
+                client_x25519_secret: &X25519Secret,
+                client_x25519_public: &X25519PubKey,
+                health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+            ) -> MigrationOutcome {
+                // 1. Verify the request still matches the active circuit + epoch.
+                if !self.verify_recovery_request(request) {
+                    eprintln!(
+                        "[n2.5-r.5.1] stale recovery request discarded \
+                         (request circuit={:?} epoch={}, active circuit={:?} epoch={})",
+                        request.circuit_id,
+                        request.epoch,
+                        self.circuit_registry.active_circuit_id(),
+                        self.epoch()
+                    );
+                    return MigrationOutcome::NotNeeded;
+                }
+
+                // 2. The probed circuit is still active and failed. Fail it.
+                if let Err(e) = self.fail_active_circuit() {
+                    eprintln!("[n2.5-r.5.1] failed to mark active circuit as failed: {}", e);
+                    // Continue anyway — try to establish a new circuit.
+                }
+
+                // 3. Attempt migration to a new route. The failed route is excluded
+                //    by quarantine (set in fail_active_circuit).
+                self.attempt_migration(
+                    candidates,
+                    node,
+                    routes,
+                    client_x25519_secret,
+                    client_x25519_public,
+                    health_check_endpoint,
+                )
+                .await
+            }
+
+            /// **N2.5-R.4** — Mark the active circuit as failed and trigger
+            /// recovery.
+            ///
+            /// This should be called after `detect_active_circuit_failure()`
+            /// returns `true`. It:
+            ///
+            /// 1. Marks the active circuit as Failed in the registry (closes it).
+            /// 2. Records a failure in route observations.
+            /// 3. Resets the optimizer's current route (so it will recommend
+            ///    a new route on the next `check()`).
+            ///
+            /// After this call, the runtime should call `attempt_migration()`
+            /// with the available candidate routes to establish a new active
+            /// circuit.
+            ///
+            /// # Errors
+            /// Returns `Err` if there is no active circuit to fail.
+            $vis fn fail_active_circuit(&mut self) -> Result<(), String> {
+                let active_id = self.circuit_registry.active_circuit_id()
+                    .ok_or_else(|| "no active circuit to fail".to_string())?;
+
+                // Get the route_id and hops BEFORE marking failed (they remain in the registry).
+                let route_id = self.circuit_registry.circuit_route_id(&active_id);
+                let hops = self.circuit_registry.circuit_hops(&active_id).map(|h| h.to_vec());
+
+                // Mark the circuit as failed (closes and drops the MultiplexedCircuit).
+                self.circuit_registry.mark_failed(&active_id)
+                    .map_err(|e| format!("failed to mark circuit {:?} as failed: {}", active_id, e))?;
+
+                // Record failure in route observations for the failed route.
+                if let Some(ref hops) = hops {
+                    self.record_route_failure(hops, "active circuit failure detected");
+                }
+
+                // N2.5-R.4.1: Quarantine the failed route so it cannot be immediately
+                // reselected for recovery. Default quarantine: 60 seconds.
+                if let Some(rid) = route_id {
+                    self.optimizer.quarantine_route(rid, Duration::from_secs(60));
+                }
+
+                // Reset the optimizer's current route and increment epoch.
+                // N2.5-R.4.1: clear_current_route now increments epoch.
+                self.optimizer.clear_current_route();
+                self.optimizer.fail_establishment();
+
+                eprintln!(
+                    "[n2.5-r.4] active circuit {:?} marked as failed, optimizer reset, route quarantined",
+                    active_id
+                );
+                Ok(())
+            }
+
+            /// **N2.5-R.4** — Recovery from active-circuit failure.
+            ///
+            /// **This is a caller-invoked recovery transaction, NOT an automatic
+            /// background monitor.** The runtime must call this method (or call
+            /// `detect_active_circuit_failure()` + `fail_active_circuit()` +
+            /// `attempt_migration()` manually) to initiate recovery.
+            ///
+            /// This is the full recovery transaction:
+            ///
+            /// 1. Detect active circuit failure (health probe).
+            /// 2. If failed: mark active circuit as Failed + quarantine route.
+            /// 3. Attempt migration to a new route (establish + health check + commit).
+            ///    The failed route is excluded from candidates by quarantine.
+            ///
+            /// If the active circuit is healthy, returns `NotNeeded`.
+            /// If recovery succeeds, returns `Success`.
+            /// If recovery fails, returns `Failed` (old circuit is already Failed).
+            $vis async fn recover_from_failure(
+                &mut self,
+                candidates: &[Vec<PeerId>],
+                node: &Node,
+                routes: &[(Vec<PeerId>, Route)],
+                client_x25519_secret: &X25519Secret,
+                client_x25519_public: &X25519PubKey,
+                health_check_endpoint: snp_gateway::stream::InternetEndpoint,
+                detection_timeout: Duration,
+            ) -> MigrationOutcome {
+                // 1. Detect active circuit failure.
+                let failed = self.detect_active_circuit_failure(
+                    health_check_endpoint.clone(),
+                    detection_timeout,
+                ).await;
+
+                if !failed {
+                    return MigrationOutcome::NotNeeded;
+                }
+
+                // 2. Mark the active circuit as failed.
+                if let Err(e) = self.fail_active_circuit() {
+                    eprintln!("[n2.5-r.4] failed to mark active circuit as failed: {}", e);
+                    // Continue anyway — try to establish a new circuit.
+                }
+
+                // 3. Attempt migration to a new route.
+                // The optimizer's current_route has been reset, so check() will
+                // recommend the best available route as a cold-start (exploration).
+                self.attempt_migration(
+                    candidates,
+                    node,
+                    routes,
+                    client_x25519_secret,
+                    client_x25519_public,
+                    health_check_endpoint,
+                ).await
+            }
+        }
+    };
+}
+
+#[cfg(not(any(test, feature = "test-utils")))]
+impl_recovery_api!(pub(crate));
+
+#[cfg(any(test, feature = "test-utils"))]
+impl_recovery_api!(pub);
