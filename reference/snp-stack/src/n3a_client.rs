@@ -52,6 +52,7 @@ use snp_crypto::{X25519PubKey, X25519Secret};
 use snp_gateway::stream::InternetEndpoint;
 use snp_node::node::stream_client::MultiplexedCircuit;
 use snp_node::node::{Node, Route};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -110,14 +111,23 @@ impl N3AClient {
     ///
     /// Listens for incoming TCP connections and forwards each one
     /// through ShareNet. Runs forever.
+    ///
+    /// If `default_destination` is set, all connections are forwarded
+    /// to that destination (fixed-destination bridge).
+    ///
+    /// If `default_destination` is `None`, the client speaks SOCKS5
+    /// (RFC 1928) to determine the destination dynamically. This allows
+    /// real applications (curl, wget, browsers) to use the bridge via
+    /// `--socks5 127.0.0.1:PORT`.
     pub async fn run(&mut self) -> Result<(), N3AError> {
         let listener = TcpListener::bind(&self.config.listen_addr)
             .await
             .map_err(|e| N3AError::Bind(e))?;
 
         eprintln!(
-            "[n3-a] listening for application connections on {}",
-            self.config.listen_addr
+            "[n3-a] listening for application connections on {} (SOCKS5: {})",
+            self.config.listen_addr,
+            self.config.default_destination.is_none()
         );
 
         loop {
@@ -132,26 +142,26 @@ impl N3AClient {
             eprintln!("[n3-a] accepted connection from {}", peer_addr);
 
             // Determine the destination.
-            let destination = match self.config.default_destination {
-                Some(ref dest) => dest.clone(),
+            let (destination, tcp_stream) = match self.config.default_destination {
+                Some(ref dest) => {
+                    // Fixed-destination mode — no SOCKS5 handshake.
+                    (dest.clone(), tcp_stream)
+                }
                 None => {
-                    // TODO: implement SOCKS5 protocol to determine destination.
-                    // For now, reject connections without a default destination.
-                    eprintln!("[n3-a] no default destination configured — closing");
-                    drop(tcp_stream);
-                    continue;
+                    // SOCKS5 mode — perform the handshake to determine destination.
+                    match socks5_handshake(tcp_stream).await {
+                        Ok((dest, stream)) => (dest, stream),
+                        Err(e) => {
+                            eprintln!("[n3-a] SOCKS5 handshake failed: {:?}", e);
+                            continue;
+                        }
+                    }
                 }
             };
 
-            // Clone the circuit handle. MultiplexedCircuit uses interior
-            // Arc<Mutex<>> so we can share it across tasks.
             let circuit_fid = self.circuit.circuit_fid();
 
-            // Spawn a task to handle this connection.
-            // We need to open a stream on the circuit — since MultiplexedCircuit
-            // is behind a mutex in the circuit handle, we need to share it.
-            // Actually, MultiplexedCircuit is not Clone. We need a different
-            // approach — open the stream before spawning the task.
+            // Open a ShareNet stream to the destination.
             match self.circuit.open_stream(destination.clone()).await {
                 Ok(mut stream) => {
                     eprintln!(
@@ -174,6 +184,132 @@ impl N3AClient {
             }
         }
     }
+}
+
+/// **SOCKS5 handshake (RFC 1928).**
+///
+/// Performs the SOCKS5 greeting + CONNECT request, returning the
+/// destination endpoint and the TCP stream (ready for data transfer).
+///
+/// ```text
+/// Client → Server: [VER=5, NMETHODS, METHODS...]
+/// Server → Client: [VER=5, METHOD=0 (no auth)]
+/// Client → Server: [VER=5, CMD=1 (CONNECT), RSV=0, ATYP, DST.ADDR, DST.PORT]
+/// Server → Client: [VER=5, REP=0 (success), RSV=0, ATYP, BND.ADDR, BND.PORT]
+/// ```
+async fn socks5_handshake(
+    mut tcp: TcpStream,
+) -> Result<(InternetEndpoint, TcpStream), N3AError> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // 1. Read greeting: [VER, NMETHODS, METHODS...]
+    let mut header = [0u8; 2];
+    tcp.read_exact(&mut header).await.map_err(N3AError::Io)?;
+    if header[0] != 0x05 {
+        return Err(N3AError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("SOCKS5: bad version {}", header[0]),
+        )));
+    }
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    tcp.read_exact(&mut methods).await.map_err(N3AError::Io)?;
+
+    // 2. Reply: no authentication required.
+    tcp.write_all(&[0x05, 0x00]).await.map_err(N3AError::Io)?;
+
+    // 3. Read CONNECT request: [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
+    let mut req_header = [0u8; 4];
+    tcp.read_exact(&mut req_header).await.map_err(N3AError::Io)?;
+    if req_header[0] != 0x05 {
+        return Err(N3AError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("SOCKS5: bad version in request {}", req_header[0]),
+        )));
+    }
+    if req_header[1] != 0x01 {
+        // Only CONNECT is supported.
+        // Reply with "command not supported".
+        let _ = tcp.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        return Err(N3AError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("SOCKS5: only CONNECT (1) supported, got CMD={}", req_header[1]),
+        )));
+    }
+
+    let atyp = req_header[3];
+    let address = match atyp {
+        0x01 => {
+            // IPv4: 4 bytes.
+            let mut addr = [0u8; 4];
+            tcp.read_exact(&mut addr).await.map_err(N3AError::Io)?;
+            IpAddr::V4(Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]))
+        }
+        0x03 => {
+            // Domain name: 1-byte length + domain.
+            let mut len_buf = [0u8; 1];
+            tcp.read_exact(&mut len_buf).await.map_err(N3AError::Io)?;
+            let len = len_buf[0] as usize;
+            let mut domain_buf = vec![0u8; len];
+            tcp.read_exact(&mut domain_buf).await.map_err(N3AError::Io)?;
+            let domain = String::from_utf8_lossy(&domain_buf).to_string();
+            // Resolve the domain to an IP address.
+            // For the first proof, we resolve via the OS DNS resolver.
+            // Future: resolve through ShareNet's DnsResolver.
+            match tokio::net::lookup_host(format!("{}:0", domain)).await {
+                Ok(mut iter) => {
+                    match iter.next() {
+                        Some(addr) => addr.ip(),
+                        None => {
+                            let _ = tcp.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                            return Err(N3AError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("SOCKS5: DNS resolution failed for {}", domain),
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tcp.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                    return Err(N3AError::Io(e));
+                }
+            }
+        }
+        0x04 => {
+            // IPv6: 16 bytes.
+            let mut addr = [0u8; 16];
+            tcp.read_exact(&mut addr).await.map_err(N3AError::Io)?;
+            IpAddr::V6(Ipv6Addr::from(addr))
+        }
+        _ => {
+            let _ = tcp.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            return Err(N3AError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("SOCKS5: unsupported ATYP {}", atyp),
+            )));
+        }
+    };
+
+    // Read destination port (2 bytes, big-endian).
+    let mut port_buf = [0u8; 2];
+    tcp.read_exact(&mut port_buf).await.map_err(N3AError::Io)?;
+    let port = u16::from_be_bytes(port_buf);
+
+    let destination = InternetEndpoint {
+        address,
+        port,
+        protocol: snp_gateway::stream::TransportProtocol::Tcp,
+    };
+
+    eprintln!("[n3-a] SOCKS5 CONNECT to {:?}:{}", address, port);
+
+    // 4. Reply: success.
+    //    BND.ADDR and BND.PORT are not meaningful for a proxy — set to 0.0.0.0:0.
+    tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(N3AError::Io)?;
+
+    Ok((destination, tcp))
 }
 
 /// Pump data bidirectionally between a TCP stream and a ShareNet stream.
