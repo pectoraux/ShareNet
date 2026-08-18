@@ -1627,7 +1627,7 @@ pub fn run_mesh_session_demo_with_failover(url: &str) -> NodeResult<()> {
 
     // ── Client: discover gateways ──
     let client_node = Node::new(
-        NodeIdentity::client(),
+        crate::node::identity::client_identity(),
         vec![Capability::Client],
         relay_a_addr.to_string(),
     );

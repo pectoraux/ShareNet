@@ -286,7 +286,7 @@ impl Node {
     /// accept incoming connections) — pass `""` or use [`Node::new_client_with_relay`].
     #[must_use]
     pub fn new_client() -> Self {
-        Self::new(NodeIdentity::client(), vec![Capability::Client], String::new())
+        Self::new(identity::client_identity(), vec![Capability::Client], String::new())
     }
 
     // ─── Persistent relay serve loop ──────────────────────────────────────
@@ -2791,7 +2791,7 @@ mod tests {
 
     #[test]
     fn node_identity_client_matches_n20_constants() {
-        let identity = NodeIdentity::client();
+        let identity = identity::client_identity();
         assert_eq!(identity.public_key, client_public_key());
         assert_eq!(identity.node_id, client_node_id());
     }
