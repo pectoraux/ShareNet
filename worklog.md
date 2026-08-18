@@ -7446,3 +7446,79 @@ Stage Summary:
   - Conformance unchanged               ✅ (138/138)
 - The transport layer is mature enough to support higher-level features
   without constantly revisiting the foundation.
+
+---
+Task ID: SHARENET-SETUP-REDO
+Agent: Z.ai Code (main orchestrator)
+Task: Set up + launch pectoraux/ShareNet (the conformance project) in the sandbox, wire up its Vercel deployment with a Neon PostgreSQL DB. Redo of the earlier mistaken pivot to sharenet-2.0.
+
+Work Log:
+
+## Pre-flight: the user corrected the target repo
+
+- The user explicitly said "the project at https://github.com/pectoraux/sharenet main branch" — that URL redirects to `pectoraux/ShareNet` (repoId 1330159747, 10.9MB, the Rust + Android + TypeScript conformance reference).
+- In the previous session I mistakenly pivoted to `pectoraux/sharenet-2.0` (a different, smaller web app repo) because the Vercel project `sharenet-2-0` was more recently updated and matched the "ShareNet 2.0" branding. The user corrected this: they want `pectoraux/ShareNet`.
+- Surveyed the three related repos:
+  - `pectoraux/ShareNet` (repoId 1330159747) — the conformance dashboard + Rust/Android reference. The repo the user pointed at.
+  - `pectoraux/sharenet-web` (repoId 1332351703) — a small web slice, connected to the `sharenet` Vercel project (Neon DB at ep-noisy-frost-aynd00my).
+  - `pectoraux/sharenet-2.0` (repoId 1335651089) — the waitlist/admin/demo web app I mistakenly worked on.
+- Neither Vercel project (`sharenet` nor `sharenet-2-0`) is connected to `pectoraux/ShareNet`. The Neon DB strings the user referenced ("stored as environment variables on the vercel deployment") live on the `sharenet` Vercel project (ep-noisy-frost-aynd00my).
+
+## Phase A — Re-sync the sandbox to pectoraux/ShareNet
+
+- Stopped the sharenet-2.0 dev server + node-link mini-service.
+- Backed up the `.zscripts/` daemon launchers + `.vercel/` link.
+- Cleared the project dir, changed the git remote back to `pectoraux/ShareNet`, fetched + reset --hard origin/main. HEAD is at `7e04b4c` (the earlier chore commit that switched sqlite -> postgresql + added daemon launchers).
+- Restored the `.zscripts/` daemon scripts (including the `.env` re-export fix from the sharenet-2.0 work).
+
+## Phase B — Wire up the Neon DB (ep-noisy-frost, shared with sharenet-web)
+
+- Pulled the `sharenet` Vercel project's production env vars via `vercel env pull`. Keys: DATABASE_URL (Neon pooled, ep-noisy-frost-aynd00my-pooler), DIRECT_URL (Neon direct, ep-noisy-frost-aynd00my), NEXTAUTH_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD.
+- Created the local `.env` from those vars (gitignored via `.env*` in `.gitignore`).
+- Inspected the existing tables on the ep-noisy-frost Neon DB via @neondatabase/serverless: found `User` + `AuditEntry` tables belonging to sharenet-web. ShareNet's `User` model has different columns, so `prisma db push --accept-data-loss` would DESTROY sharenet-web's data. Decision: do NOT run db:push against the shared Neon DB.
+- Updated `prisma/schema.prisma`:
+  - `directUrl` env var renamed `DIRECT_DATABASE_URL` -> `DIRECT_URL` to match the Vercel env var name (so production works without adding a new env var).
+  - Rewrote the leading comment to document that ShareNet's runtime (the conformance dashboard at src/app/page.tsx) does NOT query the database — the User/Post models are scaffolding for future control-plane work. The Neon DATABASE_URL is wired up so the sandbox does NOT fall back to the default SQLite, and any future DB-backed feature can use it directly. No db:push is run against the shared Neon DB because it is shared with the sharenet-web app.
+- Confirmed via ripgrep that nothing in ShareNet's `src/` imports `@/lib/db` (only `src/lib/db.ts` references PrismaClient, and it is never imported). The Prisma Client is generated (`bun run db:generate`) so the build passes, but no runtime query is ever made.
+- Ran `bun run db:generate` — Prisma Client regenerated for postgresql + DIRECT_URL. No errors.
+
+## Phase C — Sandbox dev server
+
+- The sandbox orchestrator exports `DATABASE_URL=file:/home/z/my-project/db/custom.db` into the global shell environment, which overrides `.env`. The `start-dev-daemon.sh` launcher re-exports `.env` (`set -a; . ./.env; set +a`) immediately before `exec next dev`, so the Neon `DATABASE_URL` wins over the sandbox's global SQLite default.
+- Started the dev server via the setsid daemon launcher. PPID=1 (fully detached, survives bash exits).
+- Started the mesh-simulator mini-service (port 3030) via its own daemon launcher.
+- Verified: `GET /` -> 200 (dashboard renders); `GET /api/conformance` -> 200, 138/138 vectors PASS across 15 suites; `POST /api/mesh-simulator` -> 200; `GET /api/integration-tests` -> 200, 16 tests. No Prisma validation errors in the dev log.
+- The Rust API routes (`/api/rust-verify`, `/api/rust-mesh`, `/api/rust-multihop`, `/api/rust-security`) return 500 because the sandbox has no Rust toolchain (no `cargo`). This is environmental, not a code defect — the TypeScript conformance suite (the authoritative N0/N1 deliverable) is unaffected.
+
+## Phase D — Vercel deployment
+
+- Created a NEW Vercel project `sharenet-conformance` (ID `prj_3l7rz1AvjfmQG8ZaeACJ1jZGC5Wb`) connected to `pectoraux/ShareNet` main via the Vercel API (`POST /v10/projects` with `gitRepository`). Chose a new project rather than repointing the existing `sharenet` project, to avoid breaking `sharenet-web`'s auto-deploy.
+- Set node version to 24.x via `PATCH /v9/projects/sharenet-conformance`.
+- Copied 6 env vars from the `sharenet` Vercel project to `sharenet-conformance` via the API: DATABASE_URL, DIRECT_URL, NEXTAUTH_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD (plus VERCEL, which Vercel auto-sets anyway).
+- Added `prisma generate` to the front of the `build` script in `package.json` + a `postinstall` hook (`prisma generate || true`). This prevents the Vercel production build from using a stale Prisma Client (the @prisma/client postinstall hook is not reliably run by bun on Vercel's build image — same issue I hit on sharenet-2.0).
+- Committed (`45a0252`) + pushed to `pectoraux/ShareNet` main. Vercel auto-detected the push and deployed.
+
+## Phase E — Production verification
+
+- Deployment `sharenet-conformance-4g5ad8kal-tay-nurs-projects.vercel.app` (from commit `45a0252`) reached READY in ~25s.
+- Production alias `https://sharenet-conformance.vercel.app` serves the real ShareNet app:
+  - `GET /` -> 200 (ShareNet 2.0 Conformance Foundation dashboard renders)
+  - `GET /api/conformance` -> 200, 138/138 vectors PASS across 15 suites
+  - `POST /api/mesh-simulator` -> 200
+  - HTML title: "ShareNet 2.0 — Conformance Foundation"
+
+## Phase F — Vercel CLI link
+
+- Re-linked the sandbox's Vercel CLI to `sharenet-conformance` (was previously linked to `sharenet-2-0` from the earlier session, then to `sharenet`). `.vercel/project.json` now points to `prj_3l7rz1AvjfmQG8ZaeACJ1jZGC5Wb` / `sharenet-conformance`.
+
+Stage Summary:
+
+- **GitHub**: TWO commits pushed to `pectoraux/ShareNet` main:
+  - `7e04b4c` — chore(env): switch Prisma to Neon PostgreSQL + add sandbox daemon launchers (from the earlier session, before the mistaken pivot)
+  - `45a0252` — chore(db): align schema to Neon DIRECT_URL env var + add prisma generate to build
+- **Neon DB**: ep-noisy-frost-aynd00my (shared with sharenet-web). DATABASE_URL (pooled) + DIRECT_URL (direct) wired into `.env` locally and into the `sharenet-conformance` Vercel project's env vars. No `db:push` was run against the shared Neon DB (to protect sharenet-web's User/AuditEntry tables). ShareNet's runtime does not query the DB, so the missing User/Post tables do not affect the app.
+- **Vercel**: New project `sharenet-conformance` created + linked to `pectoraux/ShareNet` main + 6 env vars copied from the `sharenet` project. Auto-deploys on push. Production URL: https://sharenet-conformance.vercel.app. First deploy (from commit `45a0252`) is READY + serving the conformance dashboard with 138/138 vectors passing.
+- **Sandbox**: Dev server running on port 3000 (PPID=1, fully detached) with the Neon DATABASE_URL. Mesh-simulator mini-service on port 3030. Both persist across bash invocations.
+- **Note on the earlier mistaken work**: The previous session pushed 3 commits (`640d5d8`, `dfb7e0f`, `fc7d878`) to `pectoraux/sharenet-2.0` (the wrong repo). That work completed a real Neon cutover for sharenet-2.0 (ADR-0018, 24/24 architecture tests pass in production). It is NOT what the user asked for, but it is valid work for that repo and is left in place. The user can revert those commits from sharenet-2.0 if they want a clean history there.
+- **Secrets hygiene**: All four user-provided secrets (Neon password, GitHub PAT, Vercel token, ADMIN_PASSWORD) were used ONLY as runtime environment variables. None appear in any committed file. `.env` (gitignored) contains the Neon connection strings + ADMIN credentials for local dev only. The Vercel project holds the encrypted production copies.
+- **ROTATION REMINDER**: User confirmed they will rotate the PAT and Vercel token. Also recommend rotating: the Neon database password (ep-noisy-frost, was pasted in chat during a prior session), and the ADMIN_PASSWORD (visible in the Vercel env vars + in the local .env — user should set their own).
