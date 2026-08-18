@@ -215,9 +215,7 @@ pub enum DnsError {
 /// Returns [`DnsError`] if the bytes are not a valid DNS query.
 pub fn parse_dns_query(data: &[u8]) -> Result<DnsQuery, DnsError> {
     if data.len() < 12 {
-        return Err(DnsError::TooShort {
-            actual: data.len(),
-        });
+        return Err(DnsError::TooShort { actual: data.len() });
     }
 
     let transaction_id = u16::from_be_bytes([data[0], data[1]]);
@@ -239,14 +237,10 @@ pub fn parse_dns_query(data: &[u8]) -> Result<DnsQuery, DnsError> {
         let qtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
         let qclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
         offset += 4;
-        let qtype_enum = DnsQtype::from_u16(qtype).ok_or(DnsError::UnknownTypeClass {
-            qtype,
-            qclass,
-        })?;
-        let qclass_enum = DnsQclass::from_u16(qclass).ok_or(DnsError::UnknownTypeClass {
-            qtype,
-            qclass,
-        })?;
+        let qtype_enum =
+            DnsQtype::from_u16(qtype).ok_or(DnsError::UnknownTypeClass { qtype, qclass })?;
+        let qclass_enum =
+            DnsQclass::from_u16(qclass).ok_or(DnsError::UnknownTypeClass { qtype, qclass })?;
         questions.push(DnsQuestion {
             qname,
             qtype: qtype_enum,
@@ -340,11 +334,7 @@ impl DnsResponse {
     /// Build a response for an A record query. Returns the encoded DNS
     /// response packet bytes.
     #[must_use]
-    pub fn build_a_response(
-        query: &DnsQuery,
-        question_bytes: &[u8],
-        ip: Ipv4Addr,
-    ) -> Vec<u8> {
+    pub fn build_a_response(query: &DnsQuery, question_bytes: &[u8], ip: Ipv4Addr) -> Vec<u8> {
         let transaction_id = query.transaction_id;
         // Flags: QR=1 (response), opcode=0 (standard query), RD copied from
         // query, RA=0 (no recursion available), Z=0, RCODE=0 (no error).
@@ -381,11 +371,7 @@ impl DnsResponse {
     /// Build a response for an AAAA record query. Returns the encoded DNS
     /// response packet bytes.
     #[must_use]
-    pub fn build_aaaa_response(
-        query: &DnsQuery,
-        question_bytes: &[u8],
-        ip: Ipv6Addr,
-    ) -> Vec<u8> {
+    pub fn build_aaaa_response(query: &DnsQuery, question_bytes: &[u8], ip: Ipv6Addr) -> Vec<u8> {
         let transaction_id = query.transaction_id;
         let rd = if query.recursion_desired() { 0x0100 } else { 0 };
         let flags = 0x8000 | rd;
@@ -421,14 +407,7 @@ impl DnsResponse {
         let qdcount: u16 = 1;
         let ancount: u16 = 0;
 
-        Self::encode_response(
-            transaction_id,
-            flags,
-            qdcount,
-            ancount,
-            question_bytes,
-            &[],
-        )
+        Self::encode_response(transaction_id, flags, qdcount, ancount, question_bytes, &[])
     }
 
     /// Encode the full DNS response packet (header + question + answer).
@@ -448,7 +427,7 @@ impl DnsResponse {
         out.extend_from_slice(&ancount.to_be_bytes());
         out.extend_from_slice(&0u16.to_be_bytes()); // nscount
         out.extend_from_slice(&0u16.to_be_bytes()); // arcount
-        // Question section.
+                                                    // Question section.
         out.extend_from_slice(question_bytes);
         // Answer section.
         out.extend_from_slice(answer_bytes);
@@ -548,9 +527,7 @@ impl DnsResolver {
                 }
             }
             DnsQtype::Aaaa => match self.resolve(&question.qname) {
-                Some(IpAddr::V6(ip)) => {
-                    DnsResponse::build_aaaa_response(query, question_bytes, ip)
-                }
+                Some(IpAddr::V6(ip)) => DnsResponse::build_aaaa_response(query, question_bytes, ip),
                 Some(IpAddr::V4(_)) => {
                     // AAAA query but only IPv4 mapping → NXDOMAIN.
                     DnsResponse::build_nxdomain_response(query, question_bytes)
@@ -595,7 +572,7 @@ fn extract_dns_payload(packet: &IpPacket) -> Option<&[u8]> {
         _ => return None,
     };
     let _ = udp; // We only needed to verify the port.
-    // The UDP payload starts after the 8-byte UDP header.
+                 // The UDP payload starts after the 8-byte UDP header.
     let transport_payload = transport_payload(packet)?;
     if transport_payload.len() < 8 {
         return None;
@@ -790,7 +767,7 @@ mod tests {
         query.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
         query.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
         query.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-        // Question: QNAME + QTYPE + QCLASS.
+                                                      // Question: QNAME + QTYPE + QCLASS.
         query.extend_from_slice(&encode_qname(domain));
         query.extend_from_slice(&(qtype as u16).to_be_bytes()); // QTYPE
         query.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
@@ -909,11 +886,7 @@ mod tests {
         let response = resolver.resolve_query(&query, &question_bytes);
 
         let flags = u16::from_be_bytes([response[2], response[3]]);
-        assert_eq!(
-            flags & 0x000f,
-            3,
-            "RCODE must be 3 (NXDOMAIN)"
-        );
+        assert_eq!(flags & 0x000f, 3, "RCODE must be 3 (NXDOMAIN)");
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert_eq!(ancount, 0, "NXDOMAIN must have 0 answers");
     }
@@ -1030,7 +1003,10 @@ mod tests {
         match resp_transport {
             TransportHeader::Udp(resp_udp) => {
                 assert_eq!(resp_udp.src_port, 53, "response src port must be 53");
-                assert_eq!(resp_udp.dst_port, 0xCDAB, "response dst port must be swapped");
+                assert_eq!(
+                    resp_udp.dst_port, 0xCDAB,
+                    "response dst port must be swapped"
+                );
             }
             _ => panic!("expected UDP"),
         }
