@@ -95,6 +95,7 @@
 
 pub mod bridge;
 pub mod dns;
+pub mod flow_destinations;
 pub mod flow_table;
 pub mod network_intelligence;
 pub mod smol_device;
@@ -121,6 +122,10 @@ pub use dns::{
     DnsQuery, DnsQtype, DnsResolver, DnsResponse, DNS_PORT,
 };
 pub use flow_table::{FlowEntry, FlowState, FlowTable, TcpState, UdpState};
+pub use flow_destinations::{
+    extract_flow, is_routable_internet_address, is_tcp_syn, tcp_destination, validate_destination,
+    FlowMetadata,
+};
 pub use tcp_engine::{TcpEngine, TcpEngineError};
 pub use transport::{
     flow_key, parse_transport, FlowKey, TcpFlags, TcpHeader, TransportError, TransportHeader,

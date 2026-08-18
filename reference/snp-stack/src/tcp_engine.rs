@@ -81,6 +81,10 @@ impl TcpEngine {
     ///
     /// The local IP is the address the TUN interface will respond to. TCP
     /// connections to this IP will be accepted by the engine.
+    ///
+    /// **N3-B**: `any_ip` is NOT enabled by this constructor. Call
+    /// [`Self::enable_any_ip`] after construction to accept SYNs for
+    /// arbitrary external destination IPs (required for transparent TCP).
     #[must_use]
     pub fn new(local_ip: Ipv4Address, mtu: usize) -> Self {
         let mut device = TunSmolDevice::new(mtu);
@@ -101,6 +105,36 @@ impl TcpEngine {
             interface,
             sockets: SocketSet::new(Vec::new()),
         }
+    }
+
+    /// **N3-B** — Enable `any_ip` mode on the smoltcp interface.
+    ///
+    /// When enabled, the interface accepts incoming IP packets addressed to
+    /// ANY destination IP, not just the local interface IPs. This is REQUIRED
+    /// for transparent TCP: an OS application connecting to an external
+    /// Internet IP (e.g. 93.184.216.34:443) sends a SYN with that external
+    /// destination. Without `any_ip`, smoltcp drops the SYN because the
+    /// destination is not a local interface IP.
+    ///
+    /// With `any_ip` enabled:
+    /// - The SYN is accepted and dispatched to a listening socket on the
+    ///   destination port.
+    /// - When the socket transitions to ESTABLISHED, `local_endpoint()`
+    ///   returns the ORIGINAL destination (the external IP:port from the SYN),
+    ///   and `remote_endpoint()` returns the OS source (src_ip:src_port).
+    ///
+    /// This is NOT NAT — the destination IP is preserved through the stack.
+    /// No packet rewriting, no checksum recomputation.
+    ///
+    /// See: smoltcp 0.11.0 `Interface::set_any_ip` (iface/interface/mod.rs:369).
+    pub fn enable_any_ip(&mut self) {
+        self.interface.set_any_ip(true);
+    }
+
+    /// Returns true if `any_ip` mode is enabled.
+    #[must_use]
+    pub fn any_ip(&self) -> bool {
+        self.interface.any_ip()
     }
 
     /// Feed an incoming raw IP packet (from the TUN) into the smoltcp stack.
@@ -218,6 +252,38 @@ impl TcpEngine {
     #[must_use]
     pub fn tcp_socket(&self, handle: SocketHandle) -> &SmolTcpSocket<'static> {
         self.sockets.get::<SmolTcpSocket<'static>>(handle)
+    }
+
+    /// **N3-B** — Returns the local endpoint of an ESTABLISHED socket.
+    ///
+    /// When `any_ip` is enabled and a socket has transitioned from LISTEN to
+    /// ESTABLISHED, this returns the ORIGINAL destination IP:port from the
+    /// accepted SYN (the external Internet endpoint the OS application was
+    /// trying to reach).
+    ///
+    /// Returns `None` if the socket is not ESTABLISHED or has no local
+    /// endpoint.
+    ///
+    /// See: smoltcp 0.11.0 `Socket::local_endpoint` (socket/tcp.rs:696).
+    #[must_use]
+    pub fn local_endpoint(&self, handle: SocketHandle) -> Option<smoltcp::wire::IpEndpoint> {
+        let socket = self.sockets.get::<SmolTcpSocket<'static>>(handle);
+        socket.local_endpoint()
+    }
+
+    /// **N3-B** — Returns the remote endpoint (peer) of an ESTABLISHED socket.
+    ///
+    /// This is the OS source IP:port of the accepted TCP connection (e.g.
+    /// 10.0.0.2:52344 — the ephemeral port the OS kernel assigned).
+    ///
+    /// Returns `None` if the socket is not ESTABLISHED or has no remote
+    /// endpoint.
+    ///
+    /// See: smoltcp 0.11.0 `Socket::remote_endpoint` (socket/tcp.rs:702).
+    #[must_use]
+    pub fn remote_endpoint(&self, handle: SocketHandle) -> Option<smoltcp::wire::IpEndpoint> {
+        let socket = self.sockets.get::<SmolTcpSocket<'static>>(handle);
+        socket.remote_endpoint()
     }
 
     /// Remove a socket from the socket set (for connection teardown).
