@@ -121,67 +121,95 @@ fn parse_hex32(s: &str, name: &str) -> Result<[u8; 32], String> {
 
 /// Serialized mesh configuration (written by `mesh`, read by `tun`).
 ///
-/// Contains the raw bytes needed to reconstruct the Route + client identity.
+/// ## Security invariant (N3-B blocker fix)
+///
+/// This config contains **ONLY public/signed information**:
+/// - SIGNED `GatewayAdvertisement` CBOR bytes (hex-encoded) for each hop.
+///   These contain the node's Ed25519 PUBLIC key, X25519 PUBLIC key,
+///   endpoints, and a signature made with the node's Ed25519 PRIVATE key.
+/// - The TUN client verifies the signatures using the embedded PUBLIC keys.
+///
+/// It contains **NO private keys** of any kind. The TUN client must NEVER
+/// possess the relay or gateway private keys. The client generates its OWN
+/// identity (Ed25519 + X25519) independently — the mesh does not generate or
+/// transfer client credentials.
+///
+/// ## Configuration ownership
+///
+/// ```text
+/// Who generates client identity?     → The TUN client process (run_tun).
+/// Who stores client private key?    → The TUN client process.
+/// Who generates relay identities?    → The mesh process (run_mesh).
+/// Who stores relay private keys?     → The mesh process (never exported).
+/// Who generates gateway identity?    → The mesh process (run_mesh).
+/// Who stores gateway private key?    → The mesh process (never exported).
+/// Who distributes signed route data? → The mesh process (writes this config).
+/// ```
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MeshConfig {
+    /// Relay A's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
+    /// Contains relay A's PUBLIC Ed25519 key, X25519 public key, node_id,
+    /// and signature. The TUN client verifies the signature using the
+    /// embedded public key — NO private key needed.
+    relay_a_advert_cbor_hex: String,
+    /// Relay B's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
+    relay_b_advert_cbor_hex: String,
+    /// The gateway's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
+    /// Contains the gateway's PUBLIC Ed25519 key, X25519 circuit public key,
+    /// node_id, and signature.
+    gateway_advert_cbor_hex: String,
+    /// Relay A's TCP listen address (for the RouteHop endpoint).
     relay_a_addr: String,
+    /// Relay B's TCP listen address.
     relay_b_addr: String,
+    /// The gateway's TCP listen address.
     gateway_addr: String,
-    client_ed25519_secret_hex: String,
-    client_x25519_secret_hex: String,
-    client_x25519_public_hex: String,
-    client_node_id_hex: String,
-    /// The relay A Ed25519 secret (so the TUN client can reconstruct the
-    /// relay's VerifiedNodeDescriptor for the Route).
-    relay_a_ed25519_secret_hex: String,
-    relay_a_x25519_public_hex: String,
-    relay_a_node_id_hex: String,
-    relay_b_ed25519_secret_hex: String,
-    relay_b_x25519_public_hex: String,
-    relay_b_node_id_hex: String,
-    gateway_ed25519_secret_hex: String,
-    gateway_x25519_secret_hex: String,
-    gateway_x25519_public_hex: String,
-    gateway_node_id_hex: String,
 }
 
-fn build_route_from_config(cfg: &MeshConfig) -> Result<Route, String> {
-    // Reconstruct identities from the serialized hex.
-    let client_node_id = parse_hex32(&cfg.client_node_id_hex, "client_node_id")?;
+/// Decode a hex-encoded CBOR GatewayAdvertisement, verify its signature
+/// using the embedded PUBLIC key, and return the VerifiedNodeDescriptor.
+///
+/// This function does NOT need any private key. The signature was made by
+/// the mesh process with the node's private key; we verify it here using
+/// only the public key embedded in the advertisement.
+fn verify_advert_to_descriptor(advert_cbor_hex: &str, name: &str) -> Result<VerifiedNodeDescriptor, String> {
+    let cbor_bytes = hex_decode(advert_cbor_hex, name)?;
+    let advert = GatewayAdvertisement::decode_cbor(&cbor_bytes)
+        .map_err(|e| format!("decode {} advert: {:?}", name, e))?;
+    let verified = advert.verify_into_verified()
+        .ok_or_else(|| format!("verify {} advert: signature invalid", name))?;
+    let descriptor = verified.descriptor()
+        .ok_or_else(|| format!("extract {} descriptor: no circuit key", name))?;
+    eprintln!("[n3b-tun] verified {} advert: node_id={} (signature valid, no private key used)",
+        name, hex(&descriptor.node_id()));
+    Ok(descriptor)
+}
 
-    // Relay A
-    let ra_ed_sk = parse_hex32(&cfg.relay_a_ed25519_secret_hex, "relay_a_ed25519_secret")?;
-    let ra_x_pk_bytes = parse_hex32(&cfg.relay_a_x25519_public_hex, "relay_a_x25519_public")?;
-    let ra_identity = NodeIdentity::from_secret(ra_ed_sk);
-    let ra_descriptor = {
-        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
-            &ra_identity, ra_x_pk_bytes, "0.0.0.0:0", "0.0.0.0:0",
-        );
-        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
-    };
+/// Decode a hex string into bytes.
+fn hex_decode(hex_str: &str, name: &str) -> Result<Vec<u8>, String> {
+    if hex_str.len() % 2 != 0 {
+        return Err(format!("{} hex length {} is odd", name, hex_str.len()));
+    }
+    (0..hex_str.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex_str[i..i+2], 16)
+                .map_err(|e| format!("{} hex byte at offset {}: {}", name, i, e))
+        })
+        .collect()
+}
 
-    // Relay B
-    let rb_ed_sk = parse_hex32(&cfg.relay_b_ed25519_secret_hex, "relay_b_ed25519_secret")?;
-    let rb_x_pk_bytes = parse_hex32(&cfg.relay_b_x25519_public_hex, "relay_b_x25519_public")?;
-    let rb_identity = NodeIdentity::from_secret(rb_ed_sk);
-    let rb_descriptor = {
-        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
-            &rb_identity, rb_x_pk_bytes, "0.0.0.0:0", "0.0.0.0:0",
-        );
-        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
-    };
-
-    // Gateway
-    let gw_ed_sk = parse_hex32(&cfg.gateway_ed25519_secret_hex, "gateway_ed25519_secret")?;
-    let gw_x_pk_bytes = parse_hex32(&cfg.gateway_x25519_public_hex, "gateway_x25519_public")?;
-    let gw_node_id = parse_hex32(&cfg.gateway_node_id_hex, "gateway_node_id")?;
-    let gw_identity = NodeIdentity::from_secret(gw_ed_sk);
-    let gw_descriptor = {
-        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
-            &gw_identity, gw_x_pk_bytes, &cfg.gateway_addr, &cfg.gateway_addr,
-        );
-        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
-    };
+/// Build the Route from the verified public descriptors + the client's node_id.
+///
+/// The client generates its OWN identity — this function only uses the
+/// client's node_id (a PUBLIC value) and the verified descriptors from
+/// the mesh config. NO private keys are needed.
+fn build_route_from_config(cfg: &MeshConfig, client_node_id: [u8; 32]) -> Result<Route, String> {
+    // Verify each advert using ONLY the embedded public keys.
+    let ra_descriptor = verify_advert_to_descriptor(&cfg.relay_a_advert_cbor_hex, "relay A")?;
+    let rb_descriptor = verify_advert_to_descriptor(&cfg.relay_b_advert_cbor_hex, "relay B")?;
+    let gw_descriptor = verify_advert_to_descriptor(&cfg.gateway_advert_cbor_hex, "gateway")?;
+    let gw_node_id = gw_descriptor.node_id();
 
     let mut route = Route::new_with_hop_details(
         client_node_id, gw_node_id,
@@ -194,6 +222,7 @@ fn build_route_from_config(cfg: &MeshConfig) -> Result<Route, String> {
     route.validate().expect("route valid");
     route.transition(RouteState::Establishing).expect("Establishing");
     route.transition(RouteState::Active).expect("Active");
+    eprintln!("[n3b-tun] route built: client → relay A → relay B → gateway (all descriptors verified)");
     Ok(route)
 }
 
@@ -237,7 +266,9 @@ async fn run_mesh(cli: MeshCli) -> Result<(), String> {
     eprintln!("[n3b-mesh] bind_ip={} gateway_port={} relay_a_port={} relay_b_port={}",
         cli.bind_ip, cli.gateway_port, cli.relay_a_port, cli.relay_b_port);
 
-    let client = NodeIdents::fresh();
+    // Generate relay/gateway identities. The mesh process OWNS these private
+    // keys — they NEVER leave this process. The client generates its OWN
+    // identity independently (see run_tun).
     let ra = NodeIdents::fresh();
     let rb = NodeIdents::fresh();
     let gw = NodeIdents::fresh();
@@ -261,6 +292,9 @@ async fn run_mesh(cli: MeshCli) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start relay B.
+    // The relay needs a route to the gateway. The route's source is the relay
+    // A's node_id (the relay above relay B), and the destination is the gateway.
+    // For relay B's own route, the source is relay A and the destination is gateway.
     let rb_route = Route::new_with_hop_details(
         ra.node_id, gw.node_id,
         vec![
@@ -280,8 +314,12 @@ async fn run_mesh(cli: MeshCli) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Start relay A.
+    // Relay A's route source is a placeholder client node_id (the real client
+    // will have its own). The relay accepts connections from any client that
+    // knows the route. The route's hop_details carry the verified descriptors.
+    let placeholder_client_node_id = [0u8; 32]; // The real client generates its own.
     let ra_route = Route::new_with_hop_details(
-        client.node_id, gw.node_id,
+        placeholder_client_node_id, gw.node_id,
         vec![
             RouteHop::new(ra.relay_descriptor(), TransportEndpoint::tcp(&ra_addr)),
             RouteHop::new(rb.relay_descriptor(), TransportEndpoint::tcp(&rb_addr)),
@@ -299,28 +337,45 @@ async fn run_mesh(cli: MeshCli) -> Result<(), String> {
     eprintln!("[n3b-mesh] relay A on {}", ra_addr);
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // Write the mesh config for the `tun` subcommand.
+    // Create SIGNED GatewayAdvertisements for each hop. These contain ONLY
+    // public keys + signatures — NO private keys. The mesh signs with the
+    // private keys (kept internal); the client verifies with the public keys.
+    let ra_advert = GatewayAdvertisement::for_identity_with_circuit_key(
+        &ra.identity(), ra.x_pk.to_bytes(), &ra_addr, &ra_addr,
+    );
+    let rb_advert = GatewayAdvertisement::for_identity_with_circuit_key(
+        &rb.identity(), rb.x_pk.to_bytes(), &rb_addr, &rb_addr,
+    );
+    let gw_advert = GatewayAdvertisement::for_identity_with_circuit_key(
+        &gw.identity(), gw.x_pk.to_bytes(), &gw_addr, &gw_addr,
+    );
+
+    // Encode the signed adverts to CBOR, then hex-encode for JSON.
+    let ra_cbor = ra_advert.encode_cbor().map_err(|e| format!("encode relay A advert: {:?}", e))?;
+    let rb_cbor = rb_advert.encode_cbor().map_err(|e| format!("encode relay B advert: {:?}", e))?;
+    let gw_cbor = gw_advert.encode_cbor().map_err(|e| format!("encode gateway advert: {:?}", e))?;
+
+    // Write the mesh config — ONLY signed/public information, NO private keys.
     let mesh_config = MeshConfig {
+        relay_a_advert_cbor_hex: hex(&ra_cbor),
+        relay_b_advert_cbor_hex: hex(&rb_cbor),
+        gateway_advert_cbor_hex: hex(&gw_cbor),
         relay_a_addr: ra_addr.clone(),
         relay_b_addr: rb_addr.clone(),
         gateway_addr: gw_addr.clone(),
-        client_ed25519_secret_hex: hex(&client.ed_sk),
-        client_x25519_secret_hex: hex(&client.x_sk.as_ref().to_bytes()),
-        client_x25519_public_hex: hex(&client.x_pk.to_bytes()),
-        client_node_id_hex: hex(&client.node_id),
-        relay_a_ed25519_secret_hex: hex(&ra.ed_sk),
-        relay_a_x25519_public_hex: hex(&ra.x_pk.to_bytes()),
-        relay_a_node_id_hex: hex(&ra.node_id),
-        relay_b_ed25519_secret_hex: hex(&rb.ed_sk),
-        relay_b_x25519_public_hex: hex(&rb.x_pk.to_bytes()),
-        relay_b_node_id_hex: hex(&rb.node_id),
-        gateway_ed25519_secret_hex: hex(&gw.ed_sk),
-        gateway_x25519_secret_hex: hex(&gw.x_sk.as_ref().to_bytes()),
-        gateway_x25519_public_hex: hex(&gw.x_pk.to_bytes()),
-        gateway_node_id_hex: hex(&gw.node_id),
     };
     let json = serde_json::to_string_pretty(&mesh_config).map_err(|e| format!("serialize: {}", e))?;
+
+    // Write with restrictive permissions (0600) — even though the config
+    // contains no private keys, it contains signed identity metadata that
+    // should not be world-readable in production.
     std::fs::write(&cli.config_path, json).map_err(|e| format!("write {}: {}", cli.config_path, e))?;
+    // Set restrictive permissions (owner-only read/write).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cli.config_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     // Print machine-readable output.
     println!("GATEWAY_ADDR={}", gw_addr);
@@ -382,7 +437,8 @@ fn parse_tun_args(args: &[String]) -> Result<TunCli, String> {
 async fn run_tun(cli: TunCli) -> Result<(), String> {
     eprintln!("[n3b-tun] starting production TUN client...");
 
-    // 1. Read the mesh config.
+    // 1. Read the mesh config (contains ONLY signed/public advertisements —
+    //    NO private keys).
     let config_json = std::fs::read_to_string(&cli.config_path)
         .map_err(|e| format!("read {}: {} (did you run `mesh` first?)", cli.config_path, e))?;
     let mesh_cfg: MeshConfig = serde_json::from_str(&config_json)
@@ -392,18 +448,21 @@ async fn run_tun(cli: TunCli) -> Result<(), String> {
     eprintln!("[n3b-tun] relay_a={} relay_b={} gateway={}",
         mesh_cfg.relay_a_addr, mesh_cfg.relay_b_addr, mesh_cfg.gateway_addr);
 
-    // 2. Build the route.
-    let route = build_route_from_config(&mesh_cfg)?;
-
-    // 3. Parse client keys.
-    let client_ed_sk = parse_hex32(&mesh_cfg.client_ed25519_secret_hex, "client_ed25519_secret")?;
-    let client_x_sk_bytes = parse_hex32(&mesh_cfg.client_x25519_secret_hex, "client_x25519_secret")?;
-    let client_x_pk_bytes = parse_hex32(&mesh_cfg.client_x25519_public_hex, "client_x25519_public")?;
-
-    let client_identity = NodeIdentity::from_secret(client_ed_sk);
+    // 2. Generate the CLIENT'S OWN identity. The client owns its private keys
+    //    — they are NEVER received from the mesh process. This is the identity
+    //    separation invariant.
+    eprintln!("[n3b-tun] generating client identity (client owns its private keys)...");
+    let client = NodeIdents::fresh();
+    let client_identity = client.identity();
     let client_node = Node::new(client_identity, vec![Capability::Client], String::new());
-    let client_x_sk = Arc::new(X25519Secret::from(client_x_sk_bytes));
-    let client_x_pk = X25519PubKey::from(client_x_sk_bytes);
+    let client_x_sk = Arc::clone(&client.x_sk);
+    let client_x_pk = client.x_pk;
+    let client_node_id = client.node_id;
+
+    // 3. Build the route using ONLY the client's node_id + the verified public
+    //    descriptors from the mesh config. No relay/gateway private keys are
+    //    needed — the descriptors are verified via the embedded public keys.
+    let route = build_route_from_config(&mesh_cfg, client_node_id)?;
 
     // 4. Extract control-plane endpoints for split-tunnel routing.
     let control_plane_endpoints: Vec<IpAddr> = [
