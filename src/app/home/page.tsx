@@ -286,11 +286,18 @@ export default function HomePage() {
           <ConnectionHero
             summary={displaySummary}
             onPrimaryAction={handlePrimaryAction}
+            onShowDetails={() => {
+              // Scroll to the connection summary section below.
+              document.getElementById('connection-summary')?.scrollIntoView({
+                behavior: 'smooth',
+                block: 'start',
+              });
+            }}
             isPending={isPending}
           />
 
           {/* Whitespace gap between hero and summary — generous on purpose. */}
-          <div className="mt-20 sm:mt-24">
+          <div id="connection-summary" className="mt-20 scroll-mt-20 sm:mt-24">
             <ConnectionSummaryGrid summary={displaySummary} />
           </div>
         </>

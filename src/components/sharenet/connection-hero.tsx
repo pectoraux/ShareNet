@@ -33,11 +33,7 @@ import { motion, useReducedMotion } from 'framer-motion';
 import { Loader2, Power, RotateCw } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
-import {
-  IS_MOCK,
-  type ConnectionSummary,
-  type ConnectionState,
-} from '@/lib/sharenet';
+import { type ConnectionSummary, type ConnectionState } from '@/lib/sharenet';
 import { Button } from '@/components/ui/button';
 import {
   ConnectionStateIndicator,
@@ -63,46 +59,42 @@ interface HeroCopy {
 const HERO_COPY: Record<ConnectionState, HeroCopy> = {
   connected: {
     headline: "You're online through ShareNet.",
-    subtext: 'Your connection is protected and a healthy path is available.',
+    subtext: 'Healthy path available.',
     action: 'Disconnect',
     showTrustBadge: true,
     buttonVariant: 'neutral',
   },
   connecting: {
-    headline: 'Connecting to ShareNet…',
-    subtext: 'Verifying relays and establishing a secure circuit.',
+    headline: 'Connecting…',
+    subtext: 'ShareNet is establishing a connection.',
     action: 'Cancel',
     showTrustBadge: false,
     buttonVariant: 'neutral',
   },
   disconnected: {
     headline: "You're not connected.",
-    subtext:
-      'Connect to ShareNet to reach the Internet through your trusted network.',
+    subtext: 'Connect to ShareNet to reach the Internet through your trusted network.',
     action: 'Connect',
     showTrustBadge: false,
     buttonVariant: 'accent',
   },
   degraded: {
-    headline: 'Your connection is slow.',
-    subtext:
-      'A path is available but performance is reduced. ShareNet is looking for a better route.',
+    headline: 'Connection is slow.',
+    subtext: 'A path is available but performance is reduced. ShareNet is looking for a better route.',
     action: 'Disconnect',
     showTrustBadge: false,
     buttonVariant: 'neutral',
   },
   recovering: {
     headline: 'Finding a new path…',
-    subtext:
-      'Your previous path degraded. ShareNet is moving you to a healthier route automatically.',
-    action: 'Disconnect',
+    subtext: 'ShareNet is moving you to a healthier route.',
+    action: 'Cancel',
     showTrustBadge: false,
     buttonVariant: 'neutral',
   },
   offline: {
     headline: "You're offline.",
-    subtext:
-      "ShareNet couldn't reach any gateway. Check your nearby devices or try again.",
+    subtext: "ShareNet couldn't reach any gateway. Check your nearby devices or try again.",
     action: 'Try Again',
     showTrustBadge: false,
     buttonVariant: 'danger',
@@ -202,6 +194,8 @@ export interface ConnectionHeroProps {
   summary: ConnectionSummary;
   /** Called when the user clicks the primary action button. */
   onPrimaryAction: () => void;
+  /** Called when the user clicks "Connection details". */
+  onShowDetails?: () => void;
   /** When true, the button shows a spinner and is disabled. */
   isPending?: boolean;
   className?: string;
@@ -210,6 +204,7 @@ export interface ConnectionHeroProps {
 export function ConnectionHero({
   summary,
   onPrimaryAction,
+  onShowDetails,
   isPending = false,
   className,
 }: ConnectionHeroProps) {
@@ -235,26 +230,6 @@ export function ConnectionHero({
       className={cn('flex flex-col items-center text-center', className)}
       aria-labelledby="hero-headline"
     >
-      {/* ─── Prototype / simulated-data badge ──────────────────────────── */}
-      {IS_MOCK && (
-        <span
-          className="mb-12 inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium"
-          style={{
-            borderColor: 'var(--border)',
-            backgroundColor: 'var(--muted)',
-            color: 'var(--muted-foreground)',
-          }}
-          aria-label="Prototype — data shown is simulated"
-        >
-          <span
-            className="size-1.5 rounded-full"
-            style={{ backgroundColor: 'var(--sn-warning)' }}
-            aria-hidden
-          />
-          Prototype · simulated data
-        </span>
-      )}
-
       {/* ─── Animated connection ring ──────────────────────────────────── */}
       <div
         className="relative mb-12 flex items-center justify-center"
@@ -382,6 +357,17 @@ export function ConnectionHero({
         </Button>
 
         {copy.showTrustBadge && <TrustBadge className="mt-1" />}
+
+        {/* Secondary affordance — Connection details */}
+        {onShowDetails && (
+          <button
+            type="button"
+            onClick={onShowDetails}
+            className="mt-2 text-sm font-medium text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--ring)] focus-visible:ring-offset-2 rounded-sm"
+          >
+            Connection details
+          </button>
+        )}
       </div>
     </section>
   );

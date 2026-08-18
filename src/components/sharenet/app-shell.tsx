@@ -291,7 +291,22 @@ function MobileHeader({ state }: { state: ConnectionState | 'loading' }) {
       }}
       aria-label="Primary"
     >
-      <Logo compact={false} />
+      <div className="flex items-center gap-2">
+        <Logo compact={false} />
+        {IS_MOCK && (
+          <span
+            className="hidden xs:inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.625rem] font-medium"
+            style={{
+              borderColor: 'var(--border)',
+              backgroundColor: 'var(--muted)',
+              color: 'var(--muted-foreground)',
+            }}
+            aria-label={MOCK_LABEL}
+          >
+            Prototype
+          </span>
+        )}
+      </div>
       <div className="flex items-center gap-2">
         {state === 'loading' ? (
           <span

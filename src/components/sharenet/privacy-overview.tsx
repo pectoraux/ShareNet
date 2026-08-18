@@ -294,10 +294,10 @@ export function PrivacyOverview({ privacy, className }: PrivacyOverviewProps) {
       {privacy ? <PrivacyStatusBlock privacy={privacy} /> : null}
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        ShareNet traffic is end-to-end encrypted between your device and the
-        gateway. Relays forward encrypted frames without seeing their
-        contents. The gateway applies egress policy (what traffic is allowed
-        to reach the Internet) but does not hold your long-term identity keys.
+        ShareNet traffic is encrypted between your device and the gateway.
+        Relays forward encrypted traffic without reading application payloads.
+        The gateway connects to the Internet and enforces egress policy.
+        Your identity remains under your device's control.
       </p>
     </div>
   );

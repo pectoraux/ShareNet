@@ -221,7 +221,7 @@ function buildMockActivity(): ActivityEvent[] {
       type: 'connected',
       title: 'Connected to ShareNet',
       description:
-        'Circuit established via Amsterdam Relay 01 → Frankfurt Gateway 03. ' +
+        'Connected via Amsterdam Relay 01 → Frankfurt Gateway 03. ' +
         'Identity verified, route signature valid.',
       severity: 'success',
     },
@@ -231,8 +231,8 @@ function buildMockActivity(): ActivityEvent[] {
       type: 'path_improved',
       title: 'Path upgraded',
       description:
-        'Recovery controller migrated from Berlin Relay 02 to Amsterdam Relay 01. ' +
-        'Round-trip latency dropped from 71ms to 42ms.',
+        'Path switched from Berlin Relay 02 to Amsterdam Relay 01. ' +
+        'Latency improved from 71ms to 42ms.',
       severity: 'success',
     },
     {
@@ -241,18 +241,18 @@ function buildMockActivity(): ActivityEvent[] {
       type: 'relay_discovered',
       title: 'New relay discovered',
       description:
-        'Peer "Amsterdam Relay 01" advertised a fresh route descriptor. ' +
-        'Identity authenticated against its Ed25519 public key (NodeId verified).',
+        'Peer "Amsterdam Relay 01" advertised a new route. ' +
+        'Identity verified against its public key.',
       severity: 'info',
     },
     {
       id: 'evt-recovery-completed',
       timestamp: minutesAgo(34),
       type: 'recovery_completed',
-      title: 'Recovery succeeded',
+      title: 'Recovery completed',
       description:
-        'Failover from degraded Berlin Relay 02 completed in 1.4s. ' +
-        'Zero user-visible sessions interrupted.',
+        'ShareNet restored a healthy path in 1.4s. ' +
+        'New connections can use the recovered path.',
       severity: 'success',
     },
     {
@@ -261,8 +261,8 @@ function buildMockActivity(): ActivityEvent[] {
       type: 'path_degraded',
       title: 'Latency spike detected',
       description:
-        'Berlin Relay 02 reported 312ms RTT with 4% packet loss. ' +
-        'Path marked degraded; recovery controller engaged.',
+        'Berlin Relay 02 reported 312ms latency with 4% packet loss. ' +
+        'Path marked degraded; looking for a healthier route.',
       severity: 'warning',
     },
   ];
