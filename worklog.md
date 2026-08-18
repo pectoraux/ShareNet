@@ -8642,3 +8642,270 @@ Stage Summary:
        to confirm PASS.
     2. Consider adding a CI variant that runs in a privileged container
        with `--device /dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN`.
+
+---
+Task ID: N3B-EXTERNAL-ENDPOINT
+Agent: general-purpose
+Task: Fix acceptance test to distinguish host-local egress from genuine Internet acceptance
+
+Work Log:
+- Read /home/z/my-project/worklog.md (last ~200 lines) for N3-B context.
+  The previous task (N3B-STATUS rewrite) established the current
+  n3b_tun_acceptance_test.sh: 1513 lines, host-local python3 -m http.server
+  on $HOST_IP, "real external endpoint" via get_host_ip auto-detection.
+  The user's concern: the default starts a LOCAL server on $HOST_IP — this
+  proves the TUN→ShareNet→gateway→HOST path but does NOT prove genuine
+  Internet egress (the gateway's outbound socket never leaves the host).
+- Read the full script (1513 lines) and identified the changes needed:
+    1. Add --mode=host-local|internet CLI option (default: host-local).
+    2. Add --token=<string> CLI option (default: auto-generated).
+    3. Validate the external endpoint in --mode=internet (not loopback,
+       not RFC1918, not link-local, not host's own IP).
+    4. In --mode=host-local, replace python3 -m http.server with a small
+       Python script that echoes the token.
+    5. In --mode=internet, do NOT start a local server; pass the token
+       as ?token=<token> in the URL.
+    6. Verify the response body contains the token (replaces the
+       hardcoded "Hello from the real Internet via ShareNet TUN!"
+       marker).
+    7. Update the banner + classification to clearly distinguish the
+       two modes.
+    8. Keep all existing functionality (mesh/tun subcommands, split
+       tunnel, SOCKS5 self-check, DIRECT→FAIL / SHARENET→SUCCESS
+       assertion, cleanup, --keep-on-failure).
+    9. Do NOT weaken the gateway (still uses GatewayStreamTable::new(),
+       NO with_allow_loopback(), NO test-utils).
+- Made the following edits to
+  /home/z/my-project/reference/snp-stack/tests/n3b_tun_acceptance_test.sh:
+    * Defaults section: added MODE="host-local" and TOKEN="".
+    * parse_args: added --mode=*) and --token=*) cases.
+    * parse_args validation: added --mode value check (must be 'host-local'
+      or 'internet', exit 3 otherwise), --token char check (rejects
+      space/&/=/#, exit 3), and the --mode=internet REQUIRES
+      --external-endpoint check (exit 3 if missing).
+    * Added 4 new helper functions:
+        - generate_token(): N3B-<YYYYMMDDTHHMMSS>-<8 hex chars from
+          /dev/urandom> (falls back to $RANDOM if /dev/urandom is
+          unavailable).
+        - extract_endpoint_host(): parses http://<host>[:port]/[path]?[query]
+          and prints the host (handles IPv6 [::1]:port form — fixed a bug
+          where the case pattern \[*\] didn't match because the hostport
+          variable includes the port; changed to \[* (starts with [)).
+        - validate_internet_endpoint(): extracts the host from the URL,
+          resolves it to an IPv4 if it's a hostname (via getent/host/dig),
+          then validates: NOT loopback (127.* or ::1), NOT the host's own
+          IP, NOT RFC1918 private (10/8, 172.16/12, 192.168/16), NOT
+          link-local (169.254/16), NOT the test's internal subnets
+          (10.0.0.0/24, 10.0.1.0/24). Exits with code 3 on any failure.
+          Also rejects https:// (the gateway dials raw TCP, no TLS) and
+          non-http schemes.
+        - verify_external_endpoint_reachable(): in --mode=internet, does
+          a quick curl from the host to confirm the external endpoint is
+          reachable before the more complex setup begins. Exits with code
+          2 if not reachable.
+        - append_token_query(): appends ?token=<token> (or &token=<token>
+          if the URL already has a query string) to a URL.
+    * start_http_server: replaced `python3 -m http.server` with a small
+      Python script (server.py, written to a temp dir via heredoc with
+      <<'PYEOF' so $TOKEN is NOT expanded into the script file). The
+      script reads the token from the N3B_TOKEN env var (NOT the command
+      line, so it doesn't leak into `ps` listings). It echoes the token
+      in the response body, with an optional sanity check: if the client
+      passes ?token=<...> that doesn't match N3B_TOKEN, it returns 403.
+    * test_direct: now appends ?token=$TOKEN to the URL (for parity with
+      TEST 2 — the connection is expected to fail anyway, but using the
+      same URL keeps the two tests comparable in the log).
+    * test_via_sharennet: now appends ?token=$TOKEN to the URL and
+      verifies the response body contains the token (replaces the
+      hardcoded "Hello from the real Internet via ShareNet TUN!"
+      marker). This proves the bytes came from the intended external
+      server (the local Python script in host-local mode, or the remote
+      server that echoes ?token= in internet mode).
+    * main():
+        - Generates the token if --token was not provided.
+        - Resolves host_ip (used as the default endpoint in host-local
+          mode, and for the "is the endpoint the host's own IP?" check
+          in internet mode). Suppresses stderr to avoid cluttering the
+          output with get_host_ip's diagnostic messages.
+        - In --mode=internet, calls validate_internet_endpoint BEFORE
+          preflight (so a misconfigured --external-endpoint fails fast
+          with exit code 3, not the confusing exit code 2 from the
+          privilege probe).
+        - Prints different banners for the two modes:
+            host-local: "=== N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST ==="
+                        + NOTE about not being Internet acceptance
+                        + suggestion to use --mode=internet
+            internet:   "=== N3-B INTERNET ACCEPTANCE TEST ==="
+                        + external endpoint + token + "The gateway will
+                          open a real outbound TCP connection to the
+                          external endpoint"
+        - In --mode=host-local, requires host_ip (exit 2 if can't be
+          determined). In --mode=internet, host_ip is optional (only
+          used for the "is the endpoint the host's own IP?" check).
+        - Branches on MODE to either start_http_server (host-local) or
+          verify_external_endpoint_reachable (internet).
+        - Result banner branches on MODE:
+            host-local PASS: "N3-B TUN INTEGRATION / HOST-LOCAL EGRESS
+                              TEST PASSED (NOT Internet acceptance —
+                              see --mode=internet)" + what it DOES prove
+                              + how to run the Internet acceptance test.
+            internet PASS:   "N3-B INTERNET ACCEPTANCE TEST PASSED"
+                              + what it proves (genuine Internet egress)
+                              + that the response contained the token.
+            FAIL:            different banners for the two modes.
+    * Header documentation:
+        - Added a "TWO MODES (--mode=host-local | --mode=internet)" section
+          at the top explaining both modes.
+        - Updated the "successful path" diagram to note that the external
+          HTTP server is "a REMOTE server the user provides" in internet
+          mode, or "a python3 server the script starts" in host-local mode.
+        - Added TWO "EXPECTED OUTPUT (PASS)" sections — one for each mode.
+        - Updated the USAGE/OPTIONS section to document --mode, --token,
+          and the mode-dependent behaviour of --external-endpoint.
+        - Updated EXIT CODES to mention --mode/--external-endpoint/--token
+          as sources of exit code 3.
+    * usage() function:
+        - Added a "TWO MODES" section explaining both modes.
+        - Added --mode, --token to the OPTIONS list.
+        - Added EXAMPLES for --mode=internet (with and without --token).
+        - Updated EXIT CODES to mention --mode/--external-endpoint/--token.
+- Ran the syntax check and verification:
+    * `bash -n snp-stack/tests/n3b_tun_acceptance_test.sh` → SYNTAX OK.
+    * `bash ... --help` → exit 0, prints usage with --mode and --token.
+    * `bash ... --mode=bogus` → exit 3.
+    * `bash ... --mode=internet` (no endpoint) → exit 3.
+    * `bash ... --mode=internet --external-endpoint=http://127.0.0.1:8080/`
+      → exit 3 (loopback rejected).
+    * `bash ... --mode=internet --external-endpoint=http://10.0.0.5:8080/`
+      → exit 3 (10/8 RFC1918 rejected).
+    * `bash ... --mode=internet --external-endpoint=http://192.168.1.5:8080/`
+      → exit 3 (192.168/16 RFC1918 rejected).
+    * `bash ... --mode=internet --external-endpoint=http://172.20.1.5:8080/`
+      → exit 3 (172.16/12 RFC1918 rejected).
+    * `bash ... --mode=internet --external-endpoint=http://169.254.1.5:8080/`
+      → exit 3 (link-local rejected).
+    * `bash ... --mode=internet --external-endpoint=https://example.com/`
+      → exit 3 (https not supported — gateway dials raw TCP).
+    * `bash ... --mode=internet --external-endpoint='http://[::1]:8080/'`
+      → exit 3 (IPv6 loopback rejected — confirmed the extract_endpoint_host
+      bug fix works).
+    * `bash ... --mode=internet --external-endpoint=http://21.0.15.220:8080/`
+      → exit 3 (endpoint is the host's own IP — comparison works).
+    * `bash ... --mode=internet --external-endpoint=http://8.8.8.8:80/`
+      → exit 2 (validation passed; preflight fails because no root in
+      sandbox — expected).
+    * `bash ...` (default, host-local) → exit 2 (preflight fails — expected
+      in sandbox; banner correctly shows "N3-B TUN INTEGRATION /
+      HOST-LOCAL EGRESS TEST" with the NOTE about not being Internet
+      acceptance).
+    * `bash ... --token="bad token"` → exit 3 (forbidden space char).
+    * Self-check (verify_no_socks): passes — no forbidden SOCKS-proxy
+      patterns in the executable code (the new Python script content
+      doesn't contain "socks5", "N3AClient", ":1080", "--proxy", etc.).
+    * Verified the host-local Python server script directly:
+        - GET with correct ?token= → 200, body contains "ShareNet N3-B
+          host-local token echo: <token>".
+        - GET with wrong ?token= → 403, body "ERROR: token mismatch".
+        - GET without ?token= → 200, body still contains the token
+          (the server always echoes N3B_TOKEN).
+        - grep -qF "$TOKEN" on the response → PASS (the script's
+          verification logic works).
+- Could NOT execute the full test in this sandbox (no root, no unshare,
+  no /dev/net/tun) — as documented in the script header. The code has
+  been reviewed line-by-line and all argument-validation paths have
+  been exercised.
+
+Stage Summary:
+- File edited: `snp-stack/tests/n3b_tun_acceptance_test.sh` (grew from
+  1513 → 2130 lines, +617 lines, +41% — mostly new validation logic,
+  the Python token-echo server, and dual-mode banner/result branches).
+- What changed:
+    * New --mode=host-local|internet CLI option (default: host-local,
+      backward-compatible with previous versions).
+    * New --token=<string> CLI option (default: auto-generated as
+      N3B-<timestamp>-<random>).
+    * --mode=internet REQUIRES --external-endpoint and validates the
+      endpoint IP is genuinely external (not loopback, not RFC1918,
+      not link-local, not the host's own IP). Exits with code 3 on
+      any failure.
+    * --mode=host-local preserves the existing behaviour (local python3
+      server on $HOST_IP) but now classifies itself clearly as
+      "N3-B TUN integration / host-local egress test (NOT Internet
+      acceptance)".
+    * The local python3 -m http.server is replaced with a small Python
+      script that echoes the token (passed via N3B_TOKEN env var, not
+      the command line, to avoid leaking into `ps` listings).
+    * The token is verified in the response body (replaces the
+      hardcoded "Hello from the real Internet via ShareNet TUN!"
+      marker). In internet mode the token is passed as ?token=<token>
+      and the external server is expected to echo it.
+    * Different banners and result messages for the two modes, so a
+      reviewer of the log can immediately tell which kind of test
+      passed.
+    * The gateway is NOT weakened — still uses
+      GatewayStreamTable::new() (production SSRF defence, NO
+      with_allow_loopback(), NO test-utils).
+    * All existing functionality retained: mesh/tun subcommands,
+      split-tunnel design, SOCKS5 self-check, DIRECT→FAIL /
+      SHARENET→SUCCESS assertion, cleanup, --keep-on-failure.
+- How to use --mode=internet:
+    # Genuine Internet acceptance test (the gateway dials a REMOTE
+    # public IP — the script does NOT start a local server):
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh \
+        --mode=internet \
+        --external-endpoint=http://<REMOTE_PUBLIC_IP>:<PORT>/
+
+    # The endpoint IP MUST be:
+    #   - NOT the gateway host's own IP
+    #   - NOT loopback (127.0.0.0/8, ::1)
+    #   - NOT RFC1918 private (10/8, 172.16/12, 192.168/16)
+    #   - NOT link-local (169.254/16)
+    #   - NOT in the test's internal subnets (10.0.0.0/24, 10.0.1.0/24)
+
+    # The external server is expected to echo the ?token=<token> query
+    # parameter in its response body. A simple implementation:
+    #   python3 -c '
+    #   import http.server, socketserver, sys
+    #   from urllib.parse import urlparse, parse_qs
+    #   class H(http.server.BaseHTTPRequestHandler):
+    #       def do_GET(self):
+    #           t = parse_qs(urlparse(self.path).query).get("token",[""])[0]
+    #           body = t.encode()
+    #           self.send_response(200); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+    #   socketserver.TCPServer.allow_reuse_address = True
+    #   socketserver.TCPServer(("0.0.0.0", 8080), H).serve_forever()
+    #   '
+
+    # Optional: --token=<your-unique-string> (otherwise auto-generated
+    # as N3B-<timestamp>-<random>).
+- Token verification design:
+    * The script generates (or accepts via --token) a unique token like
+      "N3B-20260818T123722-ac580d95".
+    * In host-local mode: the token is passed to the local Python server
+      via the N3B_TOKEN env var (NOT the command line, to avoid leaking
+      into `ps`). The server echoes it in the response body. The script
+      appends ?token=<token> to the curl URL for parity with internet
+      mode (the local server optionally verifies it matches).
+    * In internet mode: the token is passed as ?token=<token> in the
+      curl URL. The external server is expected to echo it in the
+      response body.
+    * The script verifies the response body contains the token via
+      `grep -qF "$TOKEN"`. This proves the bytes came from the intended
+      external server (not from a transparent proxy, captive portal, or
+      misconfigured relay along the path).
+    * Token validation: --token rejects space/&/=/# (would break URL
+      parsing) and tokens >256 chars. The auto-generated token uses
+      only [A-Za-z0-9-] (timestamp + hex random).
+- Next actions for the orchestrator:
+    1. Run `sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh
+       --mode=internet --external-endpoint=http://<REMOTE_PUBLIC_IP>:<PORT>/`
+       in a real Linux environment with root + iproute2 + cargo +
+       /dev/net/tun + Internet access, against a remote HTTP server that
+       echoes ?token=<token>. Expected: PASS (N3-B INTERNET ACCEPTANCE
+       TEST: PASS).
+    2. Consider providing a small reference "echo server" implementation
+       (Python one-liner documented above) for users who don't have an
+       existing public HTTP server that echoes ?token=.
+    3. The default --mode=host-local remains the CI-friendly default
+       (no Internet access required) — but it now clearly identifies
+       itself as "NOT Internet acceptance" in the banner and result.
