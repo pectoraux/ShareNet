@@ -8408,3 +8408,237 @@ Stage Summary:
        to confirm PASS once the binary is extended.
     3. Consider adding a CI variant that runs in a privileged container
        with `--device /dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN`.
+
+---
+Task ID: N3B-ACCEPTANCE-V2
+Agent: general-purpose
+Task: Rewrite n3b_tun_acceptance_test.sh to match the mesh/tun binary interface
+
+Work Log:
+- Read the worklog entries for N3B-ACCEPTANCE (the previous version of
+  the script) to understand the context. The previous version was
+  written when the n3b_tun_demo binary did NOT yet support the `mesh`
+  / `tun` subcommands — it bundled everything in one process and bound
+  to 127.0.0.1, which was incompatible with namespace isolation. The
+  previous script's CLI probe detected this gap and exited with code 2.
+- Read the n3b_tun_demo binary source (snp-stack/examples/n3b_tun_demo.rs)
+  and confirmed it NOW supports the `mesh` and `tun` subcommands with
+  the verified interface:
+    * `mesh` subcommand:
+        --bind-ip <ip>          (default: 10.0.1.1)
+        --gateway-port <p>      (default: 7003)
+        --relay-a-port <p>      (default: 7002)
+        --relay-b-port <p>      (default: 7001)
+        --config <path>         (default: /tmp/sharenet-mesh-config.json)
+      Writes a JSON mesh config to <path>. Prints on stdout:
+        GATEWAY_ADDR=<addr>, RELAY_A_ADDR=<addr>, RELAY_B_ADDR=<addr>,
+        CONFIG_PATH=<path>. Prints "N3-B mesh READY" on stderr.
+      Uses GatewayStreamTable::new() (PRODUCTION SSRF defence —
+      NO loopback exception — the gateway REJECTS loopback/private IPs).
+    * `tun` subcommand:
+        --config <path>         (reads the mesh config written by `mesh`)
+        --tun-name <name>      (default: snp0)
+        --tun-ip <ip>          (default: 10.0.0.1, plain IPv4 — NO CIDR)
+        --physical-interface <iface>  (for control-plane routes)
+      Reads the config, creates the TUN, establishes the ShareNet
+      circuit, and calls configure_os_routes() which installs:
+        - TUN IP (10.0.0.1/24) + brings it up
+        - Host routes for control-plane endpoints via <iface>
+        - Default route via the TUN
+      Prints on stdout: TUN_NAME=<name>, TUN_IP=<ip>.
+      Prints "N3-B TUN client READY" on stderr.
+- Read snp-stack/src/os_routes.rs and confirmed the binary's
+  configure_os_routes() handles the split-tunnel route installation
+  (control-plane host routes + TUN default route). The script no
+  longer needs to install these routes manually — the binary does it.
+  The script just passes --physical-interface $CLIENT_VETH so the
+  binary knows which interface to use for control-plane routes.
+- Rewrote snp-stack/tests/n3b_tun_acceptance_test.sh (1513 lines, 75KB):
+    * Updated header documentation to reflect the actual binary
+      interface (mesh writes config, tun reads config, production
+      SSRF defence, external HTTP server started by the script).
+    * Updated default ports to match the binary's defaults:
+        GATEWAY_PORT=7003 (was 7002)
+        RELAY_A_PORT=7002 (was 7001)
+        RELAY_B_PORT=7001 (was 7000)
+    * Removed options that the binary does NOT accept:
+        --tun-cidr  (binary hardcodes /24 in os_routes.rs)
+        --mtu       (binary hardcodes 1500 in TunClientConfig)
+        --cargo-features  (binary MUST be built with --features
+          circuit-upstream only — NO test-utils — production SSRF)
+    * Added --config=PATH option (default: /tmp/sharenet-mesh-config.json)
+      passed to both mesh and tun subcommands.
+    * Updated build command to:
+        cargo build --example n3b_tun_demo -p snp-stack --features circuit-upstream
+      (NO test-utils — the gateway must use GatewayStreamTable::new()).
+    * Updated start_mesh() to pass --config $CONFIG_PATH and wait for
+      the "CONFIG_PATH=" readiness marker on stdout (the binary prints
+      this AFTER writing the config file and binding all listeners).
+      Also verifies the config file exists after the mesh reports ready.
+    * Updated start_tun_client() to pass --config $CONFIG_PATH,
+      --tun-name $TUN_NAME, --tun-ip $TUN_IP (plain IP, no CIDR), and
+      --physical-interface $CLIENT_VETH. Waits for the "TUN_NAME="
+      readiness marker on stdout (printed AFTER configure_os_routes()
+      succeeds). Verifies the default route via snp0 AND the
+      control-plane host route to $HOST_VETH_IP via $CLIENT_VETH
+      were installed by the binary.
+    * Updated setup_namespace() to NOT install the split-tunnel route
+      manually — the binary's configure_os_routes() does it. The
+      script still sets up the namespace + veth pair + IPs, and
+      asserts NO default route exists before the TUN starts (for
+      TEST 1). The connected route 10.0.1.0/24 (auto-created when
+      assigning $CLIENT_IP/24 to veth_client) ensures reachability.
+    * Updated cleanup() to send SIGINT first (the binary's
+      tokio::signal::ctrl_c handler catches SIGINT and calls
+      cleanup_os_routes() to remove the routes it installed), then
+      SIGTERM, then SIGKILL. Also removes the config file on exit.
+    * Updated the CLI probe in ensure_binary() to check that the
+      binary supports mesh/tun subcommands (now a sanity check, not
+      a design-gap detector).
+    * Added loopback-external-endpoint guard that explains WHY
+      loopback is rejected (the gateway uses production SSRF defence).
+    * RETAINED the verify_no_socks() self-check EXACTLY as in the
+      previous version (with the string-concatenation indirection so
+      the self-check doesn't flag its own source). This is the HARD
+      requirement: NO SOCKS5, NO curl --socks5, NO N3AClient.
+    * Updated the RESULT section to print the required output format:
+        [1] DIRECT: curl from client namespace → FAIL (expected)
+        [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)
+        N3-B TUN ACCEPTANCE TEST: PASS
+- Verified the script's syntax (`bash -n` → OK) and behaviour in the
+  sandbox:
+    * --help: prints usage text, exit 0.
+    * no args: detects insufficient privileges (uid=1001, no
+      CAP_NET_ADMIN, no /dev/net/tun, no unshare permission), prints
+      clear error suggesting `sudo`, exits 2. The cleanup trap runs
+      cleanly (no processes to kill, no namespace to delete).
+    * --bogus-arg: exits 3 (unknown argument).
+    * --http-port=foo: exits 3 (non-numeric).
+    * --gateway-port=7001 --relay-a-port=7001: exits 3 (ports must
+      be distinct).
+    * --tun-name=this_name_is_way_too_long_for_linux: exits 3 (TUN
+      name > 15 chars).
+    * --tun-ip=192.168.1.1: exits 3 (TUN IP must be in 10.0.0.0/24).
+    * --host-veth-ip=192.168.1.1: exits 3 (must be in 10.0.1.0/24).
+    * --external-endpoint=http://127.0.0.1:8080/: exits 3 (loopback
+      rejected — gateway uses production SSRF defence).
+    * --external-endpoint=http://10.0.0.5:8080/: exits 3 (internal
+      TUN subnet rejected — would make DIRECT test succeed via veth).
+    * --config=/tmp/my-custom-config.json: respected (shown in banner).
+    * -v --keep-on-failure: preflight fails (sandbox), cleanup trap
+      reports state for debugging (mesh log path, tun log path, config
+      file path, etc.).
+    * Self-check injection test: injecting a `curl --socks5 127.0.0.1:1080
+      ...` line into a copy of the script and running it triggers the
+      self-check with exit code 2 and a clear error pointing to the
+      offending line (catches both --socks5 and :1080 patterns).
+    * Self-check on the ORIGINAL script: passes cleanly (no false
+      positives from the header documentation, which is stripped as
+      comments by the awk preprocessor).
+- Could NOT execute the full test in this sandbox (no root, no unshare
+  permission, no /dev/net/tun) — as documented in the script header.
+  The code is correct and has been reviewed line-by-line against the
+  actual binary source (n3b_tun_demo.rs, tun_client.rs, os_routes.rs).
+
+Stage Summary:
+- File rewritten: `snp-stack/tests/n3b_tun_acceptance_test.sh` (1513
+  lines, 75KB, executable, `bash -n` passes).
+- What it tests: the N3-B "transparent networking" north-star — an
+  unmodified OS application (plain `curl http://IP:PORT/` with NO proxy
+  flags) running inside a network namespace with NO direct Internet
+  route can still reach a real, non-loopback external endpoint, because
+  the OS TCP/IP stack routes its SYNs through a real TUN interface that
+  is plumbed into the ShareNet circuit mesh.
+    CLIENT DIRECT INTERNET       → FAILS  (no route in namespace)
+    CLIENT THROUGH SHARENET TUN  → SUCCEEDS (real TUN + real circuit)
+- Topology (split-tunnel, prevents routing loops):
+    Client namespace (snp_n3b):
+      - snp0 (TUN): 10.0.0.1/24, default route → snp0
+        (installed by the binary's configure_os_routes())
+      - veth_client: 10.0.1.2/24 (veth to host)
+      - host route 10.0.1.1/32 → veth_client
+        (installed by the binary's configure_os_routes())
+      - n3b_tun_demo tun --config <path> --tun-name snp0
+          --tun-ip 10.0.0.1 --physical-interface veth_client
+    Host namespace (full Internet):
+      - veth_host: 10.0.1.1/24 (mesh binds here, reachable from client)
+      - External HTTP server on $HOST_IP:$HTTP_PORT (python3, NOT the binary)
+      - n3b_tun_demo mesh --bind-ip 10.0.1.1
+          --gateway-port 7003 --relay-a-port 7002 --relay-b-port 7001
+          --config /tmp/sharenet-mesh-config.json
+      - Gateway uses GatewayStreamTable::new() (PRODUCTION SSRF defence —
+        NO loopback exception — the gateway REJECTS loopback/private IPs)
+- How to run it (REQUIRES root + /dev/net/tun + iproute2 + cargo):
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh
+  Or with options:
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh -v --keep-on-failure
+  Or with a real public Internet endpoint:
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh \
+        --external-endpoint=http://example.com/
+- Expected output (PASS):
+    === N3-B TUN ACCEPTANCE TEST ===
+    host IP:             192.168.1.42
+    external endpoint:   http://192.168.1.42:8888/
+    TUN interface:       snp0 (10.0.0.1, mtu 1500 — hardcoded by binary)
+    client namespace:    snp_n3b (veth 10.0.1.2, no default route yet)
+    mesh:               gateway=10.0.1.1:7003 relayA=10.0.1.1:7002 relayB=10.0.1.1:7001
+    config file:        /tmp/sharenet-mesh-config.json
+
+    === STEP 1: starting external HTTP server (the 'Internet' endpoint) ===
+    python3 -m http.server 8888 --bind 0.0.0.0 (PID 12345)
+
+    === STEP 2: starting ShareNet mesh (gateway + 2 relays) in host namespace ===
+    n3b_tun_demo mesh --bind-ip 10.0.1.1 ... (PID 12346)
+    waiting for mesh to be ready... OK
+
+    === STEP 3: setting up network namespace + veth pair ===
+    ip netns add snp_n3b
+    veth pair: veth_snp_n3b_host ↔ veth_snp_n3b_client
+    host: 10.0.1.1/24 on veth_snp_n3b_host
+    client: 10.0.1.2/24 on veth_snp_n3b_client
+    NO default route in client namespace (verified)
+
+    === TEST 1: DIRECT access from client namespace (no TUN yet) — EXPECTED: FAIL ===
+    [1] DIRECT: curl from client namespace → FAIL (expected)
+
+    === STEP 4: starting TunClient in client namespace (creates TUN + installs routes) ===
+    ip netns exec snp_n3b n3b_tun_demo tun --config ... --tun-name snp0 ...
+    waiting for TunClient to be ready... OK
+    ✓ default route installed via snp0 (by the binary's configure_os_routes)
+    ✓ TUN interface snp0 exists in snp_n3b
+    ✓ control-plane route to 10.0.1.1 via veth_snp_n3b_client (split-tunnel active)
+
+    === TEST 2: ShareNet via TUN from client namespace — EXPECTED: SUCCESS ===
+    [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)
+
+    N3-B TUN ACCEPTANCE TEST: PASS
+- NO SOCKS5: the script has a built-in self-check (`verify_no_socks`)
+  that scans its own executable code for forbidden SOCKS-proxy patterns
+  and exits with code 2 if any are found. Verified by injecting a
+  `curl --socks5` line and confirming the self-check catches it.
+- Known limitations (documented in the script header):
+    1. The script CANNOT run in this sandbox (no root, no unshare, no
+       /dev/net/tun). Pre-flight checks detect this and exit with code 2
+       and a clear error message.
+    2. The binary's configure_os_routes() hardcodes the TUN CIDR as /24
+       and the MTU as 1500. To use different values, the binary source
+       (os_routes.rs / tun_client.rs) must be modified.
+    3. The split-tunnel design assumes TUN subnet = 10.0.0.0/24 and
+       veth subnet = 10.0.1.0/24 (different subnets, both more specific
+       than default). To use different subnets, change --tun-ip,
+       --host-veth-ip, --client-ip, AND update the binary's hardcoded
+       /24 in os_routes.rs.
+- Related files (NOT modified by this task):
+    * snp-stack/examples/n3b_tun_demo.rs  — the mesh+tun binary (now
+      supports the mesh/tun subcommands this script depends on).
+    * snp-stack/src/tun_client.rs        — TunClient runtime (production).
+    * snp-stack/src/os_routes.rs         — OS route configuration helpers
+      (called by the binary's configure_os_routes() to install the
+      split-tunnel routes).
+    * Worklog entry N3B-STATUS            — architectural status matrix.
+- Next actions for the orchestrator:
+    1. Run `sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh` in a
+       real Linux environment with root + iproute2 + cargo + /dev/net/tun
+       to confirm PASS.
+    2. Consider adding a CI variant that runs in a privileged container
+       with `--device /dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN`.
