@@ -283,7 +283,12 @@ fn node_descriptor_alias_removed() {
     //
     // We can't test this at compile time from a test, but we can scan the
     // source.
-    let source = include_str!("../src/node/descriptor.rs");
+    //
+    // R2.2 (DESCRIPTOR-EXTRACTION): the descriptor types were moved to
+    // `snp-identity/src/descriptor.rs`. The `include_str!` path now points
+    // there instead of the local re-export stub in
+    // `snp-node/src/node/descriptor.rs`.
+    let source = include_str!("../../snp-identity/src/descriptor.rs");
     assert!(
         !source.contains("pub type NodeDescriptor ="),
         "The dangerous `NodeDescriptor = UnverifiedNodeDescriptor` alias MUST be removed"
@@ -335,7 +340,11 @@ fn cross_platform_advertisement_vectors() {
 /// `VerifiedGatewayAdvertisement`.
 #[test]
 fn verified_node_descriptor_is_generic() {
-    let source = include_str!("../src/node/descriptor.rs");
+    // R2.2 (DESCRIPTOR-EXTRACTION): the descriptor types were moved to
+    // `snp-identity/src/descriptor.rs`. The `include_str!` path now points
+    // there instead of the local re-export stub in
+    // `snp-node/src/node/descriptor.rs`.
+    let source = include_str!("../../snp-identity/src/descriptor.rs");
     assert!(
         source.contains("from_verified_advert_internal"),
         "VerifiedNodeDescriptor must have a generic construction path from NodeAdvertisement"

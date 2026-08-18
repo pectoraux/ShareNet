@@ -43,6 +43,15 @@ pub enum IdentityError {
     /// Underlying crypto failure.
     #[error("crypto error: {0}")]
     Crypto(String),
+    /// R2.2 (DESCRIPTOR-EXTRACTION): a GatewayAdvertisement / descriptor
+    /// failed to (de)serialise for a reason NOT covered by [`Self::Cbor`]
+    /// (e.g. a required CBOR field was missing, or a field had the wrong
+    /// CBOR type). The previous snp-node implementation surfaced these as
+    /// `NodeError::Other(format!(...))`; snp-identity surfaces them as
+    /// `IdentityError::Other(String)` so callers can map them back to
+    /// `NodeError::Other` without losing the diagnostic message.
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Convenience `Result` alias.
@@ -84,6 +93,42 @@ pub fn verify_signed(
     preimage.extend_from_slice(payload_bytes);
     snp_crypto::ed25519_verify(public_key, &preimage, signature)
 }
+
+/// Current unix timestamp in seconds.
+///
+/// R2.2 (DESCRIPTOR-EXTRACTION): moved verbatim from
+/// `snp-node/src/node/mod.rs` so the `GatewayAdvertisement` constructors in
+/// [`gateway`] can use it without depending on snp-node. snp-node's
+/// `node::mod.rs` re-exports this via `pub(crate) use snp_identity::now_unix;`
+/// so all existing in-crate callers (`now_unix()`, `super::now_unix()`)
+/// continue to compile.
+#[must_use]
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// === Submodules ===
+//
+// R2.2 (DESCRIPTOR-EXTRACTION): the `gateway` and `descriptor` modules were
+// moved verbatim from `snp-node/src/node/{gateway,descriptor}.rs`. The CBOR
+// encoding, signature preimage, verification logic, and type-system
+// distinctions are byte-for-byte identical to the pre-extraction
+// implementation — no field names, types, or canonical-CBOR shapes were
+// changed.
+
+pub mod gateway;
+pub mod descriptor;
+
+// Re-export the public types at the crate root for ergonomic access
+// (`snp_identity::GatewayAdvertisement`, etc.).
+pub use gateway::{GatewayAdvertisement, ADVERTISEMENT_TTL_SECS};
+pub use descriptor::{
+    IdentityConsistentNodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
+    VerifiedGatewayAdvertisement, VerifiedNodeDescriptor, verify_node_id_consistency,
+};
 
 // === Runtime identity types (extracted from snp-node/src/node/identity.rs) ===
 //

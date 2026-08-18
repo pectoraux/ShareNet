@@ -79,12 +79,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use snp_cbor::CborValue;
-use snp_crypto::{
-    derive_node_id, derive_public_key, ed25519_sign, ed25519_verify, sig_contexts,
-};
+use snp_crypto::{derive_node_id, derive_public_key};
 use snp_frames::{should_drop, Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_gateway::{
     decode_transit_request, decode_transit_response, encode_transit_request,
@@ -202,8 +200,11 @@ pub use async_transport::{
 // constant is retained in `crate::legacy` for backward compatibility with
 // any external callers that may still reference it.
 
-/// Default advertisement lifetime: 1 hour.
-const ADVERTISEMENT_TTL_SECS: u64 = 3600;
+// R2.2 (DESCRIPTOR-EXTRACTION): `ADVERTISEMENT_TTL_SECS` has moved to
+// `snp_identity::ADVERTISEMENT_TTL_SECS`. No in-crate caller in `snp-node`
+// references the constant any more (the only user was `gateway.rs`, which
+// has been extracted). External callers should use
+// `snp_identity::ADVERTISEMENT_TTL_SECS` directly.
 
 /// Body marker for the Class C "upstream-failure" NACK frame. When a relay
 /// cannot forward a frame (upstream EOF / connection reset), it sends a
@@ -1907,88 +1908,12 @@ fn u(n: u64) -> CborValue {
     CborValue::UnsignedInt(n)
 }
 
-fn extract_uint(v: CborValue, field: &str) -> NodeResult<u64> {
-    match v {
-        CborValue::UnsignedInt(n) => Ok(n),
-        other => Err(NodeError::Other(format!(
-            "GatewayAdvertisement.{field} must be a CBOR uint; got {other:?}"
-        ))),
-    }
-}
-
-fn extract_text(v: CborValue, field: &str) -> NodeResult<String> {
-    match v {
-        CborValue::TextString(s) => Ok(s),
-        other => Err(NodeError::Other(format!(
-            "GatewayAdvertisement.{field} must be a text string; got {other:?}"
-        ))),
-    }
-}
-
-fn extract_bstr_32(v: CborValue, field: &str) -> NodeResult<[u8; 32]> {
-    match v {
-        CborValue::ByteString(bytes) => {
-            if bytes.len() != 32 {
-                return Err(NodeError::Other(format!(
-                    "GatewayAdvertisement.{field} must be 32 bytes; got {}",
-                    bytes.len()
-                )));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            Ok(arr)
-        }
-        other => Err(NodeError::Other(format!(
-            "GatewayAdvertisement.{field} must be a byte string; got {other:?}"
-        ))),
-    }
-}
-
-fn extract_bstr_64(v: CborValue, field: &str) -> NodeResult<[u8; 64]> {
-    match v {
-        CborValue::ByteString(bytes) => {
-            if bytes.len() != 64 {
-                return Err(NodeError::Other(format!(
-                    "GatewayAdvertisement.{field} must be 64 bytes; got {}",
-                    bytes.len()
-                )));
-            }
-            let mut arr = [0u8; 64];
-            arr.copy_from_slice(&bytes);
-            Ok(arr)
-        }
-        other => Err(NodeError::Other(format!(
-            "GatewayAdvertisement.{field} must be a byte string; got {other:?}"
-        ))),
-    }
-}
-
-fn extract_caps(v: CborValue, field: &str) -> NodeResult<Vec<Capability>> {
-    match v {
-        CborValue::Array(items) => {
-            let mut caps = Vec::with_capacity(items.len());
-            for item in items {
-                let s = match item {
-                    CborValue::TextString(s) => s,
-                    other => {
-                        return Err(NodeError::Other(format!(
-                            "GatewayAdvertisement.{field} array item must be a text string; got {other:?}"
-                        )));
-                    }
-                };
-                caps.push(
-                    Capability::from_str(&s).ok_or_else(|| {
-                        NodeError::Other(format!("unknown capability \"{s}\""))
-                    })?,
-                );
-            }
-            Ok(caps)
-        }
-        other => Err(NodeError::Other(format!(
-            "GatewayAdvertisement.{field} must be a CBOR array; got {other:?}"
-        ))),
-    }
-}
+// R2.2 (DESCRIPTOR-EXTRACTION): the `extract_uint` / `extract_text` /
+// `extract_bstr_32` / `extract_bstr_64` / `extract_caps` helpers were used
+// only by `GatewayAdvertisement::decode_cbor` (now in `snp-identity`). They
+// have been removed from `snp-node` to avoid dead-code warnings. The
+// canonical implementations now live in `snp-identity::gateway` (private
+// to that module).
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -2000,12 +1925,11 @@ static REQ_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Monotonic counter for unique flow IDs within a process.
 static FID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// R2.2 (DESCRIPTOR-EXTRACTION): `now_unix()` moved to snp-identity. We
+// re-export it here under the original (private) name so every existing
+// in-crate caller (`now_unix()`, `super::now_unix()`) continues to compile
+// unchanged. The body is identical (4-line `SystemTime` → `u64` mapping).
+pub(crate) use snp_identity::now_unix;
 
 /// Generate a unique 16-byte req_id. Combines the current unix timestamp
 /// (seconds) with a monotonic counter, then SHA-256-hashes the combination.
@@ -2421,9 +2345,13 @@ mod tests {
 
     /// N2.0.7: The `GatewayAdvertisement` must carry `circuit_x25519_pub`
     /// in the SIGNED preimage (binding the X25519 key to the Ed25519 identity).
+    ///
+    /// R2.2 (DESCRIPTOR-EXTRACTION): `GatewayAdvertisement` was moved to
+    /// `snp-identity/src/gateway.rs`. The `include_str!` path now points
+    /// there instead of the local re-export stub in `snp-node/src/node/gateway.rs`.
     #[test]
     fn gateway_advertisement_binds_x25519_in_signed_preimage() {
-        let source = include_str!("gateway.rs");
+        let source = include_str!("../../../snp-identity/src/gateway.rs");
         // The struct must have a circuit_x25519_pub field.
         assert!(
             source.contains("pub circuit_x25519_pub: [u8; 32]"),
@@ -2539,9 +2467,14 @@ mod tests {
 
     /// N2.0.7.1: `NodeDescriptor` and `TransportEndpoint` must exist in
     /// `descriptor.rs`.
+    ///
+    /// R2.2 (DESCRIPTOR-EXTRACTION): the descriptor types were moved to
+    /// `snp-identity/src/descriptor.rs`. The `include_str!` path now points
+    /// there instead of the local re-export stub in
+    /// `snp-node/src/node/descriptor.rs`.
     #[test]
     fn node_descriptor_and_transport_endpoint_exist() {
-        let source = include_str!("descriptor.rs");
+        let source = include_str!("../../../snp-identity/src/descriptor.rs");
         assert!(
             source.contains("pub struct UnverifiedNodeDescriptor")
                 || source.contains("pub struct NodeDescriptor"),
@@ -2693,9 +2626,14 @@ mod tests {
     }
 
     /// N2.0.7.2: VerifiedNodeDescriptor must exist and enforce NodeId consistency.
+    ///
+    /// R2.2 (DESCRIPTOR-EXTRACTION): the descriptor types were moved to
+    /// `snp-identity/src/descriptor.rs`. The `include_str!` path now points
+    /// there instead of the local re-export stub in
+    /// `snp-node/src/node/descriptor.rs`.
     #[test]
     fn verified_node_descriptor_enforces_consistency() {
-        let source = include_str!("descriptor.rs");
+        let source = include_str!("../../../snp-identity/src/descriptor.rs");
         assert!(
             source.contains("pub struct VerifiedNodeDescriptor"),
             "VerifiedNodeDescriptor must exist"

@@ -53,6 +53,23 @@ pub enum NodeError {
     Other(String),
 }
 
+/// R2.2 (DESCRIPTOR-EXTRACTION): convert `IdentityError` (from `snp-identity`)
+/// into `NodeError`. This is required because `GatewayAdvertisement::encode_cbor`
+/// and `GatewayAdvertisement::decode_cbor` now return `IdentityResult<_>` (the
+/// type lives in `snp-identity`, which cannot depend on `snp-node`'s `NodeError`).
+/// All call sites that previously used `?` on a `NodeResult<_>` continue to
+/// work — the `From` impl below preserves the diagnostic message for non-CBOR
+/// errors and forwards `Cbor` errors directly into `NodeError::Cbor` (which
+/// already had `#[from] snp_cbor::CborError`).
+impl From<snp_identity::IdentityError> for NodeError {
+    fn from(e: snp_identity::IdentityError) -> Self {
+        match e {
+            snp_identity::IdentityError::Cbor(c) => NodeError::Cbor(c),
+            other => NodeError::Other(format!("identity: {other}")),
+        }
+    }
+}
+
 /// Convenience `Result` alias.
 pub type NodeResult<T> = Result<T, NodeError>;
 

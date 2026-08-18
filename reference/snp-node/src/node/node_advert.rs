@@ -428,9 +428,25 @@ pub struct VerifiedNodeAdvertisement {
 
 impl VerifiedNodeAdvertisement {
     /// Derive a `VerifiedNodeDescriptor` from this verified advertisement.
+    ///
+    /// R2.2 (DESCRIPTOR-EXTRACTION): the underlying constructor now lives
+    /// in `snp-identity` and takes the primitive fields of an advertisement
+    /// (instead of a `&NodeAdvertisement` directly). This avoids a circular
+    /// dependency: `NodeAdvertisement` is in `snp-node`, but
+    /// `VerifiedNodeDescriptor` is in `snp-identity`. The
+    /// [`VerifiedNodeDescriptor::from_verified_advert_internal`] constructor
+    /// takes the underlying fields and re-derives the
+    /// [`IdentityConsistentNodeDescriptor`] wrapper. It still panics if
+    /// NodeId consistency fails — but `verify_into_verified()` already
+    /// checked this before constructing `self`, so the panic is unreachable.
     #[must_use]
     pub fn descriptor(&self) -> VerifiedNodeDescriptor {
-        VerifiedNodeDescriptor::from_verified_advert_internal(&self.advert)
+        VerifiedNodeDescriptor::from_verified_advert_internal(
+            self.advert.node_id,
+            self.advert.ed25519_public_key,
+            self.advert.x25519_circuit_public,
+            self.advert.capabilities.clone(),
+        )
     }
 
     /// Create an `AuthenticatedNodeRecord` that binds the descriptor with

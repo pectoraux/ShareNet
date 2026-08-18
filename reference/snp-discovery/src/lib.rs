@@ -153,6 +153,83 @@ impl HaveVector {
     }
 }
 
+// ─── Runtime discovery types (extracted from snp-node/src/node/discovery.rs) ===
+//
+// R2.4 extraction: DiscoveredNode, DiscoveryProvider, and StaticDiscovery
+// were moved from snp-node into snp-discovery. They depend on
+// GatewayAdvertisement (now in snp-identity) and basic std types only.
+//
+// BootstrapDiscovery (which uses TCP I/O) remains in snp-node — it is
+// runtime code, not a discovery type.
+
+/// A discovered node: a signed advertisement + the endpoint at which it
+/// can be reached for transit.
+///
+/// The caller MUST verify the advertisement's signature before use.
+#[derive(Debug, Clone)]
+pub struct DiscoveredNode {
+    /// The signed advertisement (caller MUST verify the signature before use).
+    pub advertisement: snp_identity::GatewayAdvertisement,
+    /// The TCP address at which this node can be reached for transit.
+    pub endpoint: String,
+}
+
+/// A discovery provider: returns a list of discovered nodes.
+///
+/// The caller is responsible for:
+/// 1. Verifying each `advertisement`'s signature.
+/// 2. Checking each `advertisement`'s expiry.
+/// 3. Cross-checking each `advertisement`'s `node_id` against
+///    `SHA-256("SNP/0.1 node\0" || public_key)` (invariant I4).
+pub trait DiscoveryProvider: Send + Sync {
+    /// Discover peers/gateways. Returns a list of [`DiscoveredNode`]s.
+    fn discover(&self) -> Vec<DiscoveredNode>;
+
+    /// Advertise this node's presence. Default no-op — providers that don't
+    /// support outbound advertising silently ignore the call.
+    fn advertise(&self, _advertisement: &snp_identity::GatewayAdvertisement, _endpoint: &str) {
+        // Default no-op.
+    }
+}
+
+/// A static discovery provider: a pre-configured list of nodes.
+#[derive(Debug, Clone, Default)]
+pub struct StaticDiscovery {
+    /// The known nodes.
+    nodes: Vec<DiscoveredNode>,
+}
+
+impl StaticDiscovery {
+    /// Construct an empty static discovery provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Add a discovered node.
+    pub fn add(&mut self, node: DiscoveredNode) {
+        self.nodes.push(node);
+    }
+
+    /// Returns the number of known nodes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns true if there are no known nodes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+impl DiscoveryProvider for StaticDiscovery {
+    fn discover(&self) -> Vec<DiscoveredNode> {
+        self.nodes.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
