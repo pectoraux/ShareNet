@@ -692,7 +692,7 @@ mod tests {
 
         let stream = AsyncLink::connect_raw(&addr).await.unwrap();
         let link = AsyncLink::new(stream, initiator_keys);
-        let mut frame = Frame::new(b'B', [1u8; 32], [2u8; 32]);
+        let mut frame = Frame::transit([1u8; 32], [2u8; 32]);
         frame.fid = [3u8; 8];
         frame.seq = 1;
         frame.body = vec![0xde, 0xad, 0xbe, 0xef];
@@ -856,7 +856,7 @@ mod tests {
 
         let stream = AsyncLink::connect_raw(&addr).await.unwrap();
         let link = Arc::new(AsyncLink::new(stream, initiator_keys));
-        let mut frame = Frame::new(b'B', [1u8; 32], [2u8; 32]);
+        let mut frame = Frame::transit([1u8; 32], [2u8; 32]);
         frame.fid = [9u8; 8];
         frame.seq = 42;
         frame.body = vec![0xca, 0xfe];

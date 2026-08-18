@@ -1662,7 +1662,7 @@ fn run_frames_vector(id: &str, vector: &Value) -> (Outcome, String) {
         let body = hex_to_bytes(DEFAULT_FRAME_BODY_HEX);
         let frame = Frame {
             v: 1,
-            cls: cls_byte,
+            cls: snp_frames::FrameClass::from_byte(cls_byte).expect("valid cls byte"),
             dst,
             src,
             ttl: 16,
@@ -1689,7 +1689,7 @@ fn run_frames_vector(id: &str, vector: &Value) -> (Outcome, String) {
             Err(e) => return (Outcome::Failed, format!("decode error: {e}")),
         };
         let want_cls = expected["decodedCls"].as_str().unwrap_or("");
-        let got_cls = (decoded.cls as char).to_string();
+        let got_cls = (decoded.cls.as_byte() as char).to_string();
         if got_cls == want_cls {
             (Outcome::Independent, format!("frame-class-{cls_str} ok"))
         } else {
@@ -1759,7 +1759,7 @@ fn parse_frame_from_json(v: &Value) -> Frame {
     }
     Frame {
         v: v["v"].as_u64().unwrap_or(1) as u8,
-        cls: cls_byte,
+        cls: snp_frames::FrameClass::from_byte(cls_byte).expect("valid cls byte"),
         dst,
         src,
         ttl: v["ttl"].as_u64().unwrap_or(0) as u8,

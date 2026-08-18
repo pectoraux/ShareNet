@@ -98,7 +98,7 @@ fn test_frame_body_is_vec_u8_at_wire_level() {
     // API level (for circuit endpoints and content APIs), not at the
     // wire level (where bytes are bytes).
 
-    let mut frame = Frame::new(FrameClass::Transit.as_byte(), [0u8; 32], [0u8; 32]);
+    let mut frame = Frame::transit([0u8; 32], [0u8; 32]);
     frame.body = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
     // The relay clones the frame and forwards it:
@@ -121,7 +121,7 @@ fn test_relay_forwarding_clones_without_inspection() {
     let dst = [0xAA; 32];
     let src = [0xBB; 32];
 
-    let mut frame = Frame::new(FrameClass::Transit.as_byte(), dst, src);
+    let mut frame = Frame::transit(dst, src);
     frame.body = vec![0x01, 0x02, 0x03, 0x04];
     frame.ttl = FRAME_TTL_MAX;
     frame.fid = [0xFF; 8];
@@ -136,7 +136,7 @@ fn test_relay_forwarding_clones_without_inspection() {
     // The forwarded frame has the SAME body, decremented TTL:
     assert_eq!(fwd.body, frame.body);
     assert_eq!(fwd.ttl, frame.ttl - 1);
-    assert_eq!(fwd.cls, FrameClass::Transit.as_byte());
+    assert_eq!(fwd.cls, FrameClass::Transit);
     assert_eq!(fwd.dst, dst);
     assert_eq!(fwd.src, src);
     assert_eq!(fwd.fid, frame.fid);

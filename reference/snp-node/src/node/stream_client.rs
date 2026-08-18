@@ -345,7 +345,7 @@ impl StreamHandle {
 
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: gateway_node_id,
             src: client_node_id,
             ttl: FRAME_TTL_MAX,
@@ -735,7 +735,7 @@ impl StreamHandle {
 
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: self.gateway_node_id,
             src: self.client_node_id,
             ttl: FRAME_TTL_MAX,
@@ -819,10 +819,10 @@ fn validate_frame(
     expected_dst: &[u8; 32],
     expected_fid: &[u8; 8],
 ) -> Result<(), StreamError> {
-    if frame.cls != b'B' {
+    if frame.cls != snp_frames::FrameClass::Transit {
         return Err(StreamError::FrameValidation(format!(
             "expected Class B, got Class {}",
-            frame.cls as char
+            frame.cls.as_byte() as char
         )));
     }
     if frame.src != *expected_src {
@@ -1043,7 +1043,7 @@ mod tests {
     fn validate_frame_rejects_wrong_class() {
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'C',
+            cls: snp_frames::FrameClass::Control,
             dst: [1u8; 32],
             src: [2u8; 32],
             ttl: FRAME_TTL_MAX,
@@ -1059,7 +1059,7 @@ mod tests {
     fn validate_frame_rejects_wrong_src() {
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: [1u8; 32],
             src: [99u8; 32], // Wrong source.
             ttl: FRAME_TTL_MAX,
@@ -1075,7 +1075,7 @@ mod tests {
     fn validate_frame_rejects_wrong_dst() {
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: [99u8; 32], // Wrong destination.
             src: [2u8; 32],
             ttl: FRAME_TTL_MAX,
@@ -1091,7 +1091,7 @@ mod tests {
     fn validate_frame_rejects_wrong_fid() {
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: [1u8; 32],
             src: [2u8; 32],
             ttl: FRAME_TTL_MAX,
@@ -1107,7 +1107,7 @@ mod tests {
     fn validate_frame_accepts_correct_frame() {
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: [1u8; 32],
             src: [2u8; 32],
             ttl: FRAME_TTL_MAX,
@@ -1500,7 +1500,7 @@ impl MultiplexedCircuit {
         // Send the frame.
         let frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: self.gateway_node_id,
             src: self.client_node_id,
             ttl: FRAME_TTL_MAX,
@@ -1738,7 +1738,7 @@ async fn send_window_update_to_gateway(
         .ok_or_else(|| StreamError::Circuit("frame sequence exhausted".into()))?;
     let frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: gateway_node_id,
         src: client_node_id,
         ttl: FRAME_TTL_MAX,

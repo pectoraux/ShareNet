@@ -492,7 +492,7 @@ fn serve_one_request(
     let req_frame = link.recv_frame()?;
     eprintln!(
         "[gateway] recv frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
-        req_frame.cls as char,
+        req_frame.cls.as_byte() as char,
         req_frame.ttl,
         req_frame.body.len()
     );
@@ -551,7 +551,7 @@ fn serve_one_request(
     // seq = request seq + 1.
     let resp_frame = Frame {
         v: snp_frames::FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id(),
         ttl: snp_frames::FRAME_TTL_MAX,
@@ -594,7 +594,7 @@ pub fn run_relay(listen_addr: &str, gateway_addr: &str) -> NodeResult<()> {
             Ok(mut frame) => {
                 eprintln!(
                     "[relay] client→gateway: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
-                    frame.cls as char, frame.ttl, frame.body.len()
+                    frame.cls.as_byte() as char, frame.ttl, frame.body.len()
                 );
                 // Decrement TTL per I7 before forwarding. (Frame::forward
                 // would also do this; we do it inline so we can re-emit the
@@ -616,7 +616,7 @@ pub fn run_relay(listen_addr: &str, gateway_addr: &str) -> NodeResult<()> {
             Ok(mut frame) => {
                 eprintln!(
                     "[relay] gateway→client: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
-                    frame.cls as char, frame.ttl, frame.body.len()
+                    frame.cls.as_byte() as char, frame.ttl, frame.body.len()
                 );
                 if frame.ttl > 0 {
                     frame.ttl -= 1;
@@ -684,7 +684,7 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
     // layer with the client↔relay hop key.
     let req_frame = Frame {
         v: snp_frames::FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: gateway_node_id(),
         src: client_node_id(),
         ttl: snp_frames::FRAME_TTL_MAX,
@@ -702,14 +702,14 @@ pub fn run_client(relay_addr: &str, url: &str) -> NodeResult<(u16, bool)> {
     let resp_frame = link.recv_frame()?;
     eprintln!(
         "[client] recv response frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
-        resp_frame.cls as char,
+        resp_frame.cls.as_byte() as char,
         resp_frame.ttl,
         resp_frame.body.len()
     );
-    if resp_frame.cls != b'B' {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {}",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 
@@ -792,7 +792,7 @@ fn serve_one_request_named(
     let req_frame = link.recv_frame()?;
     eprintln!(
         "[gateway-{gw:?}] recv frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
-        req_frame.cls as char,
+        req_frame.cls.as_byte() as char,
         req_frame.ttl,
         req_frame.body.len()
     );
@@ -840,7 +840,7 @@ fn serve_one_request_named(
 
     let resp_frame = Frame {
         v: snp_frames::FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id_for(gw),
         ttl: snp_frames::FRAME_TTL_MAX,
@@ -904,7 +904,7 @@ pub fn run_relay_multiHop(
             Ok(mut frame) => {
                 eprintln!(
                     "[relay-multiHop] prev→next: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
-                    frame.cls as char,
+                    frame.cls.as_byte() as char,
                     frame.ttl,
                     frame.body.len()
                 );
@@ -939,7 +939,7 @@ pub fn run_relay_multiHop(
             Ok(mut frame) => {
                 eprintln!(
                     "[relay-multiHop] next→prev: recv frame cls={} ttl={} body={} bytes (opaque circuit ciphertext)",
-                    frame.cls as char,
+                    frame.cls.as_byte() as char,
                     frame.ttl,
                     frame.body.len()
                 );
@@ -1010,7 +1010,7 @@ pub fn run_client_to_gateway(
 
     let req_frame = Frame {
         v: snp_frames::FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: gateway_node_id_for(gw),
         src: client_node_id(),
         ttl: snp_frames::FRAME_TTL_MAX,
@@ -1026,14 +1026,14 @@ pub fn run_client_to_gateway(
     let resp_frame = link.recv_frame()?;
     eprintln!(
         "[client-{gw:?}] recv response frame: cls={} ttl={} body={} bytes (circuit ciphertext)",
-        resp_frame.cls as char,
+        resp_frame.cls.as_byte() as char,
         resp_frame.ttl,
         resp_frame.body.len()
     );
-    if resp_frame.cls != b'B' {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {}",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 

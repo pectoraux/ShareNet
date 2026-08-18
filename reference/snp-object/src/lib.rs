@@ -70,11 +70,14 @@ pub struct Manifest {
     pub encryption_key: Option<[u8; 32]>,
 }
 
-/// A content-addressed store: SHA-256 key → bytes. Skeleton trait kept for
-/// downstream crates; not exercised by the conformance harness.
+/// A content-addressed store: SHA-256 key → content bytes.
+///
+/// The `put` method accepts [`ContentBytes`] (Class A), NOT raw `&[u8]`.
+/// This prevents transit data ([`Ciphertext`]) from accidentally entering
+/// the content cache — there is no `as_bytes()` on `Ciphertext`.
 pub trait Cas: Send + Sync {
-    /// Insert `bytes` and return its SHA-256 key.
-    fn put(&self, bytes: &[u8]) -> ObjectResult<ContentHash>;
+    /// Insert content and return its SHA-256 key.
+    fn put(&self, content: &snp_frames::ContentBytes) -> ObjectResult<ContentHash>;
     /// Fetch the bytes for `key`, if present.
     fn get(&self, key: &ContentHash) -> ObjectResult<Vec<u8>>;
     /// Returns true if `key` is present.
@@ -85,7 +88,7 @@ pub trait Cas: Send + Sync {
 pub struct InMemoryCas;
 
 impl Cas for InMemoryCas {
-    fn put(&self, _bytes: &[u8]) -> ObjectResult<ContentHash> {
+    fn put(&self, _content: &snp_frames::ContentBytes) -> ObjectResult<ContentHash> {
         todo!("Implement in-memory CAS put")
     }
     fn get(&self, _key: &ContentHash) -> ObjectResult<Vec<u8>> {

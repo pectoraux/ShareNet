@@ -1615,7 +1615,7 @@ mod tests {
     use std::net::TcpListener;
 
     fn make_frame(seq: u32) -> Frame {
-        let mut frame = Frame::new(b'B', [7u8; 32], [9u8; 32]);
+        let mut frame = Frame::transit([7u8; 32], [9u8; 32]);
         frame.fid = [1, 2, 3, 4, 5, 6, 7, 8];
         frame.seq = seq;
         frame.body = vec![0xde, 0xad, 0xbe, 0xef];

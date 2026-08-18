@@ -125,7 +125,7 @@ pub struct Frame {
     /// Protocol version. MUST equal [`FRAME_VERSION`] (1).
     pub v: u8,
     /// Traffic class: `b'A'`, `b'B'`, or `b'C'`.
-    pub cls: u8,
+    pub cls: crate::traffic_class::FrameClass,
     /// Destination NodeId (32 bytes).
     pub dst: [u8; NODE_ID_BYTES],
     /// Source NodeId (32 bytes).
@@ -145,7 +145,11 @@ impl Frame {
     /// `ttl=FRAME_TTL_MAX`. Other fields are zeroed/empty — the caller fills
     /// them in.
     #[must_use]
-    pub fn new(cls: u8, dst: [u8; NODE_ID_BYTES], src: [u8; NODE_ID_BYTES]) -> Self {
+    pub fn new(
+        cls: crate::traffic_class::FrameClass,
+        dst: [u8; NODE_ID_BYTES],
+        src: [u8; NODE_ID_BYTES],
+    ) -> Self {
         Self {
             v: FRAME_VERSION,
             cls,
@@ -156,6 +160,24 @@ impl Frame {
             seq: 0,
             body: Vec::new(),
         }
+    }
+
+    /// Construct a transit (Class B) frame.
+    #[must_use]
+    pub fn transit(dst: [u8; NODE_ID_BYTES], src: [u8; NODE_ID_BYTES]) -> Self {
+        Self::new(crate::traffic_class::FrameClass::Transit, dst, src)
+    }
+
+    /// Construct a content (Class A) frame.
+    #[must_use]
+    pub fn content(dst: [u8; NODE_ID_BYTES], src: [u8; NODE_ID_BYTES]) -> Self {
+        Self::new(crate::traffic_class::FrameClass::Content, dst, src)
+    }
+
+    /// Construct a control (Class C) frame.
+    #[must_use]
+    pub fn control(dst: [u8; NODE_ID_BYTES], src: [u8; NODE_ID_BYTES]) -> Self {
+        Self::new(crate::traffic_class::FrameClass::Control, dst, src)
     }
 
     /// Validate this frame's fields against the CDDL constraints (I20).
@@ -170,13 +192,7 @@ impl Frame {
                 self.v
             )));
         }
-        if self.cls != b'A' && self.cls != b'B' && self.cls != b'C' {
-            return Err(FrameError::Malformed(format!(
-                "Frame.cls must be b'A', b'B', or b'C'; got 0x{:02x} ({})",
-                self.cls,
-                self.cls as char
-            )));
-        }
+        // cls is now FrameClass (typed enum) — invalid values are rejected at decode time.
         if self.ttl > FRAME_TTL_MAX {
             return Err(FrameError::Malformed(format!(
                 "Frame.ttl must be in [0, {FRAME_TTL_MAX}]; got {}",
@@ -198,9 +214,7 @@ impl Frame {
     /// Returns [`FrameError`] if validation fails or CBOR encoding fails.
     pub fn encode_cbor(&self) -> FrameResult<Vec<u8>> {
         self.validate()?;
-        let cls_str = char::from_u32(u32::from(self.cls))
-            .ok_or_else(|| FrameError::Malformed(format!("Frame.cls 0x{:02x} is not a valid char", self.cls)))?
-            .to_string();
+        let cls_str = (self.cls.as_byte() as char).to_string();
         let map = snp_cbor::CborValue::Map(vec![
             (s(KEY_V), u(u64::from(self.v))),
             (s(KEY_CLS), snp_cbor::CborValue::TextString(cls_str)),
@@ -241,7 +255,7 @@ impl Frame {
         }
         // Extract by key. All keys must be text strings; reject anything else.
         let mut v: Option<u64> = None;
-        let mut cls: Option<u8> = None;
+        let mut cls: Option<crate::traffic_class::FrameClass> = None;
         let mut dst: Option<[u8; NODE_ID_BYTES]> = None;
         let mut src: Option<[u8; NODE_ID_BYTES]> = None;
         let mut ttl: Option<u8> = None;
@@ -267,9 +281,7 @@ impl Frame {
                 KEY_SEQ => seq = Some(extract_uint(val, KEY_SEQ)? as u32),
                 KEY_BODY => body = Some(extract_bstr_any(val, KEY_BODY)?),
                 other => {
-                    return Err(FrameError::Shape(format!(
-                        "unknown Frame key \"{other}\""
-                    )));
+                    return Err(FrameError::Shape(format!("unknown Frame key \"{other}\"")));
                 }
             }
         }
@@ -335,15 +347,22 @@ fn extract_uint(v: snp_cbor::CborValue, field: &str) -> FrameResult<u64> {
     }
 }
 
-fn extract_class(v: snp_cbor::CborValue, field: &str) -> FrameResult<u8> {
+fn extract_class(
+    v: snp_cbor::CborValue,
+    field: &str,
+) -> FrameResult<crate::traffic_class::FrameClass> {
     match v {
         snp_cbor::CborValue::TextString(s) => {
             let c = s.as_bytes();
-            if c.len() == 1 && (c[0] == b'A' || c[0] == b'B' || c[0] == b'C') {
-                Ok(c[0])
+            if c.len() == 1 {
+                crate::traffic_class::FrameClass::from_byte(c[0]).ok_or_else(|| {
+                    FrameError::Shape(format!(
+                        "Frame.{field} must be \"A\", \"B\", or \"C\"; got \"{s}\""
+                    ))
+                })
             } else {
                 Err(FrameError::Shape(format!(
-                    "Frame.{field} must be \"A\", \"B\", or \"C\"; got \"{s}\""
+                    "Frame.{field} must be a single char; got \"{s}\""
                 )))
             }
         }
@@ -441,7 +460,7 @@ mod tests {
         fid.copy_from_slice(&from_hex(fid_hex));
         Frame {
             v: 1,
-            cls: b'B',
+            cls: crate::traffic_class::FrameClass::Transit,
             dst,
             src,
             ttl: 16,
@@ -467,7 +486,7 @@ mod tests {
         let forwarded = forward(&frame).unwrap();
         assert_eq!(forwarded.ttl, 15);
         assert_eq!(frame.ttl, 16); // input not mutated
-        // All other fields preserved.
+                                   // All other fields preserved.
         assert_eq!(forwarded.cls, frame.cls);
         assert_eq!(forwarded.dst, frame.dst);
         assert_eq!(forwarded.src, frame.src);
@@ -499,16 +518,26 @@ mod tests {
     fn rejects_ttl_above_max() {
         let mut frame = sample_frame();
         frame.ttl = 17;
-        let err = frame.encode_cbor().unwrap_err();
+        let err = frame.validate().unwrap_err();
         assert!(matches!(err, FrameError::Malformed(_)));
     }
 
     #[test]
-    fn rejects_unknown_class() {
-        let mut frame = sample_frame();
-        frame.cls = b'X';
-        let err = frame.encode_cbor().unwrap_err();
-        assert!(matches!(err, FrameError::Malformed(_)));
+    fn rejects_unknown_class_byte() {
+        // Invalid class bytes are rejected at decode time by FrameClass::from_byte().
+        let bad = snp_cbor::encode(&snp_cbor::CborValue::Map(vec![
+            (s("v"), u(1)),
+            (s("cls"), s("X")),
+            (s("dst"), b(&[0u8; 32])),
+            (s("src"), b(&[0u8; 32])),
+            (s("ttl"), u(16)),
+            (s("fid"), b(&[0u8; 8])),
+            (s("seq"), u(1)),
+            (s("body"), b(&[])),
+        ]))
+        .unwrap();
+        let err = Frame::decode_cbor(&bad).unwrap_err();
+        assert!(matches!(err, FrameError::Shape(_)));
     }
 
     #[test]
@@ -533,19 +562,19 @@ mod tests {
     #[test]
     fn class_a_roundtrip() {
         let mut frame = sample_frame();
-        frame.cls = b'A';
+        frame.cls = crate::traffic_class::FrameClass::Content;
         let encoded = frame.encode_cbor().unwrap();
         let decoded = Frame::decode_cbor(&encoded).unwrap();
-        assert_eq!(decoded.cls, b'A');
+        assert_eq!(decoded.cls, crate::traffic_class::FrameClass::Content);
     }
 
     #[test]
     fn class_c_roundtrip() {
         let mut frame = sample_frame();
-        frame.cls = b'C';
+        frame.cls = crate::traffic_class::FrameClass::Control;
         let encoded = frame.encode_cbor().unwrap();
         let decoded = Frame::decode_cbor(&encoded).unwrap();
-        assert_eq!(decoded.cls, b'C');
+        assert_eq!(decoded.cls, crate::traffic_class::FrameClass::Control);
     }
 }
 

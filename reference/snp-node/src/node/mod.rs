@@ -945,7 +945,7 @@ impl Node {
         // Build the request frame addressed to the gateway NodeId.
         let req_frame = Frame {
             v: FRAME_VERSION,
-            cls: b'B',
+            cls: snp_frames::FrameClass::Transit,
             dst: *gateway_node_id,
             src: self.identity.node_id,
             ttl: FRAME_TTL_MAX,
@@ -963,15 +963,15 @@ impl Node {
         link.send_frame(&req_frame)?;
         let resp_frame = link.recv_frame()?;
 
-        if resp_frame.cls != b'B' {
+        if resp_frame.cls != snp_frames::FrameClass::Transit {
             // Class C (or other) — this is a control frame, likely an
             // upstream-failure NACK from the relay.
-            if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+            if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
                 return Err(NodeError::UpstreamFailure);
             }
             return Err(NodeError::Other(format!(
                 "expected Class B response, got Class {} (body={} bytes) — likely upstream failure",
-                resp_frame.cls as char,
+                resp_frame.cls.as_byte() as char,
                 resp_frame.body.len()
             )));
         }
@@ -1246,7 +1246,7 @@ fn serve_relay_persistent_inner(
             };
             eprintln!(
                 "[relay-persistent] prev→next: cls={} ttl={} body={} bytes",
-                req_frame.cls as char,
+                req_frame.cls.as_byte() as char,
                 req_frame.ttl,
                 req_frame.body.len()
             );
@@ -1271,7 +1271,7 @@ fn serve_relay_persistent_inner(
                     // knows the request failed (and the client can fail over).
                     let nack = Frame {
                         v: FRAME_VERSION,
-                        cls: b'C',
+                        cls: snp_frames::FrameClass::Control,
                         dst: req_frame.src,
                         src: req_frame.dst,
                         ttl: FRAME_TTL_MAX,
@@ -1382,7 +1382,7 @@ fn serve_relay_multi_upstream_persistent_inner(
             };
             eprintln!(
                 "[relay-multi-upstream] recv frame: cls={} dst={} ttl={} body={} bytes",
-                req_frame.cls as char,
+                req_frame.cls.as_byte() as char,
                 hex_short(&req_frame.dst),
                 req_frame.ttl,
                 req_frame.body.len()
@@ -1454,7 +1454,7 @@ fn serve_relay_multi_upstream_persistent_inner(
 fn send_upstream_failure_nack(prev_link: &snp_link::Link, req_frame: &Frame) {
     let nack = Frame {
         v: FRAME_VERSION,
-        cls: b'C',
+        cls: snp_frames::FrameClass::Control,
         dst: req_frame.src,
         src: req_frame.dst,
         ttl: FRAME_TTL_MAX,
@@ -1597,7 +1597,7 @@ where
     eprintln!(
         "[gateway-persistent {}] recv frame: cls={} ttl={} body={} bytes",
         hex_short(&gateway_node_id),
-        req_frame.cls as char,
+        req_frame.cls.as_byte() as char,
         req_frame.ttl,
         req_frame.body.len()
     );
@@ -1653,7 +1653,7 @@ where
 
     let resp_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
@@ -1851,7 +1851,7 @@ fn serve_relay_persistent_with_drop_after_inner(
             };
             eprintln!(
                 "[relay-drop-after] prev→next: cls={} ttl={} body={} bytes",
-                req_frame.cls as char,
+                req_frame.cls.as_byte() as char,
                 req_frame.ttl,
                 req_frame.body.len()
             );
@@ -1874,7 +1874,7 @@ fn serve_relay_persistent_with_drop_after_inner(
                     eprintln!("[relay-drop-after] next→prev recv error: {e}");
                     let nack = Frame {
                         v: FRAME_VERSION,
-                        cls: b'C',
+                        cls: snp_frames::FrameClass::Control,
                         dst: req_frame.src,
                         src: req_frame.dst,
                         ttl: FRAME_TTL_MAX,

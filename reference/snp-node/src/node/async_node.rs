@@ -424,7 +424,7 @@ where
     let sealed_resp = encrypt_circuit_payload(&circuit.send_key, &resp_bytes);
     let resp_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
@@ -620,7 +620,7 @@ pub async fn serve_relay_multi_upstream_persistent_async(
 async fn send_upstream_failure_nack_async(prev_link: &Arc<AsyncLink>, req_frame: &Frame) {
     let nack = Frame {
         v: FRAME_VERSION,
-        cls: b'C',
+        cls: snp_frames::FrameClass::Control,
         dst: req_frame.src,
         src: req_frame.dst,
         ttl: FRAME_TTL_MAX,
@@ -886,7 +886,7 @@ pub async fn send_request_via_gateway_full_with_relay_async(
 
     let req_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: *gateway_node_id,
         src: node.identity.node_id,
         ttl: FRAME_TTL_MAX,
@@ -900,13 +900,13 @@ pub async fn send_request_via_gateway_full_with_relay_async(
         .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    if resp_frame.cls != b'B' {
-        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
+        if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
             return Err(NodeError::UpstreamFailure);
         }
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {} — likely upstream failure",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 
@@ -1261,7 +1261,7 @@ where
 
     let resp_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
@@ -1377,7 +1377,7 @@ where
 
     let resp_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: req_frame.src,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
@@ -1832,7 +1832,7 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
 
     let req_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: *gateway_node_id,
         src: node.identity.node_id,
         ttl: FRAME_TTL_MAX,
@@ -1847,13 +1847,13 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
         .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    if resp_frame.cls != b'B' {
-        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
+        if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
             return Err(NodeError::UpstreamFailure);
         }
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {} — likely upstream failure",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 
@@ -1973,7 +1973,7 @@ pub async fn send_with_protocol_circuit_async(
     // 4. Build the Class B frame addressed to the gateway.
     let req_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: *gateway_node_id,
         src: node.identity.node_id,
         ttl: FRAME_TTL_MAX,
@@ -1988,13 +1988,13 @@ pub async fn send_with_protocol_circuit_async(
         .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    if resp_frame.cls != b'B' {
-        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
+        if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
             return Err(NodeError::UpstreamFailure);
         }
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {} — likely upstream failure",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 
@@ -2112,7 +2112,7 @@ pub async fn send_with_protocol_circuit_async_with_body(
     // 4. Build + send the Class B frame.
     let req_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: *gateway_node_id,
         src: node.identity.node_id,
         ttl: FRAME_TTL_MAX,
@@ -2125,13 +2125,13 @@ pub async fn send_with_protocol_circuit_async_with_body(
         .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    if resp_frame.cls != b'B' {
-        if resp_frame.cls == b'C' && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+    if resp_frame.cls != snp_frames::FrameClass::Transit {
+        if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
             return Err(NodeError::UpstreamFailure);
         }
         return Err(NodeError::Other(format!(
             "expected Class B response, got Class {} — likely upstream failure",
-            resp_frame.cls as char
+            resp_frame.cls.as_byte() as char
         )));
     }
 
@@ -2504,10 +2504,10 @@ pub async fn serve_gateway_mode_b(
     // Validate the first frame's outer metadata BEFORE any cryptographic
     // processing. The frame must be Class B addressed to this gateway.
     // (fid is not checked here — it becomes the circuit identifier.)
-    if first_frame.cls != b'B' || first_frame.dst != gateway_node_id {
+    if first_frame.cls != snp_frames::FrameClass::Transit || first_frame.dst != gateway_node_id {
         return Err(NodeError::Other(format!(
             "first frame validation failed: cls={}, dst={:?} (expected cls=B, dst={:?})",
-            first_frame.cls as char, first_frame.dst, gateway_node_id,
+            first_frame.cls.as_byte() as char, first_frame.dst, gateway_node_id,
         )));
     }
 
@@ -2563,7 +2563,7 @@ pub async fn serve_gateway_mode_b(
 
     let ack_frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: first_frame.src,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
@@ -2608,14 +2608,14 @@ pub async fn serve_gateway_mode_b(
                         // be checked explicitly. The src field is the
                         // immediate authenticated relay peer, not necessarily
                         // the original client, so we do not check src here.
-                        if frame.cls != b'B'
+                        if frame.cls != snp_frames::FrameClass::Transit
                             || frame.dst != gateway_node_id
                             || frame.fid != first_frame.fid
                         {
                             eprintln!(
                                 "[gateway-mode-b] outer frame validation failed \
                                  (cls={}, dst={:?}, fid={:?}) — closing",
-                                frame.cls as char, frame.dst, frame.fid,
+                                frame.cls.as_byte() as char, frame.dst, frame.fid,
                             );
                             break;
                         }
@@ -2660,7 +2660,7 @@ pub async fn serve_gateway_mode_b(
                                         );
                                         if next_gateway_frame_seq == u32::MAX { break; }
                                         let frame = Frame {
-                                            v: FRAME_VERSION, cls: b'B', dst: first_frame.src,
+                                            v: FRAME_VERSION, cls: snp_frames::FrameClass::Transit, dst: first_frame.src,
                                             src: gateway_node_id, ttl: FRAME_TTL_MAX,
                                             fid: first_frame.fid, seq: next_gateway_frame_seq,
                                             body: sealed,
@@ -2708,7 +2708,7 @@ pub async fn serve_gateway_mode_b(
                             break;
                         }
                         let frame = Frame {
-                            v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
+                            v: FRAME_VERSION, cls: snp_frames::FrameClass::Transit, dst: first_frame.src, src: gateway_node_id,
                             ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: next_gateway_frame_seq, body: sealed,
                         };
                         next_gateway_frame_seq += 1;
@@ -2792,7 +2792,7 @@ pub async fn serve_gateway_mode_b_multiplexed(
     // Receive the first frame (StreamOpen — establishes the circuit).
     let first_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
-    if first_frame.cls != b'B' || first_frame.dst != gateway_node_id {
+    if first_frame.cls != snp_frames::FrameClass::Transit || first_frame.dst != gateway_node_id {
         return Err(NodeError::Other("first frame validation failed".into()));
     }
 
@@ -2933,7 +2933,7 @@ pub async fn serve_gateway_mode_b_multiplexed(
             let sealed = snp_link::encrypt_circuit_payload(&writer_key, &cbor);
             let frame = Frame {
                 v: FRAME_VERSION,
-                cls: b'B',
+                cls: snp_frames::FrameClass::Transit,
                 dst: circuit_client,
                 src: gateway_node_id,
                 ttl: FRAME_TTL_MAX,
@@ -2967,7 +2967,7 @@ pub async fn serve_gateway_mode_b_multiplexed(
         };
 
         // Validate outer frame.
-        if frame.cls != b'B' || frame.dst != gateway_node_id || frame.fid != circuit_fid {
+        if frame.cls != snp_frames::FrameClass::Transit || frame.dst != gateway_node_id || frame.fid != circuit_fid {
             eprintln!("[gateway-mode-b-mux] outer frame validation failed — closing circuit");
             break;
         }
@@ -3292,7 +3292,7 @@ async fn send_gateway_frame(
     let sealed = snp_link::encrypt_circuit_payload(send_key, &cbor);
     let frame = Frame {
         v: FRAME_VERSION,
-        cls: b'B',
+        cls: snp_frames::FrameClass::Transit,
         dst: client_node_id,
         src: gateway_node_id,
         ttl: FRAME_TTL_MAX,
