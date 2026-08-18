@@ -548,3 +548,8 @@ mod tests {
         assert_eq!(decoded.cls, b'C');
     }
 }
+
+pub mod traffic_class;
+
+// Re-export the traffic class types for convenience.
+pub use traffic_class::{Ciphertext, ContentBytes, FrameClass};
