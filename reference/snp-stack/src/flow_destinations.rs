@@ -352,20 +352,34 @@ mod tests {
 
     #[test]
     fn is_routable_accepts_real_internet_ips() {
-        assert!(is_routable_internet_address(&"93.184.216.34".parse().unwrap()));
+        assert!(is_routable_internet_address(
+            &"93.184.216.34".parse().unwrap()
+        ));
         assert!(is_routable_internet_address(&"8.8.8.8".parse().unwrap()));
         assert!(is_routable_internet_address(&"1.1.1.1".parse().unwrap()));
-        assert!(is_routable_internet_address(&"140.82.121.4".parse().unwrap())); // github.com
+        assert!(is_routable_internet_address(
+            &"140.82.121.4".parse().unwrap()
+        )); // github.com
     }
 
     #[test]
     fn is_routable_rejects_all_private_ranges() {
         assert!(!is_routable_internet_address(&"10.0.0.1".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"10.255.255.255".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"172.16.0.1".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"172.31.255.255".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"192.168.0.1".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"192.168.255.255".parse().unwrap()));
+        assert!(!is_routable_internet_address(
+            &"10.255.255.255".parse().unwrap()
+        ));
+        assert!(!is_routable_internet_address(
+            &"172.16.0.1".parse().unwrap()
+        ));
+        assert!(!is_routable_internet_address(
+            &"172.31.255.255".parse().unwrap()
+        ));
+        assert!(!is_routable_internet_address(
+            &"192.168.0.1".parse().unwrap()
+        ));
+        assert!(!is_routable_internet_address(
+            &"192.168.255.255".parse().unwrap()
+        ));
     }
 
     // ─── IPv6 validation tests (N3-B Step 4) ─────────────────────────────────
@@ -375,7 +389,10 @@ mod tests {
         // ::1
         let result = validate_destination(&"::1".parse().unwrap(), 443);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("private"), "loopback ::1 must be rejected");
+        assert!(
+            result.unwrap_err().contains("private"),
+            "loopback ::1 must be rejected"
+        );
     }
 
     #[test]
@@ -391,15 +408,24 @@ mod tests {
         // because is_routable_ipv6() checked is_loopback() twice instead of
         // checking for link-local.
         let result = validate_destination(&"fe80::1".parse().unwrap(), 443);
-        assert!(result.is_err(), "fe80::1 (link-local) MUST be rejected — this was the N3-B Step 4 bug");
+        assert!(
+            result.is_err(),
+            "fe80::1 (link-local) MUST be rejected — this was the N3-B Step 4 bug"
+        );
         assert!(result.unwrap_err().contains("private"));
 
         // fe80::1234:5678
         let result = validate_destination(&"fe80::1234:5678".parse().unwrap(), 443);
-        assert!(result.is_err(), "fe80::1234:5678 (link-local) MUST be rejected");
+        assert!(
+            result.is_err(),
+            "fe80::1234:5678 (link-local) MUST be rejected"
+        );
 
         // febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff (last address in fe80::/10)
-        let result = validate_destination(&"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(), 443);
+        let result = validate_destination(
+            &"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+            443,
+        );
         assert!(result.is_err(), "febf::/10 (link-local) MUST be rejected");
     }
 
@@ -412,7 +438,10 @@ mod tests {
         let result = validate_destination(&"fd00::1".parse().unwrap(), 443);
         assert!(result.is_err(), "fd00::1 (ULA) MUST be rejected");
 
-        let result = validate_destination(&"fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(), 443);
+        let result = validate_destination(
+            &"fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+            443,
+        );
         assert!(result.is_err(), "fdff::/7 (ULA) MUST be rejected");
     }
 
@@ -430,8 +459,12 @@ mod tests {
     fn is_routable_ipv6_rejects_link_local() {
         // This is the regression test for the N3-B Step 4 bug.
         assert!(!is_routable_internet_address(&"fe80::1".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"fe80::1234:5678".parse().unwrap()));
-        assert!(!is_routable_internet_address(&"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
+        assert!(!is_routable_internet_address(
+            &"fe80::1234:5678".parse().unwrap()
+        ));
+        assert!(!is_routable_internet_address(
+            &"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -452,8 +485,12 @@ mod tests {
 
     #[test]
     fn is_routable_ipv6_accepts_public() {
-        assert!(is_routable_internet_address(&"2606:4700:4700::1111".parse().unwrap()));
-        assert!(is_routable_internet_address(&"2001:4860:4860::8888".parse().unwrap()));
+        assert!(is_routable_internet_address(
+            &"2606:4700:4700::1111".parse().unwrap()
+        ));
+        assert!(is_routable_internet_address(
+            &"2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 
     // ─── Full extraction from raw IP packet ───────────────────────────────────
@@ -468,9 +505,10 @@ mod tests {
 
         // IPv4 header
         packet_bytes[0] = 0x45; // version=4, IHL=5
-        packet_bytes[2] = 0x00; packet_bytes[3] = 0x28; // total length = 40
+        packet_bytes[2] = 0x00;
+        packet_bytes[3] = 0x28; // total length = 40
         packet_bytes[9] = PROTO_TCP; // protocol = TCP
-        // src IP: 10.0.0.2
+                                     // src IP: 10.0.0.2
         packet_bytes[12] = 10;
         packet_bytes[13] = 0;
         packet_bytes[14] = 0;
@@ -514,7 +552,8 @@ mod tests {
         // SYN to 10.0.0.1 (private) — should extract but fail validation.
         let mut packet_bytes = vec![0u8; 40];
         packet_bytes[0] = 0x45;
-        packet_bytes[2] = 0x00; packet_bytes[3] = 0x28; // total length = 40
+        packet_bytes[2] = 0x00;
+        packet_bytes[3] = 0x28; // total length = 40
         packet_bytes[9] = PROTO_TCP;
         packet_bytes[12] = 10;
         packet_bytes[13] = 0;
@@ -542,7 +581,8 @@ mod tests {
         // ICMP packet — protocol = 1, no TCP/UDP header.
         let mut packet_bytes = vec![0u8; 28]; // 20 IP + 8 ICMP
         packet_bytes[0] = 0x45;
-        packet_bytes[2] = 0x00; packet_bytes[3] = 0x1C; // total length = 28
+        packet_bytes[2] = 0x00;
+        packet_bytes[3] = 0x1C; // total length = 28
         packet_bytes[9] = 1; // ICMP
         packet_bytes[12] = 10;
         packet_bytes[13] = 0;
@@ -562,7 +602,8 @@ mod tests {
         // IP packet with only 10 bytes of TCP header (truncated).
         let mut packet_bytes = vec![0u8; 30]; // 20 IP + 10 (truncated TCP)
         packet_bytes[0] = 0x45;
-        packet_bytes[2] = 0x00; packet_bytes[3] = 0x1E; // total length = 30
+        packet_bytes[2] = 0x00;
+        packet_bytes[3] = 0x1E; // total length = 30
         packet_bytes[9] = PROTO_TCP;
         packet_bytes[12] = 10;
         packet_bytes[13] = 0;

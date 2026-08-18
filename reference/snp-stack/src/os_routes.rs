@@ -174,7 +174,10 @@ fn assign_tun_ip(tun_name: &str, ip_cidr: &str) -> Result<(), OsRouteError> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("File exists") {
             return Err(OsRouteError::CommandFailed(format!(
-                "ip addr add {} dev {}: {}", ip_cidr, tun_name, stderr.trim()
+                "ip addr add {} dev {}: {}",
+                ip_cidr,
+                tun_name,
+                stderr.trim()
             )));
         }
     }
@@ -190,14 +193,19 @@ fn bring_up(tun_name: &str) -> Result<(), OsRouteError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(OsRouteError::CommandFailed(format!(
-            "ip link set up dev {}: {}", tun_name, stderr.trim()
+            "ip link set up dev {}: {}",
+            tun_name,
+            stderr.trim()
         )));
     }
     eprintln!("[n3-os] interface {} is UP", tun_name);
     Ok(())
 }
 
-fn install_control_plane_route(endpoint: &std::net::IpAddr, iface: &str) -> Result<(), OsRouteError> {
+fn install_control_plane_route(
+    endpoint: &std::net::IpAddr,
+    iface: &str,
+) -> Result<(), OsRouteError> {
     let ip_str = endpoint.to_string();
     let output = Command::new("ip")
         .args(["route", "add", &ip_str, "dev", iface])
@@ -207,7 +215,10 @@ fn install_control_plane_route(endpoint: &std::net::IpAddr, iface: &str) -> Resu
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("File exists") {
             return Err(OsRouteError::CommandFailed(format!(
-                "ip route add {} dev {}: {}", ip_str, iface, stderr.trim()
+                "ip route add {} dev {}: {}",
+                ip_str,
+                iface,
+                stderr.trim()
             )));
         }
     }
@@ -224,7 +235,9 @@ fn install_default_route(tun_name: &str) -> Result<(), OsRouteError> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("File exists") {
             return Err(OsRouteError::CommandFailed(format!(
-                "ip route add default dev {}: {}", tun_name, stderr.trim()
+                "ip route add default dev {}: {}",
+                tun_name,
+                stderr.trim()
             )));
         }
     }
@@ -259,7 +272,9 @@ fn detect_default_interface() -> Result<Option<String>, OsRouteError> {
             }
         }
     }
-    eprintln!("[n3-os] no default route found — control-plane routes will need manual configuration");
+    eprintln!(
+        "[n3-os] no default route found — control-plane routes will need manual configuration"
+    );
     Ok(None)
 }
 

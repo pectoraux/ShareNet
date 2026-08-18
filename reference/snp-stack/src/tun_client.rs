@@ -164,11 +164,14 @@ impl TunClient {
     /// etc.) or the circuit cannot be established.
     pub async fn create(config: TunClientConfig) -> Result<Self, TunClientError> {
         // 1. Open the TUN device.
-        let tun = LinuxTunDevice::create(&config.tun_name)
-            .map_err(TunClientError::TunCreate)?;
+        let tun = LinuxTunDevice::create(&config.tun_name).map_err(TunClientError::TunCreate)?;
 
-        eprintln!("[n3] TUN interface '{}' created (fd={}, ip={})",
-            tun.name(), tun.as_raw_fd(), config.tun_ip);
+        eprintln!(
+            "[n3] TUN interface '{}' created (fd={}, ip={})",
+            tun.name(),
+            tun.as_raw_fd(),
+            config.tun_ip
+        );
 
         // 2. Create the smoltcp engine bound to the TUN IP.
         let smoltcp_ip = smoltcp::wire::Ipv4Address::new(
@@ -210,8 +213,10 @@ impl TunClient {
         .await
         .map_err(|e| TunClientError::CircuitEstablish(format!("{:?}", e)))?;
 
-        eprintln!("[n3] multiplexed circuit established (fid={:?})",
-            circuit.circuit_fid());
+        eprintln!(
+            "[n3] multiplexed circuit established (fid={:?})",
+            circuit.circuit_fid()
+        );
 
         Ok(Self {
             tun,
@@ -309,10 +314,7 @@ impl TunClient {
         loop {
             // 1. Read a packet from TUN (with a short timeout so we don't
             //    block forever if no packets arrive).
-            match tokio::time::timeout(
-                Duration::from_millis(10),
-                self.tun.read_packet(),
-            ).await {
+            match tokio::time::timeout(Duration::from_millis(10), self.tun.read_packet()).await {
                 Ok(Ok(packet)) => {
                     // N3-B: Intercept the packet BEFORE feeding to smoltcp.
                     // If it's a TCP SYN, extract the destination and ensure
@@ -392,7 +394,10 @@ impl TunClient {
         // defence, but we reject early to avoid wasting circuit bandwidth and
         // to give the OS application an immediate RST.
         if let Err(reason) = validate_destination(&dst_ip, dst_port) {
-            eprintln!("[n3] SYN to {}:{} rejected client-side: {}", dst_ip, dst_port, reason);
+            eprintln!(
+                "[n3] SYN to {}:{} rejected client-side: {}",
+                dst_ip, dst_port, reason
+            );
             // Don't feed this packet to smoltcp — it would establish a connection
             // that the gateway would reject. Instead, let smoltcp drop it (by not
             // having a listening socket for this port, smoltcp will send a RST).
@@ -418,8 +423,10 @@ impl TunClient {
         let handle = self.engine.add_tcp_socket();
         match self.engine.listen(handle, dst_port) {
             Ok(()) => {
-                eprintln!("[n3] added listening socket on port {} for SYN to {}",
-                    dst_port, dst_ip);
+                eprintln!(
+                    "[n3] added listening socket on port {} for SYN to {}",
+                    dst_port, dst_ip
+                );
                 self.listening_sockets
                     .entry(dst_port)
                     .or_default()
@@ -468,15 +475,17 @@ impl TunClient {
                 Some(ep) => {
                     #[allow(unreachable_patterns)]
                     let ip = match ep.addr {
-                        IpAddress::Ipv4(v4) => IpAddr::V4(std::net::Ipv4Addr::new(
-                            v4.0[0], v4.0[1], v4.0[2], v4.0[3],
-                        )),
+                        IpAddress::Ipv4(v4) => {
+                            IpAddr::V4(std::net::Ipv4Addr::new(v4.0[0], v4.0[1], v4.0[2], v4.0[3]))
+                        }
                         // N3-B: smoltcp is compiled with proto-ipv4 only
                         // (Cargo.toml features). IPv6 SYN interception is
                         // a future extension — not claimed here.
                         _ => {
-                            eprintln!("[n3] non-IPv4 local_endpoint {:?} — closing socket {:?}",
-                                ep.addr, socket_handle);
+                            eprintln!(
+                                "[n3] non-IPv4 local_endpoint {:?} — closing socket {:?}",
+                                ep.addr, socket_handle
+                            );
                             self.engine.tcp_socket_mut(socket_handle).close();
                             continue;
                         }
@@ -484,8 +493,10 @@ impl TunClient {
                     (ip, ep.port)
                 }
                 None => {
-                    eprintln!("[n3] ESTABLISHED socket {:?} has no local_endpoint — closing",
-                        socket_handle);
+                    eprintln!(
+                        "[n3] ESTABLISHED socket {:?} has no local_endpoint — closing",
+                        socket_handle
+                    );
                     self.engine.tcp_socket_mut(socket_handle).close();
                     continue;
                 }
@@ -502,7 +513,10 @@ impl TunClient {
             };
 
             // Open a ShareNet stream to the destination.
-            match self.open_stream_for_socket(socket_handle, destination).await {
+            match self
+                .open_stream_for_socket(socket_handle, destination)
+                .await
+            {
                 Ok(()) => {
                     // Add a replacement listening socket for the same port
                     // so future connections on this port can be accepted.
@@ -515,15 +529,19 @@ impl TunClient {
                                 .push(new_handle);
                         }
                         Err(e) => {
-                            eprintln!("[n3] failed to add replacement listener on port {}: {:?}",
-                                port, e);
+                            eprintln!(
+                                "[n3] failed to add replacement listener on port {}: {:?}",
+                                port, e
+                            );
                             self.engine.remove_socket(new_handle);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[n3] failed to open stream for socket {:?}: {}",
-                        socket_handle, e);
+                    eprintln!(
+                        "[n3] failed to open stream for socket {:?}: {}",
+                        socket_handle, e
+                    );
                     // Close the smoltcp socket so the OS gets a RST.
                     self.engine.tcp_socket_mut(socket_handle).close();
                     // Still add a replacement listener.
@@ -547,12 +565,19 @@ impl TunClient {
         socket: SmolSocketHandle,
         destination: InternetEndpoint,
     ) -> Result<(), TunClientError> {
-        let stream = self.circuit.open_stream(destination.clone()).await
+        let stream = self
+            .circuit
+            .open_stream(destination.clone())
+            .await
             .map_err(|e| TunClientError::StreamOpen(format!("{:?}", e)))?;
 
         let upstream = MultiplexedUpstream::new(stream);
-        self.bridge.attach_async_upstream(socket, Box::new(upstream));
-        eprintln!("[n3] opened stream to {:?} for socket {:?}", destination, socket);
+        self.bridge
+            .attach_async_upstream(socket, Box::new(upstream));
+        eprintln!(
+            "[n3] opened stream to {:?} for socket {:?}",
+            destination, socket
+        );
         Ok(())
     }
 }
@@ -604,12 +629,16 @@ impl MultiplexedUpstream {
 #[async_trait::async_trait]
 impl crate::bridge::AsyncUpstream for MultiplexedUpstream {
     async fn send(&mut self, data: &[u8]) -> Result<usize, crate::bridge::BridgeError> {
-        self.handle.send(data).await
+        self.handle
+            .send(data)
+            .await
             .map_err(|e| crate::bridge::BridgeError::SmolTcp(format!("{:?}", e)))
     }
 
     async fn recv(&mut self) -> Result<Option<Vec<u8>>, crate::bridge::BridgeError> {
-        self.handle.recv().await
+        self.handle
+            .recv()
+            .await
             .map_err(|e| crate::bridge::BridgeError::SmolTcp(format!("{:?}", e)))
     }
 

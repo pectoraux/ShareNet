@@ -212,9 +212,7 @@ impl TcpEngine {
     /// Returns [`TcpEngineError::SmolTcp`] if the socket is not in a state
     /// that allows listening (e.g. already connected).
     pub fn listen(&mut self, handle: SocketHandle, port: u16) -> Result<(), TcpEngineError> {
-        let socket = self
-            .sockets
-            .get_mut::<SmolTcpSocket>(handle);
+        let socket = self.sockets.get_mut::<SmolTcpSocket>(handle);
         socket
             .listen(port)
             .map_err(|e| TcpEngineError::SmolTcp(format!("{e:?}")))
