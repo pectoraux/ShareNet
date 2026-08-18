@@ -1,7 +1,14 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+/* Tailwind's `dark:` variant — applies when the element is inside `.dark` AND
+ * NOT inside the consumer `.sharenet-shell`. The shell forces a warm-light
+ * aesthetic via scoped CSS variables (see below), so dark-mode palette
+ * overrides from shadcn/sharenet components (e.g. `dark:bg-emerald-950/40`)
+ * would clash with the light bg. Excluding `.sharenet-shell` descendants
+ * keeps the engineering `/diagnostics` route (which is NOT inside the shell)
+ * working in dark mode exactly as before. */
+@custom-variant dark (&:is(.dark *):not(.sharenet-shell *));
 
 @theme inline {
   --color-background: var(--background);
@@ -119,4 +126,100 @@
   body {
     @apply bg-background text-foreground;
   }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ShareNet consumer-app design tokens
+ *
+ * Scoped under `.sharenet-shell` so the warm-light consumer aesthetic only
+ * applies inside the AppShell wrapper — the engineering /diagnostics route
+ * keeps its default dark theme untouched.
+ *
+ * Palette (task spec, all in OKLCH so the perceptual lightness is the real
+ * perceptual lightness — no neon, no gradients, no glassmorphism):
+ *
+ *   background         oklch(0.98 0.002 90)   warm off-white (NOT pure #FFF)
+ *   foreground         oklch(0.2  0.005 90)   soft graphite (NOT pure black)
+ *   muted              oklch(0.95 0.003 90)   subtle warm gray
+ *   muted-foreground   oklch(0.48 0.008 90)   secondary text
+ *   border             oklch(0.91 0.004 90)   hairline
+ *   card               oklch(0.99 0.001 90)   slightly brighter than bg
+ *
+ *   accent (teal-green, connected):
+ *     --sn-connected       oklch(0.7  0.1   165)  calm teal-green
+ *     --sn-connected-soft  oklch(0.93 0.025 165)  ~6% tint of above
+ *
+ *   amber (recovering / degraded):
+ *     --sn-warning         oklch(0.7  0.12  60)
+ *     --sn-warning-soft    oklch(0.94 0.03  60)
+ *
+ *   red (errors / offline only):
+ *     --sn-error           oklch(0.65 0.15  25)
+ *     --sn-error-soft      oklch(0.94 0.03  25)
+ *
+ *   neutral (connecting / disconnected):
+ *     --sn-neutral         oklch(0.6  0.01  90)
+ *     --sn-neutral-soft    oklch(0.93 0.003 90)
+ *
+ * Task ID: UI-SHELL-HOME
+ * ─────────────────────────────────────────────────────────────────────── */
+
+.sharenet-shell {
+  --background: oklch(0.98 0.002 90);
+  --foreground: oklch(0.2 0.005 90);
+  --card: oklch(0.99 0.001 90);
+  --card-foreground: oklch(0.2 0.005 90);
+  --popover: oklch(0.99 0.001 90);
+  --popover-foreground: oklch(0.2 0.005 90);
+  --primary: oklch(0.28 0.01 90);
+  --primary-foreground: oklch(0.98 0.002 90);
+  --secondary: oklch(0.95 0.003 90);
+  --secondary-foreground: oklch(0.25 0.005 90);
+  --muted: oklch(0.95 0.003 90);
+  --muted-foreground: oklch(0.48 0.008 90);
+  --accent: oklch(0.93 0.025 165);
+  --accent-foreground: oklch(0.3 0.06 165);
+  --destructive: oklch(0.65 0.15 25);
+  --border: oklch(0.91 0.004 90);
+  --input: oklch(0.95 0.003 90);
+  --ring: oklch(0.7 0.1 165);
+
+  --sidebar: oklch(0.97 0.003 90);
+  --sidebar-foreground: oklch(0.2 0.005 90);
+  --sidebar-primary: oklch(0.7 0.1 165);
+  --sidebar-primary-foreground: oklch(0.98 0.002 90);
+  --sidebar-accent: oklch(0.93 0.025 165);
+  --sidebar-accent-foreground: oklch(0.3 0.06 165);
+  --sidebar-border: oklch(0.91 0.004 90);
+  --sidebar-ring: oklch(0.7 0.1 165);
+
+  /* ShareNet-specific connection-state tokens (referenced by components) */
+  --sn-connected: oklch(0.7 0.1 165);
+  --sn-connected-soft: oklch(0.93 0.025 165);
+  --sn-connected-text: oklch(0.4 0.09 165);
+  --sn-warning: oklch(0.7 0.12 60);
+  --sn-warning-soft: oklch(0.94 0.03 60);
+  --sn-warning-text: oklch(0.45 0.1 60);
+  --sn-error: oklch(0.65 0.15 25);
+  --sn-error-soft: oklch(0.94 0.03 25);
+  --sn-error-text: oklch(0.45 0.13 25);
+  --sn-neutral: oklch(0.6 0.01 90);
+  --sn-neutral-soft: oklch(0.93 0.003 90);
+  --sn-neutral-text: oklch(0.45 0.01 90);
+
+  color: var(--foreground);
+  background-color: var(--background);
+}
+
+/* Make sure the html background behind the consumer shell matches too,
+   so overscroll / rubber-banding on mobile doesn't flash dark. */
+html:has(.sharenet-shell) {
+  background-color: oklch(0.98 0.002 90);
+}
+
+/* Visible keyboard focus inside the shell — accessible + on-brand */
+.sharenet-shell *:focus-visible {
+  outline: 2px solid var(--sn-connected);
+  outline-offset: 2px;
+  border-radius: 4px;
 }

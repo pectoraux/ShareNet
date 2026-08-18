@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ShareNet 2.0 — Conformance Foundation",
+  title: "ShareNet",
   description:
     "ShareNet 2.0 conformance dashboard — 130 executable golden vectors across 14 suites, all carrying real Ed25519 signatures over canonical SNP-CBOR preimages. The proof that the N0/N1 foundation is real.",
   keywords: [
