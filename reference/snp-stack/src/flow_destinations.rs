@@ -164,12 +164,19 @@ fn is_routable_ipv6(addr: &Ipv6Addr) -> bool {
     if addr.is_loopback() {
         return false;
     }
-    // Link-local (fe80::/10)
-    if addr.is_loopback() {
+    // Link-local (fe80::/10) — N3-B Step 4 FIX: was checking is_loopback()
+    // twice instead of checking for link-local. This is the bug the user
+    // identified: the documentation claimed link-local addresses were
+    // rejected, but the code checked is_loopback() a second time.
+    //
+    // Rust std::net::Ipv6Addr does not have is_unicast_link_local() until
+    // Rust 1.83+. We check manually: fe80::/10 means the first 10 bits are
+    // 1111111010, i.e. segment[0] & 0xFFC0 == 0xFE80.
+    let segments = addr.segments();
+    if (segments[0] & 0xFFC0) == 0xFE80 {
         return false;
     }
     // Unique local addresses (fc00::/7) — RFC 4193
-    let segments = addr.segments();
     if (segments[0] & 0xFE00) == 0xFC00 {
         return false;
     }
@@ -359,6 +366,94 @@ mod tests {
         assert!(!is_routable_internet_address(&"172.31.255.255".parse().unwrap()));
         assert!(!is_routable_internet_address(&"192.168.0.1".parse().unwrap()));
         assert!(!is_routable_internet_address(&"192.168.255.255".parse().unwrap()));
+    }
+
+    // ─── IPv6 validation tests (N3-B Step 4) ─────────────────────────────────
+
+    #[test]
+    fn validate_destination_rejects_ipv6_loopback() {
+        // ::1
+        let result = validate_destination(&"::1".parse().unwrap(), 443);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("private"), "loopback ::1 must be rejected");
+    }
+
+    #[test]
+    fn validate_destination_rejects_ipv6_unspecified() {
+        // ::
+        let result = validate_destination(&"::".parse().unwrap(), 443);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_destination_rejects_ipv6_link_local() {
+        // fe80::/10 — the bug the user identified: was NOT rejected before
+        // because is_routable_ipv6() checked is_loopback() twice instead of
+        // checking for link-local.
+        let result = validate_destination(&"fe80::1".parse().unwrap(), 443);
+        assert!(result.is_err(), "fe80::1 (link-local) MUST be rejected — this was the N3-B Step 4 bug");
+        assert!(result.unwrap_err().contains("private"));
+
+        // fe80::1234:5678
+        let result = validate_destination(&"fe80::1234:5678".parse().unwrap(), 443);
+        assert!(result.is_err(), "fe80::1234:5678 (link-local) MUST be rejected");
+
+        // febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff (last address in fe80::/10)
+        let result = validate_destination(&"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(), 443);
+        assert!(result.is_err(), "febf::/10 (link-local) MUST be rejected");
+    }
+
+    #[test]
+    fn validate_destination_rejects_ipv6_unique_local() {
+        // fc00::/7 (RFC 4193 unique local addresses)
+        let result = validate_destination(&"fc00::1".parse().unwrap(), 443);
+        assert!(result.is_err(), "fc00::1 (ULA) MUST be rejected");
+
+        let result = validate_destination(&"fd00::1".parse().unwrap(), 443);
+        assert!(result.is_err(), "fd00::1 (ULA) MUST be rejected");
+
+        let result = validate_destination(&"fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(), 443);
+        assert!(result.is_err(), "fdff::/7 (ULA) MUST be rejected");
+    }
+
+    #[test]
+    fn validate_destination_accepts_public_ipv6() {
+        // 2606:4700:4700::1111 (Cloudflare DNS)
+        assert!(validate_destination(&"2606:4700:4700::1111".parse().unwrap(), 443).is_ok());
+        // 2001:4860:4860::8888 (Google DNS)
+        assert!(validate_destination(&"2001:4860:4860::8888".parse().unwrap(), 443).is_ok());
+        // 2607:f8b0:4004:800::200e (google.com)
+        assert!(validate_destination(&"2607:f8b0:4004:800::200e".parse().unwrap(), 443).is_ok());
+    }
+
+    #[test]
+    fn is_routable_ipv6_rejects_link_local() {
+        // This is the regression test for the N3-B Step 4 bug.
+        assert!(!is_routable_internet_address(&"fe80::1".parse().unwrap()));
+        assert!(!is_routable_internet_address(&"fe80::1234:5678".parse().unwrap()));
+        assert!(!is_routable_internet_address(&"febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_routable_ipv6_rejects_unique_local() {
+        assert!(!is_routable_internet_address(&"fc00::1".parse().unwrap()));
+        assert!(!is_routable_internet_address(&"fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_routable_ipv6_rejects_loopback() {
+        assert!(!is_routable_internet_address(&"::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_routable_ipv6_rejects_unspecified() {
+        assert!(!is_routable_internet_address(&"::".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_routable_ipv6_accepts_public() {
+        assert!(is_routable_internet_address(&"2606:4700:4700::1111".parse().unwrap()));
+        assert!(is_routable_internet_address(&"2001:4860:4860::8888".parse().unwrap()));
     }
 
     // ─── Full extraction from raw IP packet ───────────────────────────────────

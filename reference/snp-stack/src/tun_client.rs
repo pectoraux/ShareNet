@@ -169,7 +169,18 @@ impl TunClient {
         // (an external Internet IP) would be dropped by smoltcp because the
         // destination is not a local interface IP.
         engine.enable_any_ip();
-        eprintln!("[n3] smoltcp any_ip enabled — accepting SYNs for any destination IP");
+
+        // N3-B FIX (Step 2): any_ip alone is INSUFFICIENT. smoltcp's any_ip
+        // check (iface/interface/ipv4.rs:113) also requires a route whose
+        // gateway is one of our own IPs. Without a default route via the TUN IP,
+        // routes.lookup(dst) returns None and the SYN is rejected.
+        //
+        // This is verified by tests/any_ip_verification.rs:
+        //   - any_ip_without_route_drops_external_syn → FAILS (SYN dropped)
+        //   - any_ip_with_route_accepts_external_syn  → PASSES (SYN accepted,
+        //     local_endpoint() returns the original destination)
+        engine.add_default_route(smoltcp_ip);
+        eprintln!("[n3] smoltcp any_ip + default route via {} enabled — accepting SYNs for any destination IP", config.tun_ip);
 
         // 3. Create the flow bridge.
         let bridge = TcpFlowBridge::new();
@@ -201,6 +212,53 @@ impl TunClient {
     #[must_use]
     pub fn tun_name(&self) -> &str {
         self.tun.name()
+    }
+
+    /// **N3-B Step 7** — Configure the OS network interface.
+    ///
+    /// This assigns the TUN IP address, brings the interface up, and
+    /// installs a default route through the TUN. After this call, the OS
+    /// kernel routes ALL traffic through the TUN interface, and the
+    /// TunClient intercepts SYNs.
+    ///
+    /// # Ownership
+    ///
+    /// - **Who creates TUN?** `TunClient::create()` (via `LinuxTunDevice::create`).
+    /// - **Who assigns its address?** This method.
+    /// - **Who installs the route?** This method.
+    /// - **Who removes the route?** `cleanup_os_routes()` (call before drop).
+    /// - **Who owns shutdown?** The `run()` loop + `Drop` (which closes the TUN fd,
+    ///   destroying the interface + removing the route automatically).
+    ///
+    /// # Permissions
+    ///
+    /// Requires `CAP_NET_ADMIN` (root or the capability must be granted).
+    ///
+    /// # Errors
+    /// Returns an error if the `ip` commands fail.
+    pub fn configure_os_routes(&self) -> Result<(), TunClientError> {
+        let config = crate::os_routes::OsRouteConfig {
+            tun_name: self.tun.name().to_string(),
+            tun_ip_cidr: format!("{}/24", self.config.tun_ip),
+        };
+        crate::os_routes::configure_os_interface(&config)
+            .map_err(|e| TunClientError::SmolTcp(format!("OS route config: {e}")))
+    }
+
+    /// **N3-B Step 7** — Clean up the OS network configuration.
+    ///
+    /// Removes the default route and brings the interface down. Call this
+    /// before dropping the TunClient for explicit cleanup.
+    ///
+    /// # Errors
+    /// Returns an error if the cleanup commands fail (non-fatal during shutdown).
+    pub fn cleanup_os_routes(&self) -> Result<(), TunClientError> {
+        let config = crate::os_routes::OsRouteConfig {
+            tun_name: self.tun.name().to_string(),
+            tun_ip_cidr: format!("{}/24", self.config.tun_ip),
+        };
+        crate::os_routes::cleanup_os_interface(&config)
+            .map_err(|e| TunClientError::SmolTcp(format!("OS route cleanup: {e}")))
     }
 
     /// Run the packet-pump loop.
@@ -316,30 +374,32 @@ impl TunClient {
             return;
         }
 
-        // Ensure a listening socket exists for the destination port.
+        // N3-B: Ensure a listening socket exists for this SYN.
+        //
         // smoltcp 0.11: a listen() socket accepts exactly ONE connection.
-        // We maintain a pool of listening sockets per port.
-        let needs_listener = self
-            .listening_sockets
-            .get(&dst_port)
-            .map(|pool| pool.is_empty())
-            .unwrap_or(true);
-
-        if needs_listener {
-            let handle = self.engine.add_tcp_socket();
-            match self.engine.listen(handle, dst_port) {
-                Ok(()) => {
-                    eprintln!("[n3] added listening socket on port {} for SYN to {}",
-                        dst_port, dst_ip);
-                    self.listening_sockets
-                        .entry(dst_port)
-                        .or_default()
-                        .push(handle);
-                }
-                Err(e) => {
-                    eprintln!("[n3] failed to listen on port {}: {:?}", dst_port, e);
-                    self.engine.remove_socket(handle);
-                }
+        // When it transitions to ESTABLISHED, it stops listening. To handle
+        // concurrent SYNs to the same port (e.g. 10 simultaneous connections
+        // to port 443), we must have N listening sockets for N SYNs.
+        //
+        // The fix (Step 3): add a NEW listening socket for EVERY SYN, not
+        // just when the pool is empty. The replacement logic in
+        // accept_new_connections() adds a replacement after each ESTABLISHED
+        // transition. This guarantees that every SYN has a listener.
+        //
+        // Verified by tests/any_ip_verification.rs::concurrent_syns_same_port.
+        let handle = self.engine.add_tcp_socket();
+        match self.engine.listen(handle, dst_port) {
+            Ok(()) => {
+                eprintln!("[n3] added listening socket on port {} for SYN to {}",
+                    dst_port, dst_ip);
+                self.listening_sockets
+                    .entry(dst_port)
+                    .or_default()
+                    .push(handle);
+            }
+            Err(e) => {
+                eprintln!("[n3] failed to listen on port {}: {:?}", dst_port, e);
+                self.engine.remove_socket(handle);
             }
         }
     }

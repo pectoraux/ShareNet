@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════════
-# n3b_acceptance_test.sh — N3-B Real Internet Acceptance Test
+# n3a_isolated_socks5_test.sh — N3-A Isolated SOCKS5 Acceptance Test (NOT N3-B)
 # ════════════════════════════════════════════════════════════════════════════
 #
 # WHAT IT TESTS
 # -------------
-# Proves the N3-B "transparent networking" north-star in the only form
+# Proves the N3-A "transparent networking" north-star in the only form
 # that actually matters: a client that has NO direct route to the Internet
 # can still reach a real, non-loopback external endpoint through ShareNet.
 #
@@ -94,7 +94,7 @@
 #   * /dev/net/tun            — no real TUN device support (the script
 #                               does not strictly need TUN since it uses
 #                               the SOCKS5 bridge, but a future pure
-#                               N3-B TUN-based variant would).
+#                               N3-A TUN-based variant would).
 #   * unshare permission      — `unshare -Urn` and `ip netns add` fail
 #                               with EPERM (CAP_SYS_ADMIN not granted).
 #   * root privileges         — uid=1001, no CAP_NET_ADMIN.
@@ -105,7 +105,7 @@
 #
 # EXPECTED OUTPUT (PASS)
 # ----------------------
-#   === N3-B REAL INTERNET ACCEPTANCE TEST ===
+#   === N3-A REAL INTERNET ACCEPTANCE TEST ===
 #   mode:                demo (cargo run --example n3_socks5_demo)
 #   host IP:             192.168.1.42
 #   external endpoint:   http://192.168.1.42:8888/
@@ -138,14 +138,14 @@
 #   ✓ SHARENET access SUCCEEDED (as expected)
 #
 #   ═══════════════════════════════════════════════════════
-#     N3-B ACCEPTANCE TEST PASSED
+#     N3-A ACCEPTANCE TEST PASSED
 #     Direct Internet:    FAIL     (correct — no route)
 #     Via ShareNet:       SUCCESS  (correct — real circuit)
 #   ═══════════════════════════════════════════════════════
 #
 # USAGE
 # -----
-#   bash snp-stack/tests/n3b_acceptance_test.sh [OPTIONS]
+#   bash snp-stack/tests/n3a_isolated_socks5_test.sh [OPTIONS]
 #
 # OPTIONS
 #   --mode=auto|prod|demo       Mesh mode (default: auto)
@@ -239,14 +239,14 @@ section() { printf '\n=== %s ===\n' "$*"; }
 
 usage() {
     cat <<'USAGE'
-n3b_acceptance_test.sh — N3-B Real Internet Acceptance Test
+n3a_isolated_socks5_test.sh — N3-A Isolated SOCKS5 Acceptance Test (NOT N3-B)
 
 Proves:
     CLIENT DIRECT INTERNET     → FAILS  (no route in client namespace)
     CLIENT THROUGH SHARENET    → SUCCEEDS (real SNP-IK + X25519 circuit)
 
 USAGE:
-    bash snp-stack/tests/n3b_acceptance_test.sh [OPTIONS]
+    bash snp-stack/tests/n3a_isolated_socks5_test.sh [OPTIONS]
 
 OPTIONS:
     --mode=auto|prod|demo       Mesh mode (default: auto)
@@ -284,17 +284,17 @@ EXIT CODES:
 
 EXAMPLES:
     # Default: auto-detect everything, build the demo, run the test.
-    sudo bash snp-stack/tests/n3b_acceptance_test.sh
+    sudo bash snp-stack/tests/n3a_isolated_socks5_test.sh
 
     # Use a real public Internet URL (no local HTTP server needed if you
     # bypass it — but note: --external-endpoint does not skip the local
     # server start; use this for prod mode where the gateway fetches
     # directly).
-    sudo bash snp-stack/tests/n3b_acceptance_test.sh \
+    sudo bash snp-stack/tests/n3a_isolated_socks5_test.sh \
         --mode=prod --external-endpoint=http://example.com/
 
     # Debug a failure without tearing down state.
-    sudo bash snp-stack/tests/n3b_acceptance_test.sh --keep-on-failure -v
+    sudo bash snp-stack/tests/n3a_isolated_socks5_test.sh --keep-on-failure -v
     ip netns exec snp_n3b_client ip route show
     ip netns exec snp_n3b_client curl -v --socks5 10.0.0.1:1080 ...
     ip netns del snp_n3b_client   # manual cleanup when done
@@ -416,7 +416,7 @@ preflight() {
     # 4. /dev/net/tun (informational only — this script uses SOCKS5, not TUN).
     if [ ! -c /dev/net/tun ]; then
         log "  note: /dev/net/tun not present (this test does not need it,"
-        log "        but a future pure-TUN N3-B variant would)."
+        log "        but a future pure-TUN N3-A variant would)."
     fi
 
     # 5. The namespace name must not already exist (we don't want to
@@ -682,7 +682,7 @@ start_http_server() {
     HTTP_ROOT="$(mktemp -d /tmp/n3b_http_root.XXXXXX)"
     cat > "$HTTP_ROOT/index.html" <<'HTML'
 <!DOCTYPE html>
-<html><head><title>ShareNet N3-B Acceptance Test</title></head>
+<html><head><title>ShareNet N3-A Acceptance Test</title></head>
 <body>
 <h1>Hello from the real Internet via ShareNet!</h1>
 <p>This response was served by a real HTTP server process bound to the
@@ -869,7 +869,7 @@ main() {
     parse_args "$@"
 
     # Print the banner + config.
-    section "N3-B REAL INTERNET ACCEPTANCE TEST"
+    section "N3-A REAL INTERNET ACCEPTANCE TEST"
     log "  mode:                $MODE"
     log "  project root:        $PROJECT_ROOT"
 
@@ -934,7 +934,7 @@ main() {
         cat <<'BANNER'
 
     ═══════════════════════════════════════════════════════
-      N3-B ACCEPTANCE TEST PASSED
+      N3-A ACCEPTANCE TEST PASSED
       Direct Internet:    FAIL     (correct — no route)
       Via ShareNet:       SUCCESS  (correct — real circuit)
     ═══════════════════════════════════════════════════════
@@ -955,7 +955,7 @@ BANNER
         cat <<'BANNER' >&2
 
     ═══════════════════════════════════════════════════════
-      N3-B ACCEPTANCE TEST FAILED
+      N3-A ACCEPTANCE TEST FAILED
 BANNER
         [ "$direct_ok"  -eq 0 ] && printf '      Direct Internet:    SUCCESS  (WRONG — isolation broken)\n' >&2
         [ "$direct_ok"  -eq 1 ] && printf '      Direct Internet:    FAIL     (correct)\n'                  >&2

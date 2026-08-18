@@ -137,6 +137,28 @@ impl TcpEngine {
         self.interface.any_ip()
     }
 
+    /// **N3-B** — Add a default IPv4 route via the given gateway.
+    ///
+    /// This is REQUIRED for `any_ip` to accept packets for external IPs.
+    /// Without a route, smoltcp's `routes.lookup(dst)` returns `None`, and
+    /// the `any_ip` check rejects the packet (see smoltcp 0.11.0
+    /// `iface/interface/ipv4.rs:113`).
+    ///
+    /// The gateway must be one of the interface's own IP addresses (e.g.
+    /// the TUN IP). This tells smoltcp: "I am the router for 0.0.0.0/0,
+    /// so accept packets for any destination."
+    ///
+    /// # Arguments
+    /// * `gateway` — The gateway IP (typically the TUN interface's own IP).
+    ///
+    /// See: smoltcp 0.11.0 `Routes::add_default_ipv4_route` (iface/route.rs:89).
+    pub fn add_default_route(&mut self, gateway: Ipv4Address) {
+        let route = smoltcp::iface::Route::new_ipv4_gateway(gateway);
+        self.interface.routes_mut().update(|routes| {
+            routes.push(route).expect("route table has space");
+        });
+    }
+
     /// Feed an incoming raw IP packet (from the TUN) into the smoltcp stack.
     /// The engine will process the packet (TCP state transitions, ACKs, etc.)
     /// and may produce outgoing packets (available via [`Self::drain_outgoing`]).
