@@ -1,24 +1,23 @@
-//! **N3-B TUN Demo — Production Composition Root for Transparent TUN Networking.**
+//! **N3-B TUN Demo — Production transparent TCP via real TUN + ShareNet.**
 //!
-//! This binary is the PRODUCTION composition root for transparent TUN
-//! networking on Linux. It starts a real ShareNet mesh (gateway + 2 relays)
-//! using the production async runtime and wires a real `TunClient` to a real
-//! kernel TUN interface.
+//! This binary is the PRODUCTION composition root for N3-B transparent TUN
+//! networking. It supports TWO subcommands:
 //!
-//! ## This is NOT SOCKS5
+//! - `n3b_tun_demo mesh` — starts the ShareNet mesh (gateway + 2 relays)
+//!   with **production SSRF defence** (`GatewayStreamTable::new()`, NO
+//!   loopback exception). Binds to a configurable IP (NOT 127.0.0.1).
+//!   Does NOT start a TUN device or an HTTP server.
 //!
-//! Unlike `n3_socks5_demo` (which uses `N3AClient` + SOCKS5), this binary
-//! uses `TunClient` — a real TUN device that intercepts OS TCP SYNs at the
-//! IP layer. Ordinary OS applications (curl, browsers, SSH, etc.) route
-//! through the TUN interface *without any SOCKS5 configuration* — the kernel
-//! TCP/IP stack hands SYNs directly to the TUN, and `TunClient` extracts
-//! the original destination from each SYN's 5-tuple.
+//! - `n3b_tun_demo tun` — starts a TunClient that connects to the mesh
+//!   started by `mesh`. Creates a real TUN device, configures split-tunnel
+//!   OS routes, and runs the packet pump. Ordinary `curl` routes through
+//!   the TUN → ShareNet → gateway → real Internet.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ordinary OS application (curl)
-//!     ↓ kernel TCP/IP stack
+//! ordinary curl
+//!     ↓ OS kernel TCP/IP stack
 //! TUN interface (snp0, 10.0.0.1/24, default route)
 //!     ↓ read_packet()
 //! TunClient (intercepts SYN, extracts destination, opens ShareNet stream)
@@ -27,67 +26,34 @@
 //!     ↓
 //! Relay A → Relay B
 //!     ↓
-//! Gateway (serve_gateway_mode_b_multiplexed)
-//!     ↓ real TCP socket
-//! external Internet
+//! Gateway (serve_gateway_mode_b_multiplexed, GatewayStreamTable::new)
+//!     ↓ real TCP socket (production SSRF defence — NO loopback exception)
+//! external Internet (separately-started HTTP server or real Internet host)
 //! ```
 //!
-//! ## Production-grade components
+//! ## What this is NOT
 //!
-//! - `async_node::serve_gateway_mode_b_multiplexed` — real Mode B gateway
-//!   that opens real outbound TCP sockets to the destination extracted
-//!   from each SYN.
-//! - `async_node::serve_relay_via_route` — real relay forwarding (two
-//!   relays: client → relay A → relay B → gateway).
-//! - `MultiplexedCircuit::establish` — real SNP-IK + X25519 circuit DH.
-//! - `TunClient` — real transparent TUN device + smoltcp stack with
-//!   `any_ip` enabled (accepts SYNs for any destination IP).
-//!
-//! ## Test-only deviations (DOCUMENTED)
-//!
-//! This binary is built with `--features "circuit-upstream test-utils"`.
-//! The `test-utils` feature is REQUIRED because the gateway uses
-//! `GatewayStreamTable::with_allow_loopback()` — this disables the
-//! production SSRF defence that blocks loopback/private addresses.
-//!
-//! **Why this is needed here:** the simulated Internet endpoint (the HTTP
-//! server started inside this binary) listens on `0.0.0.0`, which means it
-//! is reachable on `127.0.0.1`. To prove the end-to-end TUN path WITHOUT
-//! requiring a real external Internet host, we let the gateway dial back
-//! to loopback. **This is the ONLY test-only deviation.** When the
-//! production CLI is wired (N3B-PROD-CLI), the production gateway will use
-//! `GatewayStreamTable::new()` (allow_loopback=false) and only dial real
-//! routable Internet addresses.
+//! - NOT SOCKS5 (no N3AClient, no SOCKS5 listener, no `curl --socks5`).
+//! - NOT a test composition (no `with_allow_loopback()`, no same-process HTTP server).
+//! - NOT legacy code (uses the production async runtime).
 //!
 //! ## Usage
 //!
 //! ```bash
-//! # Build (requires Linux + the circuit-upstream + test-utils features)
-//! cargo build --example n3b_tun_demo -p snp-stack \
-//!     --features "circuit-upstream test-utils"
+//! # Build (requires Linux + circuit-upstream)
+//! cargo build --example n3b_tun_demo -p snp-stack --features circuit-upstream
 //!
-//! # Run (REQUIRES root / CAP_NET_ADMIN to create the TUN device + install
-//! # the default route). The binary prints the TUN interface name and the
-//! # HTTP server port for the acceptance test harness.
-//! sudo ./target/debug/examples/n3b_tun_demo
+//! # 1. Start the mesh in the HOST namespace (has Internet access):
+//! ./target/debug/examples/n3b_tun_demo mesh \
+//!     --bind-ip 10.0.1.1 \
+//!     --gateway-port 7003 --relay-a-port 7002 --relay-b-port 7001
 //!
-//! # Optional CLI flags:
-//! sudo ./target/debug/examples/n3b_tun_demo --tun-name tun9 --tun-ip 10.0.0.1
+//! # 2. Start the TUN client in the CLIENT namespace (no direct Internet):
+//! ip netns exec snp_n3b ./target/debug/examples/n3b_tun_demo tun \
+//!     --config /tmp/sharenet-mesh-config.json \
+//!     --tun-name snp0 --tun-ip 10.0.0.1 \
+//!     --physical-interface veth_client
 //! ```
-//!
-//! Once running, from the SAME host (or from a network namespace whose
-//! default route points at the TUN), an ordinary application transparently
-//! flows through ShareNet:
-//!
-//! ```bash
-//! # The HTTP server prints "Hello from ShareNet (N3-B TUN)!" on any GET.
-//! curl http://127.0.0.1:<HTTP_PORT>/
-//! # Or, transparently — kernel routes the SYN through snp0:
-//! curl http://<any-address>:<any-port>/
-//! ```
-//!
-//! Press Ctrl+C to shut down — the binary cleans up the OS routes it
-//! installed.
 
 #![cfg(feature = "circuit-upstream")]
 #![cfg(target_os = "linux")]
@@ -104,61 +70,10 @@ use snp_node::node::{
     TransportEndpoint, VerifiedNodeDescriptor,
 };
 use snp_stack::tun_client::{TunClient, TunClientConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
-/// CLI configuration parsed from command-line flags.
-struct CliConfig {
-    /// The TUN interface name (default "snp0"). Max 15 chars. If empty,
-    /// the kernel auto-assigns (e.g. "tun0").
-    tun_name: String,
-    /// The virtual IP address assigned to the TUN interface (default 10.0.0.1).
-    tun_ip: Ipv4Addr,
-}
-
-/// Parse command-line flags. Unknown flags are rejected.
-fn parse_args() -> Result<CliConfig, String> {
-    let mut tun_name = "snp0".to_string();
-    let mut tun_ip: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--tun-name" => {
-                let Some(v) = iter.next() else {
-                    return Err(format!("{} requires a value", arg));
-                };
-                if v.len() > 15 {
-                    return Err(format!("--tun-name '{}' exceeds 15 chars (kernel limit)", v));
-                }
-                tun_name = v;
-            }
-            "--tun-ip" => {
-                let Some(v) = iter.next() else {
-                    return Err(format!("{} requires a value", arg));
-                };
-                tun_ip = v
-                    .parse::<Ipv4Addr>()
-                    .map_err(|e| format!("--tun-ip '{}' invalid: {}", v, e))?;
-            }
-            "--help" | "-h" => {
-                println!("n3b_tun_demo — Production N3-B TUN composition root\n");
-                println!("Usage: n3b_tun_demo [--tun-name <NAME>] [--tun-ip <IPv4>]\n");
-                println!("Options:");
-                println!("  --tun-name <NAME>   TUN interface name (default: snp0, max 15 chars)");
-                println!("  --tun-ip <IPv4>     TUN interface IP (default: 10.0.0.1)");
-                println!("  -h, --help          Print this help and exit");
-                std::process::exit(0);
-            }
-            other => {
-                return Err(format!("unknown argument: {} (try --help)", other));
-            }
-        }
-    }
-
-    Ok(CliConfig { tun_name, tun_ip })
-}
+// ════════════════════════════════════════════════════════════════════════════
+// Identity + helpers (shared by both subcommands)
+// ════════════════════════════════════════════════════════════════════════════
 
 struct NodeIdents {
     ed_sk: [u8; 32],
@@ -177,154 +92,183 @@ impl NodeIdents {
         Self { ed_sk, x_sk: Arc::new(x_sk), x_pk, node_id }
     }
     fn identity(&self) -> NodeIdentity { NodeIdentity::from_secret(self.ed_sk) }
-    fn gateway_descriptor(&self) -> VerifiedNodeDescriptor {
+    fn gateway_descriptor(&self, advert_addr: &str, circuit_addr: &str) -> VerifiedNodeDescriptor {
         let advert = GatewayAdvertisement::for_identity_with_circuit_key(
-            &self.identity(), self.x_pk.to_bytes(), "127.0.0.1:0", "127.0.0.1:0",
+            &self.identity(), self.x_pk.to_bytes(), advert_addr, circuit_addr,
         );
         advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
     }
-    fn relay_descriptor(&self) -> VerifiedNodeDescriptor { self.gateway_descriptor() }
+    fn relay_descriptor(&self) -> VerifiedNodeDescriptor {
+        self.gateway_descriptor("0.0.0.0:0", "0.0.0.0:0")
+    }
 }
 
-async fn ephemeral_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Start a simple HTTP server on `0.0.0.0:0` (NOT 127.0.0.1).
+fn parse_hex32(s: &str, name: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err(format!("{} must be 64 hex chars, got {}", name, s.len()));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex_str = std::str::from_utf8(chunk).map_err(|e| format!("{}: invalid utf8: {}", name, e))?;
+        bytes[i] = u8::from_str_radix(hex_str, 16).map_err(|e| format!("{}: invalid hex: {}", name, e))?;
+    }
+    Ok(bytes)
+}
+
+/// Serialized mesh configuration (written by `mesh`, read by `tun`).
 ///
-/// **Why 0.0.0.0:** the gateway (which dials the destination extracted
-/// from each SYN) is a separate async task. It needs to reach the HTTP
-/// server via a real IP address that is NOT the TUN's own IP. Binding to
-/// `0.0.0.0` makes the HTTP server reachable on all of the host's IPs
-/// (including 127.0.0.1 — which the `with_allow_loopback()` test-utils
-/// gateway permits).
-///
-/// Responds "Hello from ShareNet (N3-B TUN)!" to any GET. This is the
-/// simulated Internet endpoint for the acceptance test harness.
-async fn start_http_server() -> (u16, tokio::task::JoinHandle<()>) {
-    // CRITICAL: bind to 0.0.0.0, NOT 127.0.0.1 — the gateway needs to
-    // reach it via a real IP.
-    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                // Read the HTTP request (don't care about content).
-                let _ = stream.read(&mut buf).await;
-                // Send a simple HTTP response.
-                let body = "Hello from ShareNet (N3-B TUN)!\n";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    });
-    (port, handle)
+/// Contains the raw bytes needed to reconstruct the Route + client identity.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MeshConfig {
+    relay_a_addr: String,
+    relay_b_addr: String,
+    gateway_addr: String,
+    client_ed25519_secret_hex: String,
+    client_x25519_secret_hex: String,
+    client_x25519_public_hex: String,
+    client_node_id_hex: String,
+    /// The relay A Ed25519 secret (so the TUN client can reconstruct the
+    /// relay's VerifiedNodeDescriptor for the Route).
+    relay_a_ed25519_secret_hex: String,
+    relay_a_x25519_public_hex: String,
+    relay_a_node_id_hex: String,
+    relay_b_ed25519_secret_hex: String,
+    relay_b_x25519_public_hex: String,
+    relay_b_node_id_hex: String,
+    gateway_ed25519_secret_hex: String,
+    gateway_x25519_secret_hex: String,
+    gateway_x25519_public_hex: String,
+    gateway_node_id_hex: String,
 }
 
-fn build_route(
-    client: &NodeIdents, ra: &NodeIdents, rb: &NodeIdents, gw: &NodeIdents,
-    ra_addr: &str, rb_addr: &str, gw_addr: &str,
-) -> Route {
+fn build_route_from_config(cfg: &MeshConfig) -> Result<Route, String> {
+    // Reconstruct identities from the serialized hex.
+    let client_node_id = parse_hex32(&cfg.client_node_id_hex, "client_node_id")?;
+
+    // Relay A
+    let ra_ed_sk = parse_hex32(&cfg.relay_a_ed25519_secret_hex, "relay_a_ed25519_secret")?;
+    let ra_x_pk_bytes = parse_hex32(&cfg.relay_a_x25519_public_hex, "relay_a_x25519_public")?;
+    let ra_identity = NodeIdentity::from_secret(ra_ed_sk);
+    let ra_descriptor = {
+        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
+            &ra_identity, ra_x_pk_bytes, "0.0.0.0:0", "0.0.0.0:0",
+        );
+        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
+    };
+
+    // Relay B
+    let rb_ed_sk = parse_hex32(&cfg.relay_b_ed25519_secret_hex, "relay_b_ed25519_secret")?;
+    let rb_x_pk_bytes = parse_hex32(&cfg.relay_b_x25519_public_hex, "relay_b_x25519_public")?;
+    let rb_identity = NodeIdentity::from_secret(rb_ed_sk);
+    let rb_descriptor = {
+        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
+            &rb_identity, rb_x_pk_bytes, "0.0.0.0:0", "0.0.0.0:0",
+        );
+        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
+    };
+
+    // Gateway
+    let gw_ed_sk = parse_hex32(&cfg.gateway_ed25519_secret_hex, "gateway_ed25519_secret")?;
+    let gw_x_pk_bytes = parse_hex32(&cfg.gateway_x25519_public_hex, "gateway_x25519_public")?;
+    let gw_node_id = parse_hex32(&cfg.gateway_node_id_hex, "gateway_node_id")?;
+    let gw_identity = NodeIdentity::from_secret(gw_ed_sk);
+    let gw_descriptor = {
+        let advert = GatewayAdvertisement::for_identity_with_circuit_key(
+            &gw_identity, gw_x_pk_bytes, &cfg.gateway_addr, &cfg.gateway_addr,
+        );
+        advert.verify_into_verified().expect("verify").descriptor().expect("descriptor")
+    };
+
     let mut route = Route::new_with_hop_details(
-        client.node_id, gw.node_id,
+        client_node_id, gw_node_id,
         vec![
-            RouteHop::new(ra.relay_descriptor(), TransportEndpoint::tcp(ra_addr)),
-            RouteHop::new(rb.relay_descriptor(), TransportEndpoint::tcp(rb_addr)),
-            RouteHop::new(gw.gateway_descriptor(), TransportEndpoint::tcp(gw_addr)),
+            RouteHop::new(ra_descriptor, TransportEndpoint::tcp(&cfg.relay_a_addr)),
+            RouteHop::new(rb_descriptor, TransportEndpoint::tcp(&cfg.relay_b_addr)),
+            RouteHop::new(gw_descriptor, TransportEndpoint::tcp(&cfg.gateway_addr)),
         ],
     );
     route.validate().expect("route valid");
     route.transition(RouteState::Establishing).expect("Establishing");
     route.transition(RouteState::Active).expect("Active");
-    route
+    Ok(route)
 }
 
-/// Build an `InternetEndpoint` at 127.0.0.1:`port` (Tcp).
-///
-/// Used for the `health_endpoint` field of `TunClientConfig`. NOTE: in
-/// the current `TunClient` implementation, `health_endpoint` is NOT used
-/// to determine the destination — the destination is extracted from each
-/// SYN's 5-tuple. It is retained only for a future optional health-check
-/// on startup.
-fn endpoint(port: u16) -> InternetEndpoint {
-    InternetEndpoint {
-        address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-        port,
-        protocol: TransportProtocol::Tcp,
-    }
+// ════════════════════════════════════════════════════════════════════════════
+// `mesh` subcommand: gateway + 2 relays, production SSRF defence
+// ════════════════════════════════════════════════════════════════════════════
+
+struct MeshCli {
+    bind_ip: Ipv4Addr,
+    gateway_port: u16,
+    relay_a_port: u16,
+    relay_b_port: u16,
+    /// Where to write the mesh config (for the `tun` subcommand to read).
+    config_path: String,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() {
-    // ---- 0. Parse CLI flags ----
-    let cli = match parse_args() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[n3b-tun] argument error: {}", e);
-            eprintln!("[n3b-tun] try --help for usage");
-            std::process::exit(2);
-        }
+fn parse_mesh_args(args: &[String]) -> Result<MeshCli, String> {
+    let mut cli = MeshCli {
+        bind_ip: Ipv4Addr::new(10, 0, 1, 1),
+        gateway_port: 7003,
+        relay_a_port: 7002,
+        relay_b_port: 7001,
+        config_path: "/tmp/sharenet-mesh-config.json".to_string(),
     };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--bind-ip" => { cli.bind_ip = iter.next().ok_or("--bind-ip requires a value")?.parse().map_err(|e| format!("--bind-ip: {}", e))?; }
+            "--gateway-port" => { cli.gateway_port = iter.next().ok_or("--gateway-port requires a value")?.parse().map_err(|e| format!("--gateway-port: {}", e))?; }
+            "--relay-a-port" => { cli.relay_a_port = iter.next().ok_or("--relay-a-port requires a value")?.parse().map_err(|e| format!("--relay-a-port: {}", e))?; }
+            "--relay-b-port" => { cli.relay_b_port = iter.next().ok_or("--relay-b-port requires a value")?.parse().map_err(|e| format!("--relay-b-port: {}", e))?; }
+            "--config" => { cli.config_path = iter.next().ok_or("--config requires a value")?.clone(); }
+            _ => return Err(format!("unknown arg: {} (try --help)", arg)),
+        }
+    }
+    Ok(cli)
+}
 
-    eprintln!("[n3b-tun] starting production TUN composition root...");
-    eprintln!("[n3b-tun] tun_name='{}' tun_ip={}", cli.tun_name, cli.tun_ip);
+async fn run_mesh(cli: MeshCli) -> Result<(), String> {
+    eprintln!("[n3b-mesh] starting production ShareNet mesh...");
+    eprintln!("[n3b-mesh] bind_ip={} gateway_port={} relay_a_port={} relay_b_port={}",
+        cli.bind_ip, cli.gateway_port, cli.relay_a_port, cli.relay_b_port);
 
-    // ---- 1. Start the simulated Internet HTTP server on 0.0.0.0:0 ----
-    let (http_port, _http) = start_http_server().await;
-    eprintln!(
-        "[n3b-tun] HTTP server (simulated Internet) listening on 0.0.0.0:{}",
-        http_port
-    );
-
-    // ---- 2. Generate fresh identities for the mesh ----
     let client = NodeIdents::fresh();
     let ra = NodeIdents::fresh();
     let rb = NodeIdents::fresh();
     let gw = NodeIdents::fresh();
 
-    // ---- 3. Start the gateway (real Mode B, multiplexed) ----
-    let gw_addr = ephemeral_addr().await;
+    let gw_addr = format!("{}:{}", cli.bind_ip, cli.gateway_port);
+    let ra_addr = format!("{}:{}", cli.bind_ip, cli.relay_a_port);
+    let rb_addr = format!("{}:{}", cli.bind_ip, cli.relay_b_port);
+
+    // Start gateway with PRODUCTION SSRF defence (NO with_allow_loopback).
     let gw_node = Node::new(gw.identity(), vec![Capability::Gateway], gw_addr.clone());
     let gw_x_sk = Arc::clone(&gw.x_sk);
     let gw_x_pk = gw.x_pk;
-
-    // TEST-ONLY DEVIATION: `with_allow_loopback()` is gated behind the
-    // `test-utils` feature. It disables the production SSRF defence that
-    // blocks loopback/private addresses. This is REQUIRED for the demo
-    // because the HTTP server is on 0.0.0.0 (reachable via 127.0.0.1).
-    // Production deployments MUST use `GatewayStreamTable::new()`.
-    let st = Arc::new(GatewayStreamTable::with_allow_loopback());
+    let st = Arc::new(GatewayStreamTable::new()); // PRODUCTION
     let gw_addr_spawn = gw_addr.clone();
     tokio::spawn(async move {
         let _ = async_node::serve_gateway_mode_b_multiplexed(
             &gw_node, &gw_addr_spawn, &gw_x_sk, &gw_x_pk, &st,
-        )
-        .await;
+        ).await;
     });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    eprintln!("[n3b-mesh] gateway on {} (GatewayStreamTable::new — NO loopback exception)", gw_addr);
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // ---- 4. Start relay B ----
-    let rb_addr = ephemeral_addr().await;
+    // Start relay B.
     let rb_route = Route::new_with_hop_details(
         ra.node_id, gw.node_id,
         vec![
             RouteHop::new(rb.relay_descriptor(), TransportEndpoint::tcp(&rb_addr)),
-            RouteHop::new(gw.gateway_descriptor(), TransportEndpoint::tcp(&gw_addr)),
+            RouteHop::new(gw.gateway_descriptor(&gw_addr, &gw_addr), TransportEndpoint::tcp(&gw_addr)),
         ],
     );
-    let rb_idents = NodeIdents {
-        ed_sk: rb.ed_sk,
-        x_sk: Arc::clone(&rb.x_sk),
-        x_pk: rb.x_pk,
-        node_id: rb.node_id,
-    };
+    let rb_idents = NodeIdents { ed_sk: rb.ed_sk, x_sk: Arc::clone(&rb.x_sk), x_pk: rb.x_pk, node_id: rb.node_id };
     let rb_addr_clone = rb_addr.clone();
     tokio::spawn(async move {
         let _ = async_node::serve_relay_via_route(
@@ -332,24 +276,19 @@ async fn main() {
             &rb_route, 0, &rb_addr_clone, &rb_idents.x_sk, &rb_idents.x_pk,
         ).await;
     });
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    eprintln!("[n3b-mesh] relay B on {}", rb_addr);
+    tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // ---- 5. Start relay A ----
-    let ra_addr = ephemeral_addr().await;
+    // Start relay A.
     let ra_route = Route::new_with_hop_details(
         client.node_id, gw.node_id,
         vec![
             RouteHop::new(ra.relay_descriptor(), TransportEndpoint::tcp(&ra_addr)),
             RouteHop::new(rb.relay_descriptor(), TransportEndpoint::tcp(&rb_addr)),
-            RouteHop::new(gw.gateway_descriptor(), TransportEndpoint::tcp(&gw_addr)),
+            RouteHop::new(gw.gateway_descriptor(&gw_addr, &gw_addr), TransportEndpoint::tcp(&gw_addr)),
         ],
     );
-    let ra_idents = NodeIdents {
-        ed_sk: ra.ed_sk,
-        x_sk: Arc::clone(&ra.x_sk),
-        x_pk: ra.x_pk,
-        node_id: ra.node_id,
-    };
+    let ra_idents = NodeIdents { ed_sk: ra.ed_sk, x_sk: Arc::clone(&ra.x_sk), x_pk: ra.x_pk, node_id: ra.node_id };
     let ra_addr_clone = ra_addr.clone();
     tokio::spawn(async move {
         let _ = async_node::serve_relay_via_route(
@@ -357,109 +296,240 @@ async fn main() {
             &ra_route, 0, &ra_addr_clone, &ra_idents.x_sk, &ra_idents.x_pk,
         ).await;
     });
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    eprintln!("[n3b-mesh] relay A on {}", ra_addr);
+    tokio::time::sleep(Duration::from_millis(80)).await;
 
-    // ---- 6. Build the production route: client → A → B → gateway ----
-    let route = build_route(&client, &ra, &rb, &gw, &ra_addr, &rb_addr, &gw_addr);
+    // Write the mesh config for the `tun` subcommand.
+    let mesh_config = MeshConfig {
+        relay_a_addr: ra_addr.clone(),
+        relay_b_addr: rb_addr.clone(),
+        gateway_addr: gw_addr.clone(),
+        client_ed25519_secret_hex: hex(&client.ed_sk),
+        client_x25519_secret_hex: hex(&client.x_sk.as_ref().to_bytes()),
+        client_x25519_public_hex: hex(&client.x_pk.to_bytes()),
+        client_node_id_hex: hex(&client.node_id),
+        relay_a_ed25519_secret_hex: hex(&ra.ed_sk),
+        relay_a_x25519_public_hex: hex(&ra.x_pk.to_bytes()),
+        relay_a_node_id_hex: hex(&ra.node_id),
+        relay_b_ed25519_secret_hex: hex(&rb.ed_sk),
+        relay_b_x25519_public_hex: hex(&rb.x_pk.to_bytes()),
+        relay_b_node_id_hex: hex(&rb.node_id),
+        gateway_ed25519_secret_hex: hex(&gw.ed_sk),
+        gateway_x25519_secret_hex: hex(&gw.x_sk.as_ref().to_bytes()),
+        gateway_x25519_public_hex: hex(&gw.x_pk.to_bytes()),
+        gateway_node_id_hex: hex(&gw.node_id),
+    };
+    let json = serde_json::to_string_pretty(&mesh_config).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(&cli.config_path, json).map_err(|e| format!("write {}: {}", cli.config_path, e))?;
 
-    // ---- 7. Construct the TunClient ----
-    let client_node = Node::new(
-        client.identity(),
-        vec![Capability::Client],
-        String::new(),
-    );
+    // Print machine-readable output.
+    println!("GATEWAY_ADDR={}", gw_addr);
+    println!("RELAY_A_ADDR={}", ra_addr);
+    println!("RELAY_B_ADDR={}", rb_addr);
+    println!("CONFIG_PATH={}", cli.config_path);
 
-    // `health_endpoint` is NOT used for destination in the current TunClient
-    // (destination is extracted from each SYN's 5-tuple). It is retained for
-    // a future optional startup health-check; we point it at the HTTP server
-    // for semantic clarity.
+    eprintln!();
+    eprintln!("  ════════════════════════════════════════════════════════════");
+    eprintln!("  N3-B mesh READY (production gateway — NO loopback exception)");
+    eprintln!("    gateway : {} (GatewayStreamTable::new)", gw_addr);
+    eprintln!("    relay A : {}", ra_addr);
+    eprintln!("    relay B : {}", rb_addr);
+    eprintln!("    config  : {}", cli.config_path);
+    eprintln!("  ════════════════════════════════════════════════════════════");
+    eprintln!();
+    eprintln!("  The gateway REJECTS loopback/private destinations.");
+    eprintln!("  Use a separately-started HTTP server on a routable IP.");
+    eprintln!();
+    eprintln!("  Press Ctrl+C to shut down.");
+    eprintln!();
+
+    let _ = tokio::signal::ctrl_c().await;
+    eprintln!("[n3b-mesh] Ctrl+C — shutting down");
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// `tun` subcommand: TunClient only
+// ════════════════════════════════════════════════════════════════════════════
+
+struct TunCli {
+    config_path: String,
+    tun_name: String,
+    tun_ip: Ipv4Addr,
+    physical_interface: Option<String>,
+}
+
+fn parse_tun_args(args: &[String]) -> Result<TunCli, String> {
+    let mut cli = TunCli {
+        config_path: "/tmp/sharenet-mesh-config.json".to_string(),
+        tun_name: "snp0".to_string(),
+        tun_ip: Ipv4Addr::new(10, 0, 0, 1),
+        physical_interface: None,
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => { cli.config_path = iter.next().ok_or("--config requires a value")?.clone(); }
+            "--tun-name" => { cli.tun_name = iter.next().ok_or("--tun-name requires a value")?.clone(); }
+            "--tun-ip" => { cli.tun_ip = iter.next().ok_or("--tun-ip requires a value")?.parse().map_err(|e| format!("--tun-ip: {}", e))?; }
+            "--physical-interface" => { cli.physical_interface = Some(iter.next().ok_or("--physical-interface requires a value")?.clone()); }
+            _ => return Err(format!("unknown arg: {} (try --help)", arg)),
+        }
+    }
+    Ok(cli)
+}
+
+async fn run_tun(cli: TunCli) -> Result<(), String> {
+    eprintln!("[n3b-tun] starting production TUN client...");
+
+    // 1. Read the mesh config.
+    let config_json = std::fs::read_to_string(&cli.config_path)
+        .map_err(|e| format!("read {}: {} (did you run `mesh` first?)", cli.config_path, e))?;
+    let mesh_cfg: MeshConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("parse config: {}", e))?;
+
+    eprintln!("[n3b-tun] loaded mesh config from {}", cli.config_path);
+    eprintln!("[n3b-tun] relay_a={} relay_b={} gateway={}",
+        mesh_cfg.relay_a_addr, mesh_cfg.relay_b_addr, mesh_cfg.gateway_addr);
+
+    // 2. Build the route.
+    let route = build_route_from_config(&mesh_cfg)?;
+
+    // 3. Parse client keys.
+    let client_ed_sk = parse_hex32(&mesh_cfg.client_ed25519_secret_hex, "client_ed25519_secret")?;
+    let client_x_sk_bytes = parse_hex32(&mesh_cfg.client_x25519_secret_hex, "client_x25519_secret")?;
+    let client_x_pk_bytes = parse_hex32(&mesh_cfg.client_x25519_public_hex, "client_x25519_public")?;
+
+    let client_identity = NodeIdentity::from_secret(client_ed_sk);
+    let client_node = Node::new(client_identity, vec![Capability::Client], String::new());
+    let client_x_sk = Arc::new(X25519Secret::from(client_x_sk_bytes));
+    let client_x_pk = X25519PubKey::from(client_x_sk_bytes);
+
+    // 4. Extract control-plane endpoints for split-tunnel routing.
+    let control_plane_endpoints: Vec<IpAddr> = [
+        &mesh_cfg.relay_a_addr, &mesh_cfg.relay_b_addr, &mesh_cfg.gateway_addr,
+    ].iter()
+     .filter_map(|addr| addr.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()))
+     .collect();
+
     let config = TunClientConfig {
         tun_name: cli.tun_name.clone(),
         tun_ip: cli.tun_ip,
         mtu: 1500,
-        route: route.clone(),
+        route,
         node: client_node,
-        client_x25519_secret: Arc::clone(&client.x_sk),
-        client_x25519_public: client.x_pk,
-        health_endpoint: endpoint(http_port),
+        client_x25519_secret: client_x_sk,
+        client_x25519_public: client_x_pk,
+        health_endpoint: InternetEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            port: 0,
+            protocol: TransportProtocol::Tcp,
+        },
+        control_plane_endpoints,
+        physical_interface: cli.physical_interface.clone(),
     };
 
     eprintln!("[n3b-tun] creating TUN device + establishing ShareNet circuit...");
-    let mut tun_client = match TunClient::create(config).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[n3b-tun] TunClient::create failed: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mut tun_client = TunClient::create(config).await
+        .map_err(|e| format!("TunClient::create: {:?}", e))?;
 
     let actual_tun_name = tun_client.tun_name().to_string();
-    eprintln!(
-        "[n3b-tun] TUN device '{}' created (requested name='{}', ip={})",
-        actual_tun_name, cli.tun_name, cli.tun_ip
-    );
+    eprintln!("[n3b-tun] TUN device '{}' created (ip={})", actual_tun_name, cli.tun_ip);
 
-    // ---- 8. Configure OS routes (assign TUN IP + install default route) ----
-    // REQUIRES root / CAP_NET_ADMIN.
+    // 5. Configure OS routes (split-tunnel).
     if let Err(e) = tun_client.configure_os_routes() {
-        eprintln!("[n3b-tun] OS route config failed: {}", e);
-        eprintln!("[n3b-tun] (this requires root or CAP_NET_ADMIN)");
-        // Best-effort cleanup before exit.
+        eprintln!("[n3b-tun] OS route config failed: {:?} (requires root/CAP_NET_ADMIN)", e);
         let _ = tun_client.cleanup_os_routes();
-        std::process::exit(1);
+        return Err(format!("OS route config: {:?}", e));
     }
-    eprintln!(
-        "[n3b-tun] OS routes installed: {} assigned {}, default route via {}",
-        actual_tun_name, cli.tun_ip, actual_tun_name
-    );
+    eprintln!("[n3b-tun] split-tunnel routes installed (control-plane → {}, default → {})",
+        cli.physical_interface.as_deref().unwrap_or("auto"), actual_tun_name);
 
-    // ---- 9. Print machine-readable output for the acceptance test harness ----
     println!("TUN_NAME={}", actual_tun_name);
     println!("TUN_IP={}", cli.tun_ip);
-    println!("HTTP_PORT={}", http_port);
-    println!("GATEWAY_ADDR={}", gw_addr);
-    println!("RELAY_A_ADDR={}", ra_addr);
-    println!("RELAY_B_ADDR={}", rb_addr);
 
     eprintln!();
     eprintln!("  ════════════════════════════════════════════════════════════");
-    eprintln!("  N3-B TUN composition root is READY");
+    eprintln!("  N3-B TUN client READY");
     eprintln!("    TUN interface : {} ({})", actual_tun_name, cli.tun_ip);
-    eprintln!("    HTTP server   : 0.0.0.0:{} (simulated Internet)", http_port);
-    eprintln!("    Mesh          : client → A({}) → B({}) → gateway({})",
-        ra_addr, rb_addr, gw_addr);
+    eprintln!("    Routing       : split-tunnel (control-plane bypasses TUN)");
     eprintln!("  ════════════════════════════════════════════════════════════");
     eprintln!();
-    eprintln!("  Test with curl (kernel routes SYN through TUN):");
-    eprintln!("    curl http://127.0.0.1:{}/", http_port);
+    eprintln!("  Ordinary curl now routes through ShareNet:");
+    eprintln!("    curl http://EXTERNAL_IP:PORT/");
     eprintln!();
-    eprintln!("  Press Ctrl+C to shut down (OS routes will be cleaned up).");
+    eprintln!("  Press Ctrl+C to shut down.");
     eprintln!();
 
-    // ---- 10. Run the TUN packet pump, with Ctrl+C graceful shutdown ----
-    //
-    // `tun_client.run()` borrows `tun_client` mutably for the duration of
-    // the future. `tokio::select!` drops that future when Ctrl+C arrives,
-    // releasing the borrow so we can call `cleanup_os_routes()` below.
     tokio::select! {
         res = tun_client.run() => {
-            // The TUN pump exited on its own (TUN device closed or fatal error).
-            eprintln!();
             eprintln!("[n3b-tun] TUN client exited: {:?}", res);
         }
         _ = tokio::signal::ctrl_c() => {
-            eprintln!();
-            eprintln!("[n3b-tun] Ctrl+C received — shutting down");
+            eprintln!("[n3b-tun] Ctrl+C — shutting down");
         }
     }
 
-    // ---- 11. Cleanup: remove the OS routes we installed ----
-    // Best-effort — if this fails (e.g. partial setup), we still exit.
     eprintln!("[n3b-tun] cleaning up OS routes...");
     match tun_client.cleanup_os_routes() {
         Ok(()) => eprintln!("[n3b-tun] OS routes cleaned up"),
-        Err(e) => eprintln!("[n3b-tun] OS route cleanup error (non-fatal): {}", e),
+        Err(e) => eprintln!("[n3b-tun] cleanup error (non-fatal): {:?}", e),
+    }
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// main: dispatch on subcommand
+// ════════════════════════════════════════════════════════════════════════════
+
+fn print_usage() {
+    eprintln!("Usage: n3b_tun_demo <subcommand> [options]\n");
+    eprintln!("Subcommands:");
+    eprintln!("  mesh    Start the ShareNet mesh (gateway + 2 relays, production SSRF)");
+    eprintln!("  tun     Start the TUN client (connects to mesh, creates TUN, configures routes)");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  n3b_tun_demo mesh --bind-ip 10.0.1.1 --config /tmp/cfg.json");
+    eprintln!("  n3b_tun_demo tun --config /tmp/cfg.json --tun-name snp0 --tun-ip 10.0.0.1");
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        print_usage();
+        std::process::exit(2);
     }
 
-    eprintln!("[n3b-tun] shutdown complete");
+    let sub_args: Vec<String> = args[2..].to_vec();
+    let result = match args[1].as_str() {
+        "mesh" => {
+            let cli = match parse_mesh_args(&sub_args) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("[n3b] mesh arg error: {}", e); std::process::exit(2); }
+            };
+            run_mesh(cli).await
+        }
+        "tun" => {
+            let cli = match parse_tun_args(&sub_args) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("[n3b] tun arg error: {}", e); std::process::exit(2); }
+            };
+            run_tun(cli).await
+        }
+        "help" | "--help" | "-h" => {
+            print_usage();
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("unknown subcommand: {}", other);
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("[n3b] error: {}", e);
+        std::process::exit(1);
+    }
 }

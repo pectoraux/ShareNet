@@ -109,6 +109,18 @@ pub struct TunClientConfig {
     /// destination is extracted from each SYN packet. It is retained
     /// only for the optional health-check on startup.)
     pub health_endpoint: InternetEndpoint,
+    /// **N3-B Step 3 fix** — The ShareNet control-plane endpoints (relay +
+    /// gateway IP addresses) that must bypass the TUN. Without these
+    /// exclusion routes, the TunClient's own circuit traffic to the relay
+    /// would loop back into the TUN, creating a routing loop.
+    ///
+    /// The runtime installs specific host routes for each endpoint via the
+    /// physical interface, so the kernel prefers them over the TUN default
+    /// route. Set to an empty vec if the mesh is in-process (testing only).
+    pub control_plane_endpoints: Vec<std::net::IpAddr>,
+    /// The physical interface name for control-plane routes (e.g. "eth0").
+    /// If None, the runtime auto-detects the current default route's interface.
+    pub physical_interface: Option<String>,
 }
 
 /// The TUN client runtime.
@@ -132,6 +144,9 @@ pub struct TunClient {
     /// we add a replacement. This maps dst_port → the listening socket handles
     /// that are currently waiting for a connection.
     listening_sockets: HashMap<u16, Vec<SmolSocketHandle>>,
+    /// **N3-B Step 7** — The OS routes installed by `configure_os_routes()`.
+    /// Stored so `cleanup_os_routes()` can remove exactly what was installed.
+    installed_routes: Option<crate::os_routes::InstalledRoutes>,
 }
 
 impl TunClient {
@@ -205,6 +220,7 @@ impl TunClient {
             circuit,
             config,
             listening_sockets: HashMap::new(),
+            installed_routes: None,
         })
     }
 
@@ -214,21 +230,27 @@ impl TunClient {
         self.tun.name()
     }
 
-    /// **N3-B Step 7** — Configure the OS network interface.
+    /// **N3-B Step 7** — Configure the OS network interface with split-tunnel routing.
     ///
-    /// This assigns the TUN IP address, brings the interface up, and
-    /// installs a default route through the TUN. After this call, the OS
-    /// kernel routes ALL traffic through the TUN interface, and the
-    /// TunClient intercepts SYNs.
+    /// This:
+    /// 1. Assigns the TUN IP address + brings the interface up.
+    /// 2. Installs specific routes for each control-plane endpoint (relay/gateway)
+    ///    via the physical interface, so ShareNet circuit traffic bypasses the TUN.
+    /// 3. Installs the TUN default route (ordinary traffic → TUN).
+    ///
+    /// After this call, the OS kernel routes ordinary Internet traffic through
+    /// the TUN (where TunClient intercepts SYNs), while ShareNet control-plane
+    /// traffic goes directly via the physical interface (no routing loop).
     ///
     /// # Ownership
     ///
     /// - **Who creates TUN?** `TunClient::create()` (via `LinuxTunDevice::create`).
     /// - **Who assigns its address?** This method.
-    /// - **Who installs the route?** This method.
-    /// - **Who removes the route?** `cleanup_os_routes()` (call before drop).
+    /// - **Who installs the TUN default route?** This method.
+    /// - **Who installs the control-plane exclusion routes?** This method.
+    /// - **Who removes the routes?** `cleanup_os_routes()` (call before drop).
     /// - **Who owns shutdown?** The `run()` loop + `Drop` (which closes the TUN fd,
-    ///   destroying the interface + removing the route automatically).
+    ///   destroying the interface + removing the TUN default route automatically).
     ///
     /// # Permissions
     ///
@@ -236,29 +258,35 @@ impl TunClient {
     ///
     /// # Errors
     /// Returns an error if the `ip` commands fail.
-    pub fn configure_os_routes(&self) -> Result<(), TunClientError> {
+    pub fn configure_os_routes(&mut self) -> Result<(), TunClientError> {
         let config = crate::os_routes::OsRouteConfig {
             tun_name: self.tun.name().to_string(),
             tun_ip_cidr: format!("{}/24", self.config.tun_ip),
+            control_plane_endpoints: self.config.control_plane_endpoints.clone(),
+            physical_interface: self.config.physical_interface.clone(),
         };
-        crate::os_routes::configure_os_interface(&config)
-            .map_err(|e| TunClientError::SmolTcp(format!("OS route config: {e}")))
+        let installed = crate::os_routes::configure_os_interface(&config)
+            .map_err(|e| TunClientError::SmolTcp(format!("OS route config: {e}")))?;
+        self.installed_routes = Some(installed);
+        Ok(())
     }
 
-    /// **N3-B Step 7** — Clean up the OS network configuration.
+    /// **N3-B Step 7** — Clean up the OS routes installed by `configure_os_routes()`.
     ///
-    /// Removes the default route and brings the interface down. Call this
-    /// before dropping the TunClient for explicit cleanup.
+    /// Removes ONLY what ShareNet installed:
+    /// - The TUN default route.
+    /// - The control-plane exclusion routes.
+    ///
+    /// Does NOT touch the physical interface's pre-existing configuration.
     ///
     /// # Errors
-    /// Returns an error if the cleanup commands fail (non-fatal during shutdown).
-    pub fn cleanup_os_routes(&self) -> Result<(), TunClientError> {
-        let config = crate::os_routes::OsRouteConfig {
-            tun_name: self.tun.name().to_string(),
-            tun_ip_cidr: format!("{}/24", self.config.tun_ip),
-        };
-        crate::os_routes::cleanup_os_interface(&config)
-            .map_err(|e| TunClientError::SmolTcp(format!("OS route cleanup: {e}")))
+    /// Non-fatal during shutdown — the caller should log and continue.
+    pub fn cleanup_os_routes(&mut self) -> Result<(), TunClientError> {
+        if let Some(installed) = self.installed_routes.take() {
+            crate::os_routes::cleanup(&installed)
+                .map_err(|e| TunClientError::SmolTcp(format!("OS route cleanup: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Run the packet-pump loop.

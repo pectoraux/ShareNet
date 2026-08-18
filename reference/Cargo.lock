@@ -1062,6 +1062,8 @@ dependencies = [
  "async-trait",
  "getrandom",
  "rand",
+ "serde",
+ "serde_json",
  "sha2",
  "smoltcp",
  "snp-crypto",

@@ -21,9 +21,9 @@
 #         ↓ TunClient reads SYN, extracts 5-tuple
 #     ShareNet circuit (SNP-IK + X25519 DH)
 #         ↓ relay(s) forward
-#     gateway (real outbound TCP socket)
+#     gateway (real outbound TCP socket, production SSRF defence)
 #         ↓ real Internet
-#     external HTTP server
+#     external HTTP server (started by THIS script, not by the binary)
 #         ← response retraces the path
 #
 #     ┌────────────────────────────────┐
@@ -60,6 +60,47 @@
 # file) enforces this at script startup.
 #
 # ════════════════════════════════════════════════════════════════════════════
+# BINARY INTERFACE (verified — matches snp-stack/examples/n3b_tun_demo.rs)
+# ════════════════════════════════════════════════════════════════════════════
+# The n3b_tun_demo binary supports TWO subcommands:
+#
+#   n3b_tun_demo mesh \
+#       --bind-ip <ip> \
+#       --gateway-port <p> --relay-a-port <p> --relay-b-port <p> \
+#       --config <path>
+#     → starts gateway + 2 relays, binds to <ip> (NOT 127.0.0.1),
+#       writes a JSON mesh config to <path>, prints on stdout:
+#         GATEWAY_ADDR=<addr>
+#         RELAY_A_ADDR=<addr>
+#         RELAY_B_ADDR=<addr>
+#         CONFIG_PATH=<path>
+#       prints "N3-B mesh READY" on stderr, waits for Ctrl+C.
+#       Uses GatewayStreamTable::new() (PRODUCTION SSRF defence —
+#       NO loopback exception). The gateway REJECTS loopback/private
+#       destinations, so the external HTTP server MUST be on a
+#       routable IP (the host's primary network IP).
+#
+#   n3b_tun_demo tun \
+#       --config <path> \
+#       --tun-name <name> \
+#       --tun-ip <ip> \
+#       --physical-interface <iface>
+#     → reads the JSON mesh config from <path>, creates a real TUN
+#       device, establishes the ShareNet circuit, and configures
+#       split-tunnel OS routes (control-plane → physical interface,
+#       default → TUN). Prints on stdout:
+#         TUN_NAME=<name>
+#         TUN_IP=<ip>
+#       prints "N3-B TUN client READY" on stderr.
+#
+# BUILD COMMAND (production — NO test-utils):
+#   cargo build --example n3b_tun_demo -p snp-stack --features circuit-upstream
+#
+# The gateway uses GatewayStreamTable::new() (production SSRF defence).
+# Do NOT build with --features test-utils — that would enable the
+# loopback exception and defeat the purpose of this acceptance test.
+#
+# ════════════════════════════════════════════════════════════════════════════
 # NETWORK TOPOLOGY — SPLIT TUNNEL
 # ════════════════════════════════════════════════════════════════════════════
 # The fundamental challenge: the TunClient process itself needs to reach
@@ -69,44 +110,52 @@
 #
 # The solution is split-tunnel routing (exactly how real VPN clients
 # like OpenVPN / WireGuard work):
-#   * A more-specific route sends ShareNet-control traffic via the veth.
-#   * The default route sends EVERYTHING ELSE via the TUN.
+#   * The TunClient binary installs specific HOST routes for each
+#     control-plane endpoint (relay/gateway IPs) via the physical
+#     interface (veth_client). These are /32 routes, more specific
+#     than the default route.
+#   * The TunClient binary installs the default route via the TUN.
+#   * Everything else (ordinary curl traffic) goes via the TUN.
 #
-#   ┌─────────────────────────────────────────┐       ┌────────────────────────────────────────────────┐
-#   │ Client network namespace (snp_n3b)       │       │ Host network namespace (full Internet)         │
-#   │                                          │       │                                                │
-#   │   lo: 127.0.0.1 (up)                     │       │  External HTTP server                          │
-#   │                                          │       │    bound to $HOST_IP:$HTTP_PORT                │
-#   │   veth_client: 10.0.1.2/24 (up)          │       │    python3 -m http.server                      │
-#   │   route 10.0.1.0/24 → veth_client        │  veth │                                                │
-#   │                                          │ ◀────▶│  ShareNet gateway  — bound to $HOST_VETH_IP    │
-#   │   snp0 (TUN): 10.0.0.1/24                │  pair │    port $GATEWAY_PORT                          │
-#   │   default route → snp0                   │       │  ShareNet relay A  — port $RELAY_A_PORT        │
-#   │                                          │       │  ShareNet relay B  — port $RELAY_B_PORT        │
-#   │   TunClient process runs HERE:           │       │                                                │
-#   │     - opens /dev/net/tun → creates snp0  │       │  The mesh process (n3b_tun_demo mesh) runs     │
-#   │     - assigns 10.0.0.1/24 to snp0        │       │  HERE (host namespace), binding its listeners   │
-#   │     - brings snp0 up                     │       │  to $HOST_VETH_IP so the client can reach      │
-#   │     - installs default route via snp0    │       │  them over the veth pair (10.0.1.0/24).        │
-#   │     - dials relay at 10.0.1.1:7001       │       │                                                │
-#   │       (matches 10.0.1.0/24 → veth)      │       │  $HOST_IP is the host's PRIMARY network IP     │
-#   │     - intercepts SYNs, opens streams     │       │  (NOT 127.0.0.1, NOT 10.0.0.x, NOT 10.0.1.x).  │
-#   │                                          │       │                                                │
-#   │   curl http://$HOST_IP:$HTTP_PORT/       │       │  The gateway opens a real outbound TCP socket  │
-#   │     ↓ OS routes via default → snp0      │       │  to $HOST_IP:$HTTP_PORT — the SYN leaves the    │
-#   │     ↓ TunClient intercepts SYN           │       │  host namespace via the host's normal Internet │
-#   │     ↓ opens ShareNet stream              │       │  route (NOT through the TUN, NOT through the   │
-#   │     ↓ circuit: client → relay → gw      │       │  veth).                                         │
-#   │     ↓ gateway dials $HOST_IP:$HTTP_PORT │       │                                                │
-#   │     ← 200 OK retraces the path           │       │                                                │
-#   └─────────────────────────────────────────┘       └────────────────────────────────────────────────┘
+#   ┌──────────────────────────────────────┐       ┌──────────────────────────────────────────────┐
+#   │ Client network namespace (snp_n3b)   │       │ Host network namespace (full Internet)        │
+#   │                                      │       │                                                │
+#   │   lo: 127.0.0.1 (up)                 │       │  External HTTP server                          │
+#   │                                      │       │    bound to $HOST_IP:$HTTP_PORT                │
+#   │   veth_client: 10.0.1.2/24 (up)     │       │    (started by THIS script via python3        │
+#   │   connected route 10.0.1.0/24        │       │     -m http.server, NOT by the binary)         │
+#   │     → veth_client (auto)             │       │                                                │
+#   │                                      │  veth │  n3b_tun_demo mesh --bind-ip 10.0.1.1        │
+#   │   snp0 (TUN): 10.0.0.1/24            │ ◀────▶│    --gateway-port 7003                        │
+#   │   default route → snp0                │  pair │    --relay-a-port 7002                        │
+#   │   (installed by the binary via       │       │    --relay-b-port 7001                        │
+#   │    configure_os_routes())            │       │    --config /tmp/sharenet-mesh-config.json    │
+#   │                                      │       │  gateway: 10.0.1.1:7003                       │
+#   │   host routes (installed by binary): │       │  relay A: 10.0.1.1:7002                       │
+#   │     10.0.1.1/32 → veth_client        │       │  relay B: 10.0.1.1:7001                       │
+#   │                                      │       │  (GatewayStreamTable::new — NO loopback)       │
+#   │   n3b_tun_demo tun runs HERE:        │       │                                                │
+#   │     --config /tmp/...-config.json    │       │  The external HTTP server MUST be on a         │
+#   │     --tun-name snp0                  │       │  routable IP (NOT 127.0.0.1, NOT 10.0.0.x,    │
+#   │     --tun-ip 10.0.0.1                │       │  NOT 10.0.1.x). Use $HOST_IP (the host's      │
+#   │     --physical-interface veth_client │       │  primary network IP).                          │
+#   │                                      │       │                                                │
+#   │   curl http://$HOST_IP:$HTTP_PORT/   │       │  The gateway opens a real outbound TCP socket  │
+#   │     ↓ OS routes via default → snp0  │       │  to $HOST_IP:$HTTP_PORT — the SYN leaves the    │
+#   │     ↓ TunClient intercepts SYN       │       │  host namespace via the host's normal Internet │
+#   │     ↓ opens ShareNet stream          │       │  route (NOT through the TUN, NOT through the   │
+#   │     ↓ circuit: client → relay → gw  │       │  veth).                                        │
+#   │     ↓ gateway dials $HOST_IP:$PORT  │       │                                                │
+#   │     ← 200 OK retraces the path       │       │                                                │
+#   └──────────────────────────────────────┘       └──────────────────────────────────────────────┘
 #
 # Why this is NOT a loop:
-#   - The TunClient's OWN outbound TCP (to 10.0.1.1:7001) matches the
-#     more-specific route 10.0.1.0/24 → veth_client, NOT the default
-#     route → snp0. So the circuit-control traffic bypasses the TUN.
+#   - The TunClient's OWN outbound TCP (to 10.0.1.1:7002) matches the
+#     host route 10.0.1.1/32 → veth_client (installed by the binary),
+#     NOT the default route → snp0. So the circuit-control traffic
+#     bypasses the TUN.
 #   - The OS application's outbound TCP (curl to $HOST_IP:$HTTP_PORT)
-#     does NOT match 10.0.1.0/24 (it's the host's LAN IP, e.g.
+#     does NOT match 10.0.1.1/32 (it's the host's LAN IP, e.g.
 #     192.168.1.42) and does NOT match 10.0.0.0/24, so it falls through
 #     to the default route → snp0, where the TunClient intercepts it.
 #   - The gateway's outbound TCP to $HOST_IP happens in the HOST
@@ -117,9 +166,9 @@
 # ════════════════════════════════════════════════════════════════════════════
 #   * REAL processes
 #       - The ShareNet mesh (gateway + 2 relays) runs as a separate OS
-#         process: `n3b_tun_demo mesh ...`
+#         process: `n3b_tun_demo mesh ...` (host namespace).
 #       - The TunClient runs as ANOTHER separate OS process:
-#         `ip netns exec snp_n3b n3b_tun_demo tun ...`
+#         `ip netns exec snp_n3b n3b_tun_demo tun ...` (client namespace).
 #       - The external HTTP server runs as a separate python3 process.
 #   * REAL TUN device
 #       - /dev/net/tun is opened via ioctl(TUNSETIFF) by LinuxTunDevice.
@@ -138,12 +187,13 @@
 #       - Two real relays: Client → Relay A → Relay B → Gateway.
 #   * REAL gateway
 #       - serve_gateway_mode_b_multiplexed() opens a real outbound TCP
-#         socket to the external endpoint.
+#         socket to the external endpoint. Uses GatewayStreamTable::new()
+#         (PRODUCTION SSRF defence — NO loopback exception).
 #   * REAL network isolation
 #       - `ip netns add` creates a real Linux network namespace.
-#       - The client namespace has ONLY a veth pair + a route for
-#         10.0.1.0/24 (the veth subnet). There is NO default route
-#         UNTIL the TunClient installs one via snp0.
+#       - The client namespace has ONLY a veth pair + a connected route
+#         for 10.0.1.0/24. There is NO default route UNTIL the TunClient
+#         installs one via snp0.
 #       - TEST 1 (DIRECT) runs BEFORE the TunClient starts, so the
 #         namespace has NO default route → curl fails with ENETUNREACH.
 #   * REAL external endpoint
@@ -160,7 +210,7 @@
 #   * `ip link add ... type veth`  — veth pair creation.
 #   * `ip link set ... netns`      — moving a veth into a namespace.
 #   * `ip addr add ... dev`        — assigning IP addresses.
-#   * `ip route add ... dev`       — route configuration.
+#   * `ip route add ... dev`       — route configuration (by the binary).
 #   * /dev/net/tun (ioctl TUNSETIFF) — TUN device creation (by the binary).
 # All of these require CAP_NET_ADMIN. The `ip netns add` command itself
 # internally calls `unshare(CLONE_NEWNET)` which requires CAP_SYS_ADMIN
@@ -184,12 +234,11 @@
 # EXPECTED OUTPUT (PASS)
 # ════════════════════════════════════════════════════════════════════════════
 #   === N3-B TUN ACCEPTANCE TEST ===
-#   mode:                demo (cargo run --example n3b_tun_demo)
 #   host IP:             192.168.1.42
 #   external endpoint:   http://192.168.1.42:8888/
-#   TUN interface:       snp0 (10.0.0.1/24, mtu 1500)
+#   TUN interface:       snp0 (10.0.0.1, mtu 1500)
 #   client namespace:    snp_n3b (veth 10.0.1.2, no default route yet)
-#   mesh:                gateway=10.0.1.1:7002 relayA=10.0.1.1:7001 relayB=10.0.1.1:7000
+#   mesh:                gateway=10.0.1.1:7003 relayA=10.0.1.1:7002 relayB=10.0.1.1:7001
 #
 #   === STEP 1: start external HTTP server ===
 #   python3 -m http.server 8888 --bind 0.0.0.0 (PID 12345)
@@ -198,34 +247,25 @@
 #   n3b_tun_demo mesh --bind-ip 10.0.1.1 ... (PID 12346)
 #   waiting for mesh to be ready... OK
 #
-#   === STEP 3: set up network namespace + veth + split-tunnel route ===
+#   === STEP 3: set up network namespace + veth pair ===
 #   ip netns add snp_n3b
 #   veth pair: veth_snp_n3b_host ↔ veth_snp_n3b_client
 #   host: 10.0.1.1/24 on veth_snp_n3b_host
-#   client: 10.0.1.2/24 on veth_snp_n3b_client, route 10.0.1.0/24
+#   client: 10.0.1.2/24 on veth_snp_n3b_client
 #   NO default route in client namespace (verified)
 #
 #   === TEST 1: DIRECT access (no TUN yet) — EXPECTED: FAIL ===
-#   $ ip netns exec snp_n3b curl --connect-timeout 5 http://192.168.1.42:8888/
-#   curl exit code: 6 (Couldn't resolve host / no route)
-#   ✓ DIRECT access FAILED (as expected)
+#   [1] DIRECT: curl from client namespace → FAIL (expected)
 #
 #   === STEP 4: start TunClient in client namespace ===
-#   ip netns exec snp_n3b n3b_tun_demo tun --relay 10.0.1.1:7001 ...
+#   ip netns exec snp_n3b n3b_tun_demo tun --config ... --tun-name snp0 ...
 #   waiting for TunClient to be ready... OK
-#   TUN snp0 created (10.0.0.1/24, default route installed)
-#   circuit established to gateway
+#   TUN snp0 created (10.0.0.1, default route installed by binary)
 #
 #   === TEST 2: SHARENET via TUN — EXPECTED: SUCCESS ===
-#   $ ip netns exec snp_n3b curl --connect-timeout 10 http://192.168.1.42:8888/
-#   response: Hello from the real Internet via ShareNet TUN!
-#   ✓ SHARENET access SUCCEEDED (as expected)
+#   [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)
 #
-#   ═══════════════════════════════════════════════════════
-#     N3-B TUN ACCEPTANCE TEST PASSED
-#     Direct Internet:    FAIL     (correct — no route)
-#     Via ShareNet TUN:   SUCCESS  (correct — real circuit)
-#   ═══════════════════════════════════════════════════════
+#   N3-B TUN ACCEPTANCE TEST: PASS
 #
 # ════════════════════════════════════════════════════════════════════════════
 # USAGE
@@ -237,21 +277,18 @@
 #                                  Default: http://$HOST_IP:$HTTP_PORT/
 #   --http-port=PORT            External HTTP server port (default: 8888)
 #   --tun-name=NAME             TUN interface name (default: snp0, max 15 chars)
-#   --tun-ip=IP                 TUN interface IP (default: 10.0.0.1)
-#   --tun-cidr=N                TUN IP CIDR prefix (default: 24)
-#   --mtu=N                     TUN MTU (default: 1500)
+#   --tun-ip=IP                 TUN interface IP (default: 10.0.0.1, plain IP)
 #   --client-ip=IP              Client namespace veth IP (default: 10.0.1.2)
 #   --host-veth-ip=IP           Host veth IP / mesh bind IP (default: 10.0.1.1)
 #   --namespace=NAME            Network namespace name (default: snp_n3b)
-#   --gateway-port=PORT         Mesh gateway listen port (default: 7002)
-#   --relay-a-port=PORT         Mesh relay A listen port (default: 7001)
-#   --relay-b-port=PORT         Mesh relay B listen port (default: 7000)
-#   --cargo-features=FEATURES   Extra cargo features for the demo binary
-#                                  (default: "circuit-upstream test-utils")
-#   --no-build                  Don't auto-build the demo binary (use existing)
+#   --gateway-port=PORT         Mesh gateway listen port (default: 7003)
+#   --relay-a-port=PORT         Mesh relay A listen port (default: 7002)
+#   --relay-b-port=PORT         Mesh relay B listen port (default: 7001)
+#   --config=PATH               Mesh config file path (default: /tmp/sharenet-mesh-config.json)
+#   --no-build                   Don't auto-build the demo binary (use existing)
 #   --keep-on-failure           Don't tear down on failure (for debugging)
-#   -v, --verbose               Verbose output
-#   -h, --help                  Show this help message
+#   -v, --verbose                Verbose output
+#   -h, --help                   Show this help message
 #
 # EXIT CODES
 #   0 — Test PASSED (direct failed AND sharenet succeeded)
@@ -261,21 +298,12 @@
 #
 # RELATED FILES
 #   * snp-stack/examples/n3b_tun_demo.rs  — the TunClient + mesh binary
-#     (created by subagent N3B-TUN-BINARY). The binary is expected to
-#     support two subcommands:
-#       n3b_tun_demo mesh --bind-ip <ip> --gateway-port <p> \
-#                       --relay-a-port <p> --relay-b-port <p>
-#         → starts gateway + 2 relays, binds to <ip>, prints "MESH_READY"
-#           on stdout when ready.
-#       n3b_tun_demo tun --relay <ip:port> --tun-name <name> \
-#                      --tun-ip <ip/cidr> --mtu <n>
-#         → opens /dev/net/tun, creates TUN, configures OS routes,
-#           establishes the circuit, prints "TUN_READY" on stdout.
+#     (supports `mesh` and `tun` subcommands). The `mesh` subcommand
+#     writes a JSON config file; the `tun` subcommand reads it.
 #   * snp-stack/src/tun_client.rs        — TunClient runtime (production).
-#   * snp-stack/src/os_routes.rs         — OS route configuration helpers.
-#   * snp-stack/tests/n3a_isolated_socks5_test.sh — the N-A variant
-#     that uses the L4.5 proxy protocol (FORBIDDEN to reference at
-#     runtime in this script).
+#   * snp-stack/src/os_routes.rs         — OS route configuration helpers
+#     (called by the binary's configure_os_routes() to install the
+#     split-tunnel routes: control-plane host routes + TUN default route).
 #   * Worklog entry N3B-STATUS            — architectural status matrix.
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -293,21 +321,21 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
+# These match the n3b_tun_demo binary's own defaults (see parse_mesh_args
+# and parse_tun_args in snp-stack/examples/n3b_tun_demo.rs).
 EXTERNAL_ENDPOINT=""
 HTTP_PORT="8888"
 TUN_NAME="snp0"
 TUN_IP="10.0.0.1"
-TUN_CIDR="24"
-MTU="1500"
 CLIENT_IP="10.0.1.2"
 HOST_VETH_IP="10.0.1.1"
 HOST_VETH="veth_snp_n3b_host"
 CLIENT_VETH="veth_snp_n3b_client"
 NAMESPACE="snp_n3b"
-GATEWAY_PORT="7002"
-RELAY_A_PORT="7001"
-RELAY_B_PORT="7000"
-CARGO_FEATURES="circuit-upstream test-utils"
+GATEWAY_PORT="7003"
+RELAY_A_PORT="7002"
+RELAY_B_PORT="7001"
+CONFIG_PATH="/tmp/sharenet-mesh-config.json"
 NO_BUILD=0
 KEEP_ON_FAILURE=0
 VERBOSE=0
@@ -330,7 +358,6 @@ HTTP_PID=""
 NAMESPACE_CREATED=0
 VETH_HOST_CREATED=0
 VETH_MOVED=0
-SPLIT_TUNNEL_ROUTE_INSTALLED=0
 EXIT_CODE=0
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -359,17 +386,14 @@ OPTIONS:
                                   Default: http://$HOST_IP:$HTTP_PORT/
     --http-port=PORT            External HTTP server port (default: 8888)
     --tun-name=NAME             TUN interface name (default: snp0, max 15 chars)
-    --tun-ip=IP                 TUN interface IP (default: 10.0.0.1)
-    --tun-cidr=N                TUN IP CIDR prefix (default: 24)
-    --mtu=N                     TUN MTU (default: 1500)
+    --tun-ip=IP                 TUN interface IP (default: 10.0.0.1, plain IP)
     --client-ip=IP              Client namespace veth IP (default: 10.0.1.2)
     --host-veth-ip=IP           Host veth IP / mesh bind IP (default: 10.0.1.1)
     --namespace=NAME            Network namespace name (default: snp_n3b)
-    --gateway-port=PORT         Mesh gateway listen port (default: 7002)
-    --relay-a-port=PORT         Mesh relay A listen port (default: 7001)
-    --relay-b-port=PORT         Mesh relay B listen port (default: 7000)
-    --cargo-features=FEATURES   Extra cargo features for the demo binary
-                                  (default: "circuit-upstream test-utils")
+    --gateway-port=PORT         Mesh gateway listen port (default: 7003)
+    --relay-a-port=PORT         Mesh relay A listen port (default: 7002)
+    --relay-b-port=PORT         Mesh relay B listen port (default: 7001)
+    --config=PATH               Mesh config file path (default: /tmp/sharenet-mesh-config.json)
     --no-build                  Don't auto-build the demo binary (use existing)
     --keep-on-failure           Don't tear down on failure (for debugging)
     -v, --verbose               Verbose output
@@ -415,6 +439,7 @@ cleanup() {
         log "  mesh log:      $MESH_LOG"
         log "  tun log:       $TUN_LOG"
         log "  http log:      $HTTP_LOG"
+        log "  config file:   $CONFIG_PATH"
         [ -n "$HTTP_ROOT" ] && log "  http root:     $HTTP_ROOT"
         log "  mesh pid:      ${MESH_PID:-<none>}"
         log "  tun pid:       ${TUN_PID:-<none>}"
@@ -422,21 +447,24 @@ cleanup() {
         return
     fi
 
-    # Kill the TunClient FIRST — it may hold the TUN fd open. Killing it
-    # closes the fd, which destroys the TUN interface (kernel auto-destroys
-    # a TUN when its last fd closes) and removes the default route.
+    # Kill the TunClient FIRST — it holds the TUN fd open and may have
+    # installed OS routes. Send SIGINT first (the binary's tokio::signal::ctrl_c
+    # handler catches SIGINT and calls cleanup_os_routes() to remove the
+    # routes it installed). Then SIGKILL as a fallback.
     if [ -n "${TUN_PID:-}" ] && kill -0 "$TUN_PID" 2>/dev/null; then
-        vlog "killing TunClient PID $TUN_PID"
-        kill "$TUN_PID" 2>/dev/null || true
+        vlog "killing TunClient PID $TUN_PID (SIGINT for graceful route cleanup)"
+        kill -INT "$TUN_PID" 2>/dev/null || true
+        sleep 0.5
+        kill -TERM "$TUN_PID" 2>/dev/null || true
         sleep 0.3
         kill -9 "$TUN_PID" 2>/dev/null || true
         wait "$TUN_PID" 2>/dev/null || true
     fi
 
-    # Kill the mesh (SIGTERM, then SIGKILL after 0.5s).
+    # Kill the mesh (SIGINT for graceful shutdown, then SIGKILL).
     if [ -n "${MESH_PID:-}" ] && kill -0 "$MESH_PID" 2>/dev/null; then
         vlog "killing mesh PID $MESH_PID"
-        kill "$MESH_PID" 2>/dev/null || true
+        kill -INT "$MESH_PID" 2>/dev/null || true
         sleep 0.5
         kill -9 "$MESH_PID" 2>/dev/null || true
         wait "$MESH_PID" 2>/dev/null || true
@@ -464,6 +492,12 @@ cleanup() {
     if [ "$NAMESPACE_CREATED" -eq 1 ]; then
         vlog "deleting namespace $NAMESPACE"
         ip netns del "$NAMESPACE" 2>/dev/null || true
+    fi
+
+    # Remove the mesh config file written by the `mesh` subcommand.
+    if [ -n "${CONFIG_PATH:-}" ] && [ -f "$CONFIG_PATH" ]; then
+        vlog "removing config file $CONFIG_PATH"
+        rm -f "$CONFIG_PATH" 2>/dev/null || true
     fi
 
     # Remove the temp HTTP root directory.
@@ -506,8 +540,7 @@ preflight() {
 
     # 2. /dev/net/tun MUST exist. This is a TUN test, not a SOCKS5 test.
     #    Without /dev/net/tun, the TunClient cannot create snp0 and the
-    #    test cannot run. (In the N3-A SOCKS5 variant, /dev/net/tun was
-    #    only informational — here it is REQUIRED.)
+    #    test cannot run.
     if [ ! -c /dev/net/tun ]; then
         err "/dev/net/tun is missing or not a character device"
         err "this test REQUIRES TUN support (it does NOT use SOCKS5)"
@@ -518,22 +551,31 @@ preflight() {
     fi
     vlog "/dev/net/tun: present"
 
-    # 3. Required tools.
+    # 3. unshare binary must be available (ip netns add calls unshare internally).
+    if ! command -v unshare >/dev/null 2>&1; then
+        err "unshare not found — ip netns requires it"
+        err "on Debian/Ubuntu: apt-get install util-linux"
+        err "on Alpine:         apk add util-linux"
+        exit 2
+    fi
+    vlog "unshare: $(command -v unshare)"
+
+    # 4. Required tools.
     local missing=()
-    for tool in ip unshare curl python3; do
+    for tool in ip curl python3; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
         fi
     done
     if [ ${#missing[@]} -gt 0 ]; then
         err "missing required tools: ${missing[*]}"
-        err "on Debian/Ubuntu: apt-get install iproute2 util-linux curl python3"
-        err "on Alpine:         apk add iproute2 util-linux curl python3"
+        err "on Debian/Ubuntu: apt-get install iproute2 curl python3"
+        err "on Alpine:         apk add iproute2 curl python3"
         exit 2
     fi
-    vlog "tools: ip=$(command -v ip) unshare=$(command -v unshare) curl=$(command -v curl) python3=$(command -v python3)"
+    vlog "tools: ip=$(command -v ip) curl=$(command -v curl) python3=$(command -v python3)"
 
-    # 4. iproute2 supports `ip netns` (some minimal distros don't).
+    # 5. iproute2 supports `ip netns` (some minimal distros don't).
     if ! ip netns list >/dev/null 2>&1; then
         err "iproute2 does not support 'ip netns' (likely missing /var/run/netns)"
         err "on Debian/Ubuntu: apt-get install iproute2"
@@ -542,7 +584,7 @@ preflight() {
     fi
     vlog "ip netns: supported"
 
-    # 5. The namespace name must not already exist (we don't want to
+    # 6. The namespace name must not already exist (we don't want to
     #    clobber someone's debugging setup silently).
     if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NAMESPACE"; then
         err "network namespace '$NAMESPACE' already exists"
@@ -550,14 +592,14 @@ preflight() {
         exit 2
     fi
 
-    # 6. The veth name must not already exist on the host.
+    # 7. The veth name must not already exist on the host.
     if ip link show "$HOST_VETH" >/dev/null 2>&1; then
         err "host veth '$HOST_VETH' already exists"
         err "remove it first:  ip link del $HOST_VETH"
         exit 2
     fi
 
-    # 7. The TUN name must not already exist on the host. (TUN interfaces
+    # 8. The TUN name must not already exist on the host. (TUN interfaces
     #    are normally created INSIDE the client namespace by the
     #    TunClient, so finding one on the host means a previous run left
     #    state behind. The length + non-empty checks happen earlier in
@@ -569,7 +611,7 @@ preflight() {
         exit 2
     fi
 
-    # 8. The mesh ports must not already be in use on $HOST_VETH_IP.
+    # 9. The mesh ports must not already be in use on $HOST_VETH_IP.
     local port
     for port in "$GATEWAY_PORT" "$RELAY_A_PORT" "$RELAY_B_PORT"; do
         if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$port\$"; then
@@ -579,14 +621,14 @@ preflight() {
         fi
     done
 
-    # 9. The HTTP_PORT must not already be in use on $HOST_IP.
+    # 10. The HTTP_PORT must not already be in use on $HOST_IP.
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$HTTP_PORT\$"; then
         err "port $HTTP_PORT is already in use (use --http-port=PORT)"
         ss -ltn 2>/dev/null | grep ":$HTTP_PORT\$" | head -3 | sed 's/^/  /' >&2
         exit 2
     fi
 
-    # 10. cargo + rustc (only needed if we'll build the demo binary).
+    # 11. cargo + rustc (only needed if we'll build the demo binary).
     #     (The pure-argument checks — port distinctness, TUN-name length,
     #     subnet-IP sanity — happen earlier in parse_args so they exit
     #     with code 3 BEFORE this privilege-dependent runtime check.)
@@ -611,15 +653,13 @@ parse_args() {
             --http-port=*)         HTTP_PORT="${1#*=}" ;;
             --tun-name=*)          TUN_NAME="${1#*=}" ;;
             --tun-ip=*)            TUN_IP="${1#*=}" ;;
-            --tun-cidr=*)          TUN_CIDR="${1#*=}" ;;
-            --mtu=*)               MTU="${1#*=}" ;;
             --client-ip=*)         CLIENT_IP="${1#*=}" ;;
             --host-veth-ip=*)      HOST_VETH_IP="${1#*=}" ;;
             --namespace=*)         NAMESPACE="${1#*=}" ;;
             --gateway-port=*)      GATEWAY_PORT="${1#*=}" ;;
             --relay-a-port=*)      RELAY_A_PORT="${1#*=}" ;;
             --relay-b-port=*)      RELAY_B_PORT="${1#*=}" ;;
-            --cargo-features=*)    CARGO_FEATURES="${1#*=}" ;;
+            --config=*)            CONFIG_PATH="${1#*=}" ;;
             --no-build)            NO_BUILD=1 ;;
             --keep-on-failure)     KEEP_ON_FAILURE=1 ;;
             -v|--verbose)          VERBOSE=1 ;;
@@ -637,12 +677,6 @@ parse_args() {
     # Validate numeric args.
     case "$HTTP_PORT" in
         ''|*[!0-9]*) err "--http-port must be numeric, got '$HTTP_PORT'"; exit 3 ;;
-    esac
-    case "$MTU" in
-        ''|*[!0-9]*) err "--mtu must be numeric, got '$MTU'"; exit 3 ;;
-    esac
-    case "$TUN_CIDR" in
-        ''|*[!0-9]*) err "--tun-cidr must be numeric, got '$TUN_CIDR'"; exit 3 ;;
     esac
     case "$GATEWAY_PORT" in
         ''|*[!0-9]*) err "--gateway-port must be numeric, got '$GATEWAY_PORT'"; exit 3 ;;
@@ -683,9 +717,9 @@ parse_args() {
     case "$TUN_IP" in
         10.0.0.*) ;;
         *)
-            err "--tun-ip $TUN_IP is not in 10.0.0.0/$TUN_CIDR (the default TUN subnet)"
-            err "the script's split-tunnel design assumes TUN is 10.0.0.0/$TUN_CIDR and veth is 10.0.1.0/24"
-            err "to use a different TUN subnet, also change the script's split-tunnel route logic"
+            err "--tun-ip $TUN_IP is not in 10.0.0.0/24 (the default TUN subnet)"
+            err "the script's split-tunnel design assumes TUN is 10.0.0.0/24 and veth is 10.0.1.0/24"
+            err "to use a different TUN subnet, also change the binary's hardcoded /24 in os_routes.rs"
             exit 3
             ;;
     esac
@@ -693,7 +727,7 @@ parse_args() {
         10.0.1.*) ;;
         *)
             err "--host-veth-ip $HOST_VETH_IP is not in 10.0.1.0/24 (the default veth subnet)"
-            err "the script's split-tunnel design assumes TUN is 10.0.0.0/$TUN_CIDR and veth is 10.0.1.0/24"
+            err "the script's split-tunnel design assumes TUN is 10.0.0.0/24 and veth is 10.0.1.0/24"
             exit 3
             ;;
     esac
@@ -704,6 +738,14 @@ parse_args() {
             exit 3
             ;;
     esac
+
+    # Validate that the config path is not empty and is writable
+    # (the directory must exist — we can't create it here because we
+    # haven't checked permissions yet, but we can sanity-check the path).
+    if [ -z "$CONFIG_PATH" ]; then
+        err "--config must not be empty"
+        exit 3
+    fi
 }
 
 # ─── Determine the host's primary network IP ─────────────────────────────────
@@ -741,7 +783,7 @@ get_host_ip() {
     case "$ip" in
         10.0.0.*|10.0.1.*)
             err "host IP $ip is inside the test's internal subnet"
-            err "(TUN subnet 10.0.0.0/$TUN_CIDR or veth subnet 10.0.1.0/24)"
+            err "(TUN subnet 10.0.0.0/24 or veth subnet 10.0.1.0/24)"
             err "the external endpoint MUST be outside these subnets so that"
             err "the only route to it is via the TUN (default route → snp0)"
             err "set --host-veth-ip and --tun-ip to use different internal subnets,"
@@ -759,109 +801,77 @@ ensure_binary() {
 
     if [ -x "$DEMO_BIN" ] && [ "$NO_BUILD" -eq 1 ]; then
         log "  using existing binary: $DEMO_BIN (--no-build)"
-        return 0
+    else
+        # Check if the example source exists. If not, give a clear pointer.
+        local example_src="$PROJECT_ROOT/snp-stack/examples/n3b_tun_demo.rs"
+        if [ ! -f "$example_src" ]; then
+            err "n3b_tun_demo example source not found: $example_src"
+            err "this test depends on the TunClient binary that should support"
+            err "the 'mesh' and 'tun' subcommands."
+            err ""
+            err "expected CLI:"
+            err "  n3b_tun_demo mesh --bind-ip <ip> \\"
+            err "                  --gateway-port <p> --relay-a-port <p> --relay-b-port <p>"
+            err "                  --config <path>"
+            err "  n3b_tun_demo tun  --config <path> --tun-name <name> \\"
+            err "                  --tun-ip <ip> --physical-interface <iface>"
+            exit 2
+        fi
+
+        # Build with PRODUCTION features only — NO test-utils.
+        # The gateway must use GatewayStreamTable::new() (production SSRF
+        # defence, NO loopback exception). Building with test-utils would
+        # enable with_allow_loopback(), defeating the purpose of this test.
+        log "  building: cargo build --example n3b_tun_demo -p snp-stack"
+        log "    features: circuit-upstream  (production — NO test-utils)"
+        ( cd "$PROJECT_ROOT" && \
+          cargo build --example n3b_tun_demo -p snp-stack \
+              --features circuit-upstream ) || {
+            err "cargo build failed"
+            err "the n3b_tun_demo binary is required by this acceptance test"
+            err "see the script header for the expected CLI contract"
+            exit 2
+        }
+
+        if [ ! -x "$DEMO_BIN" ]; then
+            err "demo binary not found after build: $DEMO_BIN"
+            exit 2
+        fi
+        log "  demo binary: $DEMO_BIN"
     fi
 
-    # Check if the example source exists. If not, give a clear pointer
-    # to the N3B-TUN-BINARY subagent that should create it.
-    local example_src="$PROJECT_ROOT/snp-stack/examples/n3b_tun_demo.rs"
-    if [ ! -f "$example_src" ]; then
-        err "n3b_tun_demo example source not found: $example_src"
-        err "this test depends on the TunClient binary that should be created by"
-        err "the N3B-TUN-BINARY subagent (see worklog N3B-STATUS for the design)."
-        err ""
-        err "expected CLI:"
-        err "  n3b_tun_demo mesh --bind-ip <ip> \\"
-        err "                  --gateway-port <p> --relay-a-port <p> --relay-b-port <p>"
-        err "  n3b_tun_demo tun  --relay <ip:port> --tun-name <name> \\"
-        err "                  --tun-ip <ip/cidr> --mtu <n>"
-        exit 2
-    fi
-
-    log "  building: cargo build --example n3b_tun_demo -p snp-stack"
-    log "    features: $CARGO_FEATURES"
-    ( cd "$PROJECT_ROOT" && \
-      cargo build --example n3b_tun_demo -p snp-stack \
-          --features "$CARGO_FEATURES" ) || {
-        err "cargo build failed"
-        err "the n3b_tun_demo binary is required by this acceptance test"
-        err "see the script header for the expected CLI contract"
-        exit 2
-    }
-
-    if [ ! -x "$DEMO_BIN" ]; then
-        err "demo binary not found after build: $DEMO_BIN"
-        exit 2
-    fi
-    log "  demo binary: $DEMO_BIN"
-
-    # Probe the binary's CLI to confirm it supports the split mesh/tun
-    # mode required for network-namespace isolation. The current
-    # n3b_tun_demo binary (as created by N3B-TUN-BINARY) bundles
-    # everything in one process and binds the mesh to 127.0.0.1 — that
-    # design CANNOT be used for the network-namespace-isolated
-    # acceptance test, because:
-    #
-    #   1. If launched in the host namespace, the TUN ends up in the
-    #      host namespace. The host's default route via snp0 would
-    #      intercept the gateway's OWN outbound TCP to the external
-    #      HTTP server → infinite routing loop.
-    #   2. If launched in the client namespace, the mesh's loopback
-    #      listeners (127.0.0.1) are unreachable from the host
-    #      namespace, AND the gateway can't reach the external HTTP
-    #      server (no Internet route in the client namespace).
-    #
-    # The split-tunnel design (mesh in host namespace, TunClient in
-    # client namespace, connected via veth pair) is REQUIRED. This
-    # means the binary MUST support two modes:
-    #
-    #   n3b_tun_demo mesh --bind-ip <ip> \
-    #                   --gateway-port <p> --relay-a-port <p> --relay-b-port <p>
-    #     → starts gateway + 2 relays bound to <ip> (NOT 127.0.0.1),
-    #       prints "MESH_READY" on stdout once listeners are bound.
-    #
-    #   n3b_tun_demo tun --relay <ip:port> --tun-name <name> \
-    #                  --tun-ip <ip/cidr> --mtu <n>
-    #     → opens /dev/net/tun, creates the TUN, assigns the IP,
-    #       brings it up, installs the default route via the TUN,
-    #       establishes the ShareNet circuit to <relay>, prints
-    #       "TUN_READY" on stdout once the packet pump is running.
-    #
-    # We probe by running `n3b_tun_demo --help` and checking that it
-    # mentions both "mesh" and "tun" subcommands. If not, we exit with
-    # a clear error pointing to the required contract.
-    log "  probing binary CLI for mesh/tun split mode..."
+    # Probe the binary's CLI to confirm it supports the mesh/tun
+    # subcommands. This is a sanity check — the binary should support
+    # both since it was built from the verified source.
+    log "  probing binary CLI for mesh/tun subcommands..."
     local help_out
     help_out=$("$DEMO_BIN" --help 2>&1 || true)
     if ! printf '%s' "$help_out" | grep -qw mesh \
         || ! printf '%s' "$help_out" | grep -qw tun; then
-        err "the n3b_tun_demo binary does not support the split mesh/tun mode"
-        err "required for network-namespace isolation."
+        err "the n3b_tun_demo binary does not support the mesh/tun subcommands"
         err ""
         err "current binary --help output:"
         printf '%s\n' "$help_out" | sed 's/^/    /' >&2
         err ""
-        err "the binary MUST be extended to support two subcommands:"
+        err "the binary MUST support two subcommands:"
         err "  n3b_tun_demo mesh --bind-ip <ip> \\"
         err "                  --gateway-port <p> --relay-a-port <p> --relay-b-port <p>"
-        err "  n3b_tun_demo tun  --relay <ip:port> --tun-name <name> \\"
-        err "                  --tun-ip <ip/cidr> --mtu <n>"
+        err "                  --config <path>"
+        err "  n3b_tun_demo tun  --config <path> --tun-name <name> \\"
+        err "                  --tun-ip <ip> --physical-interface <iface>"
         err ""
         err "the 'mesh' subcommand binds the gateway + 2 relays to <ip>"
         err "(NOT 127.0.0.1 — must be reachable via the veth pair)."
-        err "the 'tun' subcommand creates the TUN, installs the default"
-        err "route, and establishes the ShareNet circuit to <relay>."
-        err ""
-        err "see the worklog entry N3B-TUN-BINARY for the existing binary"
-        err "design, and the script header for the required CLI contract."
+        err "the 'tun' subcommand creates the TUN, installs split-tunnel"
+        err "routes, and establishes the ShareNet circuit."
         exit 2
     fi
-    log "  binary supports mesh/tun split mode"
+    log "  binary supports mesh/tun subcommands"
 }
 
 # ─── Start the external HTTP server ──────────────────────────────────────────
 start_http_server() {
-    section "starting external HTTP server (the 'Internet' endpoint)"
+    section "STEP 1: starting external HTTP server (the 'Internet' endpoint)"
 
     # Create a temp directory with an index.html that we'll serve.
     # The body content is what we'll look for in the TUN test response
@@ -924,41 +934,34 @@ HTML
 
 # ─── Start the ShareNet mesh (gateway + relays) ──────────────────────────────
 start_mesh() {
-    section "starting ShareNet mesh (gateway + 2 relays) in host namespace"
+    section "STEP 2: starting ShareNet mesh (gateway + 2 relays) in host namespace"
 
     # The mesh process binds its listeners to $HOST_VETH_IP so the
     # TunClient (running in the client namespace) can reach them via the
     # veth pair. The mesh process itself runs in the HOST namespace,
     # so it has full Internet access for the gateway's outbound socket.
     #
-    # Expected CLI (N3B-TUN-BINARY contract):
-    #   n3b_tun_demo mesh --bind-ip <ip> \
-    #                   --gateway-port <p> --relay-a-port <p> --relay-b-port <p>
-    #
-    # The binary is expected to:
-    #   * generate fresh identities for gateway + 2 relays
-    #   * bind the gateway listener to <bind-ip>:<gateway-port>
-    #   * bind relay A's link listener to <bind-ip>:<relay-a-port>
-    #   * bind relay B's link listener to <bind-ip>:<relay-b-port>
-    #   * start serving gateway_mode_b_multiplexed + serve_relay_via_route
-    #   * print "MESH_READY" on stdout once all listeners are bound
+    # The `mesh` subcommand:
+    #   * generates fresh identities for gateway + 2 relays
+    #   * binds the gateway listener to <bind-ip>:<gateway-port>
+    #   * binds relay A's link listener to <bind-ip>:<relay-a-port>
+    #   * binds relay B's link listener to <bind-ip>:<relay-b-port>
+    #   * writes a JSON mesh config to <config-path>
+    #   * prints on stdout: GATEWAY_ADDR=, RELAY_A_ADDR=, RELAY_B_ADDR=, CONFIG_PATH=
+    #   * prints "N3-B mesh READY" on stderr
+    #   * uses GatewayStreamTable::new() (PRODUCTION SSRF defence —
+    #     NO loopback exception — the gateway REJECTS loopback/private IPs)
     #
     # Real components inside the mesh:
     #   * MultiplexedCircuit::establish  (real SNP-IK + X25519 DH)
-    #   * serve_gateway_mode_b_multiplexed (real outbound TCP)
+    #   * serve_gateway_mode_b_multiplexed (real outbound TCP, prod SSRF)
     #   * serve_relay_via_route  (real relay forwarding, 2 hops)
-    #
-    # IMPORTANT: like the N3-A demo, this binary uses
-    # GatewayStreamTable::with_allow_loopback() (gated behind
-    # --features test-utils) so that the gateway can dial $HOST_IP even
-    # if it is a private LAN address. When the production CLI is wired,
-    # --mode=prod will use GatewayStreamTable::new() (allow_loopback=false)
-    # for true production SSRF defence, and the external endpoint MUST
-    # be a real public Internet address.
-    log "  starting: $DEMO_BIN mesh --bind-ip $HOST_VETH_IP \\"
+    log "  starting: $DEMO_BIN mesh \\"
+    log "              --bind-ip $HOST_VETH_IP \\"
     log "              --gateway-port $GATEWAY_PORT \\"
     log "              --relay-a-port $RELAY_A_PORT \\"
-    log "              --relay-b-port $RELAY_B_PORT"
+    log "              --relay-b-port $RELAY_B_PORT \\"
+    log "              --config $CONFIG_PATH"
     log "  log:      $MESH_LOG"
 
     "$DEMO_BIN" mesh \
@@ -966,14 +969,16 @@ start_mesh() {
         --gateway-port "$GATEWAY_PORT" \
         --relay-a-port "$RELAY_A_PORT" \
         --relay-b-port "$RELAY_B_PORT" \
+        --config "$CONFIG_PATH" \
         >"$MESH_LOG" 2>&1 &
     MESH_PID=$!
     log "  mesh PID: $MESH_PID"
 
-    # Wait for the mesh to print its readiness marker. The contract
-    # is that the binary prints "MESH_READY" on stdout once all three
-    # listeners (gateway + 2 relays) are bound and ready to accept
-    # connections.
+    # Wait for the mesh to print its readiness marker. The binary
+    # prints "CONFIG_PATH=<path>" on stdout AFTER writing the config
+    # file and binding all three listeners. It also prints
+    # "N3-B mesh READY" on stderr. Since both stdout and stderr go to
+    # the same log file, we grep for either.
     log "  waiting for mesh to be ready..."
     local ready=0
     local i
@@ -984,7 +989,7 @@ start_mesh() {
             cat "$MESH_LOG" >&2 || true
             exit 2
         fi
-        if grep -q 'MESH_READY' "$MESH_LOG" 2>/dev/null; then
+        if grep -q 'CONFIG_PATH=' "$MESH_LOG" 2>/dev/null; then
             ready=1
             break
         fi
@@ -993,21 +998,30 @@ start_mesh() {
 
     if [ "$ready" -ne 1 ]; then
         err "mesh did not become ready within 30s"
-        err "expected 'MESH_READY' marker on stdout"
+        err "expected 'CONFIG_PATH=' marker on stdout (or 'N3-B mesh READY' on stderr)"
         err "----- mesh log (last 40 lines) -----"
         tail -40 "$MESH_LOG" >&2 || true
         exit 2
     fi
 
+    # Verify the config file was written (the `tun` subcommand will read it).
+    if [ ! -f "$CONFIG_PATH" ]; then
+        err "mesh reported ready but config file not found: $CONFIG_PATH"
+        err "----- mesh log (last 20 lines) -----"
+        tail -20 "$MESH_LOG" >&2 || true
+        exit 2
+    fi
     log "  mesh is ready"
-    log "    gateway:  $HOST_VETH_IP:$GATEWAY_PORT"
-    log "    relay A:  $HOST_VETH_IP:$RELAY_A_PORT"
-    log "    relay B:  $HOST_VETH_IP:$RELAY_B_PORT"
+    log "    config file: $CONFIG_PATH ($(wc -c < "$CONFIG_PATH") bytes)"
+    log "    gateway:     $HOST_VETH_IP:$GATEWAY_PORT"
+    log "    relay A:     $HOST_VETH_IP:$RELAY_A_PORT"
+    log "    relay B:     $HOST_VETH_IP:$RELAY_B_PORT"
+    log "    SSRF defence: GatewayStreamTable::new() (production — NO loopback exception)"
 }
 
-# ─── Set up network namespace + veth pair + split-tunnel route ────────────────
+# ─── Set up network namespace + veth pair ─────────────────────────────────────
 setup_namespace() {
-    section "setting up network namespace + veth + split-tunnel route"
+    section "STEP 3: setting up network namespace + veth pair"
 
     # 1. Create the namespace.
     log "  ip netns add $NAMESPACE"
@@ -1050,29 +1064,23 @@ setup_namespace() {
     ip netns exec "$NAMESPACE" ip addr add "$CLIENT_IP/24" dev "$CLIENT_VETH" \
         || { err "client addr add failed"; exit 2; }
 
-    # 6. SPLIT-TUNNEL ROUTE — the critical piece.
-    #    Install a route for the veth subnet (10.0.1.0/24) via the veth
-    #    interface. This route is MORE SPECIFIC than the default route
-    #    (which the TunClient will install later via snp0), so traffic
-    #    to the mesh's bind IP (10.0.1.1) goes via veth_client, NOT via
-    #    the TUN. This is what prevents the routing loop:
-    #
-    #      TunClient's outbound TCP to 10.0.1.1:7001
-    #        → route lookup: 10.0.1.1 matches 10.0.1.0/24 (more specific)
-    #        → goes via veth_client → reaches mesh in host namespace ✓
-    #
-    #      curl's outbound TCP to 192.168.1.42:8888 (host's LAN IP)
-    #        → route lookup: no match for 10.0.0.0/24 or 10.0.1.0/24
-    #        → falls through to default route → snp0 (TUN)
-    #        → TunClient intercepts SYN, opens ShareNet stream ✓
-    log "  client: ip route add 10.0.1.0/24 dev $CLIENT_VETH  (SPLIT-TUNNEL — mesh bypass)"
-    if ! ip netns exec "$NAMESPACE" ip route add 10.0.1.0/24 dev "$CLIENT_VETH"; then
-        err "client split-tunnel route add failed"
-        err "this route is essential — without it, the TunClient's own circuit"
-        err "traffic would loop back through the TUN"
-        exit 2
-    fi
-    SPLIT_TUNNEL_ROUTE_INSTALLED=1
+    # 6. SPLIT-TUNNEL ROUTING — handled by the binary.
+    #    The n3b_tun_demo `tun` subcommand calls configure_os_routes()
+    #    which installs:
+    #      a) The TUN interface IP (10.0.0.1/24) + brings it up.
+    #      b) Specific HOST routes for each control-plane endpoint
+    #         (relay/gateway IPs, e.g. 10.0.1.1/32) via the physical
+    #         interface (veth_client). These are /32 routes, more
+    #         specific than the default route, so the kernel prefers
+    #         them for ShareNet circuit traffic → no routing loop.
+    #      c) The TUN default route (ordinary traffic → TUN).
+    #    The script passes --physical-interface $CLIENT_VETH so the
+    #    binary knows which interface to use for control-plane routes.
+    #    The connected route 10.0.1.0/24 (auto-created when we assigned
+    #    $CLIENT_IP/24 to veth_client) also ensures reachability.
+    log "  split-tunnel routes will be installed by the binary (configure_os_routes)"
+    log "    control-plane (10.0.1.1) → $CLIENT_VETH (host route, installed by binary)"
+    log "    default             → $TUN_NAME (installed by binary when TUN starts)"
 
     # 7. CRITICAL: assert there is NO default route in the client namespace.
     #    This is what makes the DIRECT test fail. If a default route exists
@@ -1121,53 +1129,60 @@ test_direct() {
         err "FAIL: DIRECT access SUCCEEDED — namespace isolation is broken"
         err "       the client namespace must NOT have any route to $EXTERNAL_ENDPOINT"
         err "       check: ip netns exec $NAMESPACE ip route show"
+        log "[1] DIRECT: curl from client namespace → SUCCESS (UNEXPECTED — isolation broken)"
         return 1
     fi
 
-    log "  ✓ DIRECT access FAILED (as expected — no route to external endpoint)"
+    log "[1] DIRECT: curl from client namespace → FAIL (expected)"
     return 0
 }
 
 # ─── Start the TunClient in the client namespace ─────────────────────────────
 # The TunClient process is launched via `ip netns exec` so it runs
 # entirely inside the client namespace. It will:
-#   1. Open /dev/net/tun (the namespace inherits the host's /dev mount)
+#   1. Read the mesh config file (written by the `mesh` subcommand).
+#   2. Reconstruct the Route + client identity from the config.
+#   3. Open /dev/net/tun (the namespace inherits the host's /dev mount)
 #      and create the TUN interface snp0 INSIDE the namespace.
-#   2. Assign 10.0.0.1/$TUN_CIDR to snp0 and bring it up.
-#   3. Install the default route via snp0 (now the OS routing table
-#      sends all non-veth traffic through the TUN).
-#   4. Dial the relay at $HOST_VETH_IP:$RELAY_A_PORT — this matches
-#      the split-tunnel route (10.0.1.0/24 → veth_client), so it
-#      bypasses the TUN. NO LOOP.
-#   5. Establish the ShareNet circuit (SNP-IK + X25519 DH) via
+#   4. Establish the ShareNet circuit (SNP-IK + X25519 DH) via
 #      Relay A → Relay B → Gateway.
-#   6. Start the packet pump: read SYNs from snp0, intercept them,
+#   5. Call configure_os_routes() to:
+#      - Assign 10.0.0.1/24 to snp0 and bring it up.
+#      - Install host routes for control-plane endpoints via veth_client.
+#      - Install the default route via snp0.
+#   6. Print "TUN_NAME=<name>" and "TUN_IP=<ip>" on stdout, then
+#      "N3-B TUN client READY" on stderr.
+#   7. Start the packet pump: read SYNs from snp0, intercept them,
 #      open ShareNet streams, pump bytes bidirectionally.
-#   7. Print "TUN_READY" on stdout once the circuit is established
-#      and the packet pump is running.
 start_tun_client() {
-    section "starting TunClient in client namespace (creates TUN + installs default route)"
+    section "STEP 4: starting TunClient in client namespace (creates TUN + installs routes)"
 
     log "  \$ ip netns exec $NAMESPACE \\"
-    log "      $DEMO_BIN tun --relay $HOST_VETH_IP:$RELAY_A_PORT \\"
-    log "          --tun-name $TUN_NAME --tun-ip $TUN_IP/$TUN_CIDR --mtu $MTU"
+    log "      $DEMO_BIN tun \\"
+    log "          --config $CONFIG_PATH \\"
+    log "          --tun-name $TUN_NAME \\"
+    log "          --tun-ip $TUN_IP \\"
+    log "          --physical-interface $CLIENT_VETH"
     log "  log: $TUN_LOG"
 
     ip netns exec "$NAMESPACE" \
         "$DEMO_BIN" tun \
-        --relay "$HOST_VETH_IP:$RELAY_A_PORT" \
+        --config "$CONFIG_PATH" \
         --tun-name "$TUN_NAME" \
-        --tun-ip "$TUN_IP/$TUN_CIDR" \
-        --mtu "$MTU" \
+        --tun-ip "$TUN_IP" \
+        --physical-interface "$CLIENT_VETH" \
         >"$TUN_LOG" 2>&1 &
     TUN_PID=$!
     log "  TunClient PID: $TUN_PID"
 
     # Wait for the TunClient to print its readiness marker.
-    # The contract is "TUN_READY" on stdout once:
-    #   - TUN snp0 is created and configured (IP + up + default route)
+    # The binary prints "TUN_NAME=<name>" on stdout AFTER:
+    #   - TUN snp0 is created and configured (IP + up)
     #   - the circuit to the gateway is established
-    #   - the packet pump is running
+    #   - configure_os_routes() has installed the split-tunnel routes
+    #     (control-plane host routes + TUN default route)
+    # It also prints "N3-B TUN client READY" on stderr. Since both
+    # stdout and stderr go to the same log file, we grep for either.
     log "  waiting for TunClient to be ready..."
     local ready=0
     local i
@@ -1178,7 +1193,7 @@ start_tun_client() {
             cat "$TUN_LOG" >&2 || true
             exit 2
         fi
-        if grep -q 'TUN_READY' "$TUN_LOG" 2>/dev/null; then
+        if grep -q 'TUN_NAME=' "$TUN_LOG" 2>/dev/null; then
             ready=1
             break
         fi
@@ -1187,7 +1202,7 @@ start_tun_client() {
 
     if [ "$ready" -ne 1 ]; then
         err "TunClient did not become ready within 30s"
-        err "expected 'TUN_READY' marker on stdout"
+        err "expected 'TUN_NAME=' marker on stdout (or 'N3-B TUN client READY' on stderr)"
         err "----- TunClient log (last 50 lines) -----"
         tail -50 "$TUN_LOG" >&2 || true
         exit 2
@@ -1197,7 +1212,7 @@ start_tun_client() {
     log "  --- client namespace routes (post-TUN) ---"
     ip netns exec "$NAMESPACE" ip route show 2>/dev/null | sed 's/^/      /'
 
-    # Verify the default route was installed via snp0.
+    # Verify the default route was installed via snp0 (by the binary).
     if ! ip netns exec "$NAMESPACE" ip route show default 2>/dev/null \
             | grep -q "dev $TUN_NAME"; then
         err "TunClient did not install a default route via $TUN_NAME"
@@ -1207,7 +1222,7 @@ start_tun_client() {
         tail -30 "$TUN_LOG" >&2 || true
         exit 2
     fi
-    log "  ✓ default route installed via $TUN_NAME (split-tunnel active)"
+    log "  ✓ default route installed via $TUN_NAME (by the binary's configure_os_routes)"
 
     # Verify the TUN interface exists in the namespace.
     if ! ip netns exec "$NAMESPACE" ip link show "$TUN_NAME" >/dev/null 2>&1; then
@@ -1216,6 +1231,20 @@ start_tun_client() {
         exit 2
     fi
     log "  ✓ TUN interface $TUN_NAME exists in $NAMESPACE"
+
+    # Verify the control-plane host routes were installed (for the mesh IPs).
+    # The binary installs these via configure_os_routes() → install_control_plane_route().
+    if ! ip netns exec "$NAMESPACE" ip route get "$HOST_VETH_IP" 2>/dev/null \
+            | grep -q "dev $CLIENT_VETH"; then
+        err "control-plane route to $HOST_VETH_IP via $CLIENT_VETH not found"
+        err "the binary's configure_os_routes() should have installed it"
+        err "client namespace routes:"
+        ip netns exec "$NAMESPACE" ip route show >&2 || true
+        err "----- TunClient log (last 30 lines) -----"
+        tail -30 "$TUN_LOG" >&2 || true
+        exit 2
+    fi
+    log "  ✓ control-plane route to $HOST_VETH_IP via $CLIENT_VETH (split-tunnel active)"
 }
 
 # ─── TEST 2: ShareNet via TUN MUST SUCCEED ───────────────────────────────────
@@ -1252,6 +1281,7 @@ test_via_sharennet() {
         tail -50 "$TUN_LOG" >&2 || true
         err "       --- mesh log (last 30 lines) ---"
         tail -30 "$MESH_LOG" >&2 || true
+        log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → FAIL (UNEXPECTED)"
         return 1
     fi
 
@@ -1263,10 +1293,11 @@ test_via_sharennet() {
         err "       expected marker 'Hello from the real Internet via ShareNet TUN!' not found"
         err "       response (first 500 chars):"
         printf '%s\n' "$output" | head -c 500 | sed 's/^/      /' >&2
+        log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → FAIL (unexpected body)"
         return 1
     fi
 
-    log "  ✓ SHARENET via TUN access SUCCEEDED (as expected)"
+    log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)"
     return 0
 }
 
@@ -1342,7 +1373,7 @@ main() {
     section "N3-B TUN ACCEPTANCE TEST"
     log "  project root:        $PROJECT_ROOT"
     log "  demo binary:         $DEMO_BIN"
-    log "  cargo features:      $CARGO_FEATURES"
+    log "  build features:      circuit-upstream  (production — NO test-utils)"
 
     # Resolve host IP.
     local host_ip
@@ -1358,16 +1389,19 @@ main() {
         EXTERNAL_ENDPOINT="http://$host_ip:$HTTP_PORT/"
     fi
     log "  external endpoint:  $EXTERNAL_ENDPOINT"
-    log "  TUN interface:      $TUN_NAME ($TUN_IP/$TUN_CIDR, mtu $MTU)"
+    log "  TUN interface:      $TUN_NAME ($TUN_IP, mtu 1500 — hardcoded by binary)"
     log "  client namespace:   $NAMESPACE (veth $CLIENT_IP, no default route yet)"
     log "  mesh:               gateway=$HOST_VETH_IP:$GATEWAY_PORT"
     log "                      relayA=$HOST_VETH_IP:$RELAY_A_PORT"
     log "                      relayB=$HOST_VETH_IP:$RELAY_B_PORT"
+    log "  config file:        $CONFIG_PATH"
 
     # Guard: the external endpoint must NOT be loopback.
     case "$EXTERNAL_ENDPOINT" in
         http://127.0.0.1:*|http://localhost:*|http://[::1]:*)
             err "external endpoint must NOT be loopback: $EXTERNAL_ENDPOINT"
+            err "the gateway uses GatewayStreamTable::new() (production SSRF defence)"
+            err "which REJECTS loopback destinations"
             err "use --external-endpoint=http://<real-ip>:<port>/ or"
             err "let the script auto-detect via hostname -I"
             exit 3
@@ -1399,8 +1433,8 @@ main() {
     local direct_ok=1 sharenet_ok=1
     test_direct || direct_ok=0
 
-    # Start the TunClient AFTER TEST 1 — this installs the default route
-    # via the TUN and intercepts SYNs.
+    # Start the TunClient AFTER TEST 1 — this creates the TUN, installs
+    # the split-tunnel routes, and intercepts SYNs.
     start_tun_client
 
     # Run TEST 2 (SHARENET via TUN).
@@ -1417,31 +1451,33 @@ main() {
       Via ShareNet TUN:   SUCCESS  (correct — real circuit)
     ═══════════════════════════════════════════════════════
 
-This proves:
-  * The client namespace is truly isolated (no default route until
-    the TunClient installs one via the TUN).
-  * Ordinary OS applications (curl with NO proxy flags) reach the
-    real Internet through the TUN + ShareNet circuit:
-      - real TUN interface (/dev/net/tun via ioctl TUNSETIFF)
-      - real smoltcp TCP/IP stack with any_ip enabled
-      - real SYN interception + 5-tuple destination extraction
-      - real ShareNet circuits (SNP-IK + X25519 circuit DH)
-      - real relay forwarding (two hops: Client → A → B → Gateway)
-      - real gateway outbound TCP (serve_gateway_mode_b_multiplexed)
-      - real external HTTP server (python3 on the host's primary IP)
-  * The split-tunnel routing prevents loops: the TunClient's own
-    circuit traffic goes via the veth (more specific route), while
-    all other traffic goes via the TUN (default route).
-  * The bytes returned actually traversed the ShareNet circuit
-    (the response marker 'Hello from the real Internet via ShareNet TUN!'
-    was written by the external HTTP server, not the gateway).
-
-NO SOCKS5 WAS USED. The client used ordinary `curl http://IP:PORT/`
-with NO proxy flags. The OS routing table did the work — this is
-the N3-B north-star: unmodified OS networking reaches the real
-Internet through ShareNet.
-
 BANNER
+        log "N3-B TUN ACCEPTANCE TEST: PASS"
+        log ""
+        log "This proves:"
+        log "  * The client namespace is truly isolated (no default route until"
+        log "    the TunClient installs one via the TUN)."
+        log "  * Ordinary OS applications (curl with NO proxy flags) reach the"
+        log "    real Internet through the TUN + ShareNet circuit:"
+        log "      - real TUN interface (/dev/net/tun via ioctl TUNSETIFF)"
+        log "      - real smoltcp TCP/IP stack with any_ip enabled"
+        log "      - real SYN interception + 5-tuple destination extraction"
+        log "      - real ShareNet circuits (SNP-IK + X25519 circuit DH)"
+        log "      - real relay forwarding (two hops: Client → A → B → Gateway)"
+        log "      - real gateway outbound TCP (serve_gateway_mode_b_multiplexed)"
+        log "      - production SSRF defence (GatewayStreamTable::new — NO loopback)"
+        log "      - real external HTTP server (python3 on the host's primary IP)"
+        log "  * The split-tunnel routing prevents loops: the TunClient's own"
+        log "    circuit traffic goes via the veth (host routes installed by the"
+        log "    binary), while all other traffic goes via the TUN (default route)."
+        log "  * The bytes returned actually traversed the ShareNet circuit"
+        log "    (the response marker 'Hello from the real Internet via ShareNet TUN!'"
+        log "    was written by the external HTTP server, not the gateway)."
+        log ""
+        log "NO SOCKS5 WAS USED. The client used ordinary curl http://IP:PORT/"
+        log "with NO proxy flags. The OS routing table did the work — this is"
+        log "the N3-B north-star: unmodified OS networking reaches the real"
+        log "Internet through ShareNet."
         EXIT_CODE=0
     else
         cat <<'BANNER' >&2
@@ -1460,7 +1496,7 @@ BANNER
         else
             printf '      SHARENET: SUCCESS (expected)\n' >&2
         fi
-        printf '    ════════════════════════════════════════════════════════\n' >&2
+        printf '    ══════════════════════════════════════════════════════════\n' >&2
 
         if [ "$sharenet_ok" -eq 0 ]; then
             printf '\n    --- TunClient log (last 50 lines) ---\n' >&2
@@ -1468,6 +1504,7 @@ BANNER
             printf '\n    --- mesh log (last 30 lines) ---\n' >&2
             tail -30 "$MESH_LOG" >&2 2>/dev/null || true
         fi
+        log "N3-B TUN ACCEPTANCE TEST: FAIL"
         EXIT_CODE=1
     fi
 }
