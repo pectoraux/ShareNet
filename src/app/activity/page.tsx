@@ -32,7 +32,11 @@ import {
 } from '@/lib/sharenet';
 import { AppShell } from '@/components/sharenet/app-shell';
 import { ActivityTimeline } from '@/components/sharenet/activity-timeline';
-import { Skeleton } from '@/components/ui/skeleton';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingSkeleton,
+} from '@/components/sharenet/state-blocks';
 import { Button } from '@/components/ui/button';
 
 export default function ActivityPage() {
@@ -74,9 +78,18 @@ function ActivityContent() {
       </p>
 
       {loading ? (
-        <ActivitySkeleton />
+        <LoadingSkeleton variant="activity" />
       ) : error ? (
-        <ErrorCard message={error} onRetry={load} />
+        <ErrorState
+          title="Couldn't load activity"
+          message="Something went wrong while reading your activity log."
+          onRetry={load}
+        />
+      ) : events.length === 0 ? (
+        <EmptyState
+          title="No activity yet"
+          message="Connection events will appear here."
+        />
       ) : (
         <ActivityTimeline events={events} />
       )}
@@ -125,45 +138,9 @@ function PageHeader({
   );
 }
 
-// ─── Skeleton ──────────────────────────────────────────────────────────────
-
-function ActivitySkeleton() {
-  return (
-    <div className="flex flex-col gap-8">
-      <div>
-        <Skeleton className="mb-3 h-3 w-16" />
-        <ol className="flex flex-col">
-          {[0, 1, 2, 3, 4].map((i) => (
-            <li key={i} className="flex gap-3.5 px-1 py-3">
-              <Skeleton className="size-9 shrink-0 rounded-full" />
-              <div className="flex flex-1 flex-col gap-2 pt-1">
-                <div className="flex items-center gap-2">
-                  <Skeleton className="h-3 w-10" />
-                  <Skeleton className="h-4 w-44" />
-                </div>
-                <Skeleton className="h-4 w-72" />
-                <Skeleton className="h-3 w-24" />
-              </div>
-            </li>
-          ))}
-        </ol>
-      </div>
-    </div>
-  );
-}
-
-// ─── Error state ────────────────────────────────────────────────────────────
-
-function ErrorCard({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="rounded-2xl border border-rose-200/60 bg-rose-50/60 p-5 dark:border-rose-900/40 dark:bg-rose-950/20">
-      <p className="text-sm font-medium text-rose-700 dark:text-rose-300">
-        Couldn't load activity
-      </p>
-      <p className="mt-1 text-xs text-rose-700/80 dark:text-rose-300/80">{message}</p>
-      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3">
-        Try again
-      </Button>
-    </div>
-  );
-}
+// ─── Skeleton + error state ─────────────────────────────────────────────────
+//
+// Inlined loading skeleton and error card have moved to the shared
+// `<LoadingSkeleton variant="activity" />` and `<ErrorState>` blocks in
+// `src/components/sharenet/state-blocks.tsx`. The block renders a Today
+// header + 5 timeline-item skeletons that mirror the live layout.

@@ -3,47 +3,45 @@
 /**
  * ShareNet 2.0 — Settings page (/settings)
  *
- * Native-looking grouped settings, modelled on the iOS/macOS Settings app:
+ * The settings root is a navigation hub: each section surfaces a short
+ * summary and a chevron that opens a dedicated detail page where the
+ * actual controls live.
  *
- *   Network       — Connect automatically / Prefer reliable paths / Allow relaying
- *   Privacy       — Private relay mode / Share diagnostics / Privacy overview link
- *   Appearance    — Theme selector (Light / Dark / System)
- *   Advanced      — Engineering diagnostics link
- *   About         — version + external links
+ *   Network          → /settings/network      (3 behavioural switches)
+ *   Privacy          → /settings/privacy      (overview + 2 inline toggles)
+ *   Appearance       → /settings/appearance   (theme selector)
+ *   Notifications    → (inline placeholder toggles, UI-only for now)
+ *   Advanced        → /diagnostics            (engineering surfaces)
+ *   About           → /settings/about        (version + protocol + resources)
  *
- * Switches persist via `updateSettings()`; the theme selector additionally
- * applies the change to next-themes immediately so the user sees the
- * preview without a reload.
+ * The two privacy switches and the two notification toggles stay inline
+ * because they are single-purpose and don't justify a dedicated route.
+ * Everything else gets a `SettingsLinkRow` so the root stays scannable.
  *
- * Task ID: UI-DEVICES-SETTINGS
+ * Task ID: UI-DEVICES-SETTINGS · updated UI-SETTINGS-DETAIL
  */
 
 import * as React from 'react';
 import { useCallback, useEffect, useState } from 'react';
-import { useTheme } from 'next-themes';
 import {
+  Bell,
+  BellRing,
   BookOpen,
   FlaskConical,
-  Globe,
   Lock,
-  Moon,
+  Palette,
   Settings as SettingsIcon,
-  Share2,
   ShieldCheck,
-  Sun,
   Wifi,
-  type LucideIcon,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import { AppShell } from '@/components/sharenet/app-shell';
 import {
   SettingsSection,
-  SettingsRow,
   SettingsSwitchRow,
   SettingsLinkRow,
 } from '@/components/sharenet/settings-section';
-import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
   getSettings,
@@ -51,8 +49,6 @@ import {
   IS_MOCK,
   type SettingsState,
 } from '@/lib/sharenet';
-
-const SHARENET_VERSION = '2.0.0';
 
 export default function SettingsPage() {
   return (
@@ -68,7 +64,10 @@ function SettingsContent() {
   const [error, setError] = useState<string | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
 
-  const { resolvedTheme, setTheme } = useTheme();
+  // UI-only placeholder toggles. The adapter can be extended later to
+  // persist these once the notification subsystem exists.
+  const [pushNotifications, setPushNotifications] = useState(false);
+  const [connectionAlerts, setConnectionAlerts] = useState(true);
 
   const fetchSettings = useCallback(async () => {
     setLoading(true);
@@ -76,10 +75,6 @@ function SettingsContent() {
     try {
       const result = await getSettings();
       setSettings(result);
-      // Apply persisted theme to next-themes on first load.
-      if (result.theme) {
-        setTheme(result.theme);
-      }
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Could not load settings.',
@@ -87,7 +82,7 @@ function SettingsContent() {
     } finally {
       setLoading(false);
     }
-  }, [setTheme]);
+  }, []);
 
   useEffect(() => {
     fetchSettings();
@@ -95,8 +90,8 @@ function SettingsContent() {
 
   /**
    * Generic switch toggle: optimistic local update + persisted update via
-   * the adapter. The `pendingKey` is used to show a tiny spinner / dim the
-   * control while the write is in flight, without blocking subsequent toggles.
+   * the adapter. The `pendingKey` is used to dim the control while the
+   * write is in flight, without blocking subsequent toggles.
    */
   const toggle = useCallback(
     async <K extends keyof SettingsState>(
@@ -120,15 +115,6 @@ function SettingsContent() {
       }
     },
     [settings],
-  );
-
-  const onTheme = useCallback(
-    (theme: SettingsState['theme']) => {
-      // Apply immediately to next-themes for a live preview, then persist.
-      setTheme(theme);
-      void toggle('theme', theme);
-    },
-    [setTheme, toggle],
   );
 
   if (loading && !settings) {
@@ -183,29 +169,11 @@ function SettingsContent() {
         title="Network"
         description="How your device reaches the ShareNet network."
       >
-        <SettingsSwitchRow
+        <SettingsLinkRow
           icon={Wifi}
-          label="Connect automatically"
-          description="Establish a ShareNet circuit when networks become available."
-          checked={settings.connectAutomatically}
-          onCheckedChange={(v) => void toggle('connectAutomatically', v)}
-          disabled={pendingKey === 'connectAutomatically'}
-        />
-        <SettingsSwitchRow
-          icon={ShieldCheck}
-          label="Prefer reliable paths"
-          description="Trade latency for higher end-to-end reliability."
-          checked={settings.preferReliablePaths}
-          onCheckedChange={(v) => void toggle('preferReliablePaths', v)}
-          disabled={pendingKey === 'preferReliablePaths'}
-        />
-        <SettingsSwitchRow
-          icon={Share2}
-          label="Allow relaying"
-          description="Let your device forward traffic for other ShareNet peers."
-          checked={settings.allowRelaying}
-          onCheckedChange={(v) => void toggle('allowRelaying', v)}
-          disabled={pendingKey === 'allowRelaying'}
+          label="Network behaviour"
+          description="Connect automatically, prefer reliable paths, allow relaying."
+          href="/settings/network"
         />
       </SettingsSection>
 
@@ -243,13 +211,34 @@ function SettingsContent() {
         title="Appearance"
         description="Theme follows your system preference by default."
       >
-        <SettingsRow icon={getColorThemeIcon(resolvedTheme)} label="Theme">
-          <ThemeSegmentedControl
-            value={settings.theme}
-            onChange={onTheme}
-            disabled={pendingKey === 'theme'}
-          />
-        </SettingsRow>
+        <SettingsLinkRow
+          icon={Palette}
+          label="Theme"
+          description="Light, dark, or follow your system."
+          href="/settings/appearance"
+          meta={capitalizeTheme(settings.theme)}
+        />
+      </SettingsSection>
+
+      {/* ─── Notifications ───────────────────────────────────────────── */}
+      <SettingsSection
+        title="Notifications"
+        description="Placeholders — the notification subsystem is coming soon."
+      >
+        <SettingsSwitchRow
+          icon={Bell}
+          label="Push notifications"
+          description="Receive notifications for important ShareNet events."
+          checked={pushNotifications}
+          onCheckedChange={setPushNotifications}
+        />
+        <SettingsSwitchRow
+          icon={BellRing}
+          label="Connection alerts"
+          description="Get notified when your connection state changes."
+          checked={connectionAlerts}
+          onCheckedChange={setConnectionAlerts}
+        />
       </SettingsSection>
 
       {/* ─── Advanced ─────────────────────────────────────────────────── */}
@@ -267,25 +256,12 @@ function SettingsContent() {
 
       {/* ─── About ───────────────────────────────────────────────────── */}
       <SettingsSection title="About ShareNet">
-        <SettingsRow icon={SettingsIcon} label="Version">
-          <span className="text-xs font-mono text-muted-foreground tabular-nums">
-            v{SHARENET_VERSION}
-          </span>
-        </SettingsRow>
         <SettingsLinkRow
-          icon={BookOpen}
-          label="Specification"
-          href="/spec/README.md"
-        />
-        <SettingsLinkRow
-          icon={ShieldCheck}
-          label="Security policy"
-          href="/docs/SECURITY.md"
-        />
-        <SettingsLinkRow
-          icon={Globe}
-          label="Architecture"
-          href="/docs/SN2_ARCHITECTURE.md"
+          icon={SettingsIcon}
+          label="About"
+          description="Version, protocol, and engineering resources."
+          href="/settings/about"
+          meta="v0.1"
         />
       </SettingsSection>
 
@@ -301,68 +277,12 @@ function SettingsContent() {
   );
 }
 
-// ─── Theme segmented control ──────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
-interface ThemeSegmentedControlProps {
-  value: SettingsState['theme'];
-  onChange: (value: SettingsState['theme']) => void;
-  disabled?: boolean;
-}
-
-function ThemeSegmentedControl({
-  value,
-  onChange,
-  disabled,
-}: ThemeSegmentedControlProps) {
-  const options: Array<{
-    value: SettingsState['theme'];
-    label: string;
-    icon: LucideIcon;
-  }> = [
-    { value: 'light', label: 'Light', icon: Sun },
-    { value: 'dark', label: 'Dark', icon: Moon },
-    { value: 'system', label: 'System', icon: SettingsIcon },
-  ];
-
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Theme"
-      className="inline-flex items-center rounded-md border border-border/60 bg-muted/40 p-0.5"
-    >
-      {options.map((opt) => {
-        const Icon = opt.icon;
-        const active = value === opt.value;
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            disabled={disabled}
-            onClick={() => onChange(opt.value)}
-            className={cn(
-              'inline-flex h-7 items-center gap-1.5 rounded-[5px] px-2.5 text-xs font-medium transition-colors',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
-              active
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground',
-              disabled ? 'opacity-50 pointer-events-none' : null,
-            )}
-          >
-            <Icon className="size-3.5" aria-hidden="true" />
-            {opt.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function getColorThemeIcon(resolvedTheme: string | undefined): LucideIcon {
-  if (resolvedTheme === 'dark') return Moon;
-  if (resolvedTheme === 'light') return Sun;
-  return SettingsIcon;
+function capitalizeTheme(theme: SettingsState['theme']): string {
+  if (theme === 'system') return 'System';
+  if (theme === 'dark') return 'Dark';
+  return 'Light';
 }
 
 // ─── Loading skeleton ───────────────────────────────────────────────────────
@@ -377,7 +297,7 @@ function SettingsSkeleton() {
           <div className="h-3 w-40 rounded bg-muted animate-pulse" />
         </div>
       </div>
-      {[0, 1, 2, 3].map((i) => (
+      {[0, 1, 2, 3, 4, 5].map((i) => (
         <div key={i} className="flex flex-col gap-2">
           <div className="h-3 w-24 rounded bg-muted animate-pulse" />
           <div className="rounded-xl border border-border/60 bg-card overflow-hidden">
@@ -403,4 +323,3 @@ function SettingsSkeleton() {
     </div>
   );
 }
-

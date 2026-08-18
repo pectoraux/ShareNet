@@ -22,6 +22,11 @@ import { MonitorSmartphone, RefreshCw } from 'lucide-react';
 import { AppShell } from '@/components/sharenet/app-shell';
 import { DeviceList } from '@/components/sharenet/device-list';
 import { DeviceDetailSheet } from '@/components/sharenet/device-detail-sheet';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingSkeleton,
+} from '@/components/sharenet/state-blocks';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { getDevices, IS_MOCK, type Device } from '@/lib/sharenet';
@@ -86,6 +91,17 @@ function DevicesContent() {
       ).length
     : 0;
 
+  // The page is the single source of truth for loading / error / empty
+  // states, using the shared state blocks. `DeviceList` is only rendered
+  // when there's actual data to show — so it no longer needs its internal
+  // loading/error/empty fallbacks.
+  const isEmpty =
+    !loading &&
+    !error &&
+    !!devices &&
+    devices.local.length === 0 &&
+    devices.nearby.length === 0;
+
   return (
     <>
       <div className="flex flex-col gap-6">
@@ -135,7 +151,7 @@ function DevicesContent() {
             </Button>
           </div>
 
-          {!loading && !error && devices ? (
+          {!loading && !error && devices && !isEmpty ? (
             <p className="text-xs text-muted-foreground">
               <span className="font-medium text-foreground tabular-nums">
                 {connectedCount}
@@ -145,13 +161,23 @@ function DevicesContent() {
           ) : null}
         </header>
 
-        {/* ─── Device list ──────────────────────────────────────────── */}
-        <DeviceList
-          devices={devices ?? undefined}
-          loading={loading}
-          error={error}
-          onSelect={onSelect}
-        />
+        {/* ─── Body: loading / error / empty / list ─────────────────── */}
+        {loading ? (
+          <LoadingSkeleton variant="devices" />
+        ) : error ? (
+          <ErrorState
+            title="Couldn't load devices"
+            message="Something went wrong while reading your paired devices."
+            onRetry={fetchDevices}
+          />
+        ) : isEmpty ? (
+          <EmptyState
+            title="No devices found"
+            message="Devices you pair with ShareNet will appear here."
+          />
+        ) : devices ? (
+          <DeviceList devices={devices} onSelect={onSelect} />
+        ) : null}
       </div>
 
       <DeviceDetailSheet

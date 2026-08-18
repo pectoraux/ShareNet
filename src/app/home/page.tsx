@@ -49,7 +49,10 @@ import {
 import {
   dispatchConnectionStateChange,
 } from '@/components/sharenet/app-shell';
-import { Skeleton } from '@/components/ui/skeleton';
+import {
+  ErrorState,
+  LoadingSkeleton,
+} from '@/components/sharenet/state-blocks';
 
 // ─── Demo-only: preview state override ────────────────────────────────────
 //
@@ -65,37 +68,6 @@ const PREVIEW_STATES: ConnectionState[] = [
   'recovering',
   'offline',
 ];
-
-// ─── Loading skeleton ──────────────────────────────────────────────────────
-
-function HomeLoadingSkeleton() {
-  return (
-    <div className="flex flex-col items-center">
-      {/* Ring skeleton */}
-      <div className="mb-12 size-44 rounded-full" aria-hidden>
-        <Skeleton className="size-full rounded-full" />
-      </div>
-      {/* Headline skeleton */}
-      <Skeleton className="mb-4 h-9 w-72" />
-      <Skeleton className="mb-2 h-9 w-56" />
-      {/* Subtext skeleton */}
-      <Skeleton className="mb-9 h-5 w-80" />
-      <Skeleton className="mb-2 h-5 w-64" />
-      {/* Button skeleton */}
-      <Skeleton className="mt-9 h-12 w-44 rounded-full" />
-
-      {/* Summary skeleton */}
-      <div className="mt-20 grid w-full grid-cols-2 gap-x-10 gap-y-10 sm:grid-cols-4 sm:gap-x-12">
-        {[0, 1, 2, 3].map((i) => (
-          <div key={i} className="flex flex-col gap-2">
-            <Skeleton className="h-3 w-16" />
-            <Skeleton className="h-6 w-24" />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 // ─── Preview state selector (demo-only) ────────────────────────────────────
 
@@ -152,57 +124,6 @@ function PreviewStateSelector({
           Reset to live
         </button>
       )}
-    </div>
-  );
-}
-
-// ─── Error state ───────────────────────────────────────────────────────────
-
-function HomeErrorState({ onRetry }: { onRetry: () => void }) {
-  return (
-    <div className="flex flex-col items-center text-center" role="alert">
-      <div
-        className="mb-6 flex size-14 items-center justify-center rounded-full"
-        style={{
-          backgroundColor: 'var(--sn-error-soft)',
-          color: 'var(--sn-error-text)',
-        }}
-        aria-hidden
-      >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.75}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className="size-6"
-        >
-          <path d="M12 9v4" />
-          <path d="M12 17h.01" />
-          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-        </svg>
-      </div>
-      <h1
-        className="text-2xl font-semibold tracking-tight"
-        style={{ color: 'var(--foreground)' }}
-      >
-        Couldn't load your connection.
-      </h1>
-      <p
-        className="mt-3 max-w-sm text-base leading-relaxed"
-        style={{ color: 'var(--muted-foreground)' }}
-      >
-        Something went wrong talking to the ShareNet adapter. Please try again.
-      </p>
-      <button
-        type="button"
-        onClick={onRetry}
-        className="mt-8 h-11 rounded-full px-6 text-sm font-medium text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--ring)] focus-visible:ring-offset-2"
-        style={{ backgroundColor: 'var(--primary)' }}
-      >
-        Try again
-      </button>
     </div>
   );
 }
@@ -278,9 +199,13 @@ export default function HomePage() {
 
       {/* Main content: hero + summary, or skeleton, or error */}
       {loadError ? (
-        <HomeErrorState onRetry={fetchSummary} />
+        <ErrorState
+          title="Couldn't load your connection"
+          message="Something went wrong while reading ShareNet status."
+          onRetry={fetchSummary}
+        />
       ) : !displaySummary ? (
-        <HomeLoadingSkeleton />
+        <LoadingSkeleton variant="home" />
       ) : (
         <>
           <ConnectionHero

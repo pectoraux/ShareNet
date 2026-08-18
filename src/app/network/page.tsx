@@ -49,7 +49,10 @@ import {
   qualityLabel,
   qualityPalette,
 } from '@/components/sharenet/quality-helpers';
-import { Skeleton } from '@/components/ui/skeleton';
+import {
+  ErrorState,
+  LoadingSkeleton,
+} from '@/components/sharenet/state-blocks';
 import { Button } from '@/components/ui/button';
 
 export default function NetworkPage() {
@@ -94,29 +97,28 @@ function NetworkContent() {
       <PageHeader onRefresh={load} refreshing={loading} />
 
       {loading ? (
-        <PathQualitySkeleton />
+        <LoadingSkeleton variant="network" />
       ) : error ? (
-        <ErrorCard message={error} onRetry={load} />
+        <ErrorState
+          title="Couldn't load the network path"
+          message="Something went wrong while reading the ShareNet network."
+          onRetry={load}
+        />
       ) : path ? (
-        <PathQualitySummary path={path} />
+        <>
+          <PathQualitySummary path={path} />
+          <section
+            aria-label="Network topology"
+            className="mt-8 flex flex-col items-center"
+          >
+            <NetworkPath
+              path={path}
+              selectedNodeId={selected?.id}
+              onSelectNode={handleSelect}
+            />
+          </section>
+        </>
       ) : null}
-
-      <section
-        aria-label="Network topology"
-        className="mt-8 flex flex-col items-center"
-      >
-        {loading ? (
-          <TopologySkeleton />
-        ) : path ? (
-          <NetworkPath
-            path={path}
-            selectedNodeId={selected?.id}
-            onSelectNode={handleSelect}
-          />
-        ) : (
-          <p className="text-sm text-muted-foreground">No active path.</p>
-        )}
-      </section>
 
       <NetworkPathDetailSheet
         node={selected}
@@ -278,52 +280,9 @@ function qualitySentence(q: NetworkPathType['overallQuality'], reliability: numb
 }
 
 // ─── Skeletons ─────────────────────────────────────────────────────────────
-
-function PathQualitySkeleton() {
-  return (
-    <div className="rounded-2xl border border-border/60 bg-card/70 p-5">
-      <div className="flex items-start gap-4">
-        <Skeleton className="size-11 rounded-full" />
-        <div className="flex-1 space-y-2">
-          <Skeleton className="h-3 w-16" />
-          <Skeleton className="h-5 w-40" />
-          <Skeleton className="h-4 w-72" />
-        </div>
-      </div>
-      <div className="mt-5 grid grid-cols-3 gap-3 border-t border-border/60 pt-4">
-        <Skeleton className="h-9" />
-        <Skeleton className="h-9" />
-        <Skeleton className="h-9" />
-      </div>
-    </div>
-  );
-}
-
-function TopologySkeleton() {
-  return (
-    <div className="mx-auto flex w-full max-w-md flex-col gap-2">
-      {[0, 1, 2, 3].map((i) => (
-        <React.Fragment key={i}>
-          <Skeleton className="h-16 w-full rounded-2xl" />
-          {i < 3 && <div className="mx-auto h-8 w-px bg-border/40" />}
-        </React.Fragment>
-      ))}
-    </div>
-  );
-}
-
-// ─── Error state ────────────────────────────────────────────────────────────
-
-function ErrorCard({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="rounded-2xl border border-rose-200/60 bg-rose-50/60 p-5 dark:border-rose-900/40 dark:bg-rose-950/20">
-      <p className="text-sm font-medium text-rose-700 dark:text-rose-300">
-        Couldn't load the network path
-      </p>
-      <p className="mt-1 text-xs text-rose-700/80 dark:text-rose-300/80">{message}</p>
-      <Button variant="outline" size="sm" onClick={onRetry} className="mt-3">
-        Try again
-      </Button>
-    </div>
-  );
-}
+//
+// Inlined loading skeletons have moved to the shared
+// `<LoadingSkeleton variant="network" />` block in
+// `src/components/sharenet/state-blocks.tsx`. The block renders the
+// path-quality card skeleton + the 4-node topology skeleton together, so
+// the loading → content transition is seamless.
