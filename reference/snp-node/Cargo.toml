@@ -53,6 +53,8 @@ async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 getrandom = "0.2"
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

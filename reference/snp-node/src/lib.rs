@@ -119,6 +119,12 @@ pub mod test_support;
 #[allow(clippy::pedantic, clippy::all, missing_docs)]
 pub mod legacy;
 
+// R1: Production configuration module for relay-prod and client-prod.
+// Handles signed-advertisement-based route construction with identity
+// separation (no private keys cross the process boundary).
+#[allow(clippy::pedantic, clippy::all, missing_docs)]
+pub mod prod_config;
+
 // Re-export legacy types that node.rs production code still references
 // (deprecated constructors + mesh session demo). These are test-only
 // deterministic seeds/keys — NOT production secrets.
