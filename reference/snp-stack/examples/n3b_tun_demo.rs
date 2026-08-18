@@ -123,16 +123,24 @@ fn parse_hex32(s: &str, name: &str) -> Result<[u8; 32], String> {
 ///
 /// ## Security invariant (N3-B blocker fix)
 ///
-/// This config contains **ONLY public/signed information**:
-/// - SIGNED `GatewayAdvertisement` CBOR bytes (hex-encoded) for each hop.
-///   These contain the node's Ed25519 PUBLIC key, X25519 PUBLIC key,
-///   endpoints, and a signature made with the node's Ed25519 PRIVATE key.
-/// - The TUN client verifies the signatures using the embedded PUBLIC keys.
+/// This config contains **ONLY signed `GatewayAdvertisement` CBOR bytes**
+/// (hex-encoded) for each hop. Each advertisement contains:
+/// - The node's Ed25519 PUBLIC key
+/// - The node's X25519 PUBLIC key
+/// - The node's NodeId (SHA-256 of the public key)
+/// - The SIGNED `listen_addr` (the TCP endpoint — cryptographically bound
+///   to the identity by the signature)
+/// - The SIGNED `discovery_addr`
+/// - A signature made with the node's Ed25519 PRIVATE key
 ///
-/// It contains **NO private keys** of any kind. The TUN client must NEVER
-/// possess the relay or gateway private keys. The client generates its OWN
-/// identity (Ed25519 + X25519) independently — the mesh does not generate or
-/// transfer client credentials.
+/// The TUN client verifies the signature using the embedded PUBLIC key, then
+/// uses the SIGNED `listen_addr` from the verified advertisement as the
+/// `RouteHop` endpoint. This cryptographically binds the destination
+/// endpoint to the authenticated hop identity — an attacker cannot redirect
+/// a valid identity to an attacker-controlled endpoint by modifying the config.
+///
+/// It contains **NO private keys** of any kind and **NO unsigned endpoints**.
+/// The client generates its OWN identity (Ed25519 + X25519) independently.
 ///
 /// ## Configuration ownership
 ///
@@ -145,34 +153,43 @@ fn parse_hex32(s: &str, name: &str) -> Result<[u8; 32], String> {
 /// Who stores gateway private key?    → The mesh process (never exported).
 /// Who distributes signed route data? → The mesh process (writes this config).
 /// ```
+///
+/// ## Client identity lifecycle
+///
+/// The `tun` subcommand generates a FRESH client identity on every invocation
+/// (`NodeIdents::fresh()`). This is acceptable for the acceptance harness (a
+/// disposable identity per test run). Persistent client identity belongs in a
+/// later runtime integration milestone and is NOT claimed here.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MeshConfig {
     /// Relay A's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
     /// Contains relay A's PUBLIC Ed25519 key, X25519 public key, node_id,
-    /// and signature. The TUN client verifies the signature using the
-    /// embedded public key — NO private key needed.
+    /// SIGNED listen_addr, and signature. The TUN client verifies the
+    /// signature and uses the signed listen_addr as the RouteHop endpoint.
     relay_a_advert_cbor_hex: String,
     /// Relay B's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
     relay_b_advert_cbor_hex: String,
     /// The gateway's signed GatewayAdvertisement (CBOR bytes, hex-encoded).
     /// Contains the gateway's PUBLIC Ed25519 key, X25519 circuit public key,
-    /// node_id, and signature.
+    /// node_id, SIGNED listen_addr, and signature.
     gateway_advert_cbor_hex: String,
-    /// Relay A's TCP listen address (for the RouteHop endpoint).
-    relay_a_addr: String,
-    /// Relay B's TCP listen address.
-    relay_b_addr: String,
-    /// The gateway's TCP listen address.
-    gateway_addr: String,
 }
 
 /// Decode a hex-encoded CBOR GatewayAdvertisement, verify its signature
-/// using the embedded PUBLIC key, and return the VerifiedNodeDescriptor.
+/// using the embedded PUBLIC key, and return the (VerifiedNodeDescriptor,
+/// authenticated_endpoint) pair.
+///
+/// The `authenticated_endpoint` is the SIGNED `listen_addr` from the verified
+/// advertisement. It is cryptographically bound to the node identity by the
+/// signature — an attacker cannot modify it without invalidating the signature.
 ///
 /// This function does NOT need any private key. The signature was made by
 /// the mesh process with the node's private key; we verify it here using
 /// only the public key embedded in the advertisement.
-fn verify_advert_to_descriptor(advert_cbor_hex: &str, name: &str) -> Result<VerifiedNodeDescriptor, String> {
+fn verify_advert_to_descriptor_and_endpoint(
+    advert_cbor_hex: &str,
+    name: &str,
+) -> Result<(VerifiedNodeDescriptor, String), String> {
     let cbor_bytes = hex_decode(advert_cbor_hex, name)?;
     let advert = GatewayAdvertisement::decode_cbor(&cbor_bytes)
         .map_err(|e| format!("decode {} advert: {:?}", name, e))?;
@@ -180,9 +197,13 @@ fn verify_advert_to_descriptor(advert_cbor_hex: &str, name: &str) -> Result<Veri
         .ok_or_else(|| format!("verify {} advert: signature invalid", name))?;
     let descriptor = verified.descriptor()
         .ok_or_else(|| format!("extract {} descriptor: no circuit key", name))?;
-    eprintln!("[n3b-tun] verified {} advert: node_id={} (signature valid, no private key used)",
-        name, hex(&descriptor.node_id()));
-    Ok(descriptor)
+    // Use the SIGNED listen_addr as the authenticated endpoint.
+    // This is the key fix: the endpoint comes from the verified advertisement,
+    // NOT from a separate unsigned config field.
+    let authenticated_endpoint = verified.listen_addr().to_string();
+    eprintln!("[n3b-tun] verified {} advert: node_id={} endpoint={} (signature valid, endpoint authenticated)",
+        name, hex(&descriptor.node_id()), authenticated_endpoint);
+    Ok((descriptor, authenticated_endpoint))
 }
 
 /// Decode a hex string into bytes.
@@ -202,27 +223,41 @@ fn hex_decode(hex_str: &str, name: &str) -> Result<Vec<u8>, String> {
 /// Build the Route from the verified public descriptors + the client's node_id.
 ///
 /// The client generates its OWN identity — this function only uses the
-/// client's node_id (a PUBLIC value) and the verified descriptors from
-/// the mesh config. NO private keys are needed.
+/// client's node_id (a PUBLIC value) and the verified descriptors +
+/// AUTHENTICATED endpoints from the mesh config. NO private keys are needed,
+/// and NO unsigned endpoints are used.
+///
+/// The endpoint for each RouteHop comes from the SIGNED `listen_addr` field
+/// of the verified advertisement — it is cryptographically bound to the
+/// hop identity by the signature.
 fn build_route_from_config(cfg: &MeshConfig, client_node_id: [u8; 32]) -> Result<Route, String> {
-    // Verify each advert using ONLY the embedded public keys.
-    let ra_descriptor = verify_advert_to_descriptor(&cfg.relay_a_advert_cbor_hex, "relay A")?;
-    let rb_descriptor = verify_advert_to_descriptor(&cfg.relay_b_advert_cbor_hex, "relay B")?;
-    let gw_descriptor = verify_advert_to_descriptor(&cfg.gateway_advert_cbor_hex, "gateway")?;
+    // Verify each advert and extract the authenticated endpoint.
+    let (ra_descriptor, ra_endpoint) = verify_advert_to_descriptor_and_endpoint(
+        &cfg.relay_a_advert_cbor_hex, "relay A",
+    )?;
+    let (rb_descriptor, rb_endpoint) = verify_advert_to_descriptor_and_endpoint(
+        &cfg.relay_b_advert_cbor_hex, "relay B",
+    )?;
+    let (gw_descriptor, gw_endpoint) = verify_advert_to_descriptor_and_endpoint(
+        &cfg.gateway_advert_cbor_hex, "gateway",
+    )?;
     let gw_node_id = gw_descriptor.node_id();
 
+    // Use the AUTHENTICATED endpoints from the signed adverts — NOT separate
+    // unsigned config fields. This binds the destination to the identity.
     let mut route = Route::new_with_hop_details(
         client_node_id, gw_node_id,
         vec![
-            RouteHop::new(ra_descriptor, TransportEndpoint::tcp(&cfg.relay_a_addr)),
-            RouteHop::new(rb_descriptor, TransportEndpoint::tcp(&cfg.relay_b_addr)),
-            RouteHop::new(gw_descriptor, TransportEndpoint::tcp(&cfg.gateway_addr)),
+            RouteHop::new(ra_descriptor, TransportEndpoint::tcp(&ra_endpoint)),
+            RouteHop::new(rb_descriptor, TransportEndpoint::tcp(&rb_endpoint)),
+            RouteHop::new(gw_descriptor, TransportEndpoint::tcp(&gw_endpoint)),
         ],
     );
     route.validate().expect("route valid");
     route.transition(RouteState::Establishing).expect("Establishing");
     route.transition(RouteState::Active).expect("Active");
-    eprintln!("[n3b-tun] route built: client → relay A → relay B → gateway (all descriptors verified)");
+    eprintln!("[n3b-tun] route built: client → relay A({}) → relay B({}) → gateway({}) (all endpoints authenticated)",
+        ra_endpoint, rb_endpoint, gw_endpoint);
     Ok(route)
 }
 
@@ -355,14 +390,12 @@ async fn run_mesh(cli: MeshCli) -> Result<(), String> {
     let rb_cbor = rb_advert.encode_cbor().map_err(|e| format!("encode relay B advert: {:?}", e))?;
     let gw_cbor = gw_advert.encode_cbor().map_err(|e| format!("encode gateway advert: {:?}", e))?;
 
-    // Write the mesh config — ONLY signed/public information, NO private keys.
+    // Write the mesh config — ONLY signed/public information, NO private keys,
+    // NO unsigned endpoints. The endpoints are inside the signed adverts.
     let mesh_config = MeshConfig {
         relay_a_advert_cbor_hex: hex(&ra_cbor),
         relay_b_advert_cbor_hex: hex(&rb_cbor),
         gateway_advert_cbor_hex: hex(&gw_cbor),
-        relay_a_addr: ra_addr.clone(),
-        relay_b_addr: rb_addr.clone(),
-        gateway_addr: gw_addr.clone(),
     };
     let json = serde_json::to_string_pretty(&mesh_config).map_err(|e| format!("serialize: {}", e))?;
 
@@ -445,8 +478,6 @@ async fn run_tun(cli: TunCli) -> Result<(), String> {
         .map_err(|e| format!("parse config: {}", e))?;
 
     eprintln!("[n3b-tun] loaded mesh config from {}", cli.config_path);
-    eprintln!("[n3b-tun] relay_a={} relay_b={} gateway={}",
-        mesh_cfg.relay_a_addr, mesh_cfg.relay_b_addr, mesh_cfg.gateway_addr);
 
     // 2. Generate the CLIENT'S OWN identity. The client owns its private keys
     //    — they are NEVER received from the mesh process. This is the identity
@@ -462,14 +493,25 @@ async fn run_tun(cli: TunCli) -> Result<(), String> {
     // 3. Build the route using ONLY the client's node_id + the verified public
     //    descriptors from the mesh config. No relay/gateway private keys are
     //    needed — the descriptors are verified via the embedded public keys.
+    //    The endpoints come from the SIGNED adverts (cryptographically bound
+    //    to the identity).
     let route = build_route_from_config(&mesh_cfg, client_node_id)?;
 
-    // 4. Extract control-plane endpoints for split-tunnel routing.
-    let control_plane_endpoints: Vec<IpAddr> = [
-        &mesh_cfg.relay_a_addr, &mesh_cfg.relay_b_addr, &mesh_cfg.gateway_addr,
-    ].iter()
-     .filter_map(|addr| addr.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()))
-     .collect();
+    // 4. Extract control-plane endpoints for split-tunnel routing from the
+    //    VERIFIED adverts (the same authenticated endpoints used in the Route).
+    //    This ensures the split-tunnel routes match the actual circuit endpoints.
+    let control_plane_endpoints: Vec<IpAddr> = route
+        .hop_details()
+        .iter()
+        .filter_map(|hop| hop.endpoints.first())
+        .filter_map(|ep| match ep {
+            TransportEndpoint::Tcp(addr) => addr.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()),
+            // Other transport types (Ble, WifiDirect, NearbyConnections) are not
+            // used in the N3-B TUN path — they don't produce IP endpoints for
+            // split-tunnel routing.
+            _ => None,
+        })
+        .collect();
 
     let config = TunClientConfig {
         tun_name: cli.tun_name.clone(),
