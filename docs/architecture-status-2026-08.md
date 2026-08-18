@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-18
+**Date:** 2026-08-18 (updated R2.2)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -23,7 +23,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Layer | Frozen Architecture | Current Implementation | Status | Evidence | Known Gaps |
 |---|---|---|---|---|---|
-| **L1 Identity** | 4 identity classes, Ed25519+X25519, rotation, revocation | snp-crypto: Ed25519+X25519+NodeId (complete). snp-identity: SKELETON. snp-node: NodeIdentity (complete). | PASS (core), PARTIAL (crate) | Conformance vectors 03-identity: 7/7 pass. snp-node tests: 97 pass. | snp-identity crate is skeleton; identity logic in snp-node |
+| **L1 Identity** | 4 identity classes, Ed25519+X25519, rotation, revocation | snp-identity: NodeIdentity + Capability (extracted R2.2) + NodeId + derive_node_id + verify_signed. snp-crypto: Ed25519+X25519 primitives. | PASS | Conformance vectors 03-identity: 7/7 pass. snp-node tests: 97 pass. | snp-identity crate is skeleton; identity logic in snp-node |
 | **L2 Object/Content** | CAS, chunking, Merkle, manifests | TS reference: complete. Android: complete. Rust (snp-object): SKELETON (todo!). | PASS (TS+Android), MISSING (Rust) | Conformance vectors 04-chunking, 05-merkle, 06-manifest: all pass. | Rust crate is skeleton; TS is authoritative |
 | **L3 Trust** | Attestations, reputation, revocation | AuthenticatedNodeRecord (complete). VerifiedNodeAdvertisement (complete). No reputation system. | PARTIAL | Conformance vectors 13-revocation: 3/3 pass. | Reputation system not yet implemented |
 | **L4 Discovery** | Peer+capability advertisement, freshness | snp-discovery: SKELETON. snp-node: discovery.rs + peer_directory.rs + topology.rs (complete). GatewayAdvertisement carries mode capability. | PASS (logic), PARTIAL (crate) | snp-node integration tests: n210, n211, n213 pass. | snp-discovery crate is skeleton; logic in snp-node |
