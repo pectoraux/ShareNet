@@ -15,16 +15,12 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
+[ -d node_modules ] || bun install
+
 nohup setsid bash -c 'cd "'"$MS_DIR"'" && exec /usr/local/bin/bun --hot run index.ts' >"$LOG_FILE" 2>&1 < /dev/null &
 DAEMON_PID=$!
 echo "$DAEMON_PID" > "$PID_FILE"
 echo "[mesh-sim] launched (initial PID $DAEMON_PID) on port 3030"
-for i in $(seq 1 10); do
-  if curl -s -o /dev/null --max-time 1 http://127.0.0.1:3030/status 2>/dev/null; then
-    echo "[mesh-sim] responding after ${i}s"
-    break
-  fi
-  sleep 1
-done
+sleep 2
 echo "[mesh-sim] log tail:"
 tail -10 "$LOG_FILE" 2>/dev/null

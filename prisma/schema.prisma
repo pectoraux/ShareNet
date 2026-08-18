@@ -2,8 +2,22 @@
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 // ShareNet 2.0 — PostgreSQL on Neon.
-// DATABASE_URL        → Neon pooled connection (PgBouncer) — used by Prisma Client at runtime.
-// DIRECT_DATABASE_URL → Neon direct connection — used by Prisma CLI for migrations / db push.
+//
+// The deployment uses the Neon PostgreSQL database wired up on the
+// `sharenet` Vercel project (ep-noisy-frost-aynd00my-pooler). The two
+// DSNs come from that project's environment variables:
+//   DATABASE_URL  → Neon pooled (PgBouncer) — used by Prisma Client at runtime.
+//   DIRECT_URL     → Neon direct — used by Prisma CLI for migrations / db push.
+//
+// NOTE: ShareNet's runtime app (the conformance dashboard at src/app/page.tsx)
+// does NOT query the database — the User / Post models below are scaffolding
+// for future control-plane work. The Neon DATABASE_URL is wired up so that
+// (a) the sandbox does NOT fall back to the default SQLite, and (b) any
+// future DB-backed feature can use it directly. The Prisma Client is
+// generated from this schema; no `db:push` is run against the shared Neon
+// database because it is shared with the `sharenet-web` app (which owns
+// its own User / AuditEntry tables).
+//
 // See: https://pris.ly/d/neon-serverless-driver and https://neon.tech/docs/guides/prisma
 
 generator client {
@@ -13,7 +27,7 @@ generator client {
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 model User {

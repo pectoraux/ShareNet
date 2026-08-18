@@ -29,8 +29,19 @@ fi
 
 # Spawn a fully-detached process group.
 # setsid + double-detach + redirect all std streams + ignore SIGHUP/SIGTERM.
+#
+# IMPORTANT: The sandbox orchestrator exports DATABASE_URL=file:.../db/custom.db
+# into the global shell environment. That value OVERRIDES anything Next.js would
+# otherwise load from .env (because process.env wins over .env files). For the
+# Neon Postgres cutover (ADR-0018) we must force the runtime Prisma Client to
+# use the Neon pooled DSN, so we explicitly re-export DATABASE_URL +
+# DIRECT_DATABASE_URL from .env right before exec'ing next dev.
 nohup setsid bash -c '
   cd "'"$PROJECT_DIR"'"
+  # Re-export env vars from .env so they win over the sandbox global env.
+  set -a
+  . ./.env
+  set +a
   exec /home/z/my-project/node_modules/.bin/next dev -p '"$PORT"'
 ' >"$LOG_FILE" 2>&1 < /dev/null &
 
