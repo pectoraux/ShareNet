@@ -726,17 +726,11 @@ impl Node {
         let mut discovered = 0usize;
         for node in discovered_nodes {
             let addr = node.endpoint().to_string();
-            let advert = node.advertisement;
-            // VERIFY THE SIGNATURE — this is the "authenticated gateway
-            // discovery" the audit requested. A forged advertisement is
-            // rejected here. (BootstrapDiscovery::discover already verifies
-            // the signature, but we re-verify here for defence in depth —
-            // a future BootstrapDiscovery implementation might forget.)
-            if !advert.verify() {
-                eprintln!("[discover] advertisement from {addr} has INVALID SIGNATURE — rejecting");
-                continue;
-            }
-            // Check expiry.
+            // The advertisement is already VERIFIED (DiscoveredNode contains
+            // a VerifiedGatewayAdvertisement). We re-check expiry for defence
+            // in depth, and cross-check the NodeId↔Ed25519 binding (I4).
+            let advert = node.advertisement.as_ref();
+            // Check expiry (defence in depth — BootstrapDiscovery already checked).
             let now = now_unix();
             if advert.is_expired(now) {
                 eprintln!("[discover] advertisement from {addr} is EXPIRED — rejecting");
@@ -764,7 +758,7 @@ impl Node {
             // publicKey to GatewayChoice::A/B) is removed — it required
             // importing `GatewayChoice` into `node.rs`, which the N2.0.3 task
             // spec forbids.
-            self.known_gateways.lock().unwrap().push(advert);
+            self.known_gateways.lock().unwrap().push(advert.clone());
             discovered += 1;
         }
         if discovered == 0 {
@@ -3248,8 +3242,11 @@ mod tests {
         let sk = snp_crypto::sha256(seed);
         let identity = NodeIdentity::from_secret(sk);
         let advert = GatewayAdvertisement::for_identity(&identity, endpoint, "127.0.0.1:0");
+        let verified = advert
+            .verify_into_verified()
+            .expect("advert must verify (test helper signs it)");
         DiscoveredNode {
-            advertisement: advert,
+            advertisement: verified,
         }
     }
 
@@ -3282,9 +3279,9 @@ mod tests {
         assert_eq!(discovered[1].endpoint(), node_b.endpoint());
         assert_eq!(discovered[2].endpoint(), node_c.endpoint());
         // The advertisements must be the signed adverts we added.
-        assert!(discovered[0].advertisement.verify());
-        assert!(discovered[1].advertisement.verify());
-        assert!(discovered[2].advertisement.verify());
+        assert!(discovered[0].advertisement.as_ref().verify());
+        assert!(discovered[1].advertisement.as_ref().verify());
+        assert!(discovered[2].advertisement.as_ref().verify());
     }
 
     /// N2.0.3 (Gate C): `StaticDiscovery::advertise()` is a no-op (the
@@ -3302,7 +3299,7 @@ mod tests {
         let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"some other gateway"));
         let advert =
             GatewayAdvertisement::for_identity(&identity, "127.0.0.1:9999", "127.0.0.1:9998");
-        provider.advertise(&advert, "127.0.0.1:9999");
+        provider.advertise(&advert);
 
         // The list is unchanged.
         assert_eq!(provider.len(), 1, "advertise() must not add to the list");
@@ -3356,16 +3353,16 @@ mod tests {
         );
         let node = &discovered[0];
         assert_eq!(node.endpoint(), transit_addr_expected);
-        assert_eq!(node.advertisement.node_id, expected_node_id);
+        assert_eq!(node.advertisement.node_id(), expected_node_id);
         // Signature was already verified inside discover() — re-verify
         // here for defence in depth.
         assert!(
-            node.advertisement.verify(),
+            node.advertisement.as_ref().verify(),
             "discovered advertisement signature must verify"
         );
         // Expiry was already checked inside discover() — re-check here.
         assert!(
-            !node.advertisement.is_expired(now_unix()),
+            !node.advertisement.as_ref().is_expired(now_unix()),
             "discovered advertisement must not be expired"
         );
 
@@ -3439,7 +3436,10 @@ mod tests {
             "BootstrapDiscovery must discover both gateways, got {}",
             discovered.len()
         );
-        let node_ids: Vec<[u8; 32]> = discovered.iter().map(|n| n.advertisement.node_id).collect();
+        let node_ids: Vec<[u8; 32]> = discovered
+            .iter()
+            .map(|n| n.advertisement.node_id())
+            .collect();
         assert!(
             node_ids.contains(&expected_a),
             "discovered set must contain gateway A"
@@ -3530,7 +3530,7 @@ mod tests {
         let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"object-safe test"));
         let advert =
             GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
-        provider.advertise(&advert, "127.0.0.1:7001");
+        provider.advertise(&advert);
     }
 
     // ─── N2.0.3 (Gate D): MetricSelector + GatewayDirectory::select tests ──

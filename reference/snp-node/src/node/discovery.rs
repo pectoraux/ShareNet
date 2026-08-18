@@ -111,8 +111,16 @@ impl BootstrapDiscovery {
             return Err("advert expired".into());
         }
 
+        // 8. Verify into VerifiedGatewayAdvertisement.
+        // This is the critical step — the advertisement is now VERIFIED.
+        // The DiscoveredNode can only be constructed with a verified advert,
+        // so the endpoint (listen_addr) is cryptographically bound.
+        let verified = advert.verify_into_verified().ok_or_else(|| {
+            "advert verification into VerifiedGatewayAdvertisement failed".to_string()
+        })?;
+
         Ok(DiscoveredNode {
-            advertisement: advert,
+            advertisement: verified,
         })
     }
 }
