@@ -131,62 +131,23 @@ impl Ciphertext {
     }
 }
 
-// ─── ContentBytes (Class A body) ───────────────────────────────────────────
+// ─── ContentBytes (re-exported from snp-object) ────────────────────────────
+//
+// ContentBytes is owned by the content layer (snp-object, L2), not the
+// transport layer (snp-frames, L8). We re-export it here so existing
+// code that imports from snp_frames continues to work, but the
+// authoritative definition lives in snp_object.
+//
+// The dependency direction is:
+//   snp-object (owns ContentBytes)
+//       ↓
+//   snp-frames (re-exports for convenience)
+//   snp-node (uses both)
+//
+// NOT:
+//   snp-object → snp-frames (this was the old, incorrect direction)
 
-/// Typed content data — the body of a Class A (content) frame or the
-/// payload of a CAS operation.
-///
-/// This type wraps `Vec<u8>` and represents content that MAY be cached,
-/// replicated, Merkle-verified, and content-addressed.
-///
-/// Unlike `Ciphertext`, `ContentBytes` exposes its inner bytes for
-/// content operations (hashing, chunking, CAS storage).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentBytes(Vec<u8>);
-
-impl ContentBytes {
-    /// Construct from raw content bytes.
-    #[must_use]
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns a reference to the content bytes (for hashing, CAS, etc.).
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    /// Consume and return the raw bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-
-    /// Returns the length.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns true if empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl From<Vec<u8>> for ContentBytes {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<&[u8]> for ContentBytes {
-    fn from(bytes: &[u8]) -> Self {
-        Self(bytes.to_vec())
-    }
-}
+pub use snp_object::ContentBytes;
 
 #[cfg(test)]
 mod tests {

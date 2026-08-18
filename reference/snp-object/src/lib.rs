@@ -50,6 +50,69 @@ pub type ObjectResult<T> = Result<T, ObjectError>;
 /// A 32-byte content hash (SHA-256 of a chunk, leaf, or root).
 pub type ContentHash = [u8; 32];
 
+// ─── ContentBytes (Class A body) ───────────────────────────────────────────
+
+/// Typed content data — represents Class A content that MAY be cached,
+/// replicated, Merkle-verified, and content-addressed.
+///
+/// This type wraps `Vec<u8>` and represents content that is semantically
+/// distinct from Class B transit ciphertext.
+///
+/// Unlike a transit ciphertext type, `ContentBytes` exposes its inner
+/// bytes for content operations (hashing, chunking, CAS storage).
+///
+/// ## Ownership
+///
+/// `ContentBytes` is owned by the content layer (L2), not the transport
+/// layer (L8). The transport layer may carry content bytes, but the
+/// semantic ownership of "what is content" belongs here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentBytes(Vec<u8>);
+
+impl ContentBytes {
+    /// Construct from raw content bytes.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns a reference to the content bytes (for hashing, CAS, etc.).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume and return the raw bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Returns the length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true if empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for ContentBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<&[u8]> for ContentBytes {
+    fn from(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
 /// A chunked object's metadata. Skeleton stub — not exercised by the Rust
 /// conformance harness. The full Manifest CBOR structure is tracked as
 /// future work; the `manifest-sign-and-verify` vector is classified as
@@ -73,11 +136,11 @@ pub struct Manifest {
 /// A content-addressed store: SHA-256 key → content bytes.
 ///
 /// The `put` method accepts [`ContentBytes`] (Class A), NOT raw `&[u8]`.
-/// This prevents transit data ([`Ciphertext`]) from accidentally entering
-/// the content cache — there is no `as_bytes()` on `Ciphertext`.
+/// This prevents transit ciphertext from accidentally entering the
+/// content cache — ciphertext types have no `as_bytes()` method.
 pub trait Cas: Send + Sync {
     /// Insert content and return its SHA-256 key.
-    fn put(&self, content: &snp_frames::ContentBytes) -> ObjectResult<ContentHash>;
+    fn put(&self, content: &ContentBytes) -> ObjectResult<ContentHash>;
     /// Fetch the bytes for `key`, if present.
     fn get(&self, key: &ContentHash) -> ObjectResult<Vec<u8>>;
     /// Returns true if `key` is present.
@@ -88,7 +151,7 @@ pub trait Cas: Send + Sync {
 pub struct InMemoryCas;
 
 impl Cas for InMemoryCas {
-    fn put(&self, _content: &snp_frames::ContentBytes) -> ObjectResult<ContentHash> {
+    fn put(&self, _content: &ContentBytes) -> ObjectResult<ContentHash> {
         todo!("Implement in-memory CAS put")
     }
     fn get(&self, _key: &ContentHash) -> ObjectResult<Vec<u8>> {

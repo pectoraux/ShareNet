@@ -10,7 +10,6 @@ rust-version.workspace = true
 [dependencies]
 snp-cbor.workspace = true
 snp-crypto.workspace = true
-snp-frames.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 serde.workspace = true
