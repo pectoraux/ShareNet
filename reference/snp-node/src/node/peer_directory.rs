@@ -289,9 +289,7 @@ impl PeerDirectory {
         let now = now_unix();
         self.active_nodes()
             .into_iter()
-            .map(|record| {
-                PeerSummary::from_record(record, distance_hint, now)
-            })
+            .map(|record| PeerSummary::from_record(record, distance_hint, now))
             .collect()
     }
 }

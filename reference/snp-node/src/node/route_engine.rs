@@ -161,7 +161,9 @@ impl Ord for HeapEntry {
         // BinaryHeap is a max-heap, so we reverse the comparison
         // to make it pop the LOWEST cost first.
         // Compare by cost first, then by counter (for determinism).
-        other.cost.cmp(&self.cost)
+        other
+            .cost
+            .cmp(&self.cost)
             .then_with(|| other.counter.cmp(&self.counter))
     }
 }
@@ -200,7 +202,7 @@ pub enum RouteCandidateState {
         destination: [u8; 32],
     },
     /// A usable path of authenticated nodes and directed links exists from
-        /// the source to the destination, but the `Route` has not yet been
+    /// the source to the destination, but the `Route` has not yet been
     /// assembled.
     Reachable {
         /// The ordered path of NodeIds from source (exclusive) to
@@ -232,7 +234,9 @@ pub enum RouteCandidateState {
 /// Errors that can occur during route discovery.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RouteDiscoveryError {
-    #[error("destination is only a remote hint and could not be resolved into an authenticated record")]
+    #[error(
+        "destination is only a remote hint and could not be resolved into an authenticated record"
+    )]
     DestinationUnresolved,
     #[error("destination is not an authenticated gateway: {0}")]
     DestinationNotGateway(NodeIdHex),
@@ -468,7 +472,8 @@ impl InMemoryResolver {
 
     /// Register a verified advertisement (convenience).
     pub fn register_verified(&mut self, verified: VerifiedNodeAdvertisement) {
-        self.records.insert(verified.node_id(), verified.into_record());
+        self.records
+            .insert(verified.node_id(), verified.into_record());
     }
 }
 
@@ -669,10 +674,7 @@ impl RouteEngine {
     ///
     /// Remote candidates MUST be resolved before route construction.
     #[must_use]
-    pub fn discover_gateway_candidates(
-        &self,
-        topology: &TopologyGraph,
-    ) -> Vec<RouteCandidate> {
+    pub fn discover_gateway_candidates(&self, topology: &TopologyGraph) -> Vec<RouteCandidate> {
         let mut candidates = Vec::new();
 
         // Direct authenticated gateways (ALL accepted gateway records,
@@ -682,7 +684,9 @@ impl RouteEngine {
             let destination = record.node_id();
             candidates.push(RouteCandidate {
                 destination,
-                origin: CandidateOrigin::Direct { record: record.clone() },
+                origin: CandidateOrigin::Direct {
+                    record: record.clone(),
+                },
                 state: RouteCandidateState::Authenticated { destination },
             });
         }
@@ -757,9 +761,7 @@ impl RouteEngine {
                             };
                             return;
                         }
-                        candidate.state = RouteCandidateState::Authenticated {
-                            destination: dest,
-                        };
+                        candidate.state = RouteCandidateState::Authenticated { destination: dest };
                     }
                     None => {
                         candidate.state = RouteCandidateState::Failed {
@@ -849,7 +851,13 @@ impl RouteEngine {
         best_cost.insert(self.source, 0u64);
 
         while let Some(entry) = heap.pop() {
-            let HeapEntry { cost, node, path, links, .. } = entry;
+            let HeapEntry {
+                cost,
+                node,
+                path,
+                links,
+                ..
+            } = entry;
 
             // Skip if we've already visited this node via a lower-cost path.
             if visited.contains(&node) {
@@ -891,12 +899,12 @@ impl RouteEngine {
                     // Compute incremental cost.
                     let mut new_links: Vec<&AuthenticatedLink> = links.iter().collect::<Vec<_>>();
                     new_links.push(auth_link);
-                    let mut new_nodes: Vec<&AuthenticatedNodeRecord> =
-                        path.iter()
-                            .filter_map(|nid| {
-                                topology.get_record(nid).or_else(|| extra_records.get(nid))
-                            })
-                            .collect::<Vec<_>>();
+                    let mut new_nodes: Vec<&AuthenticatedNodeRecord> = path
+                        .iter()
+                        .filter_map(|nid| {
+                            topology.get_record(nid).or_else(|| extra_records.get(nid))
+                        })
+                        .collect::<Vec<_>>();
                     new_nodes.push(neighbor_record);
                     let new_cost = cost_model.path_cost(&new_links, &new_nodes);
 
@@ -965,10 +973,13 @@ impl RouteEngine {
                 // After resolution, the record should be available via
                 // the resolver. We re-resolve to get the record.
                 // (In a production system, the resolver would cache this.)
-                match resolver.resolve(&destination, &match &candidate.origin {
-                    CandidateOrigin::Remote { hint } => hint.clone(),
-                    _ => unreachable!(),
-                }) {
+                match resolver.resolve(
+                    &destination,
+                    &match &candidate.origin {
+                        CandidateOrigin::Remote { hint } => hint.clone(),
+                        _ => unreachable!(),
+                    },
+                ) {
                     Some(r) => r,
                     None => {
                         candidate.state = RouteCandidateState::Failed {
@@ -989,30 +1000,26 @@ impl RouteEngine {
         // Step 2: Find a usable directed path.
         // N2.1.2.1: find_path now returns (path, links, cost).
         // The links carry the selected LinkKey.endpoint for each hop.
-        let (path, links, route_cost) = match self.find_path(
-            topology,
-            &destination,
-            cost_model,
-            &extra_records,
-        ) {
-            None => {
-                candidate.state = RouteCandidateState::Failed {
-                    reason: RouteDiscoveryError::NoPathFound,
-                };
-                return;
-            }
-            Some((path, links, cost)) => {
-                if path.len() > MAX_ROUTE_HOPS {
+        let (path, links, route_cost) =
+            match self.find_path(topology, &destination, cost_model, &extra_records) {
+                None => {
                     candidate.state = RouteCandidateState::Failed {
-                        reason: RouteDiscoveryError::TooManyHops(path.len()),
+                        reason: RouteDiscoveryError::NoPathFound,
                     };
                     return;
                 }
-                // Move to Reachable state.
-                candidate.state = RouteCandidateState::Reachable { path: path.clone() };
-                (path, links, cost)
-            }
-        };
+                Some((path, links, cost)) => {
+                    if path.len() > MAX_ROUTE_HOPS {
+                        candidate.state = RouteCandidateState::Failed {
+                            reason: RouteDiscoveryError::TooManyHops(path.len()),
+                        };
+                        return;
+                    }
+                    // Move to Reachable state.
+                    candidate.state = RouteCandidateState::Reachable { path: path.clone() };
+                    (path, links, cost)
+                }
+            };
 
         // Step 3: Construct RouteHops from authenticated records + SELECTED
         // LINK ENDPOINTS.
@@ -1123,10 +1130,7 @@ impl RouteEngine {
     /// Get all ready routes from a list of candidates.
     #[must_use]
     pub fn ready_routes(candidates: &[RouteCandidate]) -> Vec<&Route> {
-        candidates
-            .iter()
-            .filter_map(|c| c.route())
-            .collect()
+        candidates.iter().filter_map(|c| c.route()).collect()
     }
 
     /// **N2.1.2.1.** Get the best (lowest-computed-cost) ready route from a

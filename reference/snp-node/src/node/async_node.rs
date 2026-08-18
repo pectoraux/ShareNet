@@ -41,9 +41,7 @@ use snp_gateway::{
     handle_transit_request_with_connector, sign_transit_request, verify_transit_response,
     PinnedConnector, TransitRequest, TransitResponse,
 };
-use snp_link::async_link::{
-    perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError,
-};
+use snp_link::async_link::{perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError};
 use snp_link::{decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, LinkKeys};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -390,9 +388,7 @@ where
 {
     let req_frame = match link.recv_frame().await {
         Ok(f) => f,
-        Err(AsyncLinkError::Io(msg))
-            if msg.contains("unexpected eof") || msg.contains("reset") =>
-        {
+        Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => {
             return Ok(ServeOutcome::Closed);
         }
         Err(e) => return Err(async_err_to_node(e)),
@@ -467,9 +463,7 @@ pub async fn serve_relay_persistent_async(
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
-    eprintln!(
-        "[relay-async] listening on {listen_addr}, next-hop={next_hop_addr}"
-    );
+    eprintln!("[relay-async] listening on {listen_addr}, next-hop={next_hop_addr}");
     loop {
         let (prev_stream, _) = match listener.accept().await {
             Ok(s) => s,
@@ -482,17 +476,14 @@ pub async fn serve_relay_persistent_async(
         let next_stream = match AsyncLink::connect_raw(next_hop_addr).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "[relay-async] connect to next-hop {next_hop_addr} failed: {e}"
-                );
+                eprintln!("[relay-async] connect to next-hop {next_hop_addr} failed: {e}");
                 continue;
             }
         };
         let next_link = Arc::new(AsyncLink::new(next_stream, next_hop_keys));
         eprintln!("[relay-async] connected to next-hop at {next_hop_addr}");
         // Forward bidirectionally until either side closes/errors.
-        if let Err(e) =
-            snp_link::async_link::async_relay_forward_links(prev_link, next_link).await
+        if let Err(e) = snp_link::async_link::async_relay_forward_links(prev_link, next_link).await
         {
             eprintln!("[relay-async] forward error: {e}");
         }
@@ -735,10 +726,7 @@ pub async fn serve_discovery_persistent_async(
 ///
 /// # Errors
 /// Returns [`NodeError`] if NO gateway could be discovered.
-pub async fn discover_gateways_async(
-    node: &Node,
-    known_addrs: &[String],
-) -> NodeResult<()> {
+pub async fn discover_gateways_async(node: &Node, known_addrs: &[String]) -> NodeResult<()> {
     let mut discovered = 0usize;
     for addr in known_addrs {
         eprintln!("[discover-async] querying {addr}");
@@ -907,7 +895,9 @@ pub async fn send_request_via_gateway_full_with_relay_async(
         body: sealed_body,
     };
 
-    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    link.send_frame(&req_frame)
+        .await
+        .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
     if resp_frame.cls != b'B' {
@@ -1179,9 +1169,7 @@ where
 {
     let req_frame = match link.recv_frame().await {
         Ok(f) => f,
-        Err(AsyncLinkError::Io(msg))
-            if msg.contains("unexpected eof") || msg.contains("reset") =>
-        {
+        Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => {
             return Ok(ServeOutcome::Closed);
         }
         Err(e) => return Err(async_err_to_node(e)),
@@ -1211,11 +1199,9 @@ where
     //
     // The gateway NEVER received CircuitKeys as a parameter — it derived them
     // FROM THE PROTOCOL MATERIAL.
-    let (client_eph_pub, req_bytes) = snp_link::open_circuit_payload_with_fresh_eph(
-        gateway_x25519_secret,
-        &req_frame.body,
-    )
-    .ok_or(NodeError::CircuitDecryptionFailed)?;
+    let (client_eph_pub, req_bytes) =
+        snp_link::open_circuit_payload_with_fresh_eph(gateway_x25519_secret, &req_frame.body)
+            .ok_or(NodeError::CircuitDecryptionFailed)?;
     eprintln!(
         "[gateway-protocol {}] derived circuit keys from client ephemeral (eph={})",
         super::hex_short(&gateway_node_id),
@@ -1268,10 +1254,8 @@ where
 
     // Derive the RESPONSE-direction keys from the SAME DH. The gateway's
     // `send_key` (responder role) equals the client's `recv_key`.
-    let response_keys = snp_link::derive_gateway_response_keys(
-        gateway_x25519_secret,
-        &client_eph_pub,
-    );
+    let response_keys =
+        snp_link::derive_gateway_response_keys(gateway_x25519_secret, &client_eph_pub);
     let resp_bytes = encode_transit_response(&fetched.response)?;
     let sealed_resp = encrypt_circuit_payload(&response_keys.send_key, &resp_bytes);
 
@@ -1327,9 +1311,7 @@ where
 {
     let req_frame = match link.recv_frame().await {
         Ok(f) => f,
-        Err(AsyncLinkError::Io(msg))
-            if msg.contains("unexpected eof") || msg.contains("reset") =>
-        {
+        Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => {
             return Ok(ServeOutcome::Closed);
         }
         Err(e) => return Err(async_err_to_node(e)),
@@ -1344,11 +1326,9 @@ where
         return Ok(ServeOutcome::Continue);
     }
 
-    let (client_eph_pub, req_bytes) = snp_link::open_circuit_payload_with_fresh_eph(
-        gateway_x25519_secret,
-        &req_frame.body,
-    )
-    .ok_or(NodeError::CircuitDecryptionFailed)?;
+    let (client_eph_pub, req_bytes) =
+        snp_link::open_circuit_payload_with_fresh_eph(gateway_x25519_secret, &req_frame.body)
+            .ok_or(NodeError::CircuitDecryptionFailed)?;
 
     let transit_req = decode_transit_request(&req_bytes)?;
 
@@ -1385,10 +1365,8 @@ where
     };
 
     // Derive the RESPONSE-direction keys from the SAME DH.
-    let response_keys = snp_link::derive_gateway_response_keys(
-        gateway_x25519_secret,
-        &client_eph_pub,
-    );
+    let response_keys =
+        snp_link::derive_gateway_response_keys(gateway_x25519_secret, &client_eph_pub);
 
     // N2.2.4-hardening: Encode the TransitEnvelope (transitResponse + body).
     // The envelope is the APPLICATION-LAYER payload — the circuit protocol
@@ -1864,7 +1842,9 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
     };
 
     // 4. Send + receive.
-    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    link.send_frame(&req_frame)
+        .await
+        .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
     if resp_frame.cls != b'B' {
@@ -1887,7 +1867,6 @@ pub async fn send_request_with_full_snp_ik_handshake_async(
     *node.current_gateway.lock().unwrap() = Some(*gateway_node_id);
     Ok(transit_resp)
 }
-
 
 // ════════════════════════════════════════════════════════════════════════════
 // N2.0.7 — PROTOCOL-DRIVEN CLIENT SEND (fresh ephemeral circuit)
@@ -2004,7 +1983,9 @@ pub async fn send_with_protocol_circuit_async(
     };
 
     // 5. Send + receive.
-    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    link.send_frame(&req_frame)
+        .await
+        .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
     if resp_frame.cls != b'B' {
@@ -2139,7 +2120,9 @@ pub async fn send_with_protocol_circuit_async_with_body(
         seq: 1,
         body: sealed_body,
     };
-    link.send_frame(&req_frame).await.map_err(async_err_to_node)?;
+    link.send_frame(&req_frame)
+        .await
+        .map_err(async_err_to_node)?;
     let resp_frame = link.recv_frame().await.map_err(async_err_to_node)?;
 
     if resp_frame.cls != b'B' {
@@ -2251,9 +2234,9 @@ pub async fn send_via_route(
         ));
     }
     let first_hop = &route.hop_details()[0];
-    let relay_endpoint = first_hop.first_endpoint().ok_or_else(|| {
-        NodeError::Other("send_via_route: first hop has no endpoints".into())
-    })?;
+    let relay_endpoint = first_hop
+        .first_endpoint()
+        .ok_or_else(|| NodeError::Other("send_via_route: first hop has no endpoints".into()))?;
     // Resolve the TransportEndpoint to a TCP address (the only transport
     // implemented for now — future transports will dispatch on the enum).
     let relay_addr = relay_endpoint.as_tcp().ok_or_else(|| {
@@ -2354,7 +2337,8 @@ pub async fn send_via_route_with_body(
     let gateway_ed25519_public = *gateway_descriptor.ed25519_public_key();
     let gateway_x25519_pub_bytes = gateway_descriptor.circuit_x25519_pub().ok_or_else(|| {
         NodeError::Other(
-            "send_via_route_with_body: destination descriptor has no X25519 circuit public key".into(),
+            "send_via_route_with_body: destination descriptor has no X25519 circuit public key"
+                .into(),
         )
     })?;
     let gateway_x25519_pub = snp_crypto::x25519_public_from_bytes(gateway_x25519_pub_bytes);
@@ -2418,16 +2402,14 @@ pub async fn serve_relay_via_route(
 ) -> NodeResult<()> {
     // The REMOTE next hop is at my_position + 1 in the Route.
     // This comes EXCLUSIVELY from the Route — NOT from a parameter.
-    let next_hop = route
-        .hop(my_position + 1)
-        .ok_or_else(|| {
-            NodeError::Other(format!(
-                "serve_relay_via_route: no hop at position {} (my_position={}, route has {} hops)",
-                my_position + 1,
-                my_position,
-                route.hop_details().len()
-            ))
-        })?;
+    let next_hop = route.hop(my_position + 1).ok_or_else(|| {
+        NodeError::Other(format!(
+            "serve_relay_via_route: no hop at position {} (my_position={}, route has {} hops)",
+            my_position + 1,
+            my_position,
+            route.hop_details().len()
+        ))
+    })?;
     let next_hop_endpoint = next_hop.first_endpoint().ok_or_else(|| {
         NodeError::Other("serve_relay_via_route: next hop has no endpoints".into())
     })?;
@@ -2492,15 +2474,27 @@ pub async fn serve_gateway_mode_b(
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
-    eprintln!("[gateway-mode-b {}] listening on {listen_addr}", super::hex_short(&gateway_node_id));
+    eprintln!(
+        "[gateway-mode-b {}] listening on {listen_addr}",
+        super::hex_short(&gateway_node_id)
+    );
 
-    let (mut stream, _) = listener.accept().await
+    let (mut stream, _) = listener
+        .accept()
+        .await
         .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
 
     let handshake = perform_snp_ik_handshake_async(
-        &mut stream, false, &gateway_ed_sk, &gateway_ed_pk,
-        gateway_x25519_secret, gateway_x25519_public, None,
-    ).await.map_err(async_err_to_node)?;
+        &mut stream,
+        false,
+        &gateway_ed_sk,
+        &gateway_ed_pk,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
 
     let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
 
@@ -2527,13 +2521,12 @@ pub async fn serve_gateway_mode_b(
     })?;
 
     // 2. Derive circuit keys from eph_pub.
-    let (client_eph_pub, plaintext) = snp_link::open_circuit_payload_with_fresh_eph(
-        gateway_x25519_secret, &first_frame.body,
-    ).ok_or(NodeError::CircuitDecryptionFailed)?;
+    let (client_eph_pub, plaintext) =
+        snp_link::open_circuit_payload_with_fresh_eph(gateway_x25519_secret, &first_frame.body)
+            .ok_or(NodeError::CircuitDecryptionFailed)?;
 
-    let response_keys = snp_link::derive_gateway_response_keys(
-        gateway_x25519_secret, &client_eph_pub,
-    );
+    let response_keys =
+        snp_link::derive_gateway_response_keys(gateway_x25519_secret, &client_eph_pub);
 
     // 3. Decode the StreamOpen.
     let stream_msg = snp_gateway::stream::decode_stream_message(&plaintext)
@@ -2541,21 +2534,26 @@ pub async fn serve_gateway_mode_b(
 
     let stream_id = match &stream_msg {
         snp_gateway::stream::StreamMessage::Open(open) => open.stream_id,
-        other => return Err(NodeError::Other(format!("expected StreamOpen, got {other:?}"))),
+        other => {
+            return Err(NodeError::Other(format!(
+                "expected StreamOpen, got {other:?}"
+            )))
+        }
     };
 
     // 4. Dispatch to GatewayStreamTable.
     let ack = if let snp_gateway::stream::StreamMessage::Open(open) = stream_msg {
         stream_table.handle_stream_open(open).await
-    } else { unreachable!() };
+    } else {
+        unreachable!()
+    };
 
     let ack_msg = match ack {
         Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
-        Err(e) => snp_gateway::stream::StreamMessage::Reset(
-            snp_gateway::stream::StreamReset {
-                stream_id, reason: snp_gateway::stream::StreamResetReason::ProtocolError,
-            },
-        ),
+        Err(e) => snp_gateway::stream::StreamMessage::Reset(snp_gateway::stream::StreamReset {
+            stream_id,
+            reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+        }),
     };
 
     // 5. Send the StreamOpenAck back through the circuit.
@@ -2564,16 +2562,28 @@ pub async fn serve_gateway_mode_b(
     let ack_sealed = snp_link::encrypt_circuit_payload(&response_keys.send_key, &ack_cbor);
 
     let ack_frame = Frame {
-        v: FRAME_VERSION, cls: b'B', dst: first_frame.src, src: gateway_node_id,
-        ttl: FRAME_TTL_MAX, fid: first_frame.fid, seq: ack_seq, body: ack_sealed,
+        v: FRAME_VERSION,
+        cls: b'B',
+        dst: first_frame.src,
+        src: gateway_node_id,
+        ttl: FRAME_TTL_MAX,
+        fid: first_frame.fid,
+        seq: ack_seq,
+        body: ack_sealed,
     };
-    link.send_frame(&ack_frame).await.map_err(async_err_to_node)?;
+    link.send_frame(&ack_frame)
+        .await
+        .map_err(async_err_to_node)?;
 
     if matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
         return Ok(());
     }
 
-    eprintln!("[gateway-mode-b {}] stream {} established — persistent loop", super::hex_short(&gateway_node_id), stream_id);
+    eprintln!(
+        "[gateway-mode-b {}] stream {} established — persistent loop",
+        super::hex_short(&gateway_node_id),
+        stream_id
+    );
 
     // Gateway outbound frame sequence — MUST be unique per (fid, key) to
     // avoid AEAD nonce reuse. The StreamOpenAck used seq = first_frame.seq + 1,
@@ -2717,7 +2727,9 @@ pub async fn serve_gateway_mode_b(
         }
     }
 
-    let _ = stream_table.handle_close(snp_gateway::stream::StreamClose { stream_id }).await;
+    let _ = stream_table
+        .handle_close(snp_gateway::stream::StreamClose { stream_id })
+        .await;
     Ok(())
 }
 
@@ -2753,15 +2765,27 @@ pub async fn serve_gateway_mode_b_multiplexed(
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| NodeError::Other(format!("bind {listen_addr}: {e}")))?;
-    eprintln!("[gateway-mode-b-mux {}] listening on {listen_addr}", super::hex_short(&gateway_node_id));
+    eprintln!(
+        "[gateway-mode-b-mux {}] listening on {listen_addr}",
+        super::hex_short(&gateway_node_id)
+    );
 
-    let (mut stream, _) = listener.accept().await
+    let (mut stream, _) = listener
+        .accept()
+        .await
         .map_err(|e| NodeError::Other(format!("accept: {e}")))?;
 
     let handshake = perform_snp_ik_handshake_async(
-        &mut stream, false, &gateway_ed_sk, &gateway_ed_pk,
-        gateway_x25519_secret, gateway_x25519_public, None,
-    ).await.map_err(async_err_to_node)?;
+        &mut stream,
+        false,
+        &gateway_ed_sk,
+        &gateway_ed_pk,
+        gateway_x25519_secret,
+        gateway_x25519_public,
+        None,
+    )
+    .await
+    .map_err(async_err_to_node)?;
 
     let link = Arc::new(AsyncLink::new(stream, handshake.link_keys));
 
@@ -2772,20 +2796,21 @@ pub async fn serve_gateway_mode_b_multiplexed(
         return Err(NodeError::Other("first frame validation failed".into()));
     }
 
-    let ack_seq = first_frame.seq.checked_add(1).ok_or_else(|| {
-        NodeError::Other("first frame seq is u32::MAX".into())
-    })?;
-    let initial_gateway_seq = first_frame.seq.checked_add(2).ok_or_else(|| {
-        NodeError::Other("first frame seq is u32::MAX-1".into())
-    })?;
+    let ack_seq = first_frame
+        .seq
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Other("first frame seq is u32::MAX".into()))?;
+    let initial_gateway_seq = first_frame
+        .seq
+        .checked_add(2)
+        .ok_or_else(|| NodeError::Other("first frame seq is u32::MAX-1".into()))?;
 
-    let (client_eph_pub, plaintext) = snp_link::open_circuit_payload_with_fresh_eph(
-        gateway_x25519_secret, &first_frame.body,
-    ).ok_or(NodeError::CircuitDecryptionFailed)?;
+    let (client_eph_pub, plaintext) =
+        snp_link::open_circuit_payload_with_fresh_eph(gateway_x25519_secret, &first_frame.body)
+            .ok_or(NodeError::CircuitDecryptionFailed)?;
 
-    let response_keys = snp_link::derive_gateway_response_keys(
-        gateway_x25519_secret, &client_eph_pub,
-    );
+    let response_keys =
+        snp_link::derive_gateway_response_keys(gateway_x25519_secret, &client_eph_pub);
 
     let circuit_fid = first_frame.fid;
     let circuit_client = first_frame.src;
@@ -2795,7 +2820,8 @@ pub async fn serve_gateway_mode_b_multiplexed(
 
     // Outbound channel: all gateway→client messages go through this.
     // The circuit writer task drains it.
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<snp_gateway::stream::StreamMessage>();
+    let (outbound_tx, outbound_rx) =
+        tokio::sync::mpsc::unbounded_channel::<snp_gateway::stream::StreamMessage>();
 
     // Process the first StreamOpen.
     let first_msg = snp_gateway::stream::decode_stream_message(&plaintext)
@@ -2814,15 +2840,22 @@ pub async fn serve_gateway_mode_b_multiplexed(
     let ack = stream_table.handle_stream_open(first_open).await;
     let ack_msg = match ack {
         Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
-        Err(_) => snp_gateway::stream::StreamMessage::Reset(
-            snp_gateway::stream::StreamReset {
-                stream_id: first_stream_id,
-                reason: snp_gateway::stream::StreamResetReason::ProtocolError,
-            },
-        ),
+        Err(_) => snp_gateway::stream::StreamMessage::Reset(snp_gateway::stream::StreamReset {
+            stream_id: first_stream_id,
+            reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+        }),
     };
     // Send the first ack directly (before the writer task starts).
-    send_gateway_frame(&link, &response_keys.send_key, gateway_node_id, circuit_client, circuit_fid, ack_seq, &ack_msg).await?;
+    send_gateway_frame(
+        &link,
+        &response_keys.send_key,
+        gateway_node_id,
+        circuit_client,
+        circuit_fid,
+        ack_seq,
+        &ack_msg,
+    )
+    .await?;
 
     if matches!(ack_msg, snp_gateway::stream::StreamMessage::Reset(_)) {
         return Ok(());
@@ -2839,11 +2872,17 @@ pub async fn serve_gateway_mode_b_multiplexed(
     let mut active_stream_ids: Vec<snp_gateway::stream::StreamId>;
 
     if first_established {
-        eprintln!("[gateway-mode-b-mux {}] stream {} established (first)", super::hex_short(&gateway_node_id), first_stream_id);
+        eprintln!(
+            "[gateway-mode-b-mux {}] stream {} established (first)",
+            super::hex_short(&gateway_node_id),
+            first_stream_id
+        );
 
         // N2.3.9: Spawn the first stream's TCP reader task.
         spawn_tcp_reader(
-            first_stream_id, stream_table.clone(), outbound_tx.clone(),
+            first_stream_id,
+            stream_table.clone(),
+            outbound_tx.clone(),
             &mut tcp_reader_handles,
         );
 
@@ -2854,7 +2893,9 @@ pub async fn serve_gateway_mode_b_multiplexed(
         // head-of-line blocking: if one stream's TCP write stalls, other
         // streams continue processing.
         let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let _ = stream_table.set_write_channel(first_stream_id, write_tx).await;
+        let _ = stream_table
+            .set_write_channel(first_stream_id, write_tx)
+            .await;
         spawn_tcp_writer(
             first_stream_id,
             stream_table.clone(),
@@ -2891,8 +2932,14 @@ pub async fn serve_gateway_mode_b_multiplexed(
             };
             let sealed = snp_link::encrypt_circuit_payload(&writer_key, &cbor);
             let frame = Frame {
-                v: FRAME_VERSION, cls: b'B', dst: circuit_client, src: gateway_node_id,
-                ttl: FRAME_TTL_MAX, fid: circuit_fid, seq, body: sealed,
+                v: FRAME_VERSION,
+                cls: b'B',
+                dst: circuit_client,
+                src: gateway_node_id,
+                ttl: FRAME_TTL_MAX,
+                fid: circuit_fid,
+                seq,
+                body: sealed,
             };
             if writer_link.send_frame(&frame).await.is_err() {
                 break;
@@ -2907,7 +2954,9 @@ pub async fn serve_gateway_mode_b_multiplexed(
     loop {
         let frame = match link.recv_frame().await {
             Ok(f) => f,
-            Err(AsyncLinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("reset") => {
+            Err(AsyncLinkError::Io(msg))
+                if msg.contains("unexpected eof") || msg.contains("reset") =>
+            {
                 eprintln!("[gateway-mode-b-mux] circuit closed by relay");
                 break;
             }
@@ -2924,13 +2973,14 @@ pub async fn serve_gateway_mode_b_multiplexed(
         }
 
         // Decrypt.
-        let plaintext = match snp_link::decrypt_circuit_payload(&response_keys.recv_key, &frame.body) {
-            Some(p) => p,
-            None => {
-                eprintln!("[gateway-mode-b-mux] decryption failed — closing circuit");
-                break;
-            }
-        };
+        let plaintext =
+            match snp_link::decrypt_circuit_payload(&response_keys.recv_key, &frame.body) {
+                Some(p) => p,
+                None => {
+                    eprintln!("[gateway-mode-b-mux] decryption failed — closing circuit");
+                    break;
+                }
+            };
 
         // Decode.
         let msg = match snp_gateway::stream::decode_stream_message(&plaintext) {
@@ -2950,7 +3000,8 @@ pub async fn serve_gateway_mode_b_multiplexed(
                     Ok(ack) => snp_gateway::stream::StreamMessage::OpenAck(ack),
                     Err(_) => snp_gateway::stream::StreamMessage::Reset(
                         snp_gateway::stream::StreamReset {
-                            stream_id: sid, reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+                            stream_id: sid,
+                            reason: snp_gateway::stream::StreamResetReason::ProtocolError,
                         },
                     ),
                 };
@@ -2961,9 +3012,15 @@ pub async fn serve_gateway_mode_b_multiplexed(
                         == Some(snp_gateway::stream::StreamState::Established);
                     if established {
                         active_stream_ids.push(sid);
-                        spawn_tcp_reader(sid, stream_table.clone(), outbound_tx.clone(), &mut tcp_reader_handles);
+                        spawn_tcp_reader(
+                            sid,
+                            stream_table.clone(),
+                            outbound_tx.clone(),
+                            &mut tcp_reader_handles,
+                        );
                         // N2.3.9: Spawn the per-stream TCP writer task.
-                        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        let (write_tx, write_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                         let _ = stream_table.set_write_channel(sid, write_tx).await;
                         spawn_tcp_writer(
                             sid,
@@ -2972,7 +3029,11 @@ pub async fn serve_gateway_mode_b_multiplexed(
                             outbound_tx.clone(),
                             &mut tcp_writer_handles,
                         );
-                        eprintln!("[gateway-mode-b-mux {}] stream {} established (multiplexed)", super::hex_short(&gateway_node_id), sid);
+                        eprintln!(
+                            "[gateway-mode-b-mux {}] stream {} established (multiplexed)",
+                            super::hex_short(&gateway_node_id),
+                            sid
+                        );
                     }
                 }
             }
@@ -2983,7 +3044,10 @@ pub async fn serve_gateway_mode_b_multiplexed(
                 if let Err(_) = stream_table.handle_stream_data(data.clone()).await {
                     let sid = data.stream_id;
                     let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
-                        snp_gateway::stream::StreamReset { stream_id: sid, reason: snp_gateway::stream::StreamResetReason::ProtocolError },
+                        snp_gateway::stream::StreamReset {
+                            stream_id: sid,
+                            reason: snp_gateway::stream::StreamResetReason::ProtocolError,
+                        },
                     ));
                     active_stream_ids.retain(|&s| s != sid);
                 }
@@ -2997,12 +3061,20 @@ pub async fn serve_gateway_mode_b_multiplexed(
             snp_gateway::stream::StreamMessage::Close(c) => {
                 let _ = stream_table.handle_close(c.clone()).await;
                 active_stream_ids.retain(|&s| s != c.stream_id);
-                eprintln!("[gateway-mode-b-mux {}] stream {} closed", super::hex_short(&gateway_node_id), c.stream_id);
+                eprintln!(
+                    "[gateway-mode-b-mux {}] stream {} closed",
+                    super::hex_short(&gateway_node_id),
+                    c.stream_id
+                );
             }
             snp_gateway::stream::StreamMessage::Reset(r) => {
                 let _ = stream_table.handle_reset(r.clone()).await;
                 active_stream_ids.retain(|&s| s != r.stream_id);
-                eprintln!("[gateway-mode-b-mux {}] stream {} reset", super::hex_short(&gateway_node_id), r.stream_id);
+                eprintln!(
+                    "[gateway-mode-b-mux {}] stream {} reset",
+                    super::hex_short(&gateway_node_id),
+                    r.stream_id
+                );
             }
             _ => {
                 eprintln!("[gateway-mode-b-mux] unexpected message — closing circuit");
@@ -3018,7 +3090,9 @@ pub async fn serve_gateway_mode_b_multiplexed(
 
     // Clean up.
     for &sid in &active_stream_ids {
-        let _ = stream_table.handle_close(snp_gateway::stream::StreamClose { stream_id: sid }).await;
+        let _ = stream_table
+            .handle_close(snp_gateway::stream::StreamClose { stream_id: sid })
+            .await;
     }
     for handle in tcp_reader_handles {
         handle.abort();
@@ -3028,7 +3102,10 @@ pub async fn serve_gateway_mode_b_multiplexed(
     }
     writer_handle.abort();
 
-    eprintln!("[gateway-mode-b-mux {}] circuit terminated", super::hex_short(&gateway_node_id));
+    eprintln!(
+        "[gateway-mode-b-mux {}] circuit terminated",
+        super::hex_short(&gateway_node_id)
+    );
     Ok(())
 }
 
@@ -3069,12 +3146,12 @@ fn spawn_tcp_reader(
                             reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
                         },
                     ));
-                    let _ = stream_table.handle_reset(
-                        snp_gateway::stream::StreamReset {
+                    let _ = stream_table
+                        .handle_reset(snp_gateway::stream::StreamReset {
                             stream_id,
                             reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
-                        },
-                    ).await;
+                        })
+                        .await;
                     break;
                 }
             }
@@ -3161,15 +3238,17 @@ fn spawn_tcp_writer(
                             let _ = outbound_tx.send(snp_gateway::stream::StreamMessage::Reset(
                                 snp_gateway::stream::StreamReset {
                                     stream_id,
-                                    reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                                    reason:
+                                        snp_gateway::stream::StreamResetReason::ConnectionRefused,
                                 },
                             ));
-                            let _ = stream_table.handle_reset(
-                                snp_gateway::stream::StreamReset {
+                            let _ = stream_table
+                                .handle_reset(snp_gateway::stream::StreamReset {
                                     stream_id,
-                                    reason: snp_gateway::stream::StreamResetReason::ConnectionRefused,
-                                },
-                            ).await;
+                                    reason:
+                                        snp_gateway::stream::StreamResetReason::ConnectionRefused,
+                                })
+                                .await;
                             break;
                         }
                     }
@@ -3221,8 +3300,6 @@ async fn send_gateway_frame(
         seq,
         body: sealed,
     };
-    link.send_frame(&frame)
-        .await
-        .map_err(async_err_to_node)?;
+    link.send_frame(&frame).await.map_err(async_err_to_node)?;
     Ok(())
 }

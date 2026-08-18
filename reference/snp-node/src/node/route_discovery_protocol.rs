@@ -308,12 +308,30 @@ impl NextHopQuery {
 
     fn preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
-            (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("maxHops".into()), CborValue::UnsignedInt(u64::from(self.max_hops))),
+            (
+                CborValue::TextString("sourceNodeId".into()),
+                CborValue::ByteString(self.source_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("sourcePublicKey".into()),
+                CborValue::ByteString(self.source_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("maxHops".into()),
+                CborValue::UnsignedInt(u64::from(self.max_hops)),
+            ),
         ])
     }
 
@@ -502,10 +520,22 @@ impl QueryStep {
     #[must_use]
     pub fn to_cbor_map(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("remainingHops".into()), CborValue::UnsignedInt(u64::from(self.remaining_hops))),
+            (
+                CborValue::TextString("sourceNodeId".into()),
+                CborValue::ByteString(self.source_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("remainingHops".into()),
+                CborValue::UnsignedInt(u64::from(self.remaining_hops)),
+            ),
         ])
     }
 
@@ -517,7 +547,8 @@ impl QueryStep {
             source_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "sourceNodeId")?)?,
             responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "responderNodeId")?)?,
             query_id: cbor_get_fixed_bytes(cbor_map_get(map, "queryId")?)?,
-            remaining_hops: u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHops")?)?).ok()?,
+            remaining_hops: u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHops")?)?)
+                .ok()?,
         })
     }
 
@@ -638,25 +669,50 @@ impl NextHopResponse {
 
     fn preimage(&self) -> CborValue {
         let result_cbor = match &self.result {
-            NextHopResult::Found { next_hop_node_id, advertisement, is_destination } => {
-                CborValue::Map(vec![
-                    (CborValue::TextString("type".into()), CborValue::TextString("found".into())),
-                    (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(next_hop_node_id.to_vec())),
-                    (CborValue::TextString("advertisement".into()), advertisement_canonical_cbor(advertisement)),
-                    (CborValue::TextString("isDestination".into()), CborValue::Bool(*is_destination)),
-                ])
-            }
-            NextHopResult::NotFound => {
-                CborValue::Map(vec![
-                    (CborValue::TextString("type".into()), CborValue::TextString("notfound".into())),
-                ])
-            }
+            NextHopResult::Found {
+                next_hop_node_id,
+                advertisement,
+                is_destination,
+            } => CborValue::Map(vec![
+                (
+                    CborValue::TextString("type".into()),
+                    CborValue::TextString("found".into()),
+                ),
+                (
+                    CborValue::TextString("nextHopNodeId".into()),
+                    CborValue::ByteString(next_hop_node_id.to_vec()),
+                ),
+                (
+                    CborValue::TextString("advertisement".into()),
+                    advertisement_canonical_cbor(advertisement),
+                ),
+                (
+                    CborValue::TextString("isDestination".into()),
+                    CborValue::Bool(*is_destination),
+                ),
+            ]),
+            NextHopResult::NotFound => CborValue::Map(vec![(
+                CborValue::TextString("type".into()),
+                CborValue::TextString("notfound".into()),
+            )]),
         };
         CborValue::Map(vec![
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.responder_ed25519_public_key.to_vec())),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("responderPublicKey".into()),
+                CborValue::ByteString(self.responder_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
             (CborValue::TextString("result".into()), result_cbor),
         ])
     }
@@ -715,23 +771,61 @@ impl NextHopResponse {
 /// Encode a `NodeAdvertisement` to canonical CBOR for signing.
 fn advertisement_canonical_cbor(advert: &NodeAdvertisement) -> CborValue {
     CborValue::Map(vec![
-        (CborValue::TextString("nodeId".into()), CborValue::ByteString(advert.node_id.to_vec())),
-        (CborValue::TextString("publicKey".into()), CborValue::ByteString(advert.ed25519_public_key.to_vec())),
-        (CborValue::TextString("capabilities".into()), CborValue::Array(
-            advert.capabilities.iter().map(|c| CborValue::TextString(c.as_str().to_string())).collect()
-        )),
-        (CborValue::TextString("endpoints".into()), CborValue::Array(
-            advert.endpoints.iter().map(|e| e.canonical_cbor()).collect()
-        )),
-        (CborValue::TextString("x25519CircuitPub".into()), match &advert.x25519_circuit_public {
-            Some(k) => CborValue::ByteString(k.to_vec()),
-            None => CborValue::Null,
-        }),
-        (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(advert.timestamp)),
-        (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(advert.expiry)),
-        (CborValue::TextString("nonce".into()), CborValue::ByteString(advert.nonce.to_vec())),
-        (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(advert.sequence)),
-        (CborValue::TextString("signature".into()), CborValue::ByteString(advert.signature.to_vec())),
+        (
+            CborValue::TextString("nodeId".into()),
+            CborValue::ByteString(advert.node_id.to_vec()),
+        ),
+        (
+            CborValue::TextString("publicKey".into()),
+            CborValue::ByteString(advert.ed25519_public_key.to_vec()),
+        ),
+        (
+            CborValue::TextString("capabilities".into()),
+            CborValue::Array(
+                advert
+                    .capabilities
+                    .iter()
+                    .map(|c| CborValue::TextString(c.as_str().to_string()))
+                    .collect(),
+            ),
+        ),
+        (
+            CborValue::TextString("endpoints".into()),
+            CborValue::Array(
+                advert
+                    .endpoints
+                    .iter()
+                    .map(|e| e.canonical_cbor())
+                    .collect(),
+            ),
+        ),
+        (
+            CborValue::TextString("x25519CircuitPub".into()),
+            match &advert.x25519_circuit_public {
+                Some(k) => CborValue::ByteString(k.to_vec()),
+                None => CborValue::Null,
+            },
+        ),
+        (
+            CborValue::TextString("timestamp".into()),
+            CborValue::UnsignedInt(advert.timestamp),
+        ),
+        (
+            CborValue::TextString("expiry".into()),
+            CborValue::UnsignedInt(advert.expiry),
+        ),
+        (
+            CborValue::TextString("nonce".into()),
+            CborValue::ByteString(advert.nonce.to_vec()),
+        ),
+        (
+            CborValue::TextString("sequence".into()),
+            CborValue::UnsignedInt(advert.sequence),
+        ),
+        (
+            CborValue::TextString("signature".into()),
+            CborValue::ByteString(advert.signature.to_vec()),
+        ),
     ])
 }
 
@@ -775,10 +869,7 @@ pub struct PendingRouteQuery {
 impl PendingRouteQuery {
     /// Create a new `PendingRouteQuery` for a query sent to `expected_responder`.
     #[must_use]
-    pub fn new(
-        query: &NextHopQuery,
-        expected_responder_node_id: [u8; 32],
-    ) -> Self {
+    pub fn new(query: &NextHopQuery, expected_responder_node_id: [u8; 32]) -> Self {
         let now = now_unix();
         Self {
             query_id: query.query_id,
@@ -933,7 +1024,11 @@ impl RoutingAssertion {
         destination_node_id: [u8; 32],
     ) -> Option<Self> {
         match &response.result {
-            NextHopResult::Found { next_hop_node_id, is_destination, .. } => Some(Self {
+            NextHopResult::Found {
+                next_hop_node_id,
+                is_destination,
+                ..
+            } => Some(Self {
                 responder_node_id: response.responder_node_id,
                 destination_node_id,
                 next_hop_node_id: *next_hop_node_id,
@@ -1001,13 +1096,34 @@ impl RoutingAssertion {
     /// The signature covers `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage)`.
     fn preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
-            (CborValue::TextString("isDestination".into()), CborValue::Bool(self.is_destination)),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("nextHopNodeId".into()),
+                CborValue::ByteString(self.next_hop_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("isDestination".into()),
+                CborValue::Bool(self.is_destination),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("responderPublicKey".into()),
+                CborValue::ByteString(self.ed25519_public_key.to_vec()),
+            ),
         ])
     }
 
@@ -1077,14 +1193,38 @@ impl RoutingAssertion {
     #[must_use]
     pub fn to_cbor_map(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
-            (CborValue::TextString("isDestination".into()), CborValue::Bool(self.is_destination)),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
-            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("nextHopNodeId".into()),
+                CborValue::ByteString(self.next_hop_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("isDestination".into()),
+                CborValue::Bool(self.is_destination),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("responderPublicKey".into()),
+                CborValue::ByteString(self.ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("signature".into()),
+                CborValue::ByteString(self.signature.to_vec()),
+            ),
         ])
     }
 
@@ -1399,7 +1539,9 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
 
         // Step 7: Verify response matches pending query (responder binding + replay).
         // Check that the pending query exists and matches.
-        let pending_match = self.pending_queries.get(&query.query_id)
+        let pending_match = self
+            .pending_queries
+            .get(&query.query_id)
             .map_or(false, |p| p.matches_response(&response));
         if !pending_match {
             return None; // Query NOT consumed — legitimate retry possible.
@@ -1409,7 +1551,11 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
         // Process the result FULLY before consuming the query.
         // A failed advertisement verification MUST NOT consume the query.
         let resolution = match &response.result {
-            NextHopResult::Found { next_hop_node_id, advertisement, is_destination: _ } => {
+            NextHopResult::Found {
+                next_hop_node_id,
+                advertisement,
+                is_destination: _,
+            } => {
                 // Verify the advertisement independently.
                 let verified = match advertisement.verify_into_verified() {
                     Some(v) => v,
@@ -1422,13 +1568,11 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
                 }
 
                 // Construct the routing assertion.
-                let assertion = match RoutingAssertion::from_verified_response(
-                    &response,
-                    *destination,
-                ) {
-                    Some(a) => a,
-                    None => return None, // Query NOT consumed — legitimate retry possible.
-                };
+                let assertion =
+                    match RoutingAssertion::from_verified_response(&response, *destination) {
+                        Some(a) => a,
+                        None => return None, // Query NOT consumed — legitimate retry possible.
+                    };
 
                 // All validation passed — construct the resolution.
                 NextHopResolution {
@@ -1458,11 +1602,16 @@ impl<'a> DistributedRouteResolver for NextHopResolver<'a> {
     }
 
     fn pending_query_count(&self) -> usize {
-        self.pending_queries.values().filter(|p| !p.consumed).count()
+        self.pending_queries
+            .values()
+            .filter(|p| !p.consumed)
+            .count()
     }
 
     fn is_query_consumed(&self, query_id: &[u8; 16]) -> bool {
-        self.pending_queries.get(query_id).map_or(false, |p| p.consumed)
+        self.pending_queries
+            .get(query_id)
+            .map_or(false, |p| p.consumed)
     }
 }
 
@@ -1503,7 +1652,8 @@ impl<'a> NextHopResolver<'a> {
 #[derive(Default)]
 pub struct InMemoryNextHopTransport {
     /// Map from neighbor NodeId → responder function.
-    responders: HashMap<[u8; 32], Box<dyn Fn(&NextHopQuery) -> Option<NextHopResponse> + Send + Sync>>,
+    responders:
+        HashMap<[u8; 32], Box<dyn Fn(&NextHopQuery) -> Option<NextHopResponse> + Send + Sync>>,
 }
 
 impl InMemoryNextHopTransport {
@@ -1518,7 +1668,8 @@ impl InMemoryNextHopTransport {
     where
         F: Fn(&NextHopQuery) -> Option<NextHopResponse> + Send + Sync + 'static,
     {
-        self.responders.insert(neighbor_node_id, Box::new(responder));
+        self.responders
+            .insert(neighbor_node_id, Box::new(responder));
     }
 }
 
@@ -1679,12 +1830,30 @@ impl ForwardedQuery {
     /// Compute the NextHopQuery preimage (same as NextHopQuery::preimage).
     fn next_hop_preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
-            (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("maxHops".into()), CborValue::UnsignedInt(u64::from(self.max_hops))),
+            (
+                CborValue::TextString("sourceNodeId".into()),
+                CborValue::ByteString(self.source_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("sourcePublicKey".into()),
+                CborValue::ByteString(self.source_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("maxHops".into()),
+                CborValue::UnsignedInt(u64::from(self.max_hops)),
+            ),
         ])
     }
 
@@ -1697,13 +1866,31 @@ impl ForwardedQuery {
     /// that was never sent.
     fn parent_binding_preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("parentQueryId".into()), CborValue::ByteString(self.parent_query_id.to_vec())),
-            (CborValue::TextString("parentResponderNodeId".into()), CborValue::ByteString(self.parent_responder_node_id.to_vec())),
-            (CborValue::TextString("parentQueryHash".into()), CborValue::ByteString(self.parent_query_hash.to_vec())),
-            (CborValue::TextString("visitedNodes".into()), CborValue::Array(
-                self.visited_nodes.iter().map(|n| CborValue::ByteString(n.to_vec())).collect()
-            )),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentQueryId".into()),
+                CborValue::ByteString(self.parent_query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentResponderNodeId".into()),
+                CborValue::ByteString(self.parent_responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentQueryHash".into()),
+                CborValue::ByteString(self.parent_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("visitedNodes".into()),
+                CborValue::Array(
+                    self.visited_nodes
+                        .iter()
+                        .map(|n| CborValue::ByteString(n.to_vec()))
+                        .collect(),
+                ),
+            ),
         ])
     }
 
@@ -1744,20 +1931,59 @@ impl ForwardedQuery {
     #[must_use]
     pub fn to_cbor_map(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("sourceNodeId".into()), CborValue::ByteString(self.source_node_id.to_vec())),
-            (CborValue::TextString("sourcePublicKey".into()), CborValue::ByteString(self.source_ed25519_public_key.to_vec())),
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("queryId".into()), CborValue::ByteString(self.query_id.to_vec())),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("maxHops".into()), CborValue::UnsignedInt(u64::from(self.max_hops))),
-            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
-            (CborValue::TextString("parentQueryId".into()), CborValue::ByteString(self.parent_query_id.to_vec())),
-            (CborValue::TextString("parentResponderNodeId".into()), CborValue::ByteString(self.parent_responder_node_id.to_vec())),
-            (CborValue::TextString("parentQueryHash".into()), CborValue::ByteString(self.parent_query_hash.to_vec())),
-            (CborValue::TextString("visitedNodes".into()), CborValue::Array(
-                self.visited_nodes.iter().map(|n| CborValue::ByteString(n.to_vec())).collect()
-            )),
-            (CborValue::TextString("parentSignature".into()), CborValue::ByteString(self.parent_signature.to_vec())),
+            (
+                CborValue::TextString("sourceNodeId".into()),
+                CborValue::ByteString(self.source_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("sourcePublicKey".into()),
+                CborValue::ByteString(self.source_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("queryId".into()),
+                CborValue::ByteString(self.query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("maxHops".into()),
+                CborValue::UnsignedInt(u64::from(self.max_hops)),
+            ),
+            (
+                CborValue::TextString("signature".into()),
+                CborValue::ByteString(self.signature.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentQueryId".into()),
+                CborValue::ByteString(self.parent_query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentResponderNodeId".into()),
+                CborValue::ByteString(self.parent_responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("parentQueryHash".into()),
+                CborValue::ByteString(self.parent_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("visitedNodes".into()),
+                CborValue::Array(
+                    self.visited_nodes
+                        .iter()
+                        .map(|n| CborValue::ByteString(n.to_vec()))
+                        .collect(),
+                ),
+            ),
+            (
+                CborValue::TextString("parentSignature".into()),
+                CborValue::ByteString(self.parent_signature.to_vec()),
+            ),
         ])
     }
 
@@ -1778,7 +2004,10 @@ impl ForwardedQuery {
             max_hops: u8::try_from(cbor_get_u64(cbor_map_get(map, "maxHops")?)?).ok()?,
             signature: cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?,
             parent_query_id: cbor_get_fixed_bytes(cbor_map_get(map, "parentQueryId")?)?,
-            parent_responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "parentResponderNodeId")?)?,
+            parent_responder_node_id: cbor_get_fixed_bytes(cbor_map_get(
+                map,
+                "parentResponderNodeId",
+            )?)?,
             parent_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "parentQueryHash")?)?,
             visited_nodes: cbor_get_byte_array(cbor_map_get(map, "visitedNodes")?)?,
             parent_signature: cbor_get_fixed_bytes(cbor_map_get(map, "parentSignature")?)?,
@@ -1790,7 +2019,8 @@ impl ForwardedQuery {
     /// used by `compute_hash()`.
     #[must_use]
     pub fn encode_cbor(&self) -> Vec<u8> {
-        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for canonical ForwardedQuery map")
+        snp_cbor::encode(&self.to_cbor_map())
+            .expect("CBOR encode never fails for canonical ForwardedQuery map")
     }
 
     /// **N2.2.1.** Decode a `ForwardedQuery` from canonical CBOR bytes.
@@ -1857,7 +2087,11 @@ impl ForwardedQuery {
         let mut msg = Vec::with_capacity(ROUTE_DISCOVERY_MSG_CONTEXT.len() + bytes.len());
         msg.extend_from_slice(ROUTE_DISCOVERY_MSG_CONTEXT);
         msg.extend_from_slice(&bytes);
-        ed25519_verify(&self.source_ed25519_public_key, &msg, &self.parent_signature)
+        ed25519_verify(
+            &self.source_ed25519_public_key,
+            &msg,
+            &self.parent_signature,
+        )
     }
 
     /// Verify both signatures (NextHopQuery + parent binding).
@@ -1990,15 +2224,42 @@ impl SignedResponseStep {
     /// The signature covers `ROUTE_DISCOVERY_MSG_CONTEXT ‖ CBOR(preimage())`.
     fn preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.responder_ed25519_public_key.to_vec())),
-            (CborValue::TextString("receivedQueryId".into()), CborValue::ByteString(self.received_query_id.to_vec())),
-            (CborValue::TextString("receivedQueryHash".into()), CborValue::ByteString(self.received_query_hash.to_vec())),
-            (CborValue::TextString("sentQueryHash".into()), CborValue::ByteString(self.sent_query_hash.to_vec())),
-            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
-            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
-            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
-            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("responderPublicKey".into()),
+                CborValue::ByteString(self.responder_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("receivedQueryId".into()),
+                CborValue::ByteString(self.received_query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("receivedQueryHash".into()),
+                CborValue::ByteString(self.received_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("sentQueryHash".into()),
+                CborValue::ByteString(self.sent_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationReached".into()),
+                CborValue::Bool(self.destination_reached),
+            ),
+            (
+                CborValue::TextString("nextHopNodeId".into()),
+                CborValue::ByteString(self.next_hop_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("remainingHopBudget".into()),
+                CborValue::UnsignedInt(u64::from(self.remaining_hop_budget)),
+            ),
+            (
+                CborValue::TextString("notFound".into()),
+                CborValue::Bool(self.not_found),
+            ),
         ])
     }
 
@@ -2093,16 +2354,46 @@ impl SignedResponseStep {
     #[must_use]
     pub fn to_cbor_map(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("responderNodeId".into()), CborValue::ByteString(self.responder_node_id.to_vec())),
-            (CborValue::TextString("responderPublicKey".into()), CborValue::ByteString(self.responder_ed25519_public_key.to_vec())),
-            (CborValue::TextString("receivedQueryId".into()), CborValue::ByteString(self.received_query_id.to_vec())),
-            (CborValue::TextString("receivedQueryHash".into()), CborValue::ByteString(self.received_query_hash.to_vec())),
-            (CborValue::TextString("sentQueryHash".into()), CborValue::ByteString(self.sent_query_hash.to_vec())),
-            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
-            (CborValue::TextString("nextHopNodeId".into()), CborValue::ByteString(self.next_hop_node_id.to_vec())),
-            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
-            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
-            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+            (
+                CborValue::TextString("responderNodeId".into()),
+                CborValue::ByteString(self.responder_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("responderPublicKey".into()),
+                CborValue::ByteString(self.responder_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("receivedQueryId".into()),
+                CborValue::ByteString(self.received_query_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("receivedQueryHash".into()),
+                CborValue::ByteString(self.received_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("sentQueryHash".into()),
+                CborValue::ByteString(self.sent_query_hash.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationReached".into()),
+                CborValue::Bool(self.destination_reached),
+            ),
+            (
+                CborValue::TextString("nextHopNodeId".into()),
+                CborValue::ByteString(self.next_hop_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("remainingHopBudget".into()),
+                CborValue::UnsignedInt(u64::from(self.remaining_hop_budget)),
+            ),
+            (
+                CborValue::TextString("notFound".into()),
+                CborValue::Bool(self.not_found),
+            ),
+            (
+                CborValue::TextString("signature".into()),
+                CborValue::ByteString(self.signature.to_vec()),
+            ),
         ])
     }
 
@@ -2116,13 +2407,20 @@ impl SignedResponseStep {
         let map = cbor_map_entries(value)?;
         Some(Self {
             responder_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "responderNodeId")?)?,
-            responder_ed25519_public_key: cbor_get_fixed_bytes(cbor_map_get(map, "responderPublicKey")?)?,
+            responder_ed25519_public_key: cbor_get_fixed_bytes(cbor_map_get(
+                map,
+                "responderPublicKey",
+            )?)?,
             received_query_id: cbor_get_fixed_bytes(cbor_map_get(map, "receivedQueryId")?)?,
             received_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "receivedQueryHash")?)?,
             sent_query_hash: cbor_get_fixed_bytes(cbor_map_get(map, "sentQueryHash")?)?,
             destination_reached: cbor_get_bool(cbor_map_get(map, "destinationReached")?)?,
             next_hop_node_id: cbor_get_fixed_bytes(cbor_map_get(map, "nextHopNodeId")?)?,
-            remaining_hop_budget: u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHopBudget")?)?).ok()?,
+            remaining_hop_budget: u8::try_from(cbor_get_u64(cbor_map_get(
+                map,
+                "remainingHopBudget",
+            )?)?)
+            .ok()?,
             not_found: cbor_get_bool(cbor_map_get(map, "notFound")?)?,
             signature: cbor_get_fixed_bytes(cbor_map_get(map, "signature")?)?,
         })
@@ -2131,7 +2429,8 @@ impl SignedResponseStep {
     /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
     #[must_use]
     pub fn encode_cbor(&self) -> Vec<u8> {
-        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for SignedResponseStep")
+        snp_cbor::encode(&self.to_cbor_map())
+            .expect("CBOR encode never fails for SignedResponseStep")
     }
 
     /// **N2.2.1.** Decode from canonical CBOR bytes.
@@ -2320,26 +2619,56 @@ impl RecursiveRouteResponse {
             None => CborValue::Array(Vec::new()),
         };
         CborValue::Map(vec![
-            (CborValue::TextString("destinationNodeId".into()), CborValue::ByteString(self.destination_node_id.to_vec())),
-            (CborValue::TextString("destinationReached".into()), CborValue::Bool(self.destination_reached)),
-            (CborValue::TextString("destinationAdvertisement".into()), destination_advert_cbor),
+            (
+                CborValue::TextString("destinationNodeId".into()),
+                CborValue::ByteString(self.destination_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("destinationReached".into()),
+                CborValue::Bool(self.destination_reached),
+            ),
+            (
+                CborValue::TextString("destinationAdvertisement".into()),
+                destination_advert_cbor,
+            ),
             (
                 CborValue::TextString("accumulatedAssertions".into()),
-                CborValue::Array(self.accumulated_assertions.iter().map(|a| a.to_cbor_map()).collect()),
+                CborValue::Array(
+                    self.accumulated_assertions
+                        .iter()
+                        .map(|a| a.to_cbor_map())
+                        .collect(),
+                ),
             ),
             (
                 CborValue::TextString("accumulatedRecords".into()),
-                CborValue::Array(self.accumulated_records.iter().map(|r| r.advert().to_cbor_map()).collect()),
+                CborValue::Array(
+                    self.accumulated_records
+                        .iter()
+                        .map(|r| r.advert().to_cbor_map())
+                        .collect(),
+                ),
             ),
             (
                 CborValue::TextString("queryChain".into()),
                 CborValue::Array(self.query_chain.iter().map(|q| q.to_cbor_map()).collect()),
             ),
-            (CborValue::TextString("remainingHopBudget".into()), CborValue::UnsignedInt(u64::from(self.remaining_hop_budget))),
-            (CborValue::TextString("notFound".into()), CborValue::Bool(self.not_found)),
+            (
+                CborValue::TextString("remainingHopBudget".into()),
+                CborValue::UnsignedInt(u64::from(self.remaining_hop_budget)),
+            ),
+            (
+                CborValue::TextString("notFound".into()),
+                CborValue::Bool(self.not_found),
+            ),
             (
                 CborValue::TextString("responseSteps".into()),
-                CborValue::Array(self.response_steps.iter().map(|s| s.to_cbor_map()).collect()),
+                CborValue::Array(
+                    self.response_steps
+                        .iter()
+                        .map(|s| s.to_cbor_map())
+                        .collect(),
+                ),
             ),
         ])
     }
@@ -2399,7 +2728,8 @@ impl RecursiveRouteResponse {
         for item in chain_arr {
             query_chain.push(QueryStep::from_cbor_map(item)?);
         }
-        let remaining_hop_budget = u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHopBudget")?)?).ok()?;
+        let remaining_hop_budget =
+            u8::try_from(cbor_get_u64(cbor_map_get(map, "remainingHopBudget")?)?).ok()?;
         let not_found = cbor_get_bool(cbor_map_get(map, "notFound")?)?;
         // responseSteps: array of SignedResponseStep maps.
         let steps_arr = match cbor_map_get(map, "responseSteps")? {
@@ -2426,7 +2756,8 @@ impl RecursiveRouteResponse {
     /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
     #[must_use]
     pub fn encode_cbor(&self) -> Vec<u8> {
-        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for RecursiveRouteResponse")
+        snp_cbor::encode(&self.to_cbor_map())
+            .expect("CBOR encode never fails for RecursiveRouteResponse")
     }
 
     /// **N2.2.1.** Decode from canonical CBOR bytes.
@@ -2731,9 +3062,7 @@ impl DistributedRouteResolution {
         // 7. Every NodeAdvertisement is authenticated (NodeId ↔ Ed25519).
         for (i, record) in self.ordered_records.iter().enumerate() {
             if !record.descriptor.verify_node_id_consistency() {
-                return Err(DistributedRouteResolutionError::NodeRecordInconsistent {
-                    index: i,
-                });
+                return Err(DistributedRouteResolutionError::NodeRecordInconsistent { index: i });
             }
             // 7b. Record's NodeId matches the corresponding node in the chain.
             let expected_node_id = self.ordered_node_ids.get(i + 1).copied();
@@ -2781,31 +3110,40 @@ impl DistributedRouteResolution {
         //      `received_query_hash` is coherent (each step's
         //      `sent_query_hash` equals the next step's
         //      `received_query_hash`, or is all-zeros for the terminal step).
-        let expected_steps = self.ordered_assertions.len().checked_add(1).expect("step count fits in usize");
+        let expected_steps = self
+            .ordered_assertions
+            .len()
+            .checked_add(1)
+            .expect("step count fits in usize");
         if self.response_steps.len() != expected_steps {
-            return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                index: 0,
-                reason: format!(
-                    "expected {} response steps (assertions + 1 terminal), got {}",
-                    expected_steps,
-                    self.response_steps.len()
-                ),
-            });
+            return Err(
+                DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                    index: 0,
+                    reason: format!(
+                        "expected {} response steps (assertions + 1 terminal), got {}",
+                        expected_steps,
+                        self.response_steps.len()
+                    ),
+                },
+            );
         }
         for (i, step) in self.response_steps.iter().enumerate() {
             // 7c-1. Verify the step's signature + I4 consistency.
             if !step.verify_signature() {
-                return Err(DistributedRouteResolutionError::ResponseStepSignatureInvalid {
-                    index: i,
-                });
+                return Err(
+                    DistributedRouteResolutionError::ResponseStepSignatureInvalid { index: i },
+                );
             }
 
             // 7c-5. received_query_hash must be non-zero (binds to a real query).
             if step.received_query_hash == [0u8; 32] {
-                return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                    index: i,
-                    reason: "received_query_hash is all-zero (must bind to a real query)".to_string(),
-                });
+                return Err(
+                    DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: "received_query_hash is all-zero (must bind to a real query)"
+                            .to_string(),
+                    },
+                );
             }
 
             // 7c-6. received_query_id matches the corresponding query_chain step.
@@ -2814,16 +3152,15 @@ impl DistributedRouteResolution {
             // query the i-th responder received).
             let expected_query_id = self.query_chain.get(i).map(|qs| qs.query_id);
             if expected_query_id != Some(step.received_query_id) {
-                return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                    index: i,
-                    reason: format!(
-                        "step {} received_query_id {:?} != query_chain[{}].query_id {:?}",
-                        i,
-                        step.received_query_id,
-                        i,
-                        expected_query_id
-                    ),
-                });
+                return Err(
+                    DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                        index: i,
+                        reason: format!(
+                            "step {} received_query_id {:?} != query_chain[{}].query_id {:?}",
+                            i, step.received_query_id, i, expected_query_id
+                        ),
+                    },
+                );
             }
 
             // 7c-7. Chain coherence: step[i].sent_query_hash == step[i+1].received_query_hash
@@ -2831,33 +3168,39 @@ impl DistributedRouteResolution {
             if i + 1 < self.response_steps.len() {
                 let next_step = &self.response_steps[i + 1];
                 if step.sent_query_hash != next_step.received_query_hash {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "step {} sent_query_hash {:?} != step {} received_query_hash {:?}",
-                            i,
-                            step.sent_query_hash,
-                            i + 1,
-                            next_step.received_query_hash
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "step {} sent_query_hash {:?} != step {} received_query_hash {:?}",
+                                i,
+                                step.sent_query_hash,
+                                i + 1,
+                                next_step.received_query_hash
+                            ),
+                        },
+                    );
                 }
                 if step.sent_query_hash == [0u8; 32] {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "non-terminal step {} has all-zero sent_query_hash (must forward)",
-                            i
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "non-terminal step {} has all-zero sent_query_hash (must forward)",
+                                i
+                            ),
+                        },
+                    );
                 }
             } else {
                 // Terminal step (last in the chain) — sent_query_hash MUST be all-zero.
                 if step.sent_query_hash != [0u8; 32] {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: "terminal step's sent_query_hash must be all-zero".to_string(),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: "terminal step's sent_query_hash must be all-zero".to_string(),
+                        },
+                    );
                 }
             }
 
@@ -2868,77 +3211,87 @@ impl DistributedRouteResolution {
             if i < self.ordered_assertions.len() {
                 let assertion = &self.ordered_assertions[i];
                 if step.responder_node_id != assertion.responder_node_id {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "step {} responder {:?} != assertion responder {:?}",
-                            i,
-                            step.responder_node_id,
-                            assertion.responder_node_id
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "step {} responder {:?} != assertion responder {:?}",
+                                i, step.responder_node_id, assertion.responder_node_id
+                            ),
+                        },
+                    );
                 }
                 if step.destination_reached != assertion.is_destination {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "step {} destination_reached {} != assertion is_destination {}",
-                            i,
-                            step.destination_reached,
-                            assertion.is_destination
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "step {} destination_reached {} != assertion is_destination {}",
+                                i, step.destination_reached, assertion.is_destination
+                            ),
+                        },
+                    );
                 }
                 if step.next_hop_node_id != assertion.next_hop_node_id {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "step {} next_hop {:?} != assertion next_hop {:?}",
-                            i,
-                            step.next_hop_node_id,
-                            assertion.next_hop_node_id
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "step {} next_hop {:?} != assertion next_hop {:?}",
+                                i, step.next_hop_node_id, assertion.next_hop_node_id
+                            ),
+                        },
+                    );
                 }
                 if step.not_found {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "non-terminal step {} has not_found=true (must be false)",
-                            i
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "non-terminal step {} has not_found=true (must be false)",
+                                i
+                            ),
+                        },
+                    );
                 }
             } else {
                 // Terminal step (destination reached) — check specific terminal fields.
                 if !step.destination_reached {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: "terminal step must have destination_reached=true".to_string(),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: "terminal step must have destination_reached=true".to_string(),
+                        },
+                    );
                 }
                 if step.next_hop_node_id != [0u8; 32] {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: "terminal step's next_hop_node_id must be all-zero".to_string(),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: "terminal step's next_hop_node_id must be all-zero".to_string(),
+                        },
+                    );
                 }
                 if step.not_found {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: "terminal step has not_found=true (resolution succeeded)".to_string(),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: "terminal step has not_found=true (resolution succeeded)"
+                                .to_string(),
+                        },
+                    );
                 }
                 // The terminal step's responder is the destination.
                 if step.responder_node_id != self.destination {
-                    return Err(DistributedRouteResolutionError::ResponseStepChainIncoherent {
-                        index: i,
-                        reason: format!(
-                            "terminal step responder {:?} != destination {:?}",
-                            step.responder_node_id,
-                            self.destination
-                        ),
-                    });
+                    return Err(
+                        DistributedRouteResolutionError::ResponseStepChainIncoherent {
+                            index: i,
+                            reason: format!(
+                                "terminal step responder {:?} != destination {:?}",
+                                step.responder_node_id, self.destination
+                            ),
+                        },
+                    );
                 }
             }
         }
@@ -2967,29 +3320,29 @@ impl DistributedRouteResolution {
                     index: i,
                 });
             }
-            let expected_responder = self
-                .ordered_node_ids
-                .get(i + 1)
-                .copied();
+            let expected_responder = self.ordered_node_ids.get(i + 1).copied();
             if expected_responder != Some(assertion.responder_node_id) {
                 return Err(DistributedRouteResolutionError::HopOrderIncoherent {
                     index: i,
                     reason: format!(
                         "assertion {} responder {:?} != chain[{}] {:?}",
-                        i, assertion.responder_node_id, i + 1, expected_responder
+                        i,
+                        assertion.responder_node_id,
+                        i + 1,
+                        expected_responder
                     ),
                 });
             }
-            let expected_next_hop = self
-                .ordered_node_ids
-                .get(i + 2)
-                .copied();
+            let expected_next_hop = self.ordered_node_ids.get(i + 2).copied();
             if expected_next_hop != Some(assertion.next_hop_node_id) {
                 return Err(DistributedRouteResolutionError::HopOrderIncoherent {
                     index: i,
                     reason: format!(
                         "assertion {} next_hop {:?} != chain[{}] {:?}",
-                        i, assertion.next_hop_node_id, i + 2, expected_next_hop
+                        i,
+                        assertion.next_hop_node_id,
+                        i + 2,
+                        expected_next_hop
                     ),
                 });
             }
@@ -3000,7 +3353,10 @@ impl DistributedRouteResolution {
                         index: i,
                         reason: format!(
                             "assertion {} next_hop {:?} != record[{}].node_id() {:?}",
-                            i, assertion.next_hop_node_id, i + 1, next_record.node_id()
+                            i,
+                            assertion.next_hop_node_id,
+                            i + 1,
+                            next_record.node_id()
                         ),
                     });
                 }
@@ -3081,18 +3437,14 @@ impl DistributedRouteResolution {
                 continue;
             }
             if record.descriptor.circuit_x25519_pub().is_some() {
-                return Err(DistributedRouteResolutionError::RelayHasCircuitKey {
-                    index: i,
-                });
+                return Err(DistributedRouteResolutionError::RelayHasCircuitKey { index: i });
             }
         }
 
         // 13. Each hop has at least one endpoint.
         for (i, record) in self.ordered_records.iter().enumerate() {
             if record.endpoints.is_empty() {
-                return Err(DistributedRouteResolutionError::HopMissingEndpoint {
-                    index: i,
-                });
+                return Err(DistributedRouteResolutionError::HopMissingEndpoint { index: i });
             }
         }
 
@@ -3128,10 +3480,7 @@ impl DistributedRouteResolution {
         // 2. Construct RouteHop entries.
         let mut hop_details = Vec::with_capacity(self.ordered_records.len());
         for record in &self.ordered_records {
-            let hop = RouteHop::with_endpoints(
-                record.descriptor.clone(),
-                record.endpoints.clone(),
-            );
+            let hop = RouteHop::with_endpoints(record.descriptor.clone(), record.endpoints.clone());
             hop_details.push(hop);
         }
 
@@ -3251,9 +3600,9 @@ impl<'a> NextHopResolver<'a> {
             self.local_node_id,
             *destination,
             initial_budget,
-            [0u8; 16],           // parent_query_id (none)
-            [0u8; 32],           // parent_responder_node_id (none)
-            [0u8; 32],           // parent_query_hash (none — initial query)
+            [0u8; 16],                // parent_query_id (none)
+            [0u8; 32],                // parent_responder_node_id (none)
+            [0u8; 32],                // parent_query_hash (none — initial query)
             vec![self.local_node_id], // visited_nodes = [A]
         );
 
@@ -3326,8 +3675,7 @@ impl<'a> NextHopResolver<'a> {
         ordered_records.extend(response.accumulated_records.iter().cloned());
 
         // Assemble ordered_node_ids: [A, first_hop, ...accumulated_records.node_ids].
-        let mut ordered_node_ids: Vec<[u8; 32]> =
-            Vec::with_capacity(ordered_records.len() + 1);
+        let mut ordered_node_ids: Vec<[u8; 32]> = Vec::with_capacity(ordered_records.len() + 1);
         ordered_node_ids.push(self.local_node_id);
         ordered_node_ids.push(first_hop);
         for record in &response.accumulated_records {
@@ -3337,8 +3685,7 @@ impl<'a> NextHopResolver<'a> {
         // 6. Assemble the query_chain.
         //    The response's query_chain has steps for B→C, C→G, etc.
         //    A prepends its own step (A→B) at the front.
-        let mut query_chain: Vec<QueryStep> =
-            Vec::with_capacity(response.query_chain.len() + 1);
+        let mut query_chain: Vec<QueryStep> = Vec::with_capacity(response.query_chain.len() + 1);
         query_chain.push(QueryStep {
             source_node_id: self.local_node_id,
             responder_node_id: first_hop,
@@ -3354,8 +3701,8 @@ impl<'a> NextHopResolver<'a> {
         //    The response carries the budget at the destination.
         //    Verify it matches initial - num_hops.
         let num_hops = ordered_node_ids.len() - 1;
-        let expected_remaining = initial_budget
-            .saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
+        let expected_remaining =
+            initial_budget.saturating_sub(u8::try_from(num_hops).unwrap_or(u8::MAX));
         // Use the response's remaining_hop_budget if it matches; otherwise
         // compute from the chain length (defensive).
         let remaining_hop_budget = if response.remaining_hop_budget == expected_remaining {
@@ -3632,14 +3979,14 @@ impl ForwardingNode {
             let terminal_step = SignedResponseStep::create_and_sign(
                 &self.ed25519_secret,
                 &self.ed25519_public,
-                self.node_id,                       // responder (us — the destination)
-                query.query_id,                     // received_query_id
-                received_query_hash,                // received_query_hash
-                [0u8; 32],                          // sent_query_hash (terminal — no child)
-                true,                               // destination_reached
-                [0u8; 32],                          // next_hop_node_id (terminal — no next hop)
-                query.max_hops.saturating_sub(1),   // remaining_hop_budget after this step
-                false,                              // not_found
+                self.node_id,                     // responder (us — the destination)
+                query.query_id,                   // received_query_id
+                received_query_hash,              // received_query_hash
+                [0u8; 32],                        // sent_query_hash (terminal — no child)
+                true,                             // destination_reached
+                [0u8; 32],                        // next_hop_node_id (terminal — no next hop)
+                query.max_hops.saturating_sub(1), // remaining_hop_budget after this step
+                false,                            // not_found
             );
             return Some(RecursiveRouteResponse {
                 destination_node_id: query.destination_node_id,
@@ -3668,14 +4015,14 @@ impl ForwardingNode {
             let not_found_step = SignedResponseStep::create_and_sign(
                 &self.ed25519_secret,
                 &self.ed25519_public,
-                self.node_id,           // responder (us — we can't forward)
-                query.query_id,         // received_query_id
-                received_query_hash,    // received_query_hash
-                [0u8; 32],              // sent_query_hash (terminal — no child)
-                false,                  // destination_reached
-                [0u8; 32],              // next_hop_node_id (no forward)
-                0,                      // remaining_hop_budget
-                true,                   // not_found
+                self.node_id,        // responder (us — we can't forward)
+                query.query_id,      // received_query_id
+                received_query_hash, // received_query_hash
+                [0u8; 32],           // sent_query_hash (terminal — no child)
+                false,               // destination_reached
+                [0u8; 32],           // next_hop_node_id (no forward)
+                0,                   // remaining_hop_budget
+                true,                // not_found
             );
             return Some(RecursiveRouteResponse {
                 destination_node_id: query.destination_node_id,
@@ -3691,10 +4038,7 @@ impl ForwardingNode {
         }
 
         // 6. Find the next hop toward the destination.
-        let next_hop_id = self.find_next_hop(
-            &query.destination_node_id,
-            &query.visited_nodes,
-        )?;
+        let next_hop_id = self.find_next_hop(&query.destination_node_id, &query.visited_nodes)?;
 
         // 7. Loop prevention — next hop must not be in visited_nodes.
         if query.has_visited(&next_hop_id) {
@@ -3725,9 +4069,9 @@ impl ForwardingNode {
             self.node_id,
             query.destination_node_id,
             query.max_hops - 1,
-            query.query_id,        // parent_query_id (the query we received)
-            self.node_id,          // parent_responder_node_id (us — we're forwarding)
-            parent_query_hash,     // SHA-256 of the complete parent query
+            query.query_id,    // parent_query_id (the query we received)
+            self.node_id,      // parent_responder_node_id (us — we're forwarding)
+            parent_query_hash, // SHA-256 of the complete parent query
             new_visited,
         );
 
@@ -3768,7 +4112,7 @@ impl ForwardingNode {
         let our_assertion = RoutingAssertion::create_and_sign(
             &self.ed25519_secret,
             &self.ed25519_public,
-            self.node_id,                 // responder_node_id (us)
+            self.node_id, // responder_node_id (us)
             query.destination_node_id,
             next_hop_id,
             is_destination,
@@ -3778,12 +4122,15 @@ impl ForwardingNode {
         // 13. Prepend our assertion + record + query_step to the response.
         response.accumulated_assertions.insert(0, our_assertion);
         response.accumulated_records.insert(0, record);
-        response.query_chain.insert(0, QueryStep {
-            source_node_id: self.node_id,
-            responder_node_id: next_hop_id,
-            query_id: new_query.query_id,
-            remaining_hops: new_query.max_hops.saturating_sub(1),
-        });
+        response.query_chain.insert(
+            0,
+            QueryStep {
+                source_node_id: self.node_id,
+                responder_node_id: next_hop_id,
+                query_id: new_query.query_id,
+                remaining_hops: new_query.max_hops.saturating_sub(1),
+            },
+        );
 
         // 14. **N2.1.3.2-response-auth.** Prepend our SignedResponseStep.
         //     Bind our step to:
@@ -3807,14 +4154,14 @@ impl ForwardingNode {
         let our_step = SignedResponseStep::create_and_sign(
             &self.ed25519_secret,
             &self.ed25519_public,
-            self.node_id,                       // responder (us — the forwarder)
-            query.query_id,                     // received_query_id
-            received_query_hash,                // received_query_hash (query we received)
-            sent_query_hash,                    // sent_query_hash (child query we sent)
-            is_destination,                     // destination_reached (this step's claim — matches assertion)
-            next_hop_id,                        // next_hop_node_id (the node we forwarded to)
-            response.remaining_hop_budget,      // remaining_hop_budget (from child response)
-            false,                              // not_found (we successfully forwarded)
+            self.node_id,                  // responder (us — the forwarder)
+            query.query_id,                // received_query_id
+            received_query_hash,           // received_query_hash (query we received)
+            sent_query_hash,               // sent_query_hash (child query we sent)
+            is_destination, // destination_reached (this step's claim — matches assertion)
+            next_hop_id,    // next_hop_node_id (the node we forwarded to)
+            response.remaining_hop_budget, // remaining_hop_budget (from child response)
+            false,          // not_found (we successfully forwarded)
         );
         response.response_steps.insert(0, our_step);
 
@@ -3827,11 +4174,7 @@ impl ForwardingNode {
     /// 1. If the destination is a direct neighbor, return it.
     /// 2. Otherwise, return any neighbor not in `visited` (and not self).
     /// 3. If no suitable neighbor is found, return `None`.
-    fn find_next_hop(
-        &self,
-        destination: &[u8; 32],
-        visited: &[[u8; 32]],
-    ) -> Option<[u8; 32]> {
+    fn find_next_hop(&self, destination: &[u8; 32], visited: &[[u8; 32]]) -> Option<[u8; 32]> {
         // 1. If destination is a direct neighbor, return it.
         if self.neighbors.contains_key(destination) {
             return Some(*destination);

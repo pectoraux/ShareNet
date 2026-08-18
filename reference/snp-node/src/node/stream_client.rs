@@ -33,27 +33,27 @@
 //!                              HalfClose/Close/Reset → state
 //! ```
 
-use std::collections::VecDeque;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use snp_crypto::X25519PubKey;
+use snp_frames::{should_drop, Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_gateway::stream::{
     decode_stream_message, encode_stream_message, InternetEndpoint, StreamClose, StreamData,
     StreamDirection, StreamHalfClose, StreamId, StreamMessage, StreamOpen, StreamOpenAck,
     StreamReset, StreamResetReason, StreamState, StreamWindowUpdate, TransportProtocol,
     DEFAULT_RECEIVE_WINDOW, MAX_STREAM_DATA_PAYLOAD, MAX_STREAM_WINDOW,
 };
-use snp_frames::{should_drop, Frame, FRAME_TTL_MAX, FRAME_VERSION};
 use snp_link::async_link::{perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError};
 use snp_link::{
     decrypt_circuit_payload, encrypt_circuit_payload, seal_circuit_payload_with_fresh_eph,
     CircuitKeys,
 };
-use tokio::sync::{Mutex, Notify};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, Notify};
 
 use super::{
     now_unix, random_fid, random_req_id, Node, NodeError, NodeIdentity, NodeResult, Route,
@@ -338,8 +338,8 @@ impl StreamHandle {
 
         let link = Arc::new(link);
 
-        let open_cbor = encode_stream_message(&open_msg)
-            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+        let open_cbor =
+            encode_stream_message(&open_msg).map_err(|e| StreamError::Cbor(e.to_string()))?;
         let (circuit_keys, _client_eph_pub, sealed_body) =
             seal_circuit_payload_with_fresh_eph(&gateway_x25519_pub, &open_cbor);
 
@@ -366,10 +366,11 @@ impl StreamHandle {
         // Validate outer frame.
         validate_frame(&resp_frame, &gateway_node_id, &client_node_id, &fid)?;
 
-        let plaintext = decrypt_circuit_payload(&circuit_keys.recv_key, &resp_frame.body)
-            .ok_or(StreamError::Circuit("StreamOpenAck decryption failed".into()))?;
-        let resp_msg = decode_stream_message(&plaintext)
-            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+        let plaintext = decrypt_circuit_payload(&circuit_keys.recv_key, &resp_frame.body).ok_or(
+            StreamError::Circuit("StreamOpenAck decryption failed".into()),
+        )?;
+        let resp_msg =
+            decode_stream_message(&plaintext).map_err(|e| StreamError::Cbor(e.to_string()))?;
 
         let send_credit = match resp_msg {
             StreamMessage::OpenAck(ack) => {
@@ -557,7 +558,8 @@ impl StreamHandle {
                 if let Some(data) = shared.pending_data.pop_front() {
                     // N2.3.9: Track consumed bytes for flow control.
                     shared.gateway_credit_consumed += data.len() as u64;
-                    shared.pending_data_total = shared.pending_data_total.saturating_sub(data.len() as u64);
+                    shared.pending_data_total =
+                        shared.pending_data_total.saturating_sub(data.len() as u64);
                     Some(data)
                 } else if shared.state == StreamState::Closed {
                     return Ok(None);
@@ -725,7 +727,10 @@ impl StreamHandle {
         let cbor = encode_stream_message(msg).map_err(|e| StreamError::Cbor(e.to_string()))?;
         let sealed = encrypt_circuit_payload(&self.circuit_keys.send_key, &cbor);
 
-        let seq = self.frame_seq.allocate().await
+        let seq = self
+            .frame_seq
+            .allocate()
+            .await
             .ok_or(StreamError::Circuit("frame sequence exhausted".into()))?;
 
         let frame = Frame {
@@ -985,10 +990,8 @@ pub trait CircuitStream: Send + Sync {
     ///
     /// # Errors
     /// Returns [`StreamError`] if the stream cannot be opened.
-    async fn open_stream(
-        &self,
-        destination: InternetEndpoint,
-    ) -> Result<StreamHandle, StreamError>;
+    async fn open_stream(&self, destination: InternetEndpoint)
+        -> Result<StreamHandle, StreamError>;
 }
 
 #[cfg(test)]
@@ -1122,7 +1125,7 @@ mod tests {
     async fn window_update_replenishes_send_credit() {
         // Test that a WindowUpdate message replenishes send_credit and
         // notifies the send() path.
-        
+
         let shared = Arc::new(Mutex::new(StreamShared {
             state: StreamState::Established,
             send_credit: 0,
@@ -1139,10 +1142,7 @@ mod tests {
         // Simulate a WindowUpdate arriving.
         {
             let mut s = shared.lock().await;
-            s.send_credit = s
-                .send_credit
-                .saturating_add(4096)
-                .min(MAX_STREAM_WINDOW);
+            s.send_credit = s.send_credit.saturating_add(4096).min(MAX_STREAM_WINDOW);
             s.credit_notify.notify_one();
         }
 
@@ -1154,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn half_close_transitions_state() {
         // Test that HalfClosedLocal → Closed when HalfClosedRemote arrives.
-        
+
         let shared = Arc::new(Mutex::new(StreamShared {
             state: StreamState::HalfClosedLocal,
             send_credit: 0,
@@ -1182,7 +1182,6 @@ mod tests {
 
     #[tokio::test]
     async fn reset_terminates_stream() {
-        
         let shared = Arc::new(Mutex::new(StreamShared {
             state: StreamState::Established,
             send_credit: 100,
@@ -1345,11 +1344,16 @@ impl MultiplexedCircuit {
             .await
             .map_err(|e| StreamError::Circuit(format!("relay connect: {e}")))?;
         let handshake = perform_snp_ik_handshake_async(
-            &mut stream, true,
-            &node.identity.secret_key, &node.identity.public_key,
-            client_x25519_secret, client_x25519_public,
+            &mut stream,
+            true,
+            &node.identity.secret_key,
+            &node.identity.public_key,
+            client_x25519_secret,
+            client_x25519_public,
             Some(&relay_node_id),
-        ).await.map_err(|e| StreamError::Circuit(format!("SNP-IK: {e}")))?;
+        )
+        .await
+        .map_err(|e| StreamError::Circuit(format!("SNP-IK: {e}")))?;
         if handshake.peer_node_id != relay_node_id {
             return Err(StreamError::Circuit("relay identity substitution".into()));
         }
@@ -1445,13 +1449,16 @@ impl MultiplexedCircuit {
             initial_receive_window: DEFAULT_RECEIVE_WINDOW,
             version: 0,
         });
-        let open_cbor = encode_stream_message(&open_msg)
-            .map_err(|e| StreamError::Cbor(e.to_string()))?;
+        let open_cbor =
+            encode_stream_message(&open_msg).map_err(|e| StreamError::Cbor(e.to_string()))?;
 
         // Send the StreamOpen. If this is the first stream, use
         // seal_circuit_payload_with_fresh_eph to establish the circuit keys.
         // Otherwise, use encrypt_circuit_payload with the existing keys.
-        let frame_seq = self.frame_seq.allocate().await
+        let frame_seq = self
+            .frame_seq
+            .allocate()
+            .await
             .ok_or(StreamError::Circuit("frame sequence exhausted".into()))?;
 
         // Create shared state for this stream BEFORE sending the open.
@@ -1472,7 +1479,10 @@ impl MultiplexedCircuit {
 
         // Register in the streams map BEFORE sending (so the background reader
         // can dispatch the OpenAck when it arrives).
-        self.streams.lock().await.insert(stream_id, Arc::clone(&shared));
+        self.streams
+            .lock()
+            .await
+            .insert(stream_id, Arc::clone(&shared));
 
         // Check if circuit keys have been established.
         let keys_established = self.circuit_keys.send_key != [0u8; 32];
@@ -1480,10 +1490,7 @@ impl MultiplexedCircuit {
         let sealed_body = if !keys_established {
             // First stream — establish circuit keys.
             let (keys, _eph_pub, sealed) =
-                seal_circuit_payload_with_fresh_eph(
-                    &self.gateway_x25519_pub,
-                    &open_cbor,
-                );
+                seal_circuit_payload_with_fresh_eph(&self.gateway_x25519_pub, &open_cbor);
             self.circuit_keys = keys;
             sealed
         } else {
@@ -1516,17 +1523,25 @@ impl MultiplexedCircuit {
         // so we call recv_frame() directly.
         let send_credit = if self.reader_handle.is_none() {
             // First stream — no background reader yet. Receive directly.
-            let resp_frame = self.link
+            let resp_frame = self
+                .link
                 .recv_frame()
                 .await
                 .map_err(|e| StreamError::Circuit(format!("recv StreamOpenAck: {e}")))?;
 
-            validate_frame(&resp_frame, &self.gateway_node_id, &self.client_node_id, &self.fid)?;
+            validate_frame(
+                &resp_frame,
+                &self.gateway_node_id,
+                &self.client_node_id,
+                &self.fid,
+            )?;
 
             let plaintext = decrypt_circuit_payload(&self.circuit_keys.recv_key, &resp_frame.body)
-                .ok_or(StreamError::Circuit("StreamOpenAck decryption failed".into()))?;
-            let resp_msg = decode_stream_message(&plaintext)
-                .map_err(|e| StreamError::Cbor(e.to_string()))?;
+                .ok_or(StreamError::Circuit(
+                    "StreamOpenAck decryption failed".into(),
+                ))?;
+            let resp_msg =
+                decode_stream_message(&plaintext).map_err(|e| StreamError::Cbor(e.to_string()))?;
 
             match resp_msg {
                 StreamMessage::OpenAck(ack) => {
@@ -1594,9 +1609,13 @@ impl MultiplexedCircuit {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 if tokio::time::Instant::now() > deadline {
-                    return Err(StreamError::Circuit("timeout waiting for StreamOpenAck".into()));
+                    return Err(StreamError::Circuit(
+                        "timeout waiting for StreamOpenAck".into(),
+                    ));
                 }
-                tokio::time::timeout(Duration::from_secs(1), notify.notified()).await.ok();
+                tokio::time::timeout(Duration::from_secs(1), notify.notified())
+                    .await
+                    .ok();
                 let s = shared.lock().await;
                 if s.state == StreamState::Established {
                     break s.send_credit;

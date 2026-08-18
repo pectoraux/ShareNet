@@ -68,7 +68,10 @@ pub struct AsyncTcpConnection {
 impl AsyncTcpConnection {
     /// Create from an existing TcpStream.
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream, alive: true }
+        Self {
+            stream,
+            alive: true,
+        }
     }
 
     /// Send raw bytes asynchronously.
@@ -76,22 +79,18 @@ impl AsyncTcpConnection {
         if !self.alive {
             return Err(AsyncTransportError::Closed);
         }
-        self.stream
-            .write_all(data)
-            .await
-            .map_err(|e| {
-                self.alive = false;
-                AsyncTransportError::Io(e.to_string())
-            })?;
+        self.stream.write_all(data).await.map_err(|e| {
+            self.alive = false;
+            AsyncTransportError::Io(e.to_string())
+        })?;
         self.stream.flush().await.ok();
         Ok(())
     }
 
     /// Send a length-prefixed message (4-byte big-endian length + payload).
     pub async fn send_framed(&mut self, data: &[u8]) -> Result<(), AsyncTransportError> {
-        let len = u32::try_from(data.len()).map_err(|_| {
-            AsyncTransportError::Io("frame too large".to_string())
-        })?;
+        let len = u32::try_from(data.len())
+            .map_err(|_| AsyncTransportError::Io("frame too large".to_string()))?;
         self.send(&len.to_be_bytes()).await?;
         self.send(data).await
     }
@@ -99,29 +98,23 @@ impl AsyncTcpConnection {
     /// Receive a length-prefixed message.
     pub async fn recv_framed(&mut self) -> Result<Vec<u8>, AsyncTransportError> {
         let mut len_buf = [0u8; 4];
-        self.stream
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| {
-                self.alive = false;
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    AsyncTransportError::Closed
-                } else {
-                    AsyncTransportError::Io(e.to_string())
-                }
-            })?;
+        self.stream.read_exact(&mut len_buf).await.map_err(|e| {
+            self.alive = false;
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                AsyncTransportError::Closed
+            } else {
+                AsyncTransportError::Io(e.to_string())
+            }
+        })?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > 16 * 1024 * 1024 {
             return Err(AsyncTransportError::Io("frame too large".to_string()));
         }
         let mut buf = vec![0u8; len];
-        self.stream
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| {
-                self.alive = false;
-                AsyncTransportError::Io(e.to_string())
-            })?;
+        self.stream.read_exact(&mut buf).await.map_err(|e| {
+            self.alive = false;
+            AsyncTransportError::Io(e.to_string())
+        })?;
         Ok(buf)
     }
 
@@ -221,25 +214,31 @@ where
     loop {
         // Read 4-byte length prefix
         let mut len_buf = [0u8; 4];
-        read.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    AsyncTransportError::Closed
-                } else {
-                    AsyncTransportError::Io(e.to_string())
-                }
-            })?;
+        read.read_exact(&mut len_buf).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                AsyncTransportError::Closed
+            } else {
+                AsyncTransportError::Io(e.to_string())
+            }
+        })?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > 16 * 1024 * 1024 {
             return Err(AsyncTransportError::Io("frame too large".to_string()));
         }
         // Read payload
         let mut buf = vec![0u8; len];
-        read.read_exact(&mut buf).await.map_err(|e| AsyncTransportError::Io(e.to_string()))?;
+        read.read_exact(&mut buf)
+            .await
+            .map_err(|e| AsyncTransportError::Io(e.to_string()))?;
         // Write length prefix + payload
-        write.write_all(&len_buf).await.map_err(|e| AsyncTransportError::Io(e.to_string()))?;
-        write.write_all(&buf).await.map_err(|e| AsyncTransportError::Io(e.to_string()))?;
+        write
+            .write_all(&len_buf)
+            .await
+            .map_err(|e| AsyncTransportError::Io(e.to_string()))?;
+        write
+            .write_all(&buf)
+            .await
+            .map_err(|e| AsyncTransportError::Io(e.to_string()))?;
         write.flush().await.ok();
     }
 }
@@ -323,10 +322,7 @@ mod tests {
         // Start relay: accept client, connect to gateway, forward
         let relay_handle = tokio::spawn(async move {
             let client = relay_listener.accept().await.unwrap();
-            let gateway = AsyncTcpTransportProvider
-                .connect(&gw_addr)
-                .await
-                .unwrap();
+            let gateway = AsyncTcpTransportProvider.connect(&gw_addr).await.unwrap();
             async_relay_forward(client, gateway).await
         });
 

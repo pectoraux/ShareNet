@@ -238,7 +238,11 @@ impl GatewayStreamTable {
 
         // 3. Validate the port. (Skipped when allow_loopback — TEST ONLY.)
         if !self.allow_loopback {
-            let scheme = if endpoint.port == 443 { "https" } else { "http" };
+            let scheme = if endpoint.port == 443 {
+                "https"
+            } else {
+                "http"
+            };
             if let Err(e) = validate_port(scheme, endpoint.port) {
                 return Ok(StreamOpenAck {
                     stream_id: open.stream_id,
@@ -251,40 +255,38 @@ impl GatewayStreamTable {
 
         // 4. Open a real TCP socket with connect timeout.
         let sock_addr = SocketAddr::new(endpoint.address, endpoint.port);
-        let tcp_socket = match tokio::time::timeout(
-            STREAM_CONNECT_TIMEOUT,
-            TokioTcpStream::connect(&sock_addr),
-        )
-        .await
-        {
-            Ok(Ok(socket)) => socket,
-            Ok(Err(e)) => {
-                // N2.3.9: Record TCP connect failure in metrics.
-                if let Some(m) = &self.metrics {
-                    m.tcp_connect_failure();
+        let tcp_socket =
+            match tokio::time::timeout(STREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&sock_addr))
+                .await
+            {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(e)) => {
+                    // N2.3.9: Record TCP connect failure in metrics.
+                    if let Some(m) = &self.metrics {
+                        m.tcp_connect_failure();
+                    }
+                    return Ok(StreamOpenAck {
+                        stream_id: open.stream_id,
+                        initial_receive_window: 0,
+                        connected: false,
+                        error: Some(format!("TCP connect to {sock_addr}: {e}")),
+                    });
                 }
-                return Ok(StreamOpenAck {
-                    stream_id: open.stream_id,
-                    initial_receive_window: 0,
-                    connected: false,
-                    error: Some(format!("TCP connect to {sock_addr}: {e}")),
-                });
-            }
-            Err(_) => {
-                // N2.3.9: Record TCP connect failure (timeout) in metrics.
-                if let Some(m) = &self.metrics {
-                    m.tcp_connect_failure();
+                Err(_) => {
+                    // N2.3.9: Record TCP connect failure (timeout) in metrics.
+                    if let Some(m) = &self.metrics {
+                        m.tcp_connect_failure();
+                    }
+                    return Ok(StreamOpenAck {
+                        stream_id: open.stream_id,
+                        initial_receive_window: 0,
+                        connected: false,
+                        error: Some(format!(
+                            "TCP connect to {sock_addr} timed out after {STREAM_CONNECT_TIMEOUT:?}"
+                        )),
+                    });
                 }
-                return Ok(StreamOpenAck {
-                    stream_id: open.stream_id,
-                    initial_receive_window: 0,
-                    connected: false,
-                    error: Some(format!(
-                        "TCP connect to {sock_addr} timed out after {STREAM_CONNECT_TIMEOUT:?}"
-                    )),
-                });
-            }
-        };
+            };
 
         // 5. Split the socket into read/write halves with independent locks.
         let (read_half, write_half) = tcp_socket.into_split();
@@ -341,22 +343,16 @@ impl GatewayStreamTable {
     /// `WindowUpdate` — the writer task sends it after the TCP write succeeds.
     ///
     /// Returns the new `client_credit` (bytes the client can still send).
-    pub async fn handle_stream_data(
-        &self,
-        data: StreamData,
-    ) -> Result<u64, GatewayError> {
+    pub async fn handle_stream_data(&self, data: StreamData) -> Result<u64, GatewayError> {
         // Look up the stream (table lock held briefly).
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&data.stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "StreamData for unknown stream_id {}",
-                        data.stream_id
-                    ))
-                })?
+            streams.get(&data.stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "StreamData for unknown stream_id {}",
+                    data.stream_id
+                ))
+            })?
         };
 
         // Validate direction and sequence (shared state lock — brief).
@@ -437,14 +433,11 @@ impl GatewayStreamTable {
     ) -> Result<(), GatewayError> {
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "set_write_channel: unknown stream_id {stream_id}"
-                    ))
-                })?
+            streams.get(&stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "set_write_channel: unknown stream_id {stream_id}"
+                ))
+            })?
         };
         let mut tx_guard = stream.write_tx.lock().await;
         *tx_guard = Some(tx);
@@ -470,15 +463,12 @@ impl GatewayStreamTable {
     ) -> Result<(), GatewayError> {
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&update.stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "StreamWindowUpdate for unknown stream_id {}",
-                        update.stream_id
-                    ))
-                })?
+            streams.get(&update.stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "StreamWindowUpdate for unknown stream_id {}",
+                    update.stream_id
+                ))
+            })?
         };
 
         let mut shared = stream.state.lock().await;
@@ -575,21 +565,15 @@ impl GatewayStreamTable {
     }
 
     /// Process a `StreamHalfClose` — the client has no more data to send.
-    pub async fn handle_half_close(
-        &self,
-        hc: StreamHalfClose,
-    ) -> Result<(), GatewayError> {
+    pub async fn handle_half_close(&self, hc: StreamHalfClose) -> Result<(), GatewayError> {
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&hc.stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "StreamHalfClose for unknown stream_id {}",
-                        hc.stream_id
-                    ))
-                })?
+            streams.get(&hc.stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "StreamHalfClose for unknown stream_id {}",
+                    hc.stream_id
+                ))
+            })?
         };
 
         if hc.direction == StreamDirection::ClientToGateway {
@@ -685,11 +669,9 @@ impl GatewayStreamTable {
                 let ack = self.handle_stream_open(open).await?;
                 Ok(Some(ack))
             }
-            StreamMessage::OpenAck(_) => {
-                Err(GatewayError::MalformedRequest(
-                    "StreamOpenAck from client is invalid".into(),
-                ))
-            }
+            StreamMessage::OpenAck(_) => Err(GatewayError::MalformedRequest(
+                "StreamOpenAck from client is invalid".into(),
+            )),
             StreamMessage::Data(data) => {
                 self.handle_stream_data(data).await?;
                 Ok(None)
@@ -743,21 +725,14 @@ impl GatewayStreamTable {
     /// Used by the per-stream writer task. Acquires the `write_half` lock
     /// and calls `write_all`. Returns an error if the stream doesn't exist,
     /// is closed/reset, or the TCP write fails.
-    pub async fn write_to_tcp(
-        &self,
-        stream_id: StreamId,
-        data: &[u8],
-    ) -> Result<(), GatewayError> {
+    pub async fn write_to_tcp(&self, stream_id: StreamId, data: &[u8]) -> Result<(), GatewayError> {
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "write_to_tcp: unknown stream_id {stream_id}"
-                    ))
-                })?
+            streams.get(&stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "write_to_tcp: unknown stream_id {stream_id}"
+                ))
+            })?
         };
 
         // Check state — don't write to a closed/reset stream.
@@ -789,14 +764,11 @@ impl GatewayStreamTable {
     pub async fn shutdown_write(&self, stream_id: StreamId) -> Result<(), GatewayError> {
         let stream = {
             let streams = self.streams.lock().await;
-            streams
-                .get(&stream_id)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::MalformedRequest(format!(
-                        "shutdown_write: unknown stream_id {stream_id}"
-                    ))
-                })?
+            streams.get(&stream_id).cloned().ok_or_else(|| {
+                GatewayError::MalformedRequest(format!(
+                    "shutdown_write: unknown stream_id {stream_id}"
+                ))
+            })?
         };
         let mut write_guard = stream.write_half.lock().await;
         if let Some(write_half) = write_guard.as_mut() {
@@ -1200,7 +1172,10 @@ mod tests {
         assert!(!ack.connected, "5th stream must be rejected");
 
         // Remove a stream (frees the permit).
-        table.handle_close(StreamClose { stream_id: 0 }).await.unwrap();
+        table
+            .handle_close(StreamClose { stream_id: 0 })
+            .await
+            .unwrap();
 
         // Now a new stream should be allowed (permit freed).
         assert_eq!(

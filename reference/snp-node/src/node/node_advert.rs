@@ -183,16 +183,24 @@ impl NodeAdvertisement {
             .iter()
             .map(|c| CborValue::TextString(c.as_str().to_string()))
             .collect();
-        let endpoints: Vec<CborValue> = self
-            .endpoints
-            .iter()
-            .map(|e| e.canonical_cbor())
-            .collect();
+        let endpoints: Vec<CborValue> = self.endpoints.iter().map(|e| e.canonical_cbor()).collect();
         CborValue::Map(vec![
-            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.node_id.to_vec())),
-            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
-            (CborValue::TextString("capabilities".into()), CborValue::Array(caps)),
-            (CborValue::TextString("endpoints".into()), CborValue::Array(endpoints)),
+            (
+                CborValue::TextString("nodeId".into()),
+                CborValue::ByteString(self.node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("publicKey".into()),
+                CborValue::ByteString(self.ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("capabilities".into()),
+                CborValue::Array(caps),
+            ),
+            (
+                CborValue::TextString("endpoints".into()),
+                CborValue::Array(endpoints),
+            ),
             (
                 CborValue::TextString("x25519CircuitPub".into()),
                 match &self.x25519_circuit_public {
@@ -200,17 +208,30 @@ impl NodeAdvertisement {
                     None => CborValue::Null,
                 },
             ),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
-            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
-            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.sequence)),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("expiry".into()),
+                CborValue::UnsignedInt(self.expiry),
+            ),
+            (
+                CborValue::TextString("nonce".into()),
+                CborValue::ByteString(self.nonce.to_vec()),
+            ),
+            (
+                CborValue::TextString("sequence".into()),
+                CborValue::UnsignedInt(self.sequence),
+            ),
         ])
     }
 
     /// Sign this advertisement.
     pub fn sign(&mut self, ed25519_secret_key: &[u8; 32]) {
         let preimage = self.preimage();
-        let bytes = snp_cbor::encode(&preimage).expect("CBOR encode never fails for valid preimage");
+        let bytes =
+            snp_cbor::encode(&preimage).expect("CBOR encode never fails for valid preimage");
         let mut msg = Vec::with_capacity(sig_contexts::NODE_ADVERT.len() + bytes.len());
         msg.extend_from_slice(sig_contexts::NODE_ADVERT);
         msg.extend_from_slice(&bytes);
@@ -279,7 +300,9 @@ impl NodeAdvertisement {
             // Non-gateway MUST NOT have X25519 key.
             return None;
         }
-        Some(VerifiedNodeAdvertisement { advert: self.clone() })
+        Some(VerifiedNodeAdvertisement {
+            advert: self.clone(),
+        })
     }
 
     /// Check if this advertisement has expired.
@@ -308,16 +331,24 @@ impl NodeAdvertisement {
             .iter()
             .map(|c| CborValue::TextString(c.as_str().to_string()))
             .collect();
-        let endpoints: Vec<CborValue> = self
-            .endpoints
-            .iter()
-            .map(|e| e.canonical_cbor())
-            .collect();
+        let endpoints: Vec<CborValue> = self.endpoints.iter().map(|e| e.canonical_cbor()).collect();
         CborValue::Map(vec![
-            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.node_id.to_vec())),
-            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
-            (CborValue::TextString("capabilities".into()), CborValue::Array(caps)),
-            (CborValue::TextString("endpoints".into()), CborValue::Array(endpoints)),
+            (
+                CborValue::TextString("nodeId".into()),
+                CborValue::ByteString(self.node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("publicKey".into()),
+                CborValue::ByteString(self.ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("capabilities".into()),
+                CborValue::Array(caps),
+            ),
+            (
+                CborValue::TextString("endpoints".into()),
+                CborValue::Array(endpoints),
+            ),
             (
                 CborValue::TextString("x25519CircuitPub".into()),
                 match &self.x25519_circuit_public {
@@ -325,11 +356,26 @@ impl NodeAdvertisement {
                     None => CborValue::Null,
                 },
             ),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.expiry)),
-            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
-            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.sequence)),
-            (CborValue::TextString("signature".into()), CborValue::ByteString(self.signature.to_vec())),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("expiry".into()),
+                CborValue::UnsignedInt(self.expiry),
+            ),
+            (
+                CborValue::TextString("nonce".into()),
+                CborValue::ByteString(self.nonce.to_vec()),
+            ),
+            (
+                CborValue::TextString("sequence".into()),
+                CborValue::UnsignedInt(self.sequence),
+            ),
+            (
+                CborValue::TextString("signature".into()),
+                CborValue::ByteString(self.signature.to_vec()),
+            ),
         ])
     }
 
@@ -400,7 +446,8 @@ impl NodeAdvertisement {
     /// **N2.2.1.** Encode to canonical CBOR bytes for wire transmission.
     #[must_use]
     pub fn encode_cbor(&self) -> Vec<u8> {
-        snp_cbor::encode(&self.to_cbor_map()).expect("CBOR encode never fails for NodeAdvertisement")
+        snp_cbor::encode(&self.to_cbor_map())
+            .expect("CBOR encode never fails for NodeAdvertisement")
     }
 
     /// **N2.2.1.** Decode from canonical CBOR bytes. Returns `None` if the
@@ -890,31 +937,38 @@ impl AdvertisementAcceptanceStore {
 
         // Check minimum header size.
         if data.len() < HEADER_SIZE {
-            return Err(AcceptanceError::CorruptPersistence(
-                format!("file too short: {} bytes < {} header", data.len(), HEADER_SIZE),
-            ));
+            return Err(AcceptanceError::CorruptPersistence(format!(
+                "file too short: {} bytes < {} header",
+                data.len(),
+                HEADER_SIZE
+            )));
         }
 
         // Check magic.
         if &data[..4] != PERSIST_MAGIC {
-            return Err(AcceptanceError::CorruptPersistence(
-                format!("invalid magic: expected {:?}, got {:?}", PERSIST_MAGIC, &data[..4]),
-            ));
+            return Err(AcceptanceError::CorruptPersistence(format!(
+                "invalid magic: expected {:?}, got {:?}",
+                PERSIST_MAGIC,
+                &data[..4]
+            )));
         }
 
         // Check version.
         if data[4] != PERSIST_VERSION {
-            return Err(AcceptanceError::CorruptPersistence(
-                format!("unsupported version: expected {}, got {}", PERSIST_VERSION, data[4]),
-            ));
+            return Err(AcceptanceError::CorruptPersistence(format!(
+                "unsupported version: expected {}, got {}",
+                PERSIST_VERSION, data[4]
+            )));
         }
 
         // Check that remaining data is a multiple of ENTRY_SIZE (no trailing bytes).
         let entries_data = &data[HEADER_SIZE..];
         if entries_data.len() % ENTRY_SIZE != 0 {
-            return Err(AcceptanceError::CorruptPersistence(
-                format!("trailing bytes: {} bytes after header is not a multiple of {}", entries_data.len(), ENTRY_SIZE),
-            ));
+            return Err(AcceptanceError::CorruptPersistence(format!(
+                "trailing bytes: {} bytes after header is not a multiple of {}",
+                entries_data.len(),
+                ENTRY_SIZE
+            )));
         }
 
         // Parse entries. Fail on duplicates or identity inconsistency.
@@ -932,24 +986,29 @@ impl AdvertisementAcceptanceStore {
 
             // Check for duplicate NodeId.
             if !seen_node_ids.insert(node_id) {
-                return Err(AcceptanceError::CorruptPersistence(
-                    format!("duplicate NodeId entry at offset {}", offset - ENTRY_SIZE),
-                ));
+                return Err(AcceptanceError::CorruptPersistence(format!(
+                    "duplicate NodeId entry at offset {}",
+                    offset - ENTRY_SIZE
+                )));
             }
 
             // Verify NodeId ↔ Ed25519 consistency (I4).
             let expected_node_id = derive_node_id(&ed25519_pk);
             if node_id != expected_node_id {
-                return Err(AcceptanceError::CorruptPersistence(
-                    format!("NodeId↔Ed25519 inconsistency for entry at offset {}", offset - ENTRY_SIZE),
-                ));
+                return Err(AcceptanceError::CorruptPersistence(format!(
+                    "NodeId↔Ed25519 inconsistency for entry at offset {}",
+                    offset - ENTRY_SIZE
+                )));
             }
 
-            self.peers.insert(node_id, PeerAcceptanceState {
-                highest_accepted_sequence: sequence,
-                ed25519_public_key: ed25519_pk,
-                current_record: None,
-            });
+            self.peers.insert(
+                node_id,
+                PeerAcceptanceState {
+                    highest_accepted_sequence: sequence,
+                    ed25519_public_key: ed25519_pk,
+                    current_record: None,
+                },
+            );
         }
         Ok(())
     }
@@ -1043,7 +1102,14 @@ impl AdvertisementAcceptanceStore {
                 }
                 Ok(AcceptanceResult::Accepted(record))
             }
-            Some(_) if sequence == self.peers.get(&node_id).map(|s| s.highest_accepted_sequence).unwrap_or(0) => {
+            Some(_)
+                if sequence
+                    == self
+                        .peers
+                        .get(&node_id)
+                        .map(|s| s.highest_accepted_sequence)
+                        .unwrap_or(0) =>
+            {
                 // Duplicate — no state change, no persistence needed.
                 Ok(AcceptanceResult::Duplicate { sequence })
             }
@@ -1061,7 +1127,9 @@ impl AdvertisementAcceptanceStore {
     /// (and if not expired).
     #[must_use]
     pub fn get(&self, node_id: &[u8; 32]) -> Option<&AuthenticatedNodeRecord> {
-        self.peers.get(node_id).and_then(|s| s.current_record.as_ref())
+        self.peers
+            .get(node_id)
+            .and_then(|s| s.current_record.as_ref())
     }
 
     /// **N2.1.2.** Iterate over ALL current (non-expired) accepted records.
@@ -1263,7 +1331,9 @@ impl std::fmt::Display for SequenceStoreError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Corrupt(msg) => write!(f, "corrupt sequence store: {msg}"),
-            Self::SequenceExhausted => write!(f, "sequence exhausted: u64::MAX reached, cannot increment"),
+            Self::SequenceExhausted => {
+                write!(f, "sequence exhausted: u64::MAX reached, cannot increment")
+            }
         }
     }
 }
@@ -1298,25 +1368,32 @@ impl AdvertisementSequenceStore {
             // Check minimum size.
             if data.len() < SEQ_FILE_SIZE {
                 return Err(SequenceStoreError::Corrupt(format!(
-                    "file too short: {} bytes < {} expected", data.len(), SEQ_FILE_SIZE
+                    "file too short: {} bytes < {} expected",
+                    data.len(),
+                    SEQ_FILE_SIZE
                 )));
             }
             // Check magic.
             if &data[..4] != SEQ_MAGIC {
                 return Err(SequenceStoreError::Corrupt(format!(
-                    "invalid magic: expected {:?}, got {:?}", SEQ_MAGIC, &data[..4]
+                    "invalid magic: expected {:?}, got {:?}",
+                    SEQ_MAGIC,
+                    &data[..4]
                 )));
             }
             // Check version.
             if data[4] != SEQ_VERSION {
                 return Err(SequenceStoreError::Corrupt(format!(
-                    "unsupported version: expected {}, got {}", SEQ_VERSION, data[4]
+                    "unsupported version: expected {}, got {}",
+                    SEQ_VERSION, data[4]
                 )));
             }
             // Check for trailing bytes.
             if data.len() > SEQ_FILE_SIZE {
                 return Err(SequenceStoreError::Corrupt(format!(
-                    "trailing bytes: {} bytes > {} expected", data.len(), SEQ_FILE_SIZE
+                    "trailing bytes: {} bytes > {} expected",
+                    data.len(),
+                    SEQ_FILE_SIZE
                 )));
             }
             // Read the sequence.

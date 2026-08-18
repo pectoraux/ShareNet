@@ -89,49 +89,49 @@ use snp_gateway::{
     encode_transit_response, handle_transit_request_with_connector, sign_transit_request,
     verify_transit_response, PinnedConnector, TransitRequest, TransitResponse,
 };
-use snp_link::{
-    decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, LinkKeys,
-};
+use snp_link::{decrypt_circuit_payload, encrypt_circuit_payload, CircuitKeys, LinkKeys};
 
 use crate::{
-    client_circuit_keys_a, client_circuit_keys_b, client_public_key,
-    client_relay_a_link_keys, client_secret_key,
-    NodeError, NodeResult,
+    client_circuit_keys_a, client_circuit_keys_b, client_public_key, client_relay_a_link_keys,
+    client_secret_key, NodeError, NodeResult,
 };
 
 // ─── Submodules ─────────────────────────────────────────────────────────────
 
-pub mod route;
-pub mod discovery;
-pub mod transport;
-pub mod async_transport;
 pub mod async_node;
-pub mod identity;
+pub mod async_transport;
+pub mod circuit;
+pub mod descriptor;
+pub mod discovery;
 pub mod gateway;
 pub mod gateway_stream;
-pub mod stream_client;
-pub mod circuit;
-pub mod session;
-pub mod descriptor;
-pub mod node_advert;
+pub mod identity;
 pub mod link;
-pub mod topology_protocol;
+pub mod node_advert;
 pub mod peer_directory;
-pub mod topology;
-pub mod route_engine;
+pub mod route;
 pub mod route_discovery_protocol;
+pub mod route_engine;
+pub mod session;
+pub mod stream_client;
 pub mod tcp_route_transport;
+pub mod topology;
+pub mod topology_protocol;
+pub mod transport;
 pub mod transport_metrics;
 
 // Re-export key types from submodules for convenience
-pub use route::{Route, RouteState, RouteMetrics, RouteError, RouteHop};
-pub use discovery::{DiscoveredNode, DiscoveryProvider, StaticDiscovery, BootstrapDiscovery};
-pub use identity::{NodeIdentity, Capability};
-pub use gateway::GatewayAdvertisement;
 pub use circuit::{Circuit, PeerConnection, UpstreamPeer};
 pub use descriptor::{
     IdentityConsistentNodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
     VerifiedNodeDescriptor,
+};
+pub use discovery::{BootstrapDiscovery, DiscoveredNode, DiscoveryProvider, StaticDiscovery};
+pub use gateway::GatewayAdvertisement;
+pub use identity::{Capability, NodeIdentity};
+pub use link::{
+    AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
+    TransportType,
 };
 pub use node_advert::{
     AcceptanceError, AcceptanceResult, AdvertisementAcceptanceStore, AdvertisementSequenceStore,
@@ -139,21 +139,9 @@ pub use node_advert::{
     SequenceStoreError, VerifiedNodeAdvertisement, MAX_ADVERTISEMENT_LIFETIME_SECS,
     MAX_CLOCK_SKEW_SECS,
 };
-pub use link::{
-    AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
-    TransportType,
-};
-pub use topology_protocol::{
-    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,
-    MAX_DISTANCE_HINT, MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,
-};
 pub use peer_directory::PeerDirectory;
-pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
-pub use route_engine::{
-    CandidateOrigin, DestinationResolver, DistributedRouteDiscovery, HopCountCost,
-    InMemoryResolver, LowLatencyCost, NullResolver, RouteCandidate, RouteCandidateState,
-    RouteCostModel, RouteDiscoveryError, RouteEngine, DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
-};
+pub use route::RouteCommitment;
+pub use route::{Route, RouteError, RouteHop, RouteMetrics, RouteState};
 pub use route_discovery_protocol::{
     DistributedRouteResolution, DistributedRouteResolutionError, DistributedRouteResolver,
     ForwardedQuery, ForwardingNode, InMemoryNextHopTransport, InMemoryRecursiveTransport,
@@ -163,14 +151,22 @@ pub use route_discovery_protocol::{
     MAX_RESPONSE_HOPS, MAX_ROUTE_CLOCK_SKEW_SECS, MAX_ROUTE_QUERY_AGE_SECS,
     MAX_ROUTE_RESPONSE_AGE_SECS, ROUTE_DISCOVERY_MSG_CONTEXT,
 };
+pub use route_engine::{
+    CandidateOrigin, DestinationResolver, DistributedRouteDiscovery, HopCountCost,
+    InMemoryResolver, LowLatencyCost, NullResolver, RouteCandidate, RouteCandidateState,
+    RouteCostModel, RouteDiscoveryError, RouteEngine, DISTRIBUTED_ROUTE_DISCOVERY_IMPLEMENTED,
+};
+pub use session::{
+    CircuitState, CircuitV2, FirstAvailableSelector, GatewayDirectory, GatewayDirectoryEntry,
+    GatewaySelector, GatewayState, MetricSelector, PeerSession, PeerSessionState,
+};
 pub use tcp_route_transport::{
     PeerInfo, TcpForwardingServer, TcpRecursiveTransport, MAX_FRAME_SIZE,
 };
-pub use route::RouteCommitment;
-pub use session::{
-    PeerSession, PeerSessionState, GatewayState, GatewayDirectoryEntry,
-    GatewayDirectory, GatewaySelector, FirstAvailableSelector, MetricSelector,
-    CircuitState, CircuitV2,
+pub use topology::{PropagationResult, RemoteNodeHint, TopologyGraph, TopologySnapshot};
+pub use topology_protocol::{
+    GoodbyeMessage, HelloMessage, PeerSummary, PeerSummaryList, VerifiedPeerSummaryList,
+    MAX_DISTANCE_HINT, MAX_PEER_SUMMARIES_PER_MESSAGE, MAX_PROPAGATION_MESSAGE_AGE_SECS,
 };
 // N2.0.5: The async transport is the SINGLE CANONICAL PRODUCTION network
 // path. The sync transport above is `#[deprecated]` — retained for tests
@@ -231,7 +227,6 @@ pub const DISCOVERY_REQUEST_MARKER: &[u8] = b"SNP/0.1 discovery-request";
 /// The advertisement's signature provides the authentication.
 pub const DISCOVERY_REQUEST_BYTE: u8 = 0x01;
 
-
 /// The unified Node abstraction. A Node holds an identity, a set of
 /// capabilities, and persistent state (peer connections, known gateways,
 /// active circuits, seen reqIds).
@@ -287,7 +282,11 @@ impl Node {
     /// accept incoming connections) — pass `""` or use [`Node::new_client_with_relay`].
     #[must_use]
     pub fn new_client() -> Self {
-        Self::new(identity::client_identity(), vec![Capability::Client], String::new())
+        Self::new(
+            identity::client_identity(),
+            vec![Capability::Client],
+            String::new(),
+        )
     }
 
     // ─── Persistent relay serve loop ──────────────────────────────────────
@@ -409,14 +408,20 @@ impl Node {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[gateway-persistent {}] accept error: {e}", hex_short(&gateway_node_id));
+                    eprintln!(
+                        "[gateway-persistent {}] accept error: {e}",
+                        hex_short(&gateway_node_id)
+                    );
                     continue;
                 }
             };
             eprintln!(
                 "[gateway-persistent {}] relay connected from {}",
                 hex_short(&gateway_node_id),
-                stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+                stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "?".into())
             );
             let link = Arc::new(snp_link::Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
@@ -497,7 +502,10 @@ impl Node {
             eprintln!(
                 "[gateway-drop-after {}] relay connected from {}",
                 hex_short(&gateway_node_id),
-                stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+                stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "?".into())
             );
             let link = Arc::new(snp_link::Link::new(stream, link_keys));
             let mut seen_req_ids = HashSet::new();
@@ -603,18 +611,18 @@ impl Node {
         );
         // N2.0.7: deprecated sync path uses for_identity (no X25519 key).
         // The async path (serve_discovery_persistent_async) is canonical.
-        let advert = GatewayAdvertisement::for_identity(
-            &self.identity,
-            transit_listen_addr,
-            discovery_addr,
-        );
+        let advert =
+            GatewayAdvertisement::for_identity(&self.identity, transit_listen_addr, discovery_addr);
         let advert_bytes = advert.encode_cbor()?;
 
         for stream in listener.incoming() {
             let mut stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[discovery {}] accept error: {e}", hex_short(&gateway_node_id));
+                    eprintln!(
+                        "[discovery {}] accept error: {e}",
+                        hex_short(&gateway_node_id)
+                    );
                     continue;
                 }
             };
@@ -640,11 +648,12 @@ impl Node {
                 hex_short(&gateway_node_id)
             );
             // N2.0.4: write 4-byte BE length prefix + CBOR advertisement.
-            let len = u32::try_from(advert_bytes.len())
-                .map_err(|_| NodeError::Other(format!(
+            let len = u32::try_from(advert_bytes.len()).map_err(|_| {
+                NodeError::Other(format!(
                     "advertisement length {} exceeds u32::MAX",
                     advert_bytes.len()
-                )))?;
+                ))
+            })?;
             if let Err(e) = std::io::Write::write_all(&mut stream, &len.to_be_bytes()) {
                 eprintln!(
                     "[discovery {}] send length error: {e}",
@@ -716,8 +725,8 @@ impl Node {
         let discovered_nodes = provider.discover();
         let mut discovered = 0usize;
         for node in discovered_nodes {
+            let addr = node.endpoint().to_string();
             let advert = node.advertisement;
-            let addr = &node.endpoint;
             // VERIFY THE SIGNATURE — this is the "authenticated gateway
             // discovery" the audit requested. A forged advertisement is
             // rejected here. (BootstrapDiscovery::discover already verifies
@@ -805,9 +814,9 @@ impl Node {
     /// Returns [`NodeError`] on any failure (link error, AEAD failure,
     /// signature verification failure, etc.).
     pub fn send_request(&self, url: &str) -> NodeResult<(u16, bool)> {
-        let advert = self
-            .select_gateway()
-            .ok_or_else(|| NodeError::Other("no gateway selected (call discover_gateways first)".into()))?;
+        let advert = self.select_gateway().ok_or_else(|| {
+            NodeError::Other("no gateway selected (call discover_gateways first)".into())
+        })?;
         self.send_request_via_gateway(url, &advert.node_id)
     }
 
@@ -904,10 +913,9 @@ impl Node {
         // Look up the circuit for this gateway.
         let circuit = {
             let circuits = self.circuits.lock().unwrap();
-            circuits
-                .get(gateway_node_id)
-                .cloned()
-                .ok_or_else(|| NodeError::Other("no circuit for gateway (call discover_gateways first)".into()))?
+            circuits.get(gateway_node_id).cloned().ok_or_else(|| {
+                NodeError::Other("no circuit for gateway (call discover_gateways first)".into())
+            })?
         };
         if !circuit.active {
             return Err(NodeError::Other(
@@ -1137,9 +1145,9 @@ impl Node {
         hops.push(gateway_node_id);
         #[allow(deprecated)]
         let route = Route::new(self.identity.node_id, gateway_node_id, hops);
-        route
-            .validate()
-            .map_err(|e| NodeError::Other(format!("construct_route: route validation failed: {e}")))?;
+        route.validate().map_err(|e| {
+            NodeError::Other(format!("construct_route: route validation failed: {e}"))
+        })?;
         Ok(route)
     }
 
@@ -1150,11 +1158,11 @@ impl Node {
         _gateway_node_id: [u8; 32],
     ) -> NodeResult<Route> {
         Err(NodeError::Other(
-            "construct_route is not available in production — use Route::new_with_hop_details".into()
+            "construct_route is not available in production — use Route::new_with_hop_details"
+                .into(),
         ))
     }
 }
-
 
 // ─── Serve-outcome enum ──────────────────────────────────────────────────────
 
@@ -1184,7 +1192,10 @@ pub enum ServeOutcome {
 /// counter (for tests to verify "same connection served N requests").
 ///
 /// **N2.0.6: DEPRECATED** — see module-level note above.
-#[deprecated(since = "N2.0.6", note = "use `async_node::serve_relay_persistent_async`")]
+#[deprecated(
+    since = "N2.0.6",
+    note = "use `async_node::serve_relay_persistent_async`"
+)]
 fn serve_relay_persistent_inner(
     listen_addr: &str,
     next_hop_addr: &str,
@@ -1205,7 +1216,10 @@ fn serve_relay_persistent_inner(
         };
         eprintln!(
             "[relay-persistent] prev-hop connected from {}",
-            prev_stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+            prev_stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "?".into())
         );
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1225,7 +1239,9 @@ fn serve_relay_persistent_inner(
             // prev → next
             let req_frame = match prev_link.recv_frame() {
                 Ok(f) => f,
-                Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
+                Err(snp_link::LinkError::Io(msg))
+                    if msg.contains("unexpected eof") || msg.contains("connection reset") =>
+                {
                     eprintln!("[relay-persistent] prev-hop closed connection (EOF)");
                     break;
                 }
@@ -1293,7 +1309,10 @@ fn serve_relay_persistent_inner(
 /// client can fail over to a different gateway) and continues serving.
 ///
 /// **N2.0.6: DEPRECATED** — see module-level note above.
-#[deprecated(since = "N2.0.6", note = "use `async_node::serve_relay_multi_upstream_persistent_async`")]
+#[deprecated(
+    since = "N2.0.6",
+    note = "use `async_node::serve_relay_multi_upstream_persistent_async`"
+)]
 fn serve_relay_multi_upstream_persistent_inner(
     listen_addr: &str,
     upstreams: &[UpstreamPeer],
@@ -1316,7 +1335,10 @@ fn serve_relay_multi_upstream_persistent_inner(
         };
         eprintln!(
             "[relay-multi-upstream] prev-hop connected from {}",
-            prev_stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+            prev_stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "?".into())
         );
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1353,7 +1375,9 @@ fn serve_relay_multi_upstream_persistent_inner(
         loop {
             let req_frame = match prev_link.recv_frame() {
                 Ok(f) => f,
-                Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
+                Err(snp_link::LinkError::Io(msg))
+                    if msg.contains("unexpected eof") || msg.contains("connection reset") =>
+                {
                     eprintln!("[relay-multi-upstream] prev-hop closed connection (EOF)");
                     break;
                 }
@@ -1567,7 +1591,9 @@ where
 {
     let req_frame = match link.recv_frame() {
         Ok(f) => f,
-        Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
+        Err(snp_link::LinkError::Io(msg))
+            if msg.contains("unexpected eof") || msg.contains("connection reset") =>
+        {
             return Ok(ServeOutcome::Closed);
         }
         Err(e) => {
@@ -1669,7 +1695,6 @@ where
 // subcommand in `main.rs` now call `crate::legacy::run_mesh_session_demo`.
 // See `crate::legacy::run_mesh_session_demo` for the legacy function.
 
-
 // ─── Test/demo helpers (public for tests) ────────────────────────────────────
 //
 // **N2.0.5: `relay_secret_a` and `relay_secret_b` MOVED to `crate::legacy`.**
@@ -1688,13 +1713,22 @@ pub fn spawn_relay_persistent_with_counter(
     next_hop_addr: &str,
     prev_hop_keys: LinkKeys,
     next_hop_keys: LinkKeys,
-) -> (std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicU64>) {
+) -> (
+    std::thread::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter_clone = Arc::clone(&counter);
     let listen = listen_addr.to_string();
     let next = next_hop_addr.to_string();
     let handle = std::thread::spawn(move || {
-        let _ = serve_relay_persistent_inner(&listen, &next, prev_hop_keys, next_hop_keys, Some(counter_clone));
+        let _ = serve_relay_persistent_inner(
+            &listen,
+            &next,
+            prev_hop_keys,
+            next_hop_keys,
+            Some(counter_clone),
+        );
     });
     (handle, counter)
 }
@@ -1705,12 +1739,20 @@ pub fn spawn_relay_multi_upstream_persistent_with_counter(
     listen_addr: &str,
     upstreams: Vec<UpstreamPeer>,
     prev_hop_keys: LinkKeys,
-) -> (std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicU64>) {
+) -> (
+    std::thread::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter_clone = Arc::clone(&counter);
     let listen = listen_addr.to_string();
     let handle = std::thread::spawn(move || {
-        let _ = serve_relay_multi_upstream_persistent_inner(&listen, &upstreams, prev_hop_keys, Some(counter_clone));
+        let _ = serve_relay_multi_upstream_persistent_inner(
+            &listen,
+            &upstreams,
+            prev_hop_keys,
+            Some(counter_clone),
+        );
     });
     (handle, counter)
 }
@@ -1740,7 +1782,10 @@ pub fn spawn_relay_multi_upstream_persistent_with_counter(
 /// logged and the relay continues accepting new connections.
 ///
 /// **N2.0.6: DEPRECATED** — see module-level note above.
-#[deprecated(since = "N2.0.6", note = "use the async runtime with `tokio::select!` for drop-after behaviour")]
+#[deprecated(
+    since = "N2.0.6",
+    note = "use the async runtime with `tokio::select!` for drop-after behaviour"
+)]
 fn serve_relay_persistent_with_drop_after_inner(
     listen_addr: &str,
     next_hop_addr: &str,
@@ -1765,7 +1810,10 @@ fn serve_relay_persistent_with_drop_after_inner(
         };
         eprintln!(
             "[relay-drop-after] prev-hop connected from {}",
-            prev_stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+            prev_stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "?".into())
         );
         if let Some(counter) = &connection_counter {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1796,7 +1844,9 @@ fn serve_relay_persistent_with_drop_after_inner(
             // prev → next
             let req_frame = match prev_link.recv_frame() {
                 Ok(f) => f,
-                Err(snp_link::LinkError::Io(msg)) if msg.contains("unexpected eof") || msg.contains("connection reset") => {
+                Err(snp_link::LinkError::Io(msg))
+                    if msg.contains("unexpected eof") || msg.contains("connection reset") =>
+                {
                     eprintln!("[relay-drop-after] prev-hop closed connection (EOF)");
                     break;
                 }
@@ -1967,7 +2017,11 @@ fn random_fid() -> [u8; 8] {
 
 fn hex_short(b: &[u8]) -> String {
     let n = b.len().min(8);
-    b[..n].iter().map(|x| format!("{x:02x}")).collect::<String>() + "…"
+    b[..n]
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<String>()
+        + "…"
 }
 
 // ─── Tests (in-module unit tests) ────────────────────────────────────────────
@@ -2128,10 +2182,15 @@ mod tests {
             ("node/route.rs", include_str!("route.rs")),
             ("node/discovery.rs", include_str!("discovery.rs")),
             ("node/transport.rs", include_str!("transport.rs")),
-            ("node/async_transport.rs", include_str!("async_transport.rs")),
+            (
+                "node/async_transport.rs",
+                include_str!("async_transport.rs"),
+            ),
         ];
         for (name, source) in modules {
-            if let Some((lineno, line)) = scan_for_offending_reference(name, source, "derive_link_keys") {
+            if let Some((lineno, line)) =
+                scan_for_offending_reference(name, source, "derive_link_keys")
+            {
                 panic!(
                     "Production node module {}:{} references `derive_link_keys` outside a \
                      #[deprecated] block or #[cfg(test)] block.\n  Line: {line}\n  \
@@ -2162,10 +2221,15 @@ mod tests {
             ("node/route.rs", include_str!("route.rs")),
             ("node/discovery.rs", include_str!("discovery.rs")),
             ("node/transport.rs", include_str!("transport.rs")),
-            ("node/async_transport.rs", include_str!("async_transport.rs")),
+            (
+                "node/async_transport.rs",
+                include_str!("async_transport.rs"),
+            ),
         ];
         for (name, source) in modules {
-            if let Some((lineno, line)) = scan_for_offending_reference(name, source, "GatewayChoice") {
+            if let Some((lineno, line)) =
+                scan_for_offending_reference(name, source, "GatewayChoice")
+            {
                 panic!(
                     "Production node module {}:{} references `GatewayChoice` outside a \
                      #[deprecated] block, #[cfg(test)] block, or comment.\n  Line: {line}\n  \
@@ -2197,7 +2261,10 @@ mod tests {
             ("node/session.rs", include_str!("session.rs")),
             ("node/route.rs", include_str!("route.rs")),
             ("node/discovery.rs", include_str!("discovery.rs")),
-            ("node/async_transport.rs", include_str!("async_transport.rs")),
+            (
+                "node/async_transport.rs",
+                include_str!("async_transport.rs"),
+            ),
             ("node/async_node.rs", include_str!("async_node.rs")),
         ];
         // The sync transport signatures we forbid in production code:
@@ -2336,7 +2403,9 @@ mod tests {
                     !sig.contains("next_hop_addr: &str"),
                     "send_via_route must NOT take an explicit next_hop_addr parameter"
                 );
-                eprintln!("[static-guard] PASS: send_via_route takes Route, not explicit addresses");
+                eprintln!(
+                    "[static-guard] PASS: send_via_route takes Route, not explicit addresses"
+                );
                 return;
             }
         }
@@ -2458,7 +2527,9 @@ mod tests {
                     !sig.contains("gateway_x25519_pub"),
                     "send_via_route must NOT take gateway_x25519_pub — get it from the Route's NodeDescriptor"
                 );
-                eprintln!("[static-guard] PASS: send_via_route does not take gateway keys as params");
+                eprintln!(
+                    "[static-guard] PASS: send_via_route does not take gateway keys as params"
+                );
                 return;
             }
         }
@@ -2557,7 +2628,9 @@ mod tests {
                 }
             }
         }
-        eprintln!("[static-guard] PASS: old circuit-key APIs are behind legacy-circuit-keys feature");
+        eprintln!(
+            "[static-guard] PASS: old circuit-key APIs are behind legacy-circuit-keys feature"
+        );
     }
 
     /// N2.0.7.2: The Route must NOT have a public `hops` field — it must be
@@ -2704,7 +2777,10 @@ mod tests {
         );
         // Force expiry in the past.
         advert.expiry = 1;
-        assert!(advert.is_expired(now_unix() + 1), "expired advertisement must be detected");
+        assert!(
+            advert.is_expired(now_unix() + 1),
+            "expired advertisement must be detected"
+        );
     }
 
     #[test]
@@ -2737,8 +2813,14 @@ mod tests {
     #[test]
     fn node_identity_gateway_a_matches_n20_constants() {
         let identity = crate::legacy::legacy_identity_for_gateway(GatewayChoice::A);
-        assert_eq!(identity.public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
-        assert_eq!(identity.node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
+        assert_eq!(
+            identity.public_key,
+            crate::legacy::gateway_public_key_for(GatewayChoice::A)
+        );
+        assert_eq!(
+            identity.node_id,
+            crate::legacy::gateway_node_id_for(GatewayChoice::A)
+        );
     }
 
     #[test]
@@ -2753,19 +2835,35 @@ mod tests {
     #[test]
     fn circuit_for_gateway_a_uses_correct_keys() {
         let circuit = crate::legacy::legacy_circuit_for_gateway(GatewayChoice::A);
-        assert_eq!(circuit.gateway_node_id, crate::legacy::gateway_node_id_for(GatewayChoice::A));
-        assert_eq!(circuit.gateway_public_key, crate::legacy::gateway_public_key_for(GatewayChoice::A));
-        assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_a().send_key);
+        assert_eq!(
+            circuit.gateway_node_id,
+            crate::legacy::gateway_node_id_for(GatewayChoice::A)
+        );
+        assert_eq!(
+            circuit.gateway_public_key,
+            crate::legacy::gateway_public_key_for(GatewayChoice::A)
+        );
+        assert_eq!(
+            circuit.circuit_keys.send_key,
+            client_circuit_keys_a().send_key
+        );
         assert!(circuit.active);
     }
 
     #[test]
     fn circuit_for_gateway_b_uses_correct_keys() {
         let circuit = crate::legacy::legacy_circuit_for_gateway(GatewayChoice::B);
-        assert_eq!(circuit.circuit_keys.send_key, client_circuit_keys_b().send_key);
+        assert_eq!(
+            circuit.circuit_keys.send_key,
+            client_circuit_keys_b().send_key
+        );
         assert_ne!(
-            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::A).circuit_keys.send_key,
-            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::B).circuit_keys.send_key,
+            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::A)
+                .circuit_keys
+                .send_key,
+            crate::legacy::legacy_circuit_for_gateway(GatewayChoice::B)
+                .circuit_keys
+                .send_key,
             "Ca and Cb MUST differ (proves failover switches circuit keys)"
         );
     }
@@ -2806,11 +2904,7 @@ mod tests {
         let relay_b = node_id_from_seed(b"relay B");
         let relay_c = node_id_from_seed(b"relay C");
         let gateway = node_id_from_seed(b"gateway");
-        let route = Route::new(
-            client,
-            gateway,
-            vec![relay_a, relay_b, relay_c, gateway],
-        );
+        let route = Route::new(client, gateway, vec![relay_a, relay_b, relay_c, gateway]);
         route.validate().expect("valid route must validate");
         assert_eq!(route.source(), client);
         assert_eq!(route.destination(), gateway);
@@ -2838,16 +2932,16 @@ mod tests {
     fn route_source_mismatch_rejected() {
         let gateway = node_id_from_seed(b"gateway");
         // source = [0u8; 32] (all-zero) → validation fails with SourceMismatch.
-        let mut route = Route::new(
-            [0u8; 32],
-            gateway,
-            vec![gateway],
-        );
+        let mut route = Route::new([0u8; 32], gateway, vec![gateway]);
         // Force the source to all-zero (Route::new stores whatever is passed;
         // we pass [0u8; 32] directly to test the SourceMismatch path).
         let _ = &mut route;
         let err = route.validate().unwrap_err();
-        assert_eq!(err, RouteError::SourceMismatch, "all-zero source must be rejected");
+        assert_eq!(
+            err,
+            RouteError::SourceMismatch,
+            "all-zero source must be rejected"
+        );
     }
 
     #[cfg(feature = "legacy-circuit-keys")]
@@ -2862,7 +2956,8 @@ mod tests {
         let _ = &mut route;
         let err = route.validate().unwrap_err();
         assert_eq!(
-            err, RouteError::DestinationDescriptorMismatch,
+            err,
+            RouteError::DestinationDescriptorMismatch,
             "destination != hops.last() must be rejected"
         );
     }
@@ -2874,11 +2969,7 @@ mod tests {
         let relay = node_id_from_seed(b"relay");
         let gateway = node_id_from_seed(b"gateway");
         // hops = [relay, relay, gateway] → duplicate relay.
-        let route = Route::new(
-            client,
-            gateway,
-            vec![relay, relay, gateway],
-        );
+        let route = Route::new(client, gateway, vec![relay, relay, gateway]);
         let err = route.validate().unwrap_err();
         assert!(
             matches!(err, RouteError::DuplicateHop(_)),
@@ -2893,9 +2984,7 @@ mod tests {
         let client = node_id_from_seed(b"client");
         let gateway = node_id_from_seed(b"gateway");
         // 17 hops (16 relays + 1 gateway) → exceeds ROUTE_MAX_HOPS (16).
-        let mut hops: Vec<[u8; 32]> = (0..16u8)
-            .map(|i| node_id_from_seed(&[i]))
-            .collect();
+        let mut hops: Vec<[u8; 32]> = (0..16u8).map(|i| node_id_from_seed(&[i])).collect();
         hops.push(gateway);
         let route = Route::new(client, gateway, hops);
         let err = route.validate().unwrap_err();
@@ -2933,21 +3022,40 @@ mod tests {
         assert_eq!(route.state(), RouteState::Proposed);
 
         // Legal: Proposed → Establishing → Active.
-        route.transition(RouteState::Establishing).expect("Proposed → Establishing");
-        route.transition(RouteState::Active).expect("Establishing → Active");
-        assert!(route.last_validated() > 0, "Active route has a non-zero last_validated");
+        route
+            .transition(RouteState::Establishing)
+            .expect("Proposed → Establishing");
+        route
+            .transition(RouteState::Active)
+            .expect("Establishing → Active");
+        assert!(
+            route.last_validated() > 0,
+            "Active route has a non-zero last_validated"
+        );
 
         // Legal: Active → Degraded → Active (recovery).
-        route.transition(RouteState::Degraded).expect("Active → Degraded");
-        route.transition(RouteState::Active).expect("Degraded → Active");
+        route
+            .transition(RouteState::Degraded)
+            .expect("Active → Degraded");
+        route
+            .transition(RouteState::Active)
+            .expect("Degraded → Active");
 
         // Legal: Active → Migrating → Active.
-        route.transition(RouteState::Migrating).expect("Active → Migrating");
-        route.transition(RouteState::Active).expect("Migrating → Active");
+        route
+            .transition(RouteState::Migrating)
+            .expect("Active → Migrating");
+        route
+            .transition(RouteState::Active)
+            .expect("Migrating → Active");
 
         // Legal: Active → Failed → Closed.
-        route.transition(RouteState::Failed).expect("Active → Failed");
-        route.transition(RouteState::Closed).expect("Failed → Closed");
+        route
+            .transition(RouteState::Failed)
+            .expect("Active → Failed");
+        route
+            .transition(RouteState::Closed)
+            .expect("Failed → Closed");
     }
 
     #[cfg(feature = "legacy-circuit-keys")]
@@ -2974,9 +3082,15 @@ mod tests {
         );
 
         // Move to Closed, then attempt revival.
-        route.transition(RouteState::Establishing).expect("Proposed → Establishing");
-        route.transition(RouteState::Active).expect("Establishing → Active");
-        route.transition(RouteState::Closed).expect("Active → Closed");
+        route
+            .transition(RouteState::Establishing)
+            .expect("Proposed → Establishing");
+        route
+            .transition(RouteState::Active)
+            .expect("Establishing → Active");
+        route
+            .transition(RouteState::Closed)
+            .expect("Active → Closed");
 
         // Illegal: Closed → Active (cannot revive).
         let err = route.transition(RouteState::Active).unwrap_err();
@@ -3026,20 +3140,40 @@ mod tests {
         route.validate().expect("constructed route must validate");
 
         // Verify the hop list is correct: [relay_a, relay_b, relay_c, gateway].
-        assert_eq!(route.hops().len(), 4, "hops must be [relay_a, relay_b, relay_c, gateway]");
+        assert_eq!(
+            route.hops().len(),
+            4,
+            "hops must be [relay_a, relay_b, relay_c, gateway]"
+        );
         assert_eq!(route.hops()[0], relay_a_id, "hops[0] must be relay A");
         assert_eq!(route.hops()[1], relay_b_id, "hops[1] must be relay B");
         assert_eq!(route.hops()[2], relay_c_id, "hops[2] must be relay C");
-        assert_eq!(route.hops()[3], gw_node_id, "hops[3] must be gateway (destination)");
+        assert_eq!(
+            route.hops()[3],
+            gw_node_id,
+            "hops[3] must be gateway (destination)"
+        );
 
         // The source must be the client's NodeId.
-        assert_eq!(route.source(), client_identity.node_id, "source must be the client NodeId");
+        assert_eq!(
+            route.source(),
+            client_identity.node_id,
+            "source must be the client NodeId"
+        );
 
         // The destination must be the gateway's NodeId.
-        assert_eq!(route.destination(), gw_node_id, "destination must be the gateway NodeId");
+        assert_eq!(
+            route.destination(),
+            gw_node_id,
+            "destination must be the gateway NodeId"
+        );
 
         // The route_id must not be all-zero (it's SHA-256 of a non-empty input).
-        assert_ne!(route.route_commitment().as_bytes(), &[0u8; 32], "route_id must not be all-zero");
+        assert_ne!(
+            route.route_commitment().as_bytes(),
+            &[0u8; 32],
+            "route_id must not be all-zero"
+        );
 
         // No GatewayChoice or compile-time identities used — all identities
         // are derived from random Ed25519 keypairs at runtime. The test
@@ -3092,7 +3226,8 @@ mod tests {
             .construct_route(&relays, gw_node_id)
             .unwrap_err();
         assert!(
-            err.to_string().contains("ExcessiveHopCount") || err.to_string().contains("too many hops"),
+            err.to_string().contains("ExcessiveHopCount")
+                || err.to_string().contains("too many hops"),
             "construct_route with 17 hops must fail with ExcessiveHopCount; got {err}"
         );
     }
@@ -3107,15 +3242,14 @@ mod tests {
     // ─── N2.0.3 (Gate C): DiscoveryProvider tests ──────────────────────
 
     /// Helper: build a `DiscoveredNode` for an arbitrary gateway identity,
-    /// for use in discovery tests.
+    /// for use in discovery tests. The endpoint is embedded in the signed
+    /// advertisement's `listen_addr` — there is no separate unsigned endpoint.
     fn discovered_node_for_seed(seed: &[u8], endpoint: &str) -> DiscoveredNode {
         let sk = snp_crypto::sha256(seed);
         let identity = NodeIdentity::from_secret(sk);
-        let advert =
-            GatewayAdvertisement::for_identity(&identity, endpoint, "127.0.0.1:0");
+        let advert = GatewayAdvertisement::for_identity(&identity, endpoint, "127.0.0.1:0");
         DiscoveredNode {
             advertisement: advert,
-            endpoint: endpoint.to_string(),
         }
     }
 
@@ -3139,10 +3273,14 @@ mod tests {
         assert!(!provider.is_empty());
 
         let discovered = provider.discover();
-        assert_eq!(discovered.len(), 3, "StaticDiscovery must return all added nodes");
-        assert_eq!(discovered[0].endpoint, node_a.endpoint);
-        assert_eq!(discovered[1].endpoint, node_b.endpoint);
-        assert_eq!(discovered[2].endpoint, node_c.endpoint);
+        assert_eq!(
+            discovered.len(),
+            3,
+            "StaticDiscovery must return all added nodes"
+        );
+        assert_eq!(discovered[0].endpoint(), node_a.endpoint());
+        assert_eq!(discovered[1].endpoint(), node_b.endpoint());
+        assert_eq!(discovered[2].endpoint(), node_c.endpoint());
         // The advertisements must be the signed adverts we added.
         assert!(discovered[0].advertisement.verify());
         assert!(discovered[1].advertisement.verify());
@@ -3162,14 +3300,15 @@ mod tests {
         // advertise() should be a no-op (StaticDiscovery does not support
         // outbound advertising — the list is configured at construction time).
         let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"some other gateway"));
-        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:9999", "127.0.0.1:9998");
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:9999", "127.0.0.1:9998");
         provider.advertise(&advert, "127.0.0.1:9999");
 
         // The list is unchanged.
         assert_eq!(provider.len(), 1, "advertise() must not add to the list");
         let discovered = provider.discover();
         assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].endpoint, "127.0.0.1:7001");
+        assert_eq!(discovered[0].endpoint(), "127.0.0.1:7001");
     }
 
     /// N2.0.4 (Gate A): `BootstrapDiscovery::discover()` performs actual
@@ -3187,6 +3326,7 @@ mod tests {
         let disc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery");
         let disc_addr = disc_listener.local_addr().expect("local_addr").to_string();
         let transit_addr = "127.0.0.1:0".to_string();
+        let transit_addr_expected = transit_addr.clone();
         drop(disc_listener);
 
         // Spawn a gateway that serves discovery via the N2.0.4 raw protocol.
@@ -3215,7 +3355,7 @@ mod tests {
             discovered.len()
         );
         let node = &discovered[0];
-        assert_eq!(node.endpoint, disc_addr);
+        assert_eq!(node.endpoint(), transit_addr_expected);
         assert_eq!(node.advertisement.node_id, expected_node_id);
         // Signature was already verified inside discover() — re-verify
         // here for defence in depth.
@@ -3259,9 +3399,15 @@ mod tests {
     fn bootstrap_discovery_discovers_multiple_gateways() {
         // Allocate two ephemeral ports for two discovery listeners.
         let disc_listener_a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind disc-a");
-        let disc_addr_a = disc_listener_a.local_addr().expect("local_addr").to_string();
+        let disc_addr_a = disc_listener_a
+            .local_addr()
+            .expect("local_addr")
+            .to_string();
         let disc_listener_b = std::net::TcpListener::bind("127.0.0.1:0").expect("bind disc-b");
-        let disc_addr_b = disc_listener_b.local_addr().expect("local_addr").to_string();
+        let disc_addr_b = disc_listener_b
+            .local_addr()
+            .expect("local_addr")
+            .to_string();
         let transit_addr = "127.0.0.1:0".to_string();
         drop(disc_listener_a);
         drop(disc_listener_b);
@@ -3293,8 +3439,7 @@ mod tests {
             "BootstrapDiscovery must discover both gateways, got {}",
             discovered.len()
         );
-        let node_ids: Vec<[u8; 32]> =
-            discovered.iter().map(|n| n.advertisement.node_id).collect();
+        let node_ids: Vec<[u8; 32]> = discovered.iter().map(|n| n.advertisement.node_id).collect();
         assert!(
             node_ids.contains(&expected_a),
             "discovered set must contain gateway A"
@@ -3383,7 +3528,8 @@ mod tests {
         assert!(discovered.is_empty());
         // advertise() is a no-op (default implementation).
         let identity = NodeIdentity::from_secret(snp_crypto::sha256(b"object-safe test"));
-        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
         provider.advertise(&advert, "127.0.0.1:7001");
     }
 
@@ -3436,10 +3582,13 @@ mod tests {
         ));
 
         let selector = MetricSelector;
-        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let selected = selector
+            .select(&directory)
+            .expect("selector must pick an entry");
         assert_eq!(
             selected.advertisement.node_id,
-            directory.get(&directory.entries()[1].advertisement.node_id)
+            directory
+                .get(&directory.entries()[1].advertisement.node_id)
                 .map(|e| e.advertisement.node_id)
                 .unwrap(),
             "MetricSelector must pick the entry with the lowest observed latency (gw B, 50ms)",
@@ -3474,7 +3623,9 @@ mod tests {
         ));
 
         let selector = MetricSelector;
-        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let selected = selector
+            .select(&directory)
+            .expect("selector must pick an entry");
         let gw_b_node_id = directory.entries()[1].advertisement.node_id;
         assert_eq!(
             selected.advertisement.node_id, gw_b_node_id,
@@ -3510,7 +3661,9 @@ mod tests {
         ));
 
         let selector = MetricSelector;
-        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let selected = selector
+            .select(&directory)
+            .expect("selector must pick an entry");
         let gw_b_node_id = directory.entries()[1].advertisement.node_id;
         assert_eq!(
             selected.advertisement.node_id, gw_b_node_id,
@@ -3547,7 +3700,9 @@ mod tests {
         ));
 
         let selector = MetricSelector;
-        let selected = selector.select(&directory).expect("selector must pick an entry");
+        let selected = selector
+            .select(&directory)
+            .expect("selector must pick an entry");
         let gw_a_node_id = directory.entries()[0].advertisement.node_id;
         assert_eq!(
             selected.advertisement.node_id, gw_a_node_id,
@@ -3600,7 +3755,9 @@ mod tests {
         ));
 
         // Using MetricSelector via the directory's select method.
-        let selected_metric = directory.select(&MetricSelector).expect("MetricSelector must pick");
+        let selected_metric = directory
+            .select(&MetricSelector)
+            .expect("MetricSelector must pick");
         let gw_b_node_id = directory.entries()[1].advertisement.node_id;
         assert_eq!(
             selected_metric.advertisement.node_id, gw_b_node_id,
@@ -3634,13 +3791,20 @@ mod tests {
     fn advertisement_observed_rtt_is_none_by_default_and_unsigned() {
         let sk = snp_crypto::sha256(b"observed_rtt test gw");
         let identity = NodeIdentity::from_secret(sk);
-        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
 
         // The field defaults to None.
-        assert!(advert.observed_rtt.is_none(), "observed_rtt must default to None");
+        assert!(
+            advert.observed_rtt.is_none(),
+            "observed_rtt must default to None"
+        );
 
         // The signature still verifies (observed_rtt is NOT in the preimage).
-        assert!(advert.verify(), "signature must verify with observed_rtt=None");
+        assert!(
+            advert.verify(),
+            "signature must verify with observed_rtt=None"
+        );
 
         // Setting observed_rtt AFTER construction does NOT invalidate the
         // signature (the field is not in the signed preimage).
@@ -3685,7 +3849,8 @@ mod tests {
     fn advertisement_decode_without_observed_rtt_key() {
         let sk = snp_crypto::sha256(b"no-rtt-key test gw");
         let identity = NodeIdentity::from_secret(sk);
-        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
         let bytes = advert.encode_cbor().expect("encode");
 
         // The encoded bytes do NOT include "observedRtt" (encode_cbor uses
@@ -3698,7 +3863,10 @@ mod tests {
 
         // Decoding succeeds and observed_rtt is None.
         let decoded = GatewayAdvertisement::decode_cbor(&bytes).expect("decode");
-        assert!(decoded.observed_rtt.is_none(), "decoded observed_rtt must be None when the key is absent");
+        assert!(
+            decoded.observed_rtt.is_none(),
+            "decoded observed_rtt must be None when the key is absent"
+        );
         assert!(decoded.verify(), "decoded advertisement must verify");
     }
 
@@ -3710,7 +3878,8 @@ mod tests {
     fn advertisement_decode_with_observed_rtt_key() {
         let sk = snp_crypto::sha256(b"with-rtt-key test gw");
         let identity = NodeIdentity::from_secret(sk);
-        let advert = GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
+        let advert =
+            GatewayAdvertisement::for_identity(&identity, "127.0.0.1:7001", "127.0.0.1:7002");
         let bytes = advert.encode_cbor().expect("encode");
 
         // Manually decode the CBOR, add the observedRtt key, re-encode.
@@ -3720,7 +3889,8 @@ mod tests {
             _ => panic!("expected a CBOR map"),
         };
         entries.push((t("observedRtt"), u(99_000)));
-        let bytes_with_rtt = snp_cbor::encode(&snp_cbor::CborValue::Map(entries)).expect("re-encode");
+        let bytes_with_rtt =
+            snp_cbor::encode(&snp_cbor::CborValue::Map(entries)).expect("re-encode");
 
         // The decoder must parse the observedRtt key and set the field.
         let decoded = GatewayAdvertisement::decode_cbor(&bytes_with_rtt).expect("decode");
@@ -3731,6 +3901,9 @@ mod tests {
         );
         // The signature still verifies (observed_rtt is not in the signed
         // preimage, so adding it to the CBOR does not invalidate the sig).
-        assert!(decoded.verify(), "decoded advertisement must verify (observed_rtt is unsigned)");
+        assert!(
+            decoded.verify(),
+            "decoded advertisement must verify (observed_rtt is unsigned)"
+        );
     }
 }

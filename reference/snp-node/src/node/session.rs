@@ -187,7 +187,10 @@ impl PeerSession {
     /// (`Established` or `Degraded`).
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        matches!(self.state, PeerSessionState::Established | PeerSessionState::Degraded)
+        matches!(
+            self.state,
+            PeerSessionState::Established | PeerSessionState::Degraded
+        )
     }
 }
 
@@ -264,7 +267,11 @@ impl GatewayDirectory {
     /// assumed to be fresher).
     pub fn upsert(&mut self, entry: GatewayDirectoryEntry) {
         let node_id = entry.advertisement.node_id;
-        if let Some(existing) = self.entries.iter_mut().find(|e| e.advertisement.node_id == node_id) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.advertisement.node_id == node_id)
+        {
             *existing = entry;
         } else {
             self.entries.push(entry);
@@ -274,12 +281,16 @@ impl GatewayDirectory {
     /// Look up an entry by NodeId.
     #[must_use]
     pub fn get(&self, node_id: &[u8; 32]) -> Option<&GatewayDirectoryEntry> {
-        self.entries.iter().find(|e| &e.advertisement.node_id == node_id)
+        self.entries
+            .iter()
+            .find(|e| &e.advertisement.node_id == node_id)
     }
 
     /// Look up an entry by NodeId (mutable).
     pub fn get_mut(&mut self, node_id: &[u8; 32]) -> Option<&mut GatewayDirectoryEntry> {
-        self.entries.iter_mut().find(|e| &e.advertisement.node_id == node_id)
+        self.entries
+            .iter_mut()
+            .find(|e| &e.advertisement.node_id == node_id)
     }
 
     /// Return all entries.
@@ -432,9 +443,7 @@ impl GatewaySelector for MetricSelector {
         directory
             .entries()
             .iter()
-            .filter(|e| {
-                matches!(e.state, GatewayState::Verified | GatewayState::Active)
-            })
+            .filter(|e| matches!(e.state, GatewayState::Verified | GatewayState::Active))
             .min_by_key(|e| {
                 let observed = e.observed_latency;
                 let advertised = e.advertisement.observed_rtt;
@@ -531,25 +540,26 @@ impl CircuitV2 {
         use CircuitState::*;
         let legal = matches!(
             (self.state, new_state),
-            (Discovering, Establishing) |
-            (Discovering, Failed) |
-            (Establishing, Active) |
-            (Establishing, Failed) |
-            (Active, Degraded) |
-            (Active, Migrating) |
-            (Active, Failed) |
-            (Active, Closed) |
-            (Degraded, Active) |
-            (Degraded, Migrating) |
-            (Degraded, Failed) |
-            (Migrating, Active) |
-            (Migrating, Failed) |
-            (Failed, Closed) |
-            (Closed, Closed)
+            (Discovering, Establishing)
+                | (Discovering, Failed)
+                | (Establishing, Active)
+                | (Establishing, Failed)
+                | (Active, Degraded)
+                | (Active, Migrating)
+                | (Active, Failed)
+                | (Active, Closed)
+                | (Degraded, Active)
+                | (Degraded, Migrating)
+                | (Degraded, Failed)
+                | (Migrating, Active)
+                | (Migrating, Failed)
+                | (Failed, Closed)
+                | (Closed, Closed)
         );
         if !legal {
             return Err(super::NodeError::Other(format!(
-                "illegal CircuitV2 transition: {:?} → {:?}", self.state, new_state
+                "illegal CircuitV2 transition: {:?} → {:?}",
+                self.state, new_state
             )));
         }
         self.state = new_state;

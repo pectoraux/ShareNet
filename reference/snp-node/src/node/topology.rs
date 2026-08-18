@@ -152,7 +152,10 @@ impl RemoteNodeHint {
 #[derive(Debug, Clone)]
 pub enum PropagationResult {
     /// The summary list was accepted (newer propagation_sequence).
-    Accepted { hints_added: usize, hints_updated: usize },
+    Accepted {
+        hints_added: usize,
+        hints_updated: usize,
+    },
     /// The summary list was rejected because its propagation_sequence is
     /// older than or equal to the highest seen from this sender.
     Stale {
@@ -352,7 +355,10 @@ impl TopologyGraph {
             }
         }
 
-        PropagationResult::Accepted { hints_added, hints_updated }
+        PropagationResult::Accepted {
+            hints_added,
+            hints_updated,
+        }
     }
 
     /// Generate PeerSummaries for propagation to other peers.
@@ -472,8 +478,7 @@ impl TopologyGraph {
     /// Check if a node is known (either directly authenticated or hinted).
     #[must_use]
     pub fn is_known(&self, node_id: &[u8; 32]) -> bool {
-        self.directory.get_record(node_id).is_some()
-            || self.remote_hints.contains_key(node_id)
+        self.directory.get_record(node_id).is_some() || self.remote_hints.contains_key(node_id)
     }
 
     /// Check if a node is **directly authenticated** (has a verified
@@ -511,9 +516,8 @@ impl TopologyGraph {
         // Purge remote hints that claim "stale" and are older than
         // the advertisement lifetime.
         let cutoff = now.saturating_sub(MAX_ADVERTISEMENT_LIFETIME_SECS);
-        self.remote_hints.retain(|_, hint| {
-            hint.claimed_visibility == "active" || hint.received_at > cutoff
-        });
+        self.remote_hints
+            .retain(|_, hint| hint.claimed_visibility == "active" || hint.received_at > cutoff);
     }
 
     /// Get the peer directory (for direct access).

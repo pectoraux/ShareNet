@@ -380,8 +380,16 @@ impl std::fmt::Display for MetricsSnapshot {
         writeln!(f, "=== Transport Metrics ===")?;
         writeln!(f, "Circuit:")?;
         writeln!(f, "  circuits_active:         {}", self.circuits_active)?;
-        writeln!(f, "  circuits_created_total:  {}", self.circuits_created_total)?;
-        writeln!(f, "  circuits_closed_total:   {}", self.circuits_closed_total)?;
+        writeln!(
+            f,
+            "  circuits_created_total:  {}",
+            self.circuits_created_total
+        )?;
+        writeln!(
+            f,
+            "  circuits_closed_total:   {}",
+            self.circuits_closed_total
+        )?;
         writeln!(
             f,
             "  circuit_bytes_sent:      {} ({:.2} MB)",
@@ -396,9 +404,17 @@ impl std::fmt::Display for MetricsSnapshot {
         )?;
         writeln!(f, "Streams:")?;
         writeln!(f, "  streams_active:          {}", self.streams_active)?;
-        writeln!(f, "  streams_opened_total:    {}", self.streams_opened_total)?;
+        writeln!(
+            f,
+            "  streams_opened_total:    {}",
+            self.streams_opened_total
+        )?;
         writeln!(f, "  streams_reset_total:     {}", self.streams_reset_total)?;
-        writeln!(f, "  streams_closed_total:    {}", self.streams_closed_total)?;
+        writeln!(
+            f,
+            "  streams_closed_total:    {}",
+            self.streams_closed_total
+        )?;
         writeln!(f, "Flow control:")?;
         writeln!(f, "  window_block_events:     {}", self.window_block_events)?;
         writeln!(f, "  credit_updates_sent:     {}", self.credit_updates_sent)?;

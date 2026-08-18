@@ -137,11 +137,11 @@ use snp_crypto::{
     aead_open, aead_seal, derive_node_id, x25519_static_keypair, NonceBytes, SymmetricKey,
     X25519PubKey, X25519Secret,
 };
-use snp_link::{LinkKeys, VerifiedHandshake, perform_snp_ik_handshake_verified_async};
+use snp_link::{perform_snp_ik_handshake_verified_async, LinkKeys, VerifiedHandshake};
 
 use super::route_discovery_protocol::{
-    ForwardedQuery, ForwardingNode, MAX_ROUTE_QUERY_AGE_SECS, RecursiveNextHopTransport,
-    RecursiveRouteResponse,
+    ForwardedQuery, ForwardingNode, RecursiveNextHopTransport, RecursiveRouteResponse,
+    MAX_ROUTE_QUERY_AGE_SECS,
 };
 
 /// Maximum size of a single sealed frame on the wire (1 MiB). Prevents
@@ -253,10 +253,7 @@ async fn write_sealed_frame(
 ///   resistance) or is smaller than `MIN_SEALED_LEN`.
 /// - AEAD authentication fails (`aead_open` returns `None`). The
 ///   connection is dropped without further I/O.
-async fn read_sealed_frame(
-    stream: &mut TcpStream,
-    recv_key: &SymmetricKey,
-) -> io::Result<Vec<u8>> {
+async fn read_sealed_frame(stream: &mut TcpStream, recv_key: &SymmetricKey) -> io::Result<Vec<u8>> {
     // 1. Read the 4-byte sealed_len prefix.
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
@@ -329,19 +326,15 @@ impl ReplayCache {
     /// Side effects: purges expired entries (older than 2×
     /// `MAX_ROUTE_QUERY_AGE_SECS`) and evicts the oldest entry when the
     /// cache is full.
-    fn check_and_insert(
-        &mut self,
-        source_node_id: [u8; 32],
-        query_id: [u8; 16],
-        now: u64,
-    ) -> bool {
+    fn check_and_insert(&mut self, source_node_id: [u8; 32], query_id: [u8; 16], now: u64) -> bool {
         let key = (source_node_id, query_id);
         if self.entries.contains_key(&key) {
             return false;
         }
         // Purge expired entries.
         let max_age = MAX_ROUTE_QUERY_AGE_SECS.saturating_mul(2);
-        self.entries.retain(|_, ts| now.saturating_sub(*ts) < max_age);
+        self.entries
+            .retain(|_, ts| now.saturating_sub(*ts) < max_age);
         // If still full, evict the oldest entry.
         while self.entries.len() >= self.max_entries {
             // Find the entry with the smallest timestamp and remove it.
@@ -429,10 +422,7 @@ impl TcpRecursiveTransport {
     /// — it is the static rendezvous keypair advertised in the SNP-IK
     /// NodeDescriptor.
     #[must_use]
-    pub fn new(
-        local_ed25519_secret: [u8; 32],
-        local_ed25519_public: [u8; 32],
-    ) -> Self {
+    pub fn new(local_ed25519_secret: [u8; 32], local_ed25519_public: [u8; 32]) -> Self {
         let (local_x25519_secret, local_x25519_public) = x25519_static_keypair();
         Self {
             peers: HashMap::new(),
@@ -505,7 +495,7 @@ impl TcpRecursiveTransport {
             ),
         )
         .await
-        .ok()?  // timeout elapsed → None
+        .ok()? // timeout elapsed → None
         .ok()?; // handshake error → None
         let LinkKeys { send_key, recv_key } = verified.link_keys();
         // 4. Encode the ForwardedQuery to canonical CBOR (== hash preimage).
@@ -928,17 +918,14 @@ impl TcpForwardingServer {
         //    rather than cloning into a `move` closure (the previous
         //    `spawn_blocking` pattern), because the future is no longer
         //    `'static` — it borrows from `&self`.
-        let response_opt = timeout(
-            FRAME_READ_TIMEOUT,
-            self.node.handle_query(&query),
-        )
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "ForwardingNode::handle_query timed out — FRAME_READ_TIMEOUT elapsed",
-            )
-        })?;
+        let response_opt = timeout(FRAME_READ_TIMEOUT, self.node.handle_query(&query))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ForwardingNode::handle_query timed out — FRAME_READ_TIMEOUT elapsed",
+                )
+            })?;
 
         let response = match response_opt {
             Some(r) => r,

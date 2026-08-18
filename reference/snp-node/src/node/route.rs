@@ -131,24 +131,42 @@ impl RouteCommitment {
         let hops_cbor: Vec<CborValue> = hop_details
             .iter()
             .map(|hop| {
-                let endpoints_cbor: Vec<CborValue> = hop
-                    .endpoints
-                    .iter()
-                    .map(|ep| ep.canonical_cbor())
-                    .collect();
+                let endpoints_cbor: Vec<CborValue> =
+                    hop.endpoints.iter().map(|ep| ep.canonical_cbor()).collect();
                 CborValue::Map(vec![
-                    (CborValue::TextString("descriptor".into()), hop.descriptor.canonical_cbor()),
-                    (CborValue::TextString("endpoints".into()), CborValue::Array(endpoints_cbor)),
+                    (
+                        CborValue::TextString("descriptor".into()),
+                        hop.descriptor.canonical_cbor(),
+                    ),
+                    (
+                        CborValue::TextString("endpoints".into()),
+                        CborValue::Array(endpoints_cbor),
+                    ),
                 ])
             })
             .collect();
 
         let route_cbor = CborValue::Map(vec![
-            (CborValue::TextString("protocolVersion".into()), CborValue::TextString("SNP/0.1 route v1".into())),
-            (CborValue::TextString("source".into()), CborValue::ByteString(source.to_vec())),
-            (CborValue::TextString("destination".into()), CborValue::ByteString(destination.to_vec())),
-            (CborValue::TextString("epoch".into()), CborValue::UnsignedInt(epoch)),
-            (CborValue::TextString("hops".into()), CborValue::Array(hops_cbor)),
+            (
+                CborValue::TextString("protocolVersion".into()),
+                CborValue::TextString("SNP/0.1 route v1".into()),
+            ),
+            (
+                CborValue::TextString("source".into()),
+                CborValue::ByteString(source.to_vec()),
+            ),
+            (
+                CborValue::TextString("destination".into()),
+                CborValue::ByteString(destination.to_vec()),
+            ),
+            (
+                CborValue::TextString("epoch".into()),
+                CborValue::UnsignedInt(epoch),
+            ),
+            (
+                CborValue::TextString("hops".into()),
+                CborValue::Array(hops_cbor),
+            ),
         ]);
 
         // Encode via canonical CBOR and hash.
@@ -264,8 +282,7 @@ impl Route {
     ) -> Self {
         let now = now_unix();
         let epoch = 0u64;
-        let route_commitment =
-            RouteCommitment::compute(&source, &destination, epoch, &hop_details);
+        let route_commitment = RouteCommitment::compute(&source, &destination, epoch, &hop_details);
         let hop_count = u32::try_from(hop_details.len()).unwrap_or(u32::MAX);
         Self {
             route_commitment,
@@ -312,9 +329,13 @@ impl Route {
             self.hop_details.iter().map(|h| h.node_id()).collect()
         } else {
             #[cfg(feature = "legacy-circuit-keys")]
-            { self.legacy_hops.clone() }
+            {
+                self.legacy_hops.clone()
+            }
             #[cfg(not(feature = "legacy-circuit-keys"))]
-            { Vec::new() }
+            {
+                Vec::new()
+            }
         }
     }
 
@@ -360,9 +381,7 @@ impl Route {
 
     #[must_use]
     pub fn first_hop_endpoint(&self) -> Option<&TransportEndpoint> {
-        self.hop_details
-            .first()
-            .and_then(|h| h.first_endpoint())
+        self.hop_details.first().and_then(|h| h.first_endpoint())
     }
 
     #[must_use]
@@ -489,17 +508,34 @@ impl Route {
         #[cfg(feature = "legacy-circuit-keys")]
         if self.hop_details.is_empty() && !self.legacy_hops.is_empty() {
             let hops = &self.legacy_hops;
-            if hops.is_empty() { return Err(RouteError::Empty); }
-            if hops.len() > ROUTE_MAX_HOPS { return Err(RouteError::ExcessiveHopCount(hops.len())); }
-            if self.source == [0u8; 32] { return Err(RouteError::SourceMismatch); }
-            if self.destination == [0u8; 32] { return Err(RouteError::DestinationMismatch); }
-            if hops.last() != Some(&self.destination) { return Err(RouteError::DestinationDescriptorMismatch); }
+            if hops.is_empty() {
+                return Err(RouteError::Empty);
+            }
+            if hops.len() > ROUTE_MAX_HOPS {
+                return Err(RouteError::ExcessiveHopCount(hops.len()));
+            }
+            if self.source == [0u8; 32] {
+                return Err(RouteError::SourceMismatch);
+            }
+            if self.destination == [0u8; 32] {
+                return Err(RouteError::DestinationMismatch);
+            }
+            if hops.last() != Some(&self.destination) {
+                return Err(RouteError::DestinationDescriptorMismatch);
+            }
             let mut seen = HashSet::new();
             for hop in hops {
-                if !seen.insert(*hop) { return Err(RouteError::DuplicateHop(hex_short(hop))); }
+                if !seen.insert(*hop) {
+                    return Err(RouteError::DuplicateHop(hex_short(hop)));
+                }
             }
             let now = now_unix();
-            if self.is_expired(now) { return Err(RouteError::Expired { expires_at: self.expires_at, now }); }
+            if self.is_expired(now) {
+                return Err(RouteError::Expired {
+                    expires_at: self.expires_at,
+                    now,
+                });
+            }
             return Ok(());
         }
         // Production validation.

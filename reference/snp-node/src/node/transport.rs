@@ -282,7 +282,10 @@ impl TransportProvider for TcpTransportProvider {
         // `set_nodelay` failing is non-fatal (the stream still works, just
         // with Nagle's algorithm enabled).
         let _ = stream.set_nodelay(true);
-        Ok(Box::new(TcpTransportConnection { stream, alive: true }))
+        Ok(Box::new(TcpTransportConnection {
+            stream,
+            alive: true,
+        }))
     }
 
     fn listen(&self, addr: &str) -> Result<Box<dyn TransportListener>, TransportError> {
@@ -318,12 +321,10 @@ impl TransportConnection for TcpTransportConnection {
         if !self.alive {
             return Err(TransportError::Closed);
         }
-        self.stream
-            .write_all(data)
-            .map_err(|e| {
-                self.alive = false;
-                TransportError::Io(e.to_string())
-            })?;
+        self.stream.write_all(data).map_err(|e| {
+            self.alive = false;
+            TransportError::Io(e.to_string())
+        })?;
         self.stream.flush().map_err(|e| {
             self.alive = false;
             TransportError::Io(e.to_string())
@@ -388,7 +389,10 @@ impl TransportListener for TcpTransportListener {
             .accept()
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let _ = stream.set_nodelay(true);
-        Ok(Box::new(TcpTransportConnection { stream, alive: true }))
+        Ok(Box::new(TcpTransportConnection {
+            stream,
+            alive: true,
+        }))
     }
 
     fn local_addr(&self) -> String {
@@ -496,9 +500,7 @@ mod tests {
         });
 
         // Client connects, sends lowercase, expects uppercase back.
-        let mut client = provider
-            .connect(&bound_addr)
-            .expect("connect must succeed");
+        let mut client = provider.connect(&bound_addr).expect("connect must succeed");
         assert!(client.is_alive());
         client.send(b"ping").expect("send ping");
         let response = client.recv().expect("recv response");

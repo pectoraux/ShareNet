@@ -113,7 +113,6 @@ impl BootstrapDiscovery {
 
         Ok(DiscoveredNode {
             advertisement: advert,
-            endpoint: addr.to_string(),
         })
     }
 }

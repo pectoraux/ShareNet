@@ -25,6 +25,6 @@
 //! passes them to this constructor.
 
 pub use snp_identity::{
-    IdentityConsistentNodeDescriptor, TransportEndpoint, UnverifiedNodeDescriptor,
-    VerifiedGatewayAdvertisement, VerifiedNodeDescriptor, verify_node_id_consistency,
+    verify_node_id_consistency, IdentityConsistentNodeDescriptor, TransportEndpoint,
+    UnverifiedNodeDescriptor, VerifiedGatewayAdvertisement, VerifiedNodeDescriptor,
 };

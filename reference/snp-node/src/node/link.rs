@@ -346,7 +346,9 @@ pub struct AuthenticatedLink {
 pub enum AuthenticatedLinkError {
     /// The `LinkKey.remote_node_id` does not match the verified
     /// advertisement's NodeId.
-    #[error("remote_node_id mismatch: LinkKey says {link_node_id}, advertisement says {advert_node_id}")]
+    #[error(
+        "remote_node_id mismatch: LinkKey says {link_node_id}, advertisement says {advert_node_id}"
+    )]
     NodeIdMismatch {
         /// The NodeId from the LinkKey.
         link_node_id: NodeIdHex,
@@ -374,7 +376,9 @@ pub enum AuthenticatedLinkError {
     HandshakePublicKeyMismatch,
     /// The handshake proof's `peer_x25519_public` does not match the
     /// advertisement's X25519 circuit public key.
-    #[error("handshake peer_x25519_public mismatch: handshake X25519 key does not match advertisement")]
+    #[error(
+        "handshake peer_x25519_public mismatch: handshake X25519 key does not match advertisement"
+    )]
     HandshakeX25519Mismatch,
     /// The handshake proof's `session_id` is all-zero, which should not
     /// happen for a successful `snp-link` handshake but is checked
@@ -493,7 +497,10 @@ impl AuthenticatedLink {
         }
         // Construct the underlying Link with the session_id set.
         let link = Link::new_up(key, Some(proof.session_id()));
-        Ok(Self { link, proof: proof.clone() })
+        Ok(Self {
+            link,
+            proof: proof.clone(),
+        })
     }
 
     /// Get a reference to the underlying `Link` (read-only).
@@ -606,9 +613,10 @@ fn transport_endpoint_matches_binding(
         (TransportEndpoint::WifiDirect(addr_str), snp_link::TransportType::WifiDirect) => {
             endpoint.as_str() == binding.canonical_addr()
         }
-        (TransportEndpoint::NearbyConnections(addr_str), snp_link::TransportType::NearbyConnections) => {
-            endpoint.as_str() == binding.canonical_addr()
-        }
+        (
+            TransportEndpoint::NearbyConnections(addr_str),
+            snp_link::TransportType::NearbyConnections,
+        ) => endpoint.as_str() == binding.canonical_addr(),
         _ => false, // Transport type mismatch.
     }
 }

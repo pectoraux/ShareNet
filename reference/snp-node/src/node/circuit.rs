@@ -82,4 +82,3 @@ pub struct UpstreamPeer {
     /// The directional hop keys for this link.
     pub hop_keys: LinkKeys,
 }
-

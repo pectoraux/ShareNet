@@ -162,16 +162,48 @@ impl HaveVector {
 // BootstrapDiscovery (which uses TCP I/O) remains in snp-node — it is
 // runtime code, not a discovery type.
 
-/// A discovered node: a signed advertisement + the endpoint at which it
-/// can be reached for transit.
+/// A discovered node: a signed advertisement from which the authenticated
+/// endpoint can be extracted.
 ///
-/// The caller MUST verify the advertisement's signature before use.
+/// The endpoint is NOT a separate field — it comes from the signed
+/// `listen_addr` inside the `GatewayAdvertisement`. This prevents an
+/// attacker from substituting an unsigned endpoint while retaining a
+/// valid signed identity.
+///
+/// ```text
+/// signed advertisement
+///     ↓
+/// verify_into_verified()
+///     ↓
+/// verified.listen_addr()
+///     ↓
+/// RouteHop endpoint
+/// ```
+///
+/// Callers MUST verify the advertisement's signature before using the
+/// endpoint.
 #[derive(Debug, Clone)]
 pub struct DiscoveredNode {
     /// The signed advertisement (caller MUST verify the signature before use).
     pub advertisement: snp_identity::GatewayAdvertisement,
-    /// The TCP address at which this node can be reached for transit.
-    pub endpoint: String,
+}
+
+impl DiscoveredNode {
+    /// Returns the transport endpoint from the advertisement.
+    ///
+    /// This is the `listen_addr` field from the (potentially unverified)
+    /// advertisement. The caller MUST verify the advertisement's signature
+    /// before trusting this endpoint.
+    ///
+    /// For a verified endpoint, use:
+    /// ```ignore
+    /// let verified = node.advertisement.verify_into_verified()?;
+    /// let endpoint = verified.listen_addr();
+    /// ```
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.advertisement.listen_addr
+    }
 }
 
 /// A discovery provider: returns a list of discovered nodes.

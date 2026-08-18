@@ -44,26 +44,67 @@ impl HelloMessage {
         // The advertisement's preimage() is private, so we construct
         // the full representation here.
         let advert_cbor = CborValue::Map(vec![
-            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.advertisement.node_id.to_vec())),
-            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.advertisement.ed25519_public_key.to_vec())),
-            (CborValue::TextString("capabilities".into()), CborValue::Array(
-                self.advertisement.capabilities.iter().map(|c| CborValue::TextString(c.as_str().to_string())).collect()
-            )),
-            (CborValue::TextString("endpoints".into()), CborValue::Array(
-                self.advertisement.endpoints.iter().map(|e| e.canonical_cbor()).collect()
-            )),
-            (CborValue::TextString("x25519CircuitPub".into()), match &self.advertisement.x25519_circuit_public {
-                Some(k) => CborValue::ByteString(k.to_vec()),
-                None => CborValue::Null,
-            }),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.advertisement.timestamp)),
-            (CborValue::TextString("expiry".into()), CborValue::UnsignedInt(self.advertisement.expiry)),
-            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.advertisement.nonce.to_vec())),
-            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.advertisement.sequence)),
-            (CborValue::TextString("signature".into()), CborValue::ByteString(self.advertisement.signature.to_vec())),
+            (
+                CborValue::TextString("nodeId".into()),
+                CborValue::ByteString(self.advertisement.node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("publicKey".into()),
+                CborValue::ByteString(self.advertisement.ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("capabilities".into()),
+                CborValue::Array(
+                    self.advertisement
+                        .capabilities
+                        .iter()
+                        .map(|c| CborValue::TextString(c.as_str().to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                CborValue::TextString("endpoints".into()),
+                CborValue::Array(
+                    self.advertisement
+                        .endpoints
+                        .iter()
+                        .map(|e| e.canonical_cbor())
+                        .collect(),
+                ),
+            ),
+            (
+                CborValue::TextString("x25519CircuitPub".into()),
+                match &self.advertisement.x25519_circuit_public {
+                    Some(k) => CborValue::ByteString(k.to_vec()),
+                    None => CborValue::Null,
+                },
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.advertisement.timestamp),
+            ),
+            (
+                CborValue::TextString("expiry".into()),
+                CborValue::UnsignedInt(self.advertisement.expiry),
+            ),
+            (
+                CborValue::TextString("nonce".into()),
+                CborValue::ByteString(self.advertisement.nonce.to_vec()),
+            ),
+            (
+                CborValue::TextString("sequence".into()),
+                CborValue::UnsignedInt(self.advertisement.sequence),
+            ),
+            (
+                CborValue::TextString("signature".into()),
+                CborValue::ByteString(self.advertisement.signature.to_vec()),
+            ),
         ]);
         let msg = CborValue::Map(vec![
-            (CborValue::TextString("messageType".into()), CborValue::TextString("hello".into())),
+            (
+                CborValue::TextString("messageType".into()),
+                CborValue::TextString("hello".into()),
+            ),
             (CborValue::TextString("advertisement".into()), advert_cbor),
         ]);
         Ok(snp_cbor::encode(&msg)?)
@@ -120,10 +161,12 @@ impl HelloMessage {
         }
         let mt = message_type.ok_or_else(|| NodeError::Other("messageType missing".into()))?;
         if mt != "hello" {
-            return Err(NodeError::Other(format!("expected messageType=hello, got {mt}")));
+            return Err(NodeError::Other(format!(
+                "expected messageType=hello, got {mt}"
+            )));
         }
-        let _advert_bytes = advertisement_bytes
-            .ok_or_else(|| NodeError::Other("advertisement missing".into()))?;
+        let _advert_bytes =
+            advertisement_bytes.ok_or_else(|| NodeError::Other("advertisement missing".into()))?;
         // For now, we don't fully decode the advertisement from the nested
         // byte string because NodeAdvertisement doesn't have a decode_cbor
         // method yet. The caller should use the raw bytes to construct
@@ -136,7 +179,8 @@ impl HelloMessage {
         //
         // TODO: Add NodeAdvertisement::encode_cbor/decode_cbor in a follow-up.
         Err(NodeError::Other(
-            "HELLO decode_cbor not yet fully implemented — NodeAdvertisement::decode_cbor needed".into()
+            "HELLO decode_cbor not yet fully implemented — NodeAdvertisement::decode_cbor needed"
+                .into(),
         ))
     }
 }
@@ -194,11 +238,26 @@ impl GoodbyeMessage {
 
     fn preimage(&self) -> CborValue {
         CborValue::Map(vec![
-            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.node_id.to_vec())),
-            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.sequence)),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
-            (CborValue::TextString("publicKey".into()), CborValue::ByteString(self.ed25519_public_key.to_vec())),
+            (
+                CborValue::TextString("nodeId".into()),
+                CborValue::ByteString(self.node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("sequence".into()),
+                CborValue::UnsignedInt(self.sequence),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("nonce".into()),
+                CborValue::ByteString(self.nonce.to_vec()),
+            ),
+            (
+                CborValue::TextString("publicKey".into()),
+                CborValue::ByteString(self.ed25519_public_key.to_vec()),
+            ),
         ])
     }
 
@@ -255,7 +314,11 @@ pub struct PeerSummary {
 impl PeerSummary {
     /// Construct a PeerSummary from an `AuthenticatedNodeRecord`.
     #[must_use]
-    pub fn from_record(record: &AuthenticatedNodeRecord, distance_hint: u8, last_seen: u64) -> Self {
+    pub fn from_record(
+        record: &AuthenticatedNodeRecord,
+        distance_hint: u8,
+        last_seen: u64,
+    ) -> Self {
         Self {
             node_id: record.descriptor.node_id(),
             advertisement_sequence: record.sequence,
@@ -291,12 +354,30 @@ impl PeerSummary {
             .map(|c| CborValue::TextString(c.clone()))
             .collect();
         CborValue::Map(vec![
-            (CborValue::TextString("nodeId".into()), CborValue::ByteString(self.node_id.to_vec())),
-            (CborValue::TextString("sequence".into()), CborValue::UnsignedInt(self.advertisement_sequence)),
-            (CborValue::TextString("capabilities".into()), CborValue::Array(caps)),
-            (CborValue::TextString("visibility".into()), CborValue::TextString(self.visibility.clone())),
-            (CborValue::TextString("lastSeen".into()), CborValue::UnsignedInt(self.last_seen)),
-            (CborValue::TextString("distanceHint".into()), CborValue::UnsignedInt(u64::from(self.distance_hint))),
+            (
+                CborValue::TextString("nodeId".into()),
+                CborValue::ByteString(self.node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("sequence".into()),
+                CborValue::UnsignedInt(self.advertisement_sequence),
+            ),
+            (
+                CborValue::TextString("capabilities".into()),
+                CborValue::Array(caps),
+            ),
+            (
+                CborValue::TextString("visibility".into()),
+                CborValue::TextString(self.visibility.clone()),
+            ),
+            (
+                CborValue::TextString("lastSeen".into()),
+                CborValue::UnsignedInt(self.last_seen),
+            ),
+            (
+                CborValue::TextString("distanceHint".into()),
+                CborValue::UnsignedInt(u64::from(self.distance_hint)),
+            ),
         ])
     }
 }
@@ -407,18 +488,32 @@ impl PeerSummaryList {
     }
 
     fn preimage(&self) -> CborValue {
-        let summaries: Vec<CborValue> = self
-            .summaries
-            .iter()
-            .map(|s| s.canonical_cbor())
-            .collect();
+        let summaries: Vec<CborValue> = self.summaries.iter().map(|s| s.canonical_cbor()).collect();
         CborValue::Map(vec![
-            (CborValue::TextString("senderNodeId".into()), CborValue::ByteString(self.sender_node_id.to_vec())),
-            (CborValue::TextString("senderPublicKey".into()), CborValue::ByteString(self.sender_ed25519_public_key.to_vec())),
-            (CborValue::TextString("summaries".into()), CborValue::Array(summaries)),
-            (CborValue::TextString("timestamp".into()), CborValue::UnsignedInt(self.timestamp)),
-            (CborValue::TextString("nonce".into()), CborValue::ByteString(self.nonce.to_vec())),
-            (CborValue::TextString("propagationSequence".into()), CborValue::UnsignedInt(self.propagation_sequence)),
+            (
+                CborValue::TextString("senderNodeId".into()),
+                CborValue::ByteString(self.sender_node_id.to_vec()),
+            ),
+            (
+                CborValue::TextString("senderPublicKey".into()),
+                CborValue::ByteString(self.sender_ed25519_public_key.to_vec()),
+            ),
+            (
+                CborValue::TextString("summaries".into()),
+                CborValue::Array(summaries),
+            ),
+            (
+                CborValue::TextString("timestamp".into()),
+                CborValue::UnsignedInt(self.timestamp),
+            ),
+            (
+                CborValue::TextString("nonce".into()),
+                CborValue::ByteString(self.nonce.to_vec()),
+            ),
+            (
+                CborValue::TextString("propagationSequence".into()),
+                CborValue::UnsignedInt(self.propagation_sequence),
+            ),
         ])
     }
 
@@ -527,7 +622,9 @@ impl PeerSummaryList {
                 return None;
             }
         }
-        Some(VerifiedPeerSummaryList { inner: self.clone() })
+        Some(VerifiedPeerSummaryList {
+            inner: self.clone(),
+        })
     }
 
     /// Get the number of summaries.
