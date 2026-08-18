@@ -54,7 +54,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 |---|---|---|
 | Class A (Content) | PASS (TS+Android) | Chunking, Merkle, manifests, CAS in TS/Android |
 | Class B (Transit) | PASS (Rust) | TransitRequest, StreamMessage, encrypted circuit frames — relays cannot read payloads |
-| Structural separation | PARTIAL | No explicit type-level enforcement. The split exists conceptually but is not enforced by a type boundary. |
+| Structural separation | PASS | `FrameClass` enum (Content/Transit/Control) replaces raw u8. `Ciphertext` newtype (opaque, no as_bytes). `ContentBytes` newtype (readable). No implicit conversion between them. 10 regression tests in snp-frames/tests/traffic_class_separation.rs. |
 
 ---
 
