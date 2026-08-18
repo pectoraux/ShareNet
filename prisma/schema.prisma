@@ -1,16 +1,19 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+// ShareNet 2.0 — PostgreSQL on Neon.
+// DATABASE_URL        → Neon pooled connection (PgBouncer) — used by Prisma Client at runtime.
+// DIRECT_DATABASE_URL → Neon direct connection — used by Prisma CLI for migrations / db push.
+// See: https://pris.ly/d/neon-serverless-driver and https://neon.tech/docs/guides/prisma
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
 }
 
 model User {

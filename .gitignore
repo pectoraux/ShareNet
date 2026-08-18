@@ -45,3 +45,9 @@ server.log
 /db/
 /sharenet-*.png
 reference/target/
+.vercel
+.env*
+
+# runtime PID files (written by sandbox daemon launchers)
+*.pid
+.zscripts/*.log
