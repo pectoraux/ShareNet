@@ -240,8 +240,7 @@ impl TcpFlowBridge {
         socket_handle: SocketHandle,
         upstream: Box<dyn AsyncUpstream + Send>,
     ) {
-        self.flows
-            .insert(socket_handle, FlowEntry::Async(upstream));
+        self.flows.insert(socket_handle, FlowEntry::Async(upstream));
     }
 
     /// Detach the upstream from a smoltcp socket. Closes the upstream and
@@ -639,9 +638,7 @@ mod circuit_upstream {
                         )
                         .await
                         .map_err(|e| {
-                            BridgeError::SmolTcp(format!(
-                                "ShareNet circuit error: {e}"
-                            ))
+                            BridgeError::SmolTcp(format!("ShareNet circuit error: {e}"))
                         })?;
 
                         // Reconstruct the HTTP response (status line + headers
@@ -676,9 +673,7 @@ mod circuit_upstream {
         if needle.is_empty() || needle.len() > haystack.len() {
             return None;
         }
-        haystack
-            .windows(needle.len())
-            .position(|w| w == needle)
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     /// Extract the URL from an HTTP request's request line.
@@ -719,10 +714,7 @@ mod circuit_upstream {
     }
 
     /// Reconstruct a minimal HTTP response from a TransitResponse + body.
-    fn format_http_response(
-        resp: &snp_gateway::TransitResponse,
-        body: &[u8],
-    ) -> Vec<u8> {
+    fn format_http_response(resp: &snp_gateway::TransitResponse, body: &[u8]) -> Vec<u8> {
         let status = resp.status;
         // Find Content-Type from the response headers.
         let content_type = resp
@@ -1069,10 +1061,7 @@ mod tests {
         let _engine = TcpEngine::new(Ipv4Address::new(10, 0, 0, 1), 1500);
 
         // Without an established socket, pump should be a no-op.
-        let (sent, recv) = bridge.pump(&mut TcpEngine::new(
-            Ipv4Address::new(10, 0, 0, 1),
-            1500,
-        ));
+        let (sent, recv) = bridge.pump(&mut TcpEngine::new(Ipv4Address::new(10, 0, 0, 1), 1500));
         assert_eq!(sent, 0);
         assert_eq!(recv, 0);
     }
