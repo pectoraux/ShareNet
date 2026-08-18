@@ -13,6 +13,43 @@
 # stack routes its SYNs through a real TUN interface that is plumbed
 # into the ShareNet circuit mesh.
 #
+# TWO MODES (--mode=host-local | --mode=internet)
+# -----------------------------------------------
+# This script supports TWO modes, classified as follows:
+#
+#   --mode=host-local  (DEFAULT — backward-compatible with previous versions)
+#     Starts a local python3 HTTP server on $HOST_IP:$HTTP_PORT that
+#     echoes a token. This proves the TUN → ShareNet → gateway → host
+#     path, but DOES NOT prove genuine Internet egress — the "external"
+#     endpoint is on the same host as the gateway, so the gateway's
+#     outbound socket never leaves the host. The script classifies
+#     this as:
+#
+#       "N3-B TUN integration / host-local egress test
+#        (NOT Internet acceptance)"
+#
+#     Useful for:
+#       - Debugging the TUN path
+#       - Verifying the split-tunnel routing
+#       - Verifying the ShareNet circuit establishment
+#       - CI runs that don't have Internet access
+#
+#   --mode=internet    (genuine Internet acceptance — REQUIRES
+#                       --external-endpoint=http://<REMOTE_IP>:<PORT>/)
+#     The script does NOT start a local HTTP server. The gateway dials
+#     the user-provided external endpoint directly, which MUST be:
+#       - a REMOTE IP (NOT the gateway host's own IP)
+#       - NOT loopback (127.0.0.0/8, ::1)
+#       - NOT RFC1918 private (10/8, 172.16/12, 192.168/16)
+#       - NOT link-local (169.254/16)
+#       - NOT in the test's internal subnets (10.0.0.0/24, 10.0.1.0/24)
+#     The token is passed as ?token=<token> in the URL and the external
+#     server is expected to echo it in the response body. This proves
+#     genuine Internet egress — the bytes left the host, traversed the
+#     real Internet, reached the external server, and returned.
+#
+#       "N3-B Internet acceptance test"
+#
 # The successful path is EXACTLY the one specified by the task:
 #
 #     ordinary curl
@@ -22,8 +59,10 @@
 #     ShareNet circuit (SNP-IK + X25519 DH)
 #         ↓ relay(s) forward
 #     gateway (real outbound TCP socket, production SSRF defence)
-#         ↓ real Internet
-#     external HTTP server (started by THIS script, not by the binary)
+#         ↓ real Internet (in --mode=internet) or host-local (in --mode=host-local)
+#     external HTTP server (in --mode=internet: a REMOTE server the
+#                            user provides; in --mode=host-local: a
+#                            python3 server the script starts)
 #         ← response retraces the path
 #
 #     ┌────────────────────────────────┐
@@ -231,17 +270,23 @@
 # partial or misleading test. `bash -n` (syntax check) DOES pass here.
 #
 # ════════════════════════════════════════════════════════════════════════════
-# EXPECTED OUTPUT (PASS)
+# EXPECTED OUTPUT (PASS) — --mode=host-local (default)
 # ════════════════════════════════════════════════════════════════════════════
-#   === N3-B TUN ACCEPTANCE TEST ===
+#   === N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST ===
+#   NOTE: this proves the TUN → ShareNet → gateway → host path,
+#         but does NOT prove genuine Internet egress.
+#         For Internet acceptance, use:
+#           --mode=internet --external-endpoint=http://<REMOTE_IP>:<PORT>/
+#   ...
 #   host IP:             192.168.1.42
 #   external endpoint:   http://192.168.1.42:8888/
 #   TUN interface:       snp0 (10.0.0.1, mtu 1500)
 #   client namespace:    snp_n3b (veth 10.0.1.2, no default route yet)
 #   mesh:                gateway=10.0.1.1:7003 relayA=10.0.1.1:7002 relayB=10.0.1.1:7001
+#   token:               N3B-20240101T120000-deadbeef
 #
-#   === STEP 1: start external HTTP server ===
-#   python3 -m http.server 8888 --bind 0.0.0.0 (PID 12345)
+#   === STEP 1: starting external HTTP server (host-local token-echo server) ===
+#   N3B_TOKEN=<redacted> N3B_HTTP_PORT=8888 python3 /tmp/.../server.py (PID 12345)
 #
 #   === STEP 2: start ShareNet mesh (gateway + relays) ===
 #   n3b_tun_demo mesh --bind-ip 10.0.1.1 ... (PID 12346)
@@ -263,9 +308,42 @@
 #   TUN snp0 created (10.0.0.1, default route installed by binary)
 #
 #   === TEST 2: SHARENET via TUN — EXPECTED: SUCCESS ===
-#   [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)
+#   [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected, token verified)
 #
-#   N3-B TUN ACCEPTANCE TEST: PASS
+#   N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST: PASS
+#
+# ════════════════════════════════════════════════════════════════════════════
+# EXPECTED OUTPUT (PASS) — --mode=internet
+# ════════════════════════════════════════════════════════════════════════════
+#   === N3-B INTERNET ACCEPTANCE TEST ===
+#   external endpoint:   http://203.0.113.42:8080/
+#   token:              N3B-20240101T120000-deadbeef
+#   The gateway will open a real outbound TCP connection to the
+#   external endpoint (NOT a local python3 server — the script
+#   does NOT start one in this mode).
+#   ...
+#   host IP:             192.168.1.42
+#   external endpoint:  http://203.0.113.42:8080/
+#   TUN interface:      snp0 (10.0.0.1, mtu 1500)
+#   client namespace:   snp_n3b (veth 10.0.1.2, no default route yet)
+#   mesh:               gateway=10.0.1.1:7003 relayA=10.0.1.1:7002 relayB=10.0.1.1:7001
+#   token:              N3B-20240101T120000-deadbeef
+#
+#   === STEP 1: verifying external endpoint is reachable from the host ===
+#   curl --connect-timeout 5 -s -o /dev/null -w '%{http_code}' 'http://203.0.113.42:8080/?token=...'
+#   (the gateway will dial this from the host namespace)
+#   external endpoint is reachable from the host (http_code 200)
+#
+#   === STEP 2: start ShareNet mesh (gateway + relays) ===
+#   ... (as above)
+#
+#   === TEST 1: DIRECT access (no TUN yet) — EXPECTED: FAIL ===
+#   [1] DIRECT: curl from client namespace → FAIL (expected)
+#
+#   === TEST 2: SHARENET via TUN — EXPECTED: SUCCESS ===
+#   [2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected, token verified)
+#
+#   N3-B INTERNET ACCEPTANCE TEST: PASS
 #
 # ════════════════════════════════════════════════════════════════════════════
 # USAGE
@@ -273,9 +351,24 @@
 #   bash snp-stack/tests/n3b_tun_acceptance_test.sh [OPTIONS]
 #
 # OPTIONS
-#   --external-endpoint=URL     Override external URL (e.g. http://example.com/)
-#                                  Default: http://$HOST_IP:$HTTP_PORT/
-#   --http-port=PORT            External HTTP server port (default: 8888)
+#   --mode=MODE                Test mode: 'host-local' (default) or 'internet'
+#                                  host-local: starts a local python3 HTTP
+#                                    server on $HOST_IP — proves the TUN path
+#                                    but NOT genuine Internet egress.
+#                                  internet:  REQUIRES --external-endpoint to a
+#                                    genuinely-remote public IP. The script
+#                                    does NOT start a local server.
+#   --external-endpoint=URL    External URL.
+#                                  Default (host-local): http://$HOST_IP:$HTTP_PORT/
+#                                  REQUIRED (internet):  http://<REMOTE_IP>:<PORT>/
+#                                    where <REMOTE_IP> is NOT the gateway host's
+#                                    IP, NOT loopback, NOT RFC1918, NOT link-local.
+#   --token=STRING             Unique token verified in the response body
+#                                  (proves the response came from the intended
+#                                  external server). Default: auto-generated
+#                                  as N3B-<timestamp>-<random>.
+#   --http-port=PORT           External HTTP server port (host-local mode only)
+#                                  (default: 8888)
 #   --tun-name=NAME             TUN interface name (default: snp0, max 15 chars)
 #   --tun-ip=IP                 TUN interface IP (default: 10.0.0.1, plain IP)
 #   --client-ip=IP              Client namespace veth IP (default: 10.0.1.2)
@@ -294,7 +387,7 @@
 #   0 — Test PASSED (direct failed AND sharenet succeeded)
 #   1 — Test FAILED (direct succeeded OR sharenet failed)
 #   2 — Setup error (missing binary / permission / preflight)
-#   3 — Invalid arguments
+#   3 — Invalid arguments (--mode, --external-endpoint, --token, etc.)
 #
 # RELATED FILES
 #   * snp-stack/examples/n3b_tun_demo.rs  — the TunClient + mesh binary
@@ -340,6 +433,18 @@ NO_BUILD=0
 KEEP_ON_FAILURE=0
 VERBOSE=0
 
+# Mode: 'host-local' (default — starts a local python3 HTTP server on
+# $HOST_IP, proves the TUN→ShareNet→gateway→host path but NOT genuine
+# Internet egress) OR 'internet' (REQUIRES --external-endpoint to a
+# genuinely-remote public IP; the script does NOT start a local server).
+MODE="host-local"
+
+# Token: passed to the external HTTP server (via env var in host-local
+# mode, via ?token= query parameter in internet mode). The response body
+# MUST contain this token. If empty, a token is generated as
+# N3B-<timestamp>-<random> in main().
+TOKEN=""
+
 # Paths derived from script location (so it can be run from anywhere).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -378,13 +483,36 @@ The successful path uses ordinary `curl http://IP:PORT/` with NO proxy
 flags. The OS routing table directs the SYN through a TUN interface
 that is plumbed into the ShareNet circuit mesh.
 
+TWO MODES (--mode=host-local | --mode=internet):
+    --mode=host-local  (DEFAULT)  starts a local python3 HTTP server on
+                                  $HOST_IP:$HTTP_PORT. Proves the TUN →
+                                  ShareNet → gateway → host path, but NOT
+                                  genuine Internet egress. The script
+                                  classifies this as "N3-B TUN integration
+                                  / host-local egress test (NOT Internet
+                                  acceptance)".
+    --mode=internet    (genuine Internet acceptance) — REQUIRES
+                                  --external-endpoint=http://<REMOTE_IP>:<PORT>/
+                                  where <REMOTE_IP> is NOT the gateway host's
+                                  IP, NOT loopback, NOT RFC1918 private,
+                                  NOT link-local. The script does NOT start
+                                  a local server — the gateway dials the
+                                  external endpoint directly.
+
 USAGE:
     bash snp-stack/tests/n3b_tun_acceptance_test.sh [OPTIONS]
 
 OPTIONS:
-    --external-endpoint=URL     Override external URL (e.g. http://example.com/)
-                                  Default: http://$HOST_IP:$HTTP_PORT/
-    --http-port=PORT            External HTTP server port (default: 8888)
+    --mode=MODE                Test mode: 'host-local' (default) or 'internet'
+    --external-endpoint=URL    External URL.
+                                  Default (host-local): http://$HOST_IP:$HTTP_PORT/
+                                  REQUIRED (internet):  http://<REMOTE_IP>:<PORT>/
+    --token=STRING             Unique token verified in the response body
+                                  (proves the response came from the intended
+                                  external server). Default: auto-generated
+                                  as N3B-<timestamp>-<random>.
+    --http-port=PORT            External HTTP server port (host-local mode only)
+                                  (default: 8888)
     --tun-name=NAME             TUN interface name (default: snp0, max 15 chars)
     --tun-ip=IP                 TUN interface IP (default: 10.0.0.1, plain IP)
     --client-ip=IP              Client namespace veth IP (default: 10.0.1.2)
@@ -411,11 +539,30 @@ EXIT CODES:
     0 — Test PASSED (direct failed AND sharenet succeeded)
     1 — Test FAILED (direct succeeded OR sharenet failed)
     2 — Setup error (missing binary / permission / preflight)
-    3 — Invalid arguments
+    3 — Invalid arguments (--mode, --external-endpoint, --token, etc.)
 
 EXAMPLES:
-    # Default: auto-detect everything, build the demo, run the test.
+    # Default (--mode=host-local): auto-detect, build the demo, run the test.
+    # Proves the TUN → ShareNet → gateway → host path. Does NOT prove
+    # genuine Internet egress (the "external" server is local python3).
     sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh
+
+    # Genuine Internet acceptance test (--mode=internet).
+    # The script does NOT start a local server; the gateway dials the
+    # user-provided external endpoint. The endpoint IP MUST be a remote
+    # public IP (NOT the host's own IP, NOT loopback, NOT RFC1918,
+    # NOT link-local).
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh \
+        --mode=internet \
+        --external-endpoint=http://203.0.113.42:8080/
+
+    # Same, with an explicit token (otherwise auto-generated as
+    # N3B-<timestamp>-<random>). The external server is expected to
+    # echo the ?token=<token> query parameter in its response body.
+    sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh \
+        --mode=internet \
+        --external-endpoint=http://203.0.113.42:8080/ \
+        --token=my-unique-token-12345
 
     # Debug a failure without tearing down state.
     sudo bash snp-stack/tests/n3b_tun_acceptance_test.sh --keep-on-failure -v
@@ -649,6 +796,8 @@ preflight() {
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
+            --mode=*)              MODE="${1#*=}" ;;
+            --token=*)              TOKEN="${1#*=}" ;;
             --external-endpoint=*) EXTERNAL_ENDPOINT="${1#*=}" ;;
             --http-port=*)         HTTP_PORT="${1#*=}" ;;
             --tun-name=*)          TUN_NAME="${1#*=}" ;;
@@ -746,6 +895,310 @@ parse_args() {
         err "--config must not be empty"
         exit 3
     fi
+
+    # Validate --mode (must be 'host-local' or 'internet'). This is an
+    # argument-validation check, so it runs BEFORE the privilege probe
+    # in preflight() — saving a confusing privilege error for what is
+    # really a typo in the args.
+    case "$MODE" in
+        host-local|internet) ;;
+        *)
+            err "--mode must be 'host-local' or 'internet', got '$MODE'"
+            err "  --mode=host-local  (default) starts a local python3 HTTP server"
+            err "                     on \$HOST_IP — proves the TUN path but NOT"
+            err "                     genuine Internet egress."
+            err "  --mode=internet   REQUIRES --external-endpoint=http://<REMOTE_IP>:<PORT>/"
+            err "                     where <REMOTE_IP> is NOT the gateway host's IP."
+            err "                     The script does NOT start a local server."
+            exit 3
+            ;;
+    esac
+
+    # Validate --token (if provided). Must be non-empty and reasonably
+    # short to avoid breaking URL parsing. The default is generated in
+    # main() if not provided.
+    if [ -n "$TOKEN" ]; then
+        if [ "${#TOKEN}" -gt 256 ]; then
+            err "--token is too long (max 256 chars, got ${#TOKEN})"
+            exit 3
+        fi
+        # Reject tokens that contain characters that would break the
+        # ?token=<TOKEN> URL query parameter (RFC 3986 reserved chars
+        # in the query component: &, =, #). Allow everything else.
+        case "$TOKEN" in
+            *"&"*|*"="*|*'#'*|*' '*)
+                err "--token contains forbidden characters (space, &, =, #)"
+                err "use a token like: N3B-<timestamp>-<random>"
+                exit 3
+                ;;
+        esac
+    fi
+
+    # In --mode=internet, --external-endpoint is REQUIRED (the script
+    # does NOT auto-detect a default in this mode). This is checked here
+    # as pure argument validation, before any external action.
+    if [ "$MODE" = "internet" ] && [ -z "$EXTERNAL_ENDPOINT" ]; then
+        err "--mode=internet REQUIRES --external-endpoint=http://<REMOTE_IP>:<PORT>/"
+        err "where <REMOTE_IP> is NOT the gateway host's own IP."
+        err "the script does NOT start a local HTTP server in this mode"
+        err "— the gateway opens a real outbound TCP socket to the external endpoint."
+        exit 3
+    fi
+}
+
+# ─── Generate a unique token ──────────────────────────────────────────────────
+# Format: N3B-<YYYYMMDDTHHMMSS>-<8 hex chars from /dev/urandom>
+# Used when --token is not provided. The token is passed to the HTTP
+# server (via env var in host-local mode, via ?token= in internet mode)
+# and verified in the response body — proving the bytes came from the
+# intended server, not from some other source.
+generate_token() {
+    local ts rand
+    ts=$(date +%Y%m%dT%H%M%S 2>/dev/null || printf 'UNKNOWN')
+    # 4 bytes from /dev/urandom → 8 hex chars. Fall back to $RANDOM
+    # (less unique but always available).
+    rand=$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ -z "$rand" ]; then
+        rand=$(printf '%04x' "$RANDOM" 2>/dev/null || echo 'noent')
+    fi
+    printf 'N3B-%s-%s' "$ts" "$rand"
+}
+
+# ─── Extract the host portion from a URL ──────────────────────────────────────
+# Parses http://<host>[:port]/[path][?query][#frag] and prints the host
+# (hostname or IP, NOT the port). Handles IPv6 [::1]:port form.
+extract_endpoint_host() {
+    local url="$1"
+    local rest hostport host
+    case "$url" in
+        http://*)  rest="${url#http://}" ;;
+        https://*) rest="${url#https://}" ;;
+        *)         rest="$url" ;;
+    esac
+    # Strip path/query/fragment: take everything up to the first /, ?, or #.
+    hostport="${rest%%[/?#]*}"
+    # Strip the port. Handle IPv6 [::1]:port form first.
+    # NOTE: use \[* (starts with '[') rather than \[*\] (starts with '['
+    # AND ends with ']') because the hostport variable already includes
+    # the port (e.g. '[::1]:8080' ends with '0', not ']').
+    case "$hostport" in
+        \[*)
+            # IPv6 form: [::1]:port  →  strip everything from ']' onward, then '['
+            host="${hostport%%]*}"
+            host="${host#\[}"
+            ;;
+        *)
+            host="${hostport%%:*}"
+            ;;
+    esac
+    printf '%s' "$host"
+}
+
+# ─── Validate the external endpoint in --mode=internet ─────────────────────────
+# Ensures the endpoint IP is genuinely external — not loopback, not
+# RFC1918 private, not link-local, and NOT the gateway host's own IP.
+# Exits with code 3 on any failure. $1 is the host's primary IP (may be
+# empty if it could not be determined — only used for the equality check).
+validate_internet_endpoint() {
+    local host_ip="${1:-}"
+
+    # --external-endpoint is REQUIRED in internet mode. (Already checked
+    # in parse_args, but double-check here for safety.)
+    if [ -z "$EXTERNAL_ENDPOINT" ]; then
+        err "--mode=internet REQUIRES --external-endpoint=http://<REMOTE_IP>:<PORT>/"
+        err "where <REMOTE_IP> is NOT the gateway host's IP."
+        err "the endpoint IP must NOT be loopback, NOT RFC1918 private,"
+        err "NOT link-local, and NOT the host's own IP."
+        exit 3
+    fi
+
+    # Must be http:// (no TLS — the gateway dials a raw TCP socket).
+    case "$EXTERNAL_ENDPOINT" in
+        http://*) ;;
+        https://*)
+            err "--mode=internet does NOT support https:// (use http://)"
+            err "the gateway dials a raw TCP socket; TLS would require the"
+            err "external server's certificate to validate, which is out of scope"
+            err "for this acceptance test. Use http://<REMOTE_IP>:<PORT>/ instead."
+            exit 3
+            ;;
+        *)
+            err "--external-endpoint must start with http:// (got: $EXTERNAL_ENDPOINT)"
+            exit 3
+            ;;
+    esac
+
+    # Extract the host portion from the URL.
+    local host
+    host=$(extract_endpoint_host "$EXTERNAL_ENDPOINT")
+    if [ -z "$host" ]; then
+        err "--mode=internet: could not parse host from $EXTERNAL_ENDPOINT"
+        err "expected format: http://<REMOTE_IP>:<PORT>/[?token=...]"
+        exit 3
+    fi
+
+    # Resolve the hostname to an IPv4 if it's not already a literal IP.
+    # (DNS resolution from the client namespace may be flaky; we
+    # recommend using a literal IP for the endpoint.)
+    local resolved_ip=""
+    case "$host" in
+        *:*)
+            # Contains ':' → IPv6 literal address (the brackets were
+            # already stripped by extract_endpoint_host). Use as-is.
+            # We do NOT resolve IPv6 hostnames here — too many edge
+            # cases for an acceptance test. The loopback (::1) and
+            # host-IP checks below still apply.
+            resolved_ip="$host"
+            vlog "internet-mode: IPv6 literal address: $host"
+            ;;
+        *[!0-9.]*)
+            # Contains non-digit, non-dot chars (and no ':') → hostname.
+            # Try getent, then host, then dig — in that order.
+            if command -v getent >/dev/null 2>&1; then
+                resolved_ip=$(getent ahostsv4 "$host" 2>/dev/null \
+                              | awk 'NR==1{print $1}' | head -1)
+            fi
+            if [ -z "$resolved_ip" ] && command -v host >/dev/null 2>&1; then
+                resolved_ip=$(host -t A "$host" 2>/dev/null \
+                              | awk '/has address/{print $NF; exit}')
+            fi
+            if [ -z "$resolved_ip" ] && command -v dig >/dev/null 2>&1; then
+                resolved_ip=$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null \
+                              | head -1)
+            fi
+            if [ -z "$resolved_ip" ]; then
+                err "--mode=internet: could not resolve hostname '$host' to an IPv4"
+                err "use a literal IP address: --external-endpoint=http://<IP>:<PORT>/"
+                err "(DNS resolution from the client namespace may be flaky because"
+                err " the TUN intercepts UDP/53 — using a literal IP avoids this.)"
+                exit 3
+            fi
+            vlog "internet-mode: hostname '$host' resolved to $resolved_ip"
+            ;;
+        *)
+            # Pure digits and dots → IPv4 literal. Use as-is.
+            resolved_ip="$host"
+            ;;
+    esac
+
+    # 1. Must NOT be loopback (127.0.0.0/8 or ::1).
+    case "$resolved_ip" in
+        127.*|::1)
+            err "--mode=internet: endpoint IP $resolved_ip is loopback (127.0.0.0/8 or ::1)"
+            err "this would NOT prove genuine Internet egress — the gateway"
+            err "would be connecting to itself."
+            err "use a remote public IP (e.g. your VPS, a public echo service)."
+            exit 3
+            ;;
+    esac
+
+    # 2. Must NOT be the host's own primary IP (if we could determine it).
+    if [ -n "$host_ip" ] && [ "$resolved_ip" = "$host_ip" ]; then
+        err "--mode=internet: endpoint IP $resolved_ip is the gateway HOST's own IP ($host_ip)"
+        err "this would NOT prove genuine Internet egress — the gateway would"
+        err "be connecting to a local interface, not the real Internet."
+        err "use a REMOTE IP that is NOT this host."
+        exit 3
+    fi
+
+    # 3. Must NOT be in RFC1918 private ranges
+    #    (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+    case "$resolved_ip" in
+        10.*)
+            err "--mode=internet: endpoint IP $resolved_ip is in 10.0.0.0/8 (RFC1918 private)"
+            err "this would NOT prove genuine Internet egress."
+            err "use a remote public IP."
+            exit 3
+            ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+            err "--mode=internet: endpoint IP $resolved_ip is in 172.16.0.0/12 (RFC1918 private)"
+            err "this would NOT prove genuine Internet egress."
+            err "use a remote public IP."
+            exit 3
+            ;;
+        192.168.*)
+            err "--mode=internet: endpoint IP $resolved_ip is in 192.168.0.0/16 (RFC1918 private)"
+            err "this would NOT prove genuine Internet egress."
+            err "use a remote public IP."
+            exit 3
+            ;;
+    esac
+
+    # 4. Must NOT be link-local (169.254.0.0/16).
+    case "$resolved_ip" in
+        169.254.*)
+            err "--mode=internet: endpoint IP $resolved_ip is in 169.254.0.0/16 (link-local)"
+            err "this would NOT prove genuine Internet egress."
+            exit 3
+            ;;
+    esac
+
+    # 5. Must NOT be in the test's internal subnets
+    #    (TUN subnet 10.0.0.0/24 or veth subnet 10.0.1.0/24). The DIRECT
+    #    test would succeed via the veth route.
+    case "$resolved_ip" in
+        10.0.0.*|10.0.1.*)
+            err "--mode=internet: endpoint IP $resolved_ip is in the test's internal subnet"
+            err "(TUN subnet 10.0.0.0/24 or veth subnet 10.0.1.0/24)"
+            err "the DIRECT test would succeed via the veth route."
+            exit 3
+            ;;
+    esac
+
+    log "  internet-mode endpoint validated:"
+    log "    endpoint URL:  $EXTERNAL_ENDPOINT"
+    log "    resolved IP:   $resolved_ip"
+    if [ -n "$host_ip" ]; then
+        log "    host IP:       $host_ip (the gateway's primary IP — must differ)"
+    fi
+    log "    NOT loopback, NOT RFC1918, NOT link-local, NOT host's own IP ✓"
+}
+
+# ─── Verify the external endpoint is reachable from the host ──────────────────
+# Used in --mode=internet. The gateway (in the host namespace) needs to
+# be able to dial the external endpoint. We do a quick reachability check
+# from the host BEFORE the more complex setup begins, so we fail fast
+# with a clear error if the endpoint is not reachable.
+verify_external_endpoint_reachable() {
+    section "STEP 1: verifying external endpoint is reachable from the host"
+
+    # Build the test URL with the token query parameter. The external
+    # server is expected to echo the token, but for this reachability
+    # check we just need a 200 (or any HTTP response).
+    local test_url
+    test_url=$(append_token_query "$EXTERNAL_ENDPOINT" "$TOKEN")
+
+    log "  \$ curl --connect-timeout 5 -s -o /dev/null -w '%{http_code}' '$test_url'"
+    log "  (the gateway will dial this from the host namespace)"
+
+    local code rc
+    code=$(curl --connect-timeout 5 -s -o /dev/null -w '%{http_code}' "$test_url" 2>/dev/null) \
+        && rc=0 || rc=$?
+
+    if [ "$rc" -ne 0 ] || [ "$code" = "000" ]; then
+        err "external endpoint is NOT reachable from the host (curl exit $rc, http_code '$code')"
+        err "the gateway needs to be able to dial $EXTERNAL_ENDPOINT"
+        err "check that the external server is running and the host has Internet"
+        err "— or pass --mode=host-local to start a local HTTP server instead."
+        exit 2
+    fi
+    log "  external endpoint is reachable from the host (http_code $code)"
+}
+
+# ─── Append ?token=<token> to a URL ───────────────────────────────────────────
+# Adds the token as a URL query parameter. If the URL already has a
+# query string, appends &token=<token>. URL-encodes nothing — the token
+# is already validated to contain no reserved chars (parse_args).
+append_token_query() {
+    local url="$1" token="$2"
+    if [ -z "$token" ]; then
+        printf '%s' "$url"
+        return 0
+    fi
+    case "$url" in
+        *\?*) printf '%s&token=%s' "$url" "$token" ;;
+        *)    printf '%s?token=%s' "$url" "$token" ;;
+    esac
 }
 
 # ─── Determine the host's primary network IP ─────────────────────────────────
@@ -870,48 +1323,91 @@ ensure_binary() {
 }
 
 # ─── Start the external HTTP server ──────────────────────────────────────────
+# Only used in --mode=host-local. In --mode=internet the script does NOT
+# start a local server — the gateway dials the user-provided external endpoint.
 start_http_server() {
-    section "STEP 1: starting external HTTP server (the 'Internet' endpoint)"
+    section "STEP 1: starting external HTTP server (host-local token-echo server)"
 
-    # Create a temp directory with an index.html that we'll serve.
-    # The body content is what we'll look for in the TUN test response
-    # to prove the bytes actually traversed the ShareNet circuit (not
-    # just that curl got an arbitrary response).
+    # Create a temp directory with a small Python script that echoes the
+    # token. The response body MUST contain the token — this proves the
+    # bytes actually traversed the ShareNet circuit (not just that curl
+    # got an arbitrary response from some other source). The token is
+    # passed to the script via the N3B_TOKEN env var (NOT the command
+    # line, so it doesn't leak into `ps` listings of unrelated users).
     HTTP_ROOT="$(mktemp -d /tmp/n3b_tun_http_root.XXXXXX)"
-    cat > "$HTTP_ROOT/index.html" <<'HTML'
-<!DOCTYPE html>
-<html><head><title>ShareNet N3-B TUN Acceptance Test</title></head>
-<body>
-<h1>Hello from the real Internet via ShareNet TUN!</h1>
-<p>This response was served by a real HTTP server process bound to the
-host's primary network interface IP (NOT 127.0.0.1, NOT localhost).
-It was reached through a real TUN interface via the ShareNet circuit
-mesh: the OS application (ordinary curl with NO proxy flags) sent a SYN
-to the external IP, the OS routing table directed it via the TUN
-interface (snp0), the TunClient intercepted the SYN, extracted the
-original destination from the 5-tuple, opened a real ShareNet stream
-(SNP-IK mutual authentication + X25519 per-circuit Diffie-Hellman),
-which traversed two real relays to the gateway, which opened a real
-outbound TCP socket to this HTTP server.</p>
-<p>This is the N3-B north-star: unmodified OS networking reaches the
-real Internet through ShareNet, with NO SOCKS5 and NO proxy flags.</p>
-</body></html>
-HTML
-    log "  http root: $HTTP_ROOT"
-    log "  index.html: $(wc -c < "$HTTP_ROOT/index.html") bytes"
+    local server_script="$HTTP_ROOT/server.py"
+    # NOTE: this heredoc uses <<'PYEOF' (single-quoted delimiter) so $TOKEN
+    # is NOT expanded here — the Python script reads it from os.environ
+    # at runtime. This avoids leaking the token into the script file.
+    cat > "$server_script" <<'PYEOF'
+import http.server, os, socketserver, sys
+from urllib.parse import urlparse, parse_qs
+
+TOKEN = os.environ.get("N3B_TOKEN", "")
+PORT = int(os.environ.get("N3B_HTTP_PORT", "8888"))
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Optional sanity check: if the client passed ?token=<...>, verify
+        # it matches. (The script always appends ?token=$TOKEN, so a mismatch
+        # would indicate something is misconfigured.)
+        qs = parse_qs(urlparse(self.path).query)
+        req_token = qs.get("token", [""])[0]
+        if req_token and req_token != TOKEN:
+            body = b"ERROR: token mismatch — expected the server's N3B_TOKEN\n"
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # Echo the token in the response body. The script verifies the
+        # body contains the token — this proves the response came from
+        # this server (not from some other source along the path).
+        body = ("ShareNet N3-B host-local token echo: " + TOKEN + "\n"
+                "mode: host-local (NOT Internet acceptance — see --mode=internet)\n"
+                "This response was served by a real HTTP server process bound to\n"
+                "the host's primary network interface IP (NOT 127.0.0.1, NOT\n"
+                "localhost). It was reached through a real TUN interface via the\n"
+                "ShareNet circuit mesh: the OS application (ordinary curl with NO\n"
+                "proxy flags) sent a SYN to the external IP, the OS routing table\n"
+                "directed it via the TUN interface (snp0), the TunClient\n"
+                "intercepted the SYN, extracted the original destination from the\n"
+                "5-tuple, opened a real ShareNet stream (SNP-IK mutual\n"
+                "authentication + X25519 per-circuit Diffie-Hellman), which\n"
+                "traversed two real relays to the gateway, which opened a real\n"
+                "outbound TCP socket to this HTTP server.\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        # Forward access logs to stderr so they appear in $HTTP_LOG.
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+socketserver.TCPServer.allow_reuse_address = True
+httpd = socketserver.TCPServer(("0.0.0.0", PORT), Handler)
+sys.stderr.write("N3-B host-local HTTP server listening on 0.0.0.0:%d\n" % PORT)
+sys.stderr.flush()
+httpd.serve_forever()
+PYEOF
+    log "  http root:     $HTTP_ROOT"
+    log "  server.py:     $(wc -c < "$server_script") bytes"
+    log "  token:         $TOKEN (passed via N3B_TOKEN env var — NOT the command line)"
 
     # Bind to 0.0.0.0 so the host's primary IP is reachable. (The
     # gateway is in the host namespace, so it can reach any of the
     # host's IPs. The client namespace can ONLY reach $HOST_VETH_IP
     # via the veth pair — which is why DIRECT fails before the TUN
     # is configured.)
-    log "  starting: python3 -m http.server $HTTP_PORT --bind 0.0.0.0"
-    log "  log:      $HTTP_LOG"
-    ( cd "$HTTP_ROOT" && \
-      python3 -m http.server "$HTTP_PORT" --bind 0.0.0.0 \
-          >"$HTTP_LOG" 2>&1 ) &
+    log "  starting:      N3B_TOKEN=<redacted> N3B_HTTP_PORT=$HTTP_PORT python3 $server_script"
+    log "  log:           $HTTP_LOG"
+    N3B_TOKEN="$TOKEN" N3B_HTTP_PORT="$HTTP_PORT" \
+        python3 "$server_script" >"$HTTP_LOG" 2>&1 &
     HTTP_PID=$!
-    log "  http PID: $HTTP_PID"
+    log "  http PID:      $HTTP_PID"
 
     # Wait for the server to bind.
     local i
@@ -1114,13 +1610,21 @@ test_direct() {
     # NO proxy flag of any kind (the L4.5 proxy flag that starts with
     # --s... is FORBIDDEN here — see the script header). This is the
     # unmodified-OS-application test.
-    log "  \$ ip netns exec $NAMESPACE curl --connect-timeout 5 $EXTERNAL_ENDPOINT"
+    #
+    # We use the same test URL as TEST 2 (with ?token=$TOKEN appended)
+    # for parity — the connection is expected to fail with ENETUNREACH
+    # before any HTTP request is made, so the URL details don't matter
+    # for this test, but using the same URL keeps the two tests
+    # comparable in the log output.
+    local test_url
+    test_url=$(append_token_query "$EXTERNAL_ENDPOINT" "$TOKEN")
+    log "  \$ ip netns exec $NAMESPACE curl --connect-timeout 5 '$test_url'"
     log "  (no default route in namespace → curl must fail with no route)"
 
     local output rc
     output=$(ip netns exec "$NAMESPACE" \
              curl --connect-timeout 5 -s -o /dev/null -w '%{http_code}' \
-                  "$EXTERNAL_ENDPOINT" 2>&1) && rc=0 || rc=$?
+                  "$test_url" 2>&1) && rc=0 || rc=$?
 
     log "  curl exit code: $rc"
     log "  curl output:    ${output:-<empty>}"
@@ -1257,13 +1761,23 @@ test_via_sharennet() {
     # NO proxy flag of any kind (the L4.5 proxy flag that starts with
     # --s... is FORBIDDEN here — see the script header). The OS routing
     # table directs the SYN through the TUN.
-    log "  \$ ip netns exec $NAMESPACE curl --connect-timeout 10 $EXTERNAL_ENDPOINT"
+    #
+    # We append ?token=$TOKEN to the URL. In host-local mode the local
+    # Python script echoes the token (it knows the token via the N3B_TOKEN
+    # env var). In internet mode the external server is expected to echo
+    # the ?token= query parameter. Either way, we verify the response body
+    # contains the token — proving the bytes came from the intended server
+    # (and traversed the real TUN + ShareNet circuit, not some shortcut).
+    local test_url
+    test_url=$(append_token_query "$EXTERNAL_ENDPOINT" "$TOKEN")
+    log "  \$ ip netns exec $NAMESPACE curl --connect-timeout 10 '$test_url'"
     log "  (SYN → TUN → TunClient → ShareNet circuit → gateway → external HTTP)"
+    log "  token:    $TOKEN"
 
     local output rc
     output=$(ip netns exec "$NAMESPACE" \
              curl --connect-timeout 10 -s \
-                  "$EXTERNAL_ENDPOINT" 2>&1) && rc=0 || rc=$?
+                  "$test_url" 2>&1) && rc=0 || rc=$?
 
     log "  curl exit code: $rc"
     if [ -n "$output" ]; then
@@ -1285,19 +1799,25 @@ test_via_sharennet() {
         return 1
     fi
 
-    # Confirm the response body contains the expected marker. This proves
-    # the bytes actually traversed the ShareNet circuit (not just that curl
-    # got an arbitrary response from some other source).
-    if ! printf '%s' "$output" | grep -q 'Hello from the real Internet via ShareNet TUN!'; then
+    # Confirm the response body contains the token. This proves the bytes
+    # actually came from the intended external server (in host-local mode,
+    # from our Python script which echoes $N3B_TOKEN; in internet mode,
+    # from the external server which is expected to echo ?token=$TOKEN).
+    # Without this check, curl could have received a response from some
+    # other source along the path (e.g. a transparent proxy, a captive
+    # portal, a misconfigured relay) and we'd incorrectly call it a PASS.
+    if ! printf '%s' "$output" | grep -qF "$TOKEN"; then
         err "FAIL: ShareNet access returned unexpected body"
-        err "       expected marker 'Hello from the real Internet via ShareNet TUN!' not found"
+        err "       expected token '$TOKEN' not found in response body"
+        err "       this proves the response did NOT come from the intended"
+        err "       external server (which should echo the token)."
         err "       response (first 500 chars):"
         printf '%s\n' "$output" | head -c 500 | sed 's/^/      /' >&2
-        log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → FAIL (unexpected body)"
+        log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → FAIL (token not echoed)"
         return 1
     fi
 
-    log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected)"
+    log "[2] SHARENET: ordinary curl through TUN → ShareNet → gateway → external → SUCCESS (expected, token verified)"
     return 0
 }
 
@@ -1369,25 +1889,71 @@ main() {
     # external action (so a forbidden pattern fails fast).
     verify_no_socks
 
-    # Print the banner + config.
-    section "N3-B TUN ACCEPTANCE TEST"
+    # Generate a token if --token was not provided. The token is passed
+    # to the external HTTP server (via env var in host-local mode, via
+    # ?token= query parameter in internet mode) and verified in the
+    # response body — proving the bytes came from the intended server.
+    if [ -z "$TOKEN" ]; then
+        TOKEN=$(generate_token)
+    fi
+    vlog "token: $TOKEN"
+
+    # Resolve the host's primary network IP. This is used:
+    #   * in host-local mode — as the default external endpoint
+    #     ($EXTERNAL_ENDPOINT defaults to http://$host_ip:$HTTP_PORT/).
+    #   * in internet mode   — to validate the endpoint is NOT the host's
+    #     own IP (the validate_internet_endpoint function compares).
+    # We suppress stderr because get_host_ip prints diagnostic messages
+    # on failure that we don't want to clutter the output with (we have
+    # our own error messages below).
+    local host_ip
+    host_ip=$(get_host_ip 2>/dev/null) || host_ip=""
+
+    # In --mode=internet, validate the external endpoint. This runs BEFORE
+    # preflight (which probes privileges) so a misconfigured --external-endpoint
+    # fails fast with exit code 3 (argument error) rather than getting into
+    # the privilege probe and producing a confusing exit code 2.
+    if [ "$MODE" = "internet" ]; then
+        validate_internet_endpoint "$host_ip"
+    fi
+
+    # Print the banner + classification. The two modes are clearly
+    # distinguished so a reviewer of the log can tell at a glance whether
+    # the test proved genuine Internet egress or only the TUN→host path.
+    if [ "$MODE" = "internet" ]; then
+        section "N3-B INTERNET ACCEPTANCE TEST"
+        log "  external endpoint:   $EXTERNAL_ENDPOINT"
+        log "  token:              $TOKEN"
+        log "  The gateway will open a real outbound TCP connection to the"
+        log "  external endpoint (NOT a local python3 server — the script"
+        log "  does NOT start one in this mode)."
+    else
+        section "N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST"
+        log "  NOTE: this proves the TUN → ShareNet → gateway → host path,"
+        log "        but does NOT prove genuine Internet egress."
+        log "        For Internet acceptance, use:"
+        log "          --mode=internet --external-endpoint=http://<REMOTE_IP>:<PORT>/"
+    fi
     log "  project root:        $PROJECT_ROOT"
     log "  demo binary:         $DEMO_BIN"
     log "  build features:      circuit-upstream  (production — NO test-utils)"
 
-    # Resolve host IP.
-    local host_ip
-    if ! host_ip=$(get_host_ip); then
-        err "could not determine host's primary network IP"
-        err "set it explicitly with --external-endpoint=http://IP:PORT/"
-        exit 2
+    # In host-local mode, the host IP is REQUIRED (we need it as the
+    # default external endpoint). In internet mode, it's optional (only
+    # used for the "is the endpoint the host's own IP?" check, which
+    # already ran in validate_internet_endpoint).
+    if [ "$MODE" = "host-local" ]; then
+        if [ -z "$host_ip" ]; then
+            err "could not determine host's primary network IP"
+            err "set it explicitly with --external-endpoint=http://IP:PORT/"
+            exit 2
+        fi
+        # Resolve external endpoint URL (host-local default).
+        if [ -z "$EXTERNAL_ENDPOINT" ]; then
+            EXTERNAL_ENDPOINT="http://$host_ip:$HTTP_PORT/"
+        fi
     fi
-    log "  host IP:             $host_ip"
-
-    # Resolve external endpoint URL.
-    if [ -z "$EXTERNAL_ENDPOINT" ]; then
-        EXTERNAL_ENDPOINT="http://$host_ip:$HTTP_PORT/"
-    fi
+    log "  host IP:             ${host_ip:-<unknown>}"
     log "  external endpoint:  $EXTERNAL_ENDPOINT"
     log "  TUN interface:      $TUN_NAME ($TUN_IP, mtu 1500 — hardcoded by binary)"
     log "  client namespace:   $NAMESPACE (veth $CLIENT_IP, no default route yet)"
@@ -1395,8 +1961,12 @@ main() {
     log "                      relayA=$HOST_VETH_IP:$RELAY_A_PORT"
     log "                      relayB=$HOST_VETH_IP:$RELAY_B_PORT"
     log "  config file:        $CONFIG_PATH"
+    log "  token:              $TOKEN"
 
-    # Guard: the external endpoint must NOT be loopback.
+    # Guard: the external endpoint must NOT be loopback. (This guard
+    # applies in BOTH modes — even host-local mode rejects loopback
+    # because the gateway uses production SSRF defence which would
+    # refuse the connection.)
     case "$EXTERNAL_ENDPOINT" in
         http://127.0.0.1:*|http://localhost:*|http://[::1]:*)
             err "external endpoint must NOT be loopback: $EXTERNAL_ENDPOINT"
@@ -1423,9 +1993,15 @@ main() {
     preflight
     ensure_binary
 
-    # Start the external HTTP server first so we can verify it's reachable
-    # before the more complex setup begins.
-    start_http_server
+    # Start the external HTTP server (host-local mode) OR verify the
+    # external endpoint is reachable (internet mode). In internet mode
+    # the script does NOT start a local server — the gateway dials the
+    # user-provided external endpoint directly.
+    if [ "$MODE" = "host-local" ]; then
+        start_http_server
+    else
+        verify_external_endpoint_reachable
+    fi
     start_mesh
     setup_namespace
 
@@ -1440,52 +2016,101 @@ main() {
     # Run TEST 2 (SHARENET via TUN).
     test_via_sharennet || sharenet_ok=0
 
-    # Report the result.
+    # Report the result. The banner wording differs by mode so a
+    # reviewer of the log can immediately tell which kind of test passed.
     section "RESULT"
     if [ "$direct_ok" -eq 1 ] && [ "$sharenet_ok" -eq 1 ]; then
-        cat <<'BANNER'
+        if [ "$MODE" = "internet" ]; then
+            cat <<'BANNER'
 
     ═══════════════════════════════════════════════════════
-      N3-B TUN ACCEPTANCE TEST PASSED
+      N3-B INTERNET ACCEPTANCE TEST PASSED
       Direct Internet:    FAIL     (correct — no route)
-      Via ShareNet TUN:   SUCCESS  (correct — real circuit)
+      Via ShareNet TUN:   SUCCESS  (correct — real Internet egress)
     ═══════════════════════════════════════════════════════
 
 BANNER
-        log "N3-B TUN ACCEPTANCE TEST: PASS"
-        log ""
-        log "This proves:"
-        log "  * The client namespace is truly isolated (no default route until"
-        log "    the TunClient installs one via the TUN)."
-        log "  * Ordinary OS applications (curl with NO proxy flags) reach the"
-        log "    real Internet through the TUN + ShareNet circuit:"
-        log "      - real TUN interface (/dev/net/tun via ioctl TUNSETIFF)"
-        log "      - real smoltcp TCP/IP stack with any_ip enabled"
-        log "      - real SYN interception + 5-tuple destination extraction"
-        log "      - real ShareNet circuits (SNP-IK + X25519 circuit DH)"
-        log "      - real relay forwarding (two hops: Client → A → B → Gateway)"
-        log "      - real gateway outbound TCP (serve_gateway_mode_b_multiplexed)"
-        log "      - production SSRF defence (GatewayStreamTable::new — NO loopback)"
-        log "      - real external HTTP server (python3 on the host's primary IP)"
-        log "  * The split-tunnel routing prevents loops: the TunClient's own"
-        log "    circuit traffic goes via the veth (host routes installed by the"
-        log "    binary), while all other traffic goes via the TUN (default route)."
-        log "  * The bytes returned actually traversed the ShareNet circuit"
-        log "    (the response marker 'Hello from the real Internet via ShareNet TUN!'"
-        log "    was written by the external HTTP server, not the gateway)."
-        log ""
-        log "NO SOCKS5 WAS USED. The client used ordinary curl http://IP:PORT/"
-        log "with NO proxy flags. The OS routing table did the work — this is"
-        log "the N3-B north-star: unmodified OS networking reaches the real"
-        log "Internet through ShareNet."
+            log "N3-B INTERNET ACCEPTANCE TEST: PASS"
+            log ""
+            log "This proves (genuine Internet egress):"
+            log "  * The client namespace is truly isolated (no default route"
+            log "    until the TunClient installs one via the TUN)."
+            log "  * Ordinary OS applications (curl with NO proxy flags) reach"
+            log "    a genuinely REMOTE, public, non-loopback, non-RFC1918,"
+            log "    non-link-local endpoint through the TUN + ShareNet circuit:"
+            log "      - real TUN interface (/dev/net/tun via ioctl TUNSETIFF)"
+            log "      - real smoltcp TCP/IP stack with any_ip enabled"
+            log "      - real SYN interception + 5-tuple destination extraction"
+            log "      - real ShareNet circuits (SNP-IK + X25519 circuit DH)"
+            log "      - real relay forwarding (two hops: Client → A → B → Gateway)"
+            log "      - real gateway outbound TCP (serve_gateway_mode_b_multiplexed)"
+            log "      - production SSRF defence (GatewayStreamTable::new — NO loopback)"
+            log "      - real external HTTP server at $EXTERNAL_ENDPOINT"
+            log "        (NOT started by this script — a genuinely remote server)"
+            log "  * The split-tunnel routing prevents loops."
+            log "  * The response body contained the token '$TOKEN', proving the"
+            log "    bytes came from the intended external server (not from some"
+            log "    other source along the path)."
+            log ""
+            log "NO SOCKS5 WAS USED. The client used ordinary curl http://.../?token=..."
+            log "with NO proxy flags. This is the N3-B north-star: unmodified OS"
+            log "networking reaches the REAL Internet through ShareNet."
+        else
+            cat <<'BANNER'
+
+    ═══════════════════════════════════════════════════════
+      N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST PASSED
+      (NOT Internet acceptance — see --mode=internet)
+      Direct Internet:    FAIL     (correct — no route)
+      Via ShareNet TUN:   SUCCESS  (correct — TUN path works)
+    ═══════════════════════════════════════════════════════
+
+BANNER
+            log "N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST: PASS"
+            log ""
+            log "This proves the TUN → ShareNet → gateway → host path, but does NOT"
+            log "prove genuine Internet egress. The 'external' endpoint was a local"
+            log "python3 HTTP server bound to the host's primary IP ($EXTERNAL_ENDPOINT)."
+            log ""
+            log "For genuine Internet acceptance, re-run with:"
+            log "  sudo $0 --mode=internet \\"
+            log "      --external-endpoint=http://<REMOTE_PUBLIC_IP>:<PORT>/"
+            log "where <REMOTE_PUBLIC_IP> is NOT the gateway host's IP, NOT loopback,"
+            log "NOT RFC1918 private, NOT link-local."
+            log ""
+            log "What this host-local test DOES prove:"
+            log "  * The client namespace is truly isolated (no default route"
+            log "    until the TunClient installs one via the TUN)."
+            log "  * Ordinary OS applications (curl with NO proxy flags) reach the"
+            log "    host's primary IP through the TUN + ShareNet circuit:"
+            log "      - real TUN interface (/dev/net/tun via ioctl TUNSETIFF)"
+            log "      - real smoltcp TCP/IP stack with any_ip enabled"
+            log "      - real SYN interception + 5-tuple destination extraction"
+            log "      - real ShareNet circuits (SNP-IK + X25519 circuit DH)"
+            log "      - real relay forwarding (two hops: Client → A → B → Gateway)"
+            log "      - real gateway outbound TCP (serve_gateway_mode_b_multiplexed)"
+            log "      - production SSRF defence (GatewayStreamTable::new — NO loopback)"
+            log "  * The split-tunnel routing prevents loops."
+            log "  * The response body contained the token '$TOKEN', proving the"
+            log "    bytes came from the local HTTP server (not from some other source)."
+        fi
         EXIT_CODE=0
     else
-        cat <<'BANNER' >&2
+        if [ "$MODE" = "internet" ]; then
+            cat <<'BANNER' >&2
 
     ═══════════════════════════════════════════════════════
-      N3-B TUN ACCEPTANCE TEST FAILED
+      N3-B INTERNET ACCEPTANCE TEST FAILED
     ═══════════════════════════════════════════════════════
 BANNER
+        else
+            cat <<'BANNER' >&2
+
+    ═══════════════════════════════════════════════════════
+      N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST FAILED
+    ═══════════════════════════════════════════════════════
+BANNER
+        fi
         if [ "$direct_ok" -eq 0 ]; then
             printf '      DIRECT:   OK (UNEXPECTED — isolation failed)\n' >&2
         else
@@ -1504,7 +2129,11 @@ BANNER
             printf '\n    --- mesh log (last 30 lines) ---\n' >&2
             tail -30 "$MESH_LOG" >&2 2>/dev/null || true
         fi
-        log "N3-B TUN ACCEPTANCE TEST: FAIL"
+        if [ "$MODE" = "internet" ]; then
+            log "N3-B INTERNET ACCEPTANCE TEST: FAIL"
+        else
+            log "N3-B TUN INTEGRATION / HOST-LOCAL EGRESS TEST: FAIL"
+        fi
         EXIT_CODE=1
     fi
 }
