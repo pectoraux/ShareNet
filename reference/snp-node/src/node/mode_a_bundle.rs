@@ -27,8 +27,29 @@
 //!
 //! The `BundleForwarder` operates at a route position and forwards to the
 //! next hop in the route. It does NOT choose routes — the route is supplied
-//! by L6/composition. The forwarder uses `AuthenticatedBundleCarrier` at
-//! every hop, with peer identity binding (provenance check) before custody.
+//! by L6/composition (constructed from signed `NodeAdvertisement` /
+//! `GatewayAdvertisement` descriptors, NOT live peer discovery). The
+//! forwarder uses `AuthenticatedBundleCarrier` at every hop, with peer
+//! identity binding (provenance check) before custody.
+//!
+//! ## Direction semantics (response-routing correction)
+//!
+//! Bundles are partitioned by direction, derived from ROUTING (the route's
+//! source and destination NodeIds), never from a catch-all identity negation:
+//!
+//! - **Forward direction** (`forward_pending_bundles`): a bundle whose
+//!   `destination` is the next hop OR the route destination (the gateway).
+//!   These travel Client → A → B → Gateway.
+//!
+//! - **Reverse direction** (`try_send_response_back`): a bundle whose
+//!   `destination` is the route source (the client). These travel
+//!   Gateway → B → A → Client via the previous-hop carrier, whose identity
+//!   is constrained to `route.hop(position - 1)` (or `route.source()` at
+//!   position 0) so an unrelated peer cannot overwrite the reverse path.
+//!
+//! A response bundle (destination == client) can therefore NEVER enter the
+//! forward path, and a request bundle (destination == gateway) can never
+//! enter the reverse path.
 //!
 //! # Process-lifetime honesty
 //!
@@ -1128,6 +1149,34 @@ impl ModeAClient {
         gateway_node_id: NodeId,
         gateway_public_key: &snp_crypto::PublicKey,
     ) -> ModeAResult<(TransitResponse, Vec<u8>)> {
+        let (resp, body, _response_bundle) = self
+            .send_request_returning_bundle(
+                url,
+                relay_addr,
+                relay_node_id,
+                gateway_node_id,
+                gateway_public_key,
+            )
+            .await?;
+        Ok((resp, body))
+    }
+
+    /// Like [`send_request`](Self::send_request), but also returns the
+    /// response `Bundle` so callers (tests, higher-level adapters) can inspect
+    /// the bundle's `source`/`destination`/`custody_chain`. The bundle is the
+    /// REVERSE-direction bundle received from the relay: its `source` is the
+    /// gateway and its `destination` is this client.
+    ///
+    /// # Errors
+    /// Returns `ModeAError` if any step fails.
+    pub async fn send_request_returning_bundle(
+        &self,
+        url: &str,
+        relay_addr: &str,
+        relay_node_id: NodeId,
+        gateway_node_id: NodeId,
+        gateway_public_key: &snp_crypto::PublicKey,
+    ) -> ModeAResult<(TransitResponse, Vec<u8>, Bundle)> {
         // 0. Establish authenticated L8 connection to the relay.
         let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
             relay_addr,
@@ -1203,7 +1252,7 @@ impl ModeAClient {
             resp.status,
             body.len()
         );
-        Ok((resp, body))
+        Ok((resp, body, response_bundle))
     }
 }
 
@@ -1331,6 +1380,29 @@ impl BundleForwarder {
         Some((addr, node_id))
     }
 
+    /// The expected PREVIOUS-hop NodeId — the authenticated transport peer
+    /// that is permitted to hand a bundle to this forwarder (and whose carrier
+    /// is retained for reverse-path delivery of responses).
+    ///
+    /// - `position == 0`: the route source (the client). The client is the
+    ///   originator; it is not listed in `hop_details`, so it is taken from
+    ///   `route.source()`.
+    /// - `position > 0`: `route.hop(position - 1).node_id()` — the immediately
+    ///   preceding relay in the route.
+    ///
+    /// This is the routing-derived previous-custodian identity. It is used:
+    ///   1. to decide which incoming authenticated connection to retain as the
+    ///      previous-hop carrier (an unrelated peer MUST NOT overwrite it), and
+    ///   2. (together with the bundle's custody chain) as the provenance check
+    ///      target — see the `expected_prev_custodian` binding in `run()`.
+    fn prev_hop_node_id(&self) -> Option<NodeId> {
+        if self.position == 0 {
+            Some(self.route.source())
+        } else {
+            self.route.hop(self.position - 1).map(|h| h.node_id())
+        }
+    }
+
     /// Run the forwarder loop: listen for incoming bundles, check provenance,
     /// take custody, store, and forward to the next hop.
     ///
@@ -1382,19 +1454,16 @@ impl BundleForwarder {
                         link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
                         peer_id: hs.peer_node_id,
                     });
-                    // Only store the carrier as prev_hop_carrier if the peer
-                    // is the previous hop (NOT the next hop reconnecting
-                    // to deliver a response).
-                    let next_node_id_check = self.route.hop(self.position + 1)
-                        .map(|h| h.node_id())
-                        .unwrap_or([0u8; 32]);
-                    if hs.peer_node_id != next_node_id_check {
-                        // This is a connection from the previous hop.
+                    // Only store the carrier as the PREVIOUS-HOP carrier if the
+                    // authenticated peer IS the expected previous hop in the
+                    // route. This prevents an unrelated peer (or the next hop
+                    // reconnecting to deliver a response) from overwriting the
+                    // previous-hop carrier — the reverse-path connection must
+                    // always point at the genuine previous custodian.
+                    if Some(hs.peer_node_id) == self.prev_hop_node_id() {
                         let mut cc = client_carrier.lock().await;
                         *cc = Some(carrier.clone());
                     }
-                    // If the peer IS the next hop, we don't store the carrier —
-                    // it's a temporary connection to deliver a response.
                     // Receive the bundle.
                     let bundle = match carrier.recv_bundle().await {
                         Ok(b) => b,
@@ -1414,13 +1483,14 @@ impl BundleForwarder {
                         eprintln!("[mode-a-fwd] bundle expired, dropping");
                         continue;
                     }
-                    // Check if this is a response bundle (going back to client).
-                    // A response bundle's source is the gateway (next hop).
-                    let next_node_id = self.route.hop(self.position + 1)
-                        .map(|h| h.node_id())
-                        .unwrap_or([0u8; 32]);
-                    let is_response = bundle.source == self.route.destination()
-                        || bundle.source == next_node_id;
+                    // Check if this is a response bundle (travelling in the
+                    // REVERSE direction). A response's source is the route
+                    // destination (the gateway). A request's source is the route
+                    // source (the client) — those take the forward path. The
+                    // previous `|| bundle.source == next_node_id` clause was an
+                    // over-generalisation and is removed: only source ==
+                    // gateway identifies a response.
+                    let is_response = bundle.source == self.route.destination();
                     if is_response {
                         // Response bundle: store it and trigger delivery
                         // to the previous hop via try_send_response_back.
@@ -1507,10 +1577,25 @@ impl BundleForwarder {
         };
         let bundles_to_forward: Vec<Bundle> = {
             let store = self.store.lock().await;
+            // FORWARD DIRECTION ONLY. A bundle is forwarded to the next hop
+            // iff its destination is the next hop itself, OR it is a request
+            // addressed to the route destination (the gateway) — i.e. it is
+            // travelling toward the gateway and the next hop is an
+            // intermediate relay en route.
+            //
+            // RESPONSE bundles (destination == route source / client) are
+            // explicitly EXCLUDED here. They travel the REVERSE path via
+            // `try_send_response_back()` and MUST NEVER be sent to the next
+            // hop. The previous (R4.4) filter used
+            //     `destination != self.identity.node_id`
+            // as a catch-all, which incorrectly captured response bundles and
+            // could forward them Gateway-ward. That is rejected here.
             store
                 .pending(now)
                 .into_iter()
-                .filter(|b| b.destination == next_node_id || b.destination != self.identity.node_id)
+                .filter(|b| {
+                    b.destination == next_node_id || b.destination == self.route.destination()
+                })
                 .cloned()
                 .collect()
         };
@@ -1548,7 +1633,6 @@ impl BundleForwarder {
         );
         for bundle in bundles_to_forward {
             let bundle_id = *bundle.bundle_id();
-            let is_response = bundle.destination != next_node_id;
             if let Err(e) = carrier.send_bundle(&bundle).await {
                 eprintln!(
                     "[mode-a-fwd {}] forward error: {e}",
@@ -1558,11 +1642,12 @@ impl BundleForwarder {
                 let _ = store.add(bundle);
                 return;
             }
-            if is_response {
-                let mut store = self.store.lock().await;
-                store.remove(&bundle_id);
-                continue;
-            }
+            // Every bundle reaching this loop is a FORWARD-direction bundle
+            // (request to gateway / next hop). It therefore always receives a
+            // custody ack, then we await the response bundle that the next hop
+            // will send back over this same duplex connection. Response bundles
+            // never enter this loop — they are handled exclusively by
+            // `try_send_response_back()`.
             // Wait for custody ack.
             match carrier.recv_bundle().await {
                 Ok(_) => {
@@ -1612,17 +1697,25 @@ impl BundleForwarder {
         &self,
         prev_hop_carrier: &Arc<tokio::sync::Mutex<Option<Arc<dyn BundleCarrier>>>>,
     ) {
-        let next_node_id = self
-            .route
-            .hop(self.position + 1)
-            .map(|h| h.node_id())
-            .unwrap_or([0u8; 32]);
+        // Identify a response bundle by ROUTING, not by an assumption about
+        // its source. A response is a bundle travelling in the REVERSE
+        // direction — its destination is the route source (the original
+        // client). This is the symmetric counterpart of the forward filter
+        // in `forward_pending_bundles` (destination == next hop / gateway).
+        //
+        // The previous (R4.4) search used `b.source == route.destination()`
+        // (source == gateway). That happens to identify a gateway-originated
+        // response, but it couples the reverse path to a single assumption.
+        // Routing on `destination == route.source()` is correct for any
+        // reverse-direction bundle regardless of which hop originated it, and
+        // it cannot accidentally match a forward request (whose destination is
+        // the gateway).
         let response_bundle = {
             let store = self.store.lock().await;
             store
                 .pending(now_unix())
                 .into_iter()
-                .find(|b| b.source == self.route.destination())
+                .find(|b| b.destination == self.route.source())
                 .cloned()
         };
         if let Some(resp) = response_bundle {

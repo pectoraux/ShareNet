@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.4)
+**Date:** 2026-08-19 (updated R4.4 correction)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | MULTI-HOP RUNTIME VERIFIED (limited) | R4.4: multi-hop store-carry-forward with Client → Relay A → Relay B → Gateway. Route-driven next-hop selection via `BundleForwarder`. Deliberate interruption test: relay A holds bundle while relay B is unavailable, then forwards when B starts. Authenticated L8 at every hop. Provenance binding at every hop. Response traverses reverse path (B → A → Client). 3 multi-hop tests + 9 R4.3 tests pass. |
+| **Mode A** (delay-tolerant) | CONFIGURED SIGNED-ROUTE MULTI-HOP (limited) — NOT live discovery | R4.4 (corrected): multi-hop store-carry-forward Client → Relay A → Relay B → Gateway. The route is constructed from **configured, signed** `NodeAdvertisement` + `GatewayAdvertisement` descriptors (`verify_into_verified()` → `VerifiedNodeDescriptor` → `RouteHop`); the `BundleForwarder` does NOT call a live peer discovery service. Direction is routing-derived: forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client (route.source)`. Response bundles can NEVER enter the forward path. Authenticated L8 (SNP-IK + AEAD) at every hop. Provenance binding (#21) at every hop. Deliberate interruption test passes. 8 multi-hop tests (incl. 4 R4.4-correction regression tests) + 9 R4.3 tests pass. **Live peer discovery (runtime relay selection from a peer graph) is NOT implemented — it is R4.5.** |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -91,6 +91,78 @@ R4.1 status:
 - ❌ Mode-A adapter (R4.3+) — no composition layer currently serializes a `TransitRequest` into `BundlePayload`, wraps it in a `Bundle`, and stores it in a `BundleStore` for store-carry-forward. The L7 gateway does not yet `from_cbor` a `Bundle`, decode the payload as a `TransitRequest`, and respond via a response `Bundle`.
 
 Until R4.2+R4.3 land, the live circuit path is Mode B semantics (proxied, not delay-tolerant), even though it carries `TransitRequest`/`TransitResponse` payloads that were originally specified for Mode A.
+
+### Mode A — R4.4 multi-hop (corrected)
+
+R4.4 extends R4.3's single-hop path to a multi-hop route
+`Client → Relay A → Relay B → Gateway → endpoint`, with a deliberate
+interruption at the `Relay A → Relay B` hop proving store-carry-forward.
+
+**Verified capability (precise wording):** multi-hop route construction from
+**configured, signed descriptors** + L6 `Route`/`RouteHop` + L8 authenticated
+transport (`AuthenticatedBundleCarrier`, SNP-IK + AEAD) + L5 store-carry-forward.
+The `BundleForwarder` operates at a route position and forwards to
+`route.hop(position + 1)`. It does NOT choose routes and does NOT call a live
+peer discovery service.
+
+**NOT live discovery-backed.** The route is supplied to the forwarder by
+composition, built from `NodeAdvertisement::create_and_sign` →
+`verify_into_verified()` → `VerifiedNodeDescriptor` → `RouteHop` →
+`Route::new_with_hop_details`. There is no `DiscoveryProvider`,
+`DiscoveredNode`, beacon, or runtime relay selection in the Mode-A path. This
+is acceptable for the R4.4 proof. **Live peer discovery remains R4.5.**
+
+**Direction semantics (R4.4 correction).** Bundles are partitioned by
+direction, derived from ROUTING (the route's source/destination NodeIds) —
+never from a catch-all identity negation:
+
+- **Forward** (`forward_pending_bundles`): `destination == next_hop
+  || destination == route.destination()` (gateway). These travel
+  Client → A → B → Gateway.
+- **Reverse** (`try_send_response_back`): `destination == route.source()`
+  (client). These travel Gateway → B → A → Client.
+
+A response bundle (destination == client) can therefore NEVER enter the forward
+path, and a request bundle (destination == gateway) can never enter the reverse
+path. The previous filter `destination != self.identity.node_id` was a
+catch-all that incorrectly captured response bundles and could push them
+Gateway-ward; it is removed.
+
+**Previous-hop carrier is identity-pinned.** The carrier retained for reverse
+delivery is set ONLY when the authenticated peer equals the route-derived
+previous hop (`route.hop(position - 1)`, or `route.source()` at position 0).
+An unrelated peer cannot overwrite the reverse-path connection.
+
+**RouteHop identity binding (verified by test).**
+`route.hop(position + 1).node_id() == AuthenticatedBundleCarrier.peer_id`
+(the initiator pins `expected_peer`, and SNP-IK verifies it). Each
+`RouteHop.endpoint` is the `listen_addr` from a SIGNED advertisement.
+
+**Custody chain.** Every hop appends a `CustodyHop` (signed by the next
+custodian). Provenance binding (#21) at every hop rejects any bundle whose
+authenticated peer != expected previous custodian, so a successful round-trip
+implies the chain `Client → A → B → Gateway`. An explicit test constructs this
+chain and verifies continuity + signatures.
+
+**Honest limitations (unchanged):**
+- In-memory `BundleStore` (process-lifetime only; no durable persistence).
+- Configured bootstrap (signed adverts), NOT live peer discovery.
+- Host-local egress (mock HTTP server on 127.0.0.1).
+- No Civic / settlement.
+
+**R4.4 tests:** 8 in `r4_multihop_store_forward.rs` — including 4 R4.4-correction
+regression tests:
+- `r4_response_bundle_never_forwarded_to_next_hop` (negative — proven to fail
+  against the buggy filter)
+- `r4_response_follows_reverse_path` (response `destination == client`)
+- `r4_multihop_route_next_hop_identity_matches_transport_peer`
+  (`RouteHop.node_id` == authenticated peer; endpoint == signed listen_addr)
+- `r4_configured_descriptor_route_is_not_called_discovery` (static: no
+  `snp_discovery` / `DiscoveryProvider` in the Mode-A path)
+- `r4_multihop_custody_chain_explicit` (chain == `[Client, A, B, Gateway]`)
+
+**STOP after R4.4.** No durable persistence, no Civic. Next: R4.5 live peer
+discovery.
 
 ---
 
@@ -220,3 +292,4 @@ advertisements.
 19. **(R4.2) Anti-entropy respects expiry.** `bundle_ids_for_have_vector` excludes bundles where `now >= deadline` (R4.1 expiry semantics). Expired bundles MUST NOT be offered as active work.
 20. **(R4.2) Anti-entropy preserves the L5 dependency boundary.** snp-sync still depends only on `snp-cbor` + `snp-crypto` + `snp-identity` + `snp-object` + `thiserror`. No L7/L6/L8/L4 dependency was added (verified via `cargo tree`). The `ObjectStore`/`DescriptorStore` traits are L5 contracts — the composition layer adapts L2 `Cas` → `ObjectStore` and L4 discovery → `DescriptorStore`.
 21. **(R4.3) Authenticated transport identity MUST equal bundle provenance.** For every received Mode-A bundle, the authenticated SNP-IK peer NodeId MUST equal the bundle's expected previous custodian (source on first hop, last custody hop's `next_custodian_id` thereafter). This check occurs BEFORE `take_custody()`. Mismatch → no custody, no `BundleStore` insertion, no forwarding. This is a permanent architecture invariant — the transport identity and bundle provenance must agree.
+22. **(R4.4) Bundle direction is routing-derived, never identity-negated.** `BundleForwarder` partitions bundles by direction using the route's source/destination NodeIds — NOT a catch-all `destination != self.identity.node_id`. Forward direction: `destination == next_hop || destination == route.destination()` (gateway). Reverse direction: `destination == route.source()` (client). A response bundle (destination == client) can therefore NEVER enter the forward path (`forward_pending_bundles`), and a request bundle (destination == gateway) can never enter the reverse path (`try_send_response_back`). The previous-hop carrier retained for reverse delivery is set ONLY when the authenticated peer equals the route-derived previous hop (`route.hop(position - 1)` / `route.source()`), so an unrelated peer cannot overwrite the reverse-path connection.
