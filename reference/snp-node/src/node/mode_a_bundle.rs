@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use snp_crypto::{SecretKey, SignatureBytes};
+use snp_crypto::{SecretKey, SignatureBytes, X25519PubKey, X25519Secret};
 use snp_gateway::{
     decode_transit_request, decode_transit_response_envelope, encode_transit_request,
     encode_transit_response_envelope, handle_transit_request_with_connector, sign_transit_request,
@@ -63,6 +63,7 @@ use snp_gateway::{
     MAX_RESPONSE_BYTES_DEFAULT,
 };
 use snp_identity::{now_unix, NodeId, NodeIdentity};
+use snp_link::async_link::{perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError};
 use snp_sync::{
     Bundle, BundleId, BundlePayload, BundleStore, SyncError, SyncResult, CUSTODY_NONCE_BYTES,
 };
@@ -80,6 +81,9 @@ pub enum ModeAError {
     /// L7 gateway error.
     #[error("gateway error: {0}")]
     Gateway(#[from] GatewayError),
+    /// L8 link error (SNP-IK handshake, AEAD, transport).
+    #[error("link error: {0}")]
+    Link(#[from] AsyncLinkError),
     /// Transport error.
     #[error("transport error: {0}")]
     Transport(String),
@@ -89,6 +93,9 @@ pub enum ModeAError {
     /// Bundle destination mismatch.
     #[error("destination mismatch: expected {expected}, got {got}")]
     DestinationMismatch { expected: String, got: String },
+    /// Identity substitution: authenticated peer NodeId != expected.
+    #[error("identity substitution: expected {expected}, got {got}")]
+    IdentitySubstitution { expected: String, got: String },
     /// No response received.
     #[error("no response received")]
     NoResponse,
@@ -224,17 +231,104 @@ pub trait BundleCarrier: Send + Sync {
     /// # Errors
     /// Returns `ModeAError` if the transport fails or the bundle is invalid.
     async fn recv_bundle(&self) -> ModeAResult<Bundle>;
+
+    /// The authenticated peer's NodeId. Returns `None` for unauthenticated
+    /// test carriers.
+    fn peer_node_id(&self) -> Option<NodeId>;
 }
 
-/// A `BundleCarrier` that uses raw TCP with length-prefixed framing.
+// ─── AuthenticatedBundleCarrier (production L8-backed) ──────────────────
+
+/// Production `BundleCarrier` using L8 `AsyncLink` with SNP-IK handshake.
 ///
-/// This is the simplest possible transport for the first R4.3 vertical
-/// slice. It does NOT use `MultiplexedCircuit`, `StreamHandle`, `N3AClient`,
-/// or `TunClient`. The bundle CBOR is sent as-is over a TCP connection.
+/// Bundle CBOR is AEAD-encrypted at the link layer (ChaCha20-Poly1305).
+/// Peer identity is verified during the SNP-IK handshake and pinned.
+pub struct AuthenticatedBundleCarrier {
+    link: Arc<AsyncLink>,
+    peer_id: NodeId,
+}
+
+impl AuthenticatedBundleCarrier {
+    /// Connect as initiator (client/relay → next hop). Pins expected NodeId.
+    pub async fn connect_as_initiator(
+        addr: &str,
+        expected_peer: NodeId,
+        ed_sk: &snp_crypto::SecretKey,
+        ed_pk: &snp_crypto::PublicKey,
+        x_sk: &X25519Secret,
+        x_pk: &X25519PubKey,
+    ) -> ModeAResult<Self> {
+        let mut stream = AsyncLink::connect_raw(addr).await?;
+        let hs = perform_snp_ik_handshake_async(
+            &mut stream,
+            true,
+            ed_sk,
+            ed_pk,
+            x_sk,
+            x_pk,
+            Some(&expected_peer),
+        )
+        .await?;
+        let link = Arc::new(AsyncLink::new(stream, hs.link_keys));
+        Ok(Self {
+            link,
+            peer_id: hs.peer_node_id,
+        })
+    }
+
+    /// Accept as responder (relay/gateway ← previous hop).
+    pub async fn accept_as_responder(
+        listener: &TcpListener,
+        ed_sk: &snp_crypto::SecretKey,
+        ed_pk: &snp_crypto::PublicKey,
+        x_sk: &X25519Secret,
+        x_pk: &X25519PubKey,
+        expected: Option<&NodeId>,
+    ) -> ModeAResult<Self> {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| ModeAError::Transport(format!("accept: {e}")))?;
+        let hs =
+            perform_snp_ik_handshake_async(&mut stream, false, ed_sk, ed_pk, x_sk, x_pk, expected)
+                .await?;
+        let link = Arc::new(AsyncLink::new(stream, hs.link_keys));
+        Ok(Self {
+            link,
+            peer_id: hs.peer_node_id,
+        })
+    }
+
+    /// The authenticated peer NodeId.
+    #[must_use]
+    pub fn authenticated_peer_node_id(&self) -> NodeId {
+        self.peer_id
+    }
+}
+
+#[async_trait::async_trait]
+impl BundleCarrier for AuthenticatedBundleCarrier {
+    async fn send_bundle(&self, bundle: &Bundle) -> ModeAResult<()> {
+        let cbor = bundle.to_cbor()?;
+        self.link.send_raw(&cbor).await?;
+        Ok(())
+    }
+    async fn recv_bundle(&self) -> ModeAResult<Bundle> {
+        let blob = self.link.recv_raw().await?;
+        Ok(Bundle::from_cbor(&blob)?)
+    }
+    fn peer_node_id(&self) -> Option<NodeId> {
+        Some(self.peer_id)
+    }
+}
+
+/// A TEST-ONLY `BundleCarrier` using raw TCP. NO authentication.
+#[cfg(test)]
 pub struct TcpBundleCarrier {
     stream: tokio::sync::Mutex<TcpStream>,
 }
 
+#[cfg(test)]
 impl TcpBundleCarrier {
     /// Create a carrier from an existing TCP stream.
     #[must_use]
@@ -268,6 +362,7 @@ impl TcpBundleCarrier {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl BundleCarrier for TcpBundleCarrier {
     async fn send_bundle(&self, bundle: &Bundle) -> ModeAResult<()> {
@@ -311,6 +406,10 @@ impl BundleCarrier for TcpBundleCarrier {
         let bundle = Bundle::from_cbor(&buf)?;
         Ok(bundle)
     }
+
+    fn peer_node_id(&self) -> Option<NodeId> {
+        None // raw TCP — no authenticated peer
+    }
 }
 
 // ─── Relay bundle loop ────────────────────────────────────────────────────
@@ -343,13 +442,16 @@ impl BundleCarrier for TcpBundleCarrier {
 pub struct ModeARelay {
     /// The relay's identity.
     identity: NodeIdentity,
+    /// The relay's X25519 static keypair (for SNP-IK handshake).
+    x25519_secret: X25519Secret,
+    x25519_public: X25519PubKey,
     /// In-memory bundle store (NOT persistent).
     store: Arc<StdMutex<BundleStore>>,
     /// The relay's listen address (for receiving bundles from the previous hop).
     listen_addr: String,
     /// The next hop's address (for forwarding bundles).
     next_hop_addr: String,
-    /// The next hop's NodeId (for custody transfer).
+    /// The next hop's NodeId (for custody transfer + identity pinning).
     next_hop_node_id: NodeId,
 }
 
@@ -358,12 +460,16 @@ impl ModeARelay {
     #[must_use]
     pub fn new(
         identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
         listen_addr: String,
         next_hop_addr: String,
         next_hop_node_id: NodeId,
     ) -> Self {
         Self {
             identity,
+            x25519_secret,
+            x25519_public,
             store: Arc::new(StdMutex::new(BundleStore::new())),
             listen_addr,
             next_hop_addr,
@@ -421,14 +527,38 @@ impl ModeARelay {
             tokio::select! {
                 // Accept a new connection.
                 accept_result = listener.accept() => {
-                    let (stream, peer_addr) = match accept_result {
+                    let (mut stream, _peer_addr) = match accept_result {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("[mode-a-relay] accept error: {e}");
                             continue;
                         }
                     };
-                    let carrier = Arc::new(TcpBundleCarrier::new(stream));
+                    // Perform SNP-IK handshake as responder on the accepted stream.
+                    let hs = match perform_snp_ik_handshake_async(
+                        &mut stream,
+                        false, // responder
+                        &self.identity.secret_key,
+                        &self.identity.public_key,
+                        &self.x25519_secret,
+                        &self.x25519_public,
+                        None, // accept any authenticated peer
+                    ).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("[mode-a-relay] handshake error: {e}");
+                            continue;
+                        }
+                    };
+                    eprintln!(
+                        "[mode-a-relay {}] accepted authenticated link from peer {}",
+                        hex_short(&self.identity.node_id),
+                        hex_short(&hs.peer_node_id)
+                    );
+                    let carrier = Arc::new(AuthenticatedBundleCarrier {
+                        link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
+                        peer_id: hs.peer_node_id,
+                    });
                     // Store the carrier so we can send the response back.
                     {
                         let mut cc = client_carrier.lock().await;
@@ -571,8 +701,17 @@ impl ModeARelay {
         if bundles_to_forward.is_empty() {
             return;
         }
-        // Try to connect to the next hop.
-        let carrier = match TcpBundleCarrier::connect(&self.next_hop_addr).await {
+        // Try to connect to the next hop via authenticated L8 transport.
+        let carrier = match AuthenticatedBundleCarrier::connect_as_initiator(
+            &self.next_hop_addr,
+            self.next_hop_node_id,
+            &self.identity.secret_key,
+            &self.identity.public_key,
+            &self.x25519_secret,
+            &self.x25519_public,
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
@@ -706,6 +845,9 @@ impl ModeARelay {
 pub struct ModeAGateway {
     /// The gateway's identity.
     identity: NodeIdentity,
+    /// The gateway's X25519 static keypair (for SNP-IK handshake).
+    x25519_secret: X25519Secret,
+    x25519_public: X25519PubKey,
     /// The gateway's listen address (for receiving bundles from the relay).
     listen_addr: String,
     /// The gateway's secret key for signing TransitResponses.
@@ -717,10 +859,17 @@ pub struct ModeAGateway {
 impl ModeAGateway {
     /// Create a new Mode-A gateway with production egress (SSRF defence).
     #[must_use]
-    pub fn new(identity: NodeIdentity, listen_addr: String) -> Self {
+    pub fn new(
+        identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
+        listen_addr: String,
+    ) -> Self {
         let gateway_secret = identity.secret_key;
         Self {
             identity,
+            x25519_secret,
+            x25519_public,
             listen_addr,
             gateway_secret,
             connector_factory: Box::new(|url: &str| PinnedConnector::new(url)),
@@ -729,13 +878,21 @@ impl ModeAGateway {
 
     /// Create a new Mode-A gateway with a custom connector factory (for testing).
     #[must_use]
-    pub fn with_connector_factory<F>(identity: NodeIdentity, listen_addr: String, f: F) -> Self
+    pub fn with_connector_factory<F>(
+        identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
+        listen_addr: String,
+        f: F,
+    ) -> Self
     where
         F: Fn(&str) -> GatewayResult<PinnedConnector> + Send + Sync + 'static,
     {
         let gateway_secret = identity.secret_key;
         Self {
             identity,
+            x25519_secret,
+            x25519_public,
             listen_addr,
             gateway_secret,
             connector_factory: Box::new(f),
@@ -757,12 +914,39 @@ impl ModeAGateway {
             self.listen_addr
         );
         loop {
-            let carrier = match TcpBundleCarrier::accept(&listener).await {
-                Ok(c) => c,
+            // Accept + perform SNP-IK handshake as responder.
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("[mode-a-gateway] accept error: {e}");
                     continue;
                 }
+            };
+            let hs = match perform_snp_ik_handshake_async(
+                &mut stream,
+                false,
+                &self.identity.secret_key,
+                &self.identity.public_key,
+                &self.x25519_secret,
+                &self.x25519_public,
+                None,
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[mode-a-gateway] handshake error: {e}");
+                    continue;
+                }
+            };
+            eprintln!(
+                "[mode-a-gateway {}] accepted authenticated link from peer {}",
+                hex_short(&self.identity.node_id),
+                hex_short(&hs.peer_node_id)
+            );
+            let carrier = AuthenticatedBundleCarrier {
+                link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
+                peer_id: hs.peer_node_id,
             };
             let bundle = match carrier.recv_bundle().await {
                 Ok(b) => b,
@@ -896,33 +1080,52 @@ impl ModeAGateway {
 pub struct ModeAClient {
     /// The client's identity.
     identity: NodeIdentity,
+    /// The client's X25519 static keypair (for SNP-IK handshake).
+    x25519_secret: X25519Secret,
+    x25519_public: X25519PubKey,
 }
 
 impl ModeAClient {
     /// Create a new Mode-A client.
     #[must_use]
-    pub fn new(identity: NodeIdentity) -> Self {
-        Self { identity }
+    pub fn new(
+        identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
+    ) -> Self {
+        Self {
+            identity,
+            x25519_secret,
+            x25519_public,
+        }
     }
 
     /// Send a Mode-A request via store-carry-forward and wait for the response.
     ///
-    /// 1. Create a signed `TransitRequest`.
-    /// 2. Wrap as a `Bundle`.
-    /// 3. Send to the carrier (relay).
-    /// 4. Wait for the response bundle.
-    /// 5. Decode the `TransitResponse` + body.
-    /// 6. Verify the gateway signature.
+    /// Creates an authenticated L8 connection to the relay (SNP-IK handshake
+    /// with the relay's NodeId pinned), sends the bundle, and waits for the
+    /// response.
     ///
     /// # Errors
     /// Returns `ModeAError` if any step fails.
     pub async fn send_request(
         &self,
         url: &str,
+        relay_addr: &str,
+        relay_node_id: NodeId,
         gateway_node_id: NodeId,
         gateway_public_key: &snp_crypto::PublicKey,
-        carrier: &dyn BundleCarrier,
     ) -> ModeAResult<(TransitResponse, Vec<u8>)> {
+        // 0. Establish authenticated L8 connection to the relay.
+        let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+            relay_addr,
+            relay_node_id,
+            &self.identity.secret_key,
+            &self.identity.public_key,
+            &self.x25519_secret,
+            &self.x25519_public,
+        )
+        .await?;
         // 1. Create a signed TransitRequest.
         let mut req = TransitRequest {
             req_id: generate_req_id(),

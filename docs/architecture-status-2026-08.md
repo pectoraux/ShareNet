@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.3)
+**Date:** 2026-08-19 (updated R4.3 hardening)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) | R4.3: first real store-carry-forward Mode-A proof. Client → Relay → Gateway → HTTP endpoint with deliberate interruption. Relay holds bundle in BundleStore while gateway unavailable, forwards when it becomes available. No MultiplexedCircuit/StreamHandle used. |
+| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) + authenticated transport | R4.3: store-carry-forward with **authenticated L8 transport** (SNP-IK handshake + AEAD-encrypted link layer). `AuthenticatedBundleCarrier` uses `AsyncLink::send_raw`/`recv_raw`. Peer identity pinned + verified during handshake. Identity substitution rejected. No MultiplexedCircuit/StreamHandle. Deliberate interruption test passes. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -60,17 +60,15 @@ with a **deliberate interruption**: the relay holds the bundle in its
 becomes available. This is the defining R4.3 property.
 
 **Limitations (honestly stated):**
+- **Authenticated transport: VERIFIED** — SNP-IK handshake + AEAD (ChaCha20-Poly1305) + peer identity pinning
 - **In-memory store**: `BundleStore` is in-memory. Bundles are NOT persisted
   across process restarts. This is honestly classified as:
   `runtime store-carry-forward: process-lifetime only`.
 - **Single-hop relay**: The first proof uses one relay (Client → Relay → Gateway).
-  Multi-hop relay forwarding is R5+.
+  Multi-hop relay forwarding is R4.4+.
 - **Host-local egress**: The gateway fetches from a mock HTTP server on
   127.0.0.1. This is honestly classified as `host-local egress test` — NOT
   genuine external Internet egress. The sandbox may not have external access.
-- **Simple transport**: The `BundleCarrier` uses raw TCP with length-prefixed
-  framing (no SNP-IK handshake, no AEAD at the link layer). A future hardening
-  pass will use the authenticated `AsyncLink` transport.
 - **No persistent database**: Bundles are stored in-memory only.
 - **No peer discovery**: The first slice uses explicitly configured carrier
   endpoints (acceptable for the first vertical proof).

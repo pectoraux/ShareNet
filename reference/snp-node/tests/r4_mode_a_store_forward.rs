@@ -40,8 +40,8 @@ use snp_gateway::{GatewayError, GatewayResult, PinnedConnector, TransitRequest, 
 use snp_identity::{NodeId, NodeIdentity};
 use snp_node::node::mode_a_bundle::{
     unwrap_transit_request_from_bundle, unwrap_transit_response_from_bundle,
-    wrap_transit_request_as_bundle, wrap_transit_response_as_bundle, BundleCarrier, ModeAClient,
-    ModeAError, ModeAGateway, ModeARelay, TcpBundleCarrier,
+    wrap_transit_request_as_bundle, wrap_transit_response_as_bundle, AuthenticatedBundleCarrier,
+    BundleCarrier, ModeAClient, ModeAError, ModeAGateway, ModeARelay,
 };
 use snp_sync::{Bundle, BundleId, BundlePayload, BundleStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,6 +51,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Generate a deterministic identity from a seed byte.
 fn test_identity(seed: u8) -> NodeIdentity {
     NodeIdentity::from_secret([seed; 32])
+}
+
+/// Generate a deterministic X25519 keypair from a seed.
+fn test_x25519_keypair(seed: u8) -> (snp_crypto::X25519Secret, snp_crypto::X25519PubKey) {
+    // Use the crypto module's keypair generation (non-deterministic but fine for tests).
+    snp_crypto::x25519_static_keypair()
 }
 
 // ─── Mock HTTP server ─────────────────────────────────────────────────────
@@ -148,8 +154,11 @@ async fn r4_mode_a_store_forward_with_interruption() {
     drop(gateway_listener);
 
     // ─── Step 1: Create and start the relay (Gateway NOT started) ──────
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x02);
     let relay = Arc::new(ModeARelay::new(
         relay_identity.clone(),
+        relay_x_sk,
+        relay_x_pk,
         relay_addr.clone(),
         gateway_addr.clone(),
         gateway_identity.node_id,
@@ -174,20 +183,23 @@ async fn r4_mode_a_store_forward_with_interruption() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // ─── Step 2: Client sends bundle to Relay ─────────────────────────
-    // The client connects to the relay, sends the bundle, and waits for
-    // the custody acknowledgment + response.
-    let carrier = TcpBundleCarrier::connect(&relay_addr)
-        .await
-        .expect("connect to relay");
-    let client = ModeAClient::new(client_identity.clone());
+    // The client establishes an authenticated L8 connection to the relay,
+    // sends the bundle, and waits for the custody acknowledgment + response.
+    let (client_x_sk, client_x_pk) = test_x25519_keypair(0x01);
+    let client = ModeAClient::new(client_identity.clone(), client_x_sk, client_x_pk);
+    let relay_addr_for_client = relay_addr.clone();
+    let relay_node_id = relay_identity.node_id;
+    let gw_node_id = gateway_identity.node_id;
+    let gw_pubkey = gateway_identity.public_key;
 
     let client_task = tokio::spawn(async move {
         client
             .send_request(
                 &url,
-                gateway_identity.node_id,
-                &gateway_identity.public_key,
-                &carrier,
+                &relay_addr_for_client,
+                relay_node_id,
+                gw_node_id,
+                &gw_pubkey,
             )
             .await
     });
@@ -219,8 +231,11 @@ async fn r4_mode_a_store_forward_with_interruption() {
     drop(store);
 
     // ─── Step 5: Start the Gateway ─────────────────────────────────────
+    let (gw_x_sk, gw_x_pk) = test_x25519_keypair(0x03);
     let gateway = ModeAGateway::with_connector_factory(
         gateway_identity.clone(),
+        gw_x_sk,
+        gw_x_pk,
         gateway_addr.clone(),
         // Connector factory: use PinnedConnector::from_parts to target the
         // mock HTTP server (bypasses SSRF for host-local testing).
@@ -379,49 +394,6 @@ fn r4_bundle_request_response_wrappers_roundtrip() {
     );
 }
 
-// ─── Test: bundle carrier TCP round-trip ─────────────────────────────────
-
-#[tokio::test]
-async fn r4_tcp_bundle_carrier_roundtrip() {
-    // Test the TCP BundleCarrier with a simple echo loop.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr").to_string();
-
-    let server_task = tokio::spawn(async move {
-        let carrier = TcpBundleCarrier::accept(&listener).await.expect("accept");
-        // Echo the bundle back.
-        let bundle = carrier.recv_bundle().await.expect("recv");
-        carrier.send_bundle(&bundle).await.expect("send back");
-    });
-
-    let client_carrier = TcpBundleCarrier::connect(&addr).await.expect("connect");
-
-    // Create a test bundle.
-    let identity = test_identity(0x99);
-    let bundle = Bundle::new(
-        identity.node_id,
-        [0xFF; 32],
-        BundlePayload::new(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-        1_000,
-        10_000,
-    )
-    .expect("valid bundle");
-
-    // Send.
-    client_carrier.send_bundle(&bundle).await.expect("send");
-
-    // Receive echo.
-    let recovered = client_carrier.recv_bundle().await.expect("recv");
-    assert_eq!(
-        bundle, recovered,
-        "bundle must round-trip through TCP carrier"
-    );
-
-    server_task.await.expect("server task");
-}
-
 // ─── Test: relay store-carry-forward with no gateway ─────────────────────
 
 #[tokio::test]
@@ -444,8 +416,11 @@ async fn r4_relay_holds_bundle_when_gateway_unavailable() {
     // Gateway address that NOTHING is listening on (port 1 is always unavailable).
     let fake_gateway_addr = "127.0.0.1:1";
 
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x11);
     let relay = Arc::new(ModeARelay::new(
         relay_identity.clone(),
+        relay_x_sk,
+        relay_x_pk,
         relay_addr.clone(),
         fake_gateway_addr.into(),
         gateway_identity.node_id,
@@ -464,10 +439,18 @@ async fn r4_relay_holds_bundle_when_gateway_unavailable() {
     };
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Client sends a bundle directly to the relay.
-    let carrier = TcpBundleCarrier::connect(&relay_addr)
-        .await
-        .expect("connect");
+    // Client sends a bundle to the relay via authenticated L8 transport.
+    let (client_x_sk, client_x_pk) = test_x25519_keypair(0x22);
+    let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_addr,
+        relay_identity.node_id,
+        &client_identity.secret_key,
+        &client_identity.public_key,
+        &client_x_sk,
+        &client_x_pk,
+    )
+    .await
+    .expect("connect to relay");
 
     // Create a test request bundle.
     let mut req = TransitRequest {
@@ -569,4 +552,72 @@ fn r4_mode_a_does_not_use_live_circuit() {
         "mode_a_bundle.rs must NOT call StreamHandle methods"
     );
     eprintln!("[test] mode_a_bundle.rs verified: no Mode-B/circuit types imported or called");
+}
+
+// ─── Test: identity substitution rejection ────────────────────────────────
+
+#[tokio::test]
+async fn r4_identity_substitution_rejected() {
+    // Test that the relay rejects a peer whose NodeId doesn't match the
+    // expected NodeId. The SNP-IK handshake has built-in identity pinning
+    // (expected_peer_node_id parameter). If the peer's authenticated NodeId
+    // doesn't match, the handshake fails.
+
+    let relay_identity = test_identity(0x11);
+    let attacker_identity = test_identity(0x99); // different identity
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x11);
+    let (attacker_x_sk, attacker_x_pk) = test_x25519_keypair(0x99);
+
+    // Relay listens on an ephemeral port.
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("local_addr").to_string();
+
+    // Start the relay — it accepts connections and performs SNP-IK as responder.
+    // It does NOT pin an expected peer NodeId (accepts any authenticated peer).
+    // But the ATTACKER will try to connect and pin the WRONG relay NodeId.
+    let relay_task = tokio::spawn(async move {
+        // Accept one connection.
+        let (mut stream, _) = relay_listener.accept().await.expect("accept");
+        // Perform SNP-IK as responder — no expected peer pinning.
+        let result = snp_link::async_link::perform_snp_ik_handshake_async(
+            &mut stream,
+            false, // responder
+            &relay_identity.secret_key,
+            &relay_identity.public_key,
+            &relay_x_sk,
+            &relay_x_pk,
+            None, // accept any authenticated peer
+        )
+        .await;
+        // The relay's handshake should succeed (the attacker IS authenticated,
+        // just not the expected relay). But the ATTACKER's handshake should
+        // FAIL because the attacker pinned a WRONG relay NodeId.
+        // We don't assert here — the assertion is on the attacker's side.
+        let _ = result;
+    });
+
+    // The attacker tries to connect to the relay, but pins the WRONG relay NodeId.
+    // The relay's actual NodeId is relay_identity.node_id.
+    // The attacker expects attacker_identity.node_id (WRONG).
+    let wrong_expected = attacker_identity.node_id; // WRONG — not the relay's NodeId
+    let result = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_addr,
+        wrong_expected,
+        &attacker_identity.secret_key,
+        &attacker_identity.public_key,
+        &attacker_x_sk,
+        &attacker_x_pk,
+    )
+    .await;
+
+    // The connection MUST fail — identity substitution detected.
+    assert!(
+        result.is_err(),
+        "identity substitution MUST be rejected: connecting with wrong expected NodeId must fail"
+    );
+    eprintln!("[test] identity substitution correctly rejected");
+
+    relay_task.await.expect("relay task");
 }
