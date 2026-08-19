@@ -1083,16 +1083,11 @@ dependencies = [
 name = "snp-sync"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "snp-cbor",
  "snp-crypto",
- "snp-discovery",
  "snp-identity",
- "snp-link",
  "snp-object",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

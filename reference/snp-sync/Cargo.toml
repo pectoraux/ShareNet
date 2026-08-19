@@ -1,22 +1,40 @@
 [package]
 name = "snp-sync"
-description = "L5 anti-entropy, store-carry-forward, Mode A bundle custody"
+description = "L5 anti-entropy, store-carry-forward, bundle custody"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# R4.1 dependency graph (target per architecture correction):
+#
+#     snp-sync (L5)
+#         ↓
+#     snp-object (L2)
+#     snp-identity (L1)
+#     snp-cbor
+#     snp-crypto
+#
+# snp-sync MUST NOT depend on snp-gateway (L7), snp-node (composition),
+# snp-routing (L6), snp-frames (L8), snp-discovery (L4), or snp-link (L8).
+#
+# The previous skeleton depended on snp-discovery + snp-link for the
+# `exchange()` anti-entropy stub. That function has been removed from R4.1
+# (anti-entropy is R4.2+). snp-discovery and snp-link will be re-introduced
+# ONLY if/when anti-entropy requires them, and only after review.
+#
+# tokio + tracing were previously declared but unused by R4.1 (no async I/O,
+# no logging in the generic Bundle layer). They are dropped to keep the
+# dependency surface minimal and the layer boundary explicit.
+
 [dependencies]
 snp-cbor.workspace = true
 snp-crypto.workspace = true
 snp-identity.workspace = true
 snp-object.workspace = true
-snp-discovery.workspace = true
-snp-link.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+# No external dev-deps required: tests use only the crate's own API plus
+# `snp_crypto` key generation (already a runtime dep).
