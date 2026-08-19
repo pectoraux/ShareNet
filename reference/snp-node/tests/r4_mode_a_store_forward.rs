@@ -59,6 +59,12 @@ fn test_x25519_keypair(seed: u8) -> (snp_crypto::X25519Secret, snp_crypto::X2551
     snp_crypto::x25519_static_keypair()
 }
 
+/// Short hex representation of a byte slice (first 8 hex chars + "..").
+fn hex_short(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{hex}..")
+}
+
 // ─── Mock HTTP server ─────────────────────────────────────────────────────
 
 /// Start a simple HTTP/1.1 mock server on 127.0.0.1. Returns the address.
@@ -620,4 +626,377 @@ async fn r4_identity_substitution_rejected() {
     eprintln!("[test] identity substitution correctly rejected");
 
     relay_task.await.expect("relay task");
+}
+
+// ─── Test: provenance binding — source must match authenticated peer ─────
+
+#[tokio::test]
+async fn r4_bundle_source_must_match_authenticated_peer() {
+    // An authenticated peer (Node B) sends a bundle claiming source = Node A.
+    // The relay MUST reject this — the authenticated peer does not match
+    // the bundle's claimed source.
+    let relay_identity = test_identity(0x11);
+    let attacker_identity = test_identity(0x22); // B — different from A
+    let victim_identity = test_identity(0x33); // A — the claimed source
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x11);
+    let (attacker_x_sk, attacker_x_pk) = test_x25519_keypair(0x22);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("local_addr").to_string();
+    drop(relay_listener);
+
+    let relay = Arc::new(ModeARelay::new(
+        relay_identity.clone(),
+        relay_x_sk,
+        relay_x_pk,
+        relay_addr.clone(),
+        "127.0.0.1:1".into(), // dummy next hop
+        [0xFF; 32],           // dummy gateway NodeId
+    ));
+    let relay_store = relay.store();
+
+    let relay_handle = {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = relay.run() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Attacker connects and sends a bundle with source = victim_identity.node_id
+    // (NOT attacker_identity.node_id).
+    let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_addr,
+        relay_identity.node_id,
+        &attacker_identity.secret_key,
+        &attacker_identity.public_key,
+        &attacker_x_sk,
+        &attacker_x_pk,
+    )
+    .await
+    .expect("connect");
+
+    // Create a bundle claiming source = victim (A), not attacker (B).
+    let now = snp_identity::now_unix();
+    let bundle = Bundle::new(
+        victim_identity.node_id, // WRONG — should be attacker_identity.node_id
+        [0xFF; 32],
+        BundlePayload::new(vec![0xDE, 0xAD]),
+        now,
+        now + 10_000,
+    )
+    .expect("valid bundle");
+
+    // Send the bundle.
+    carrier.send_bundle(&bundle).await.expect("send");
+
+    // Wait a moment for the relay to process.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The relay MUST NOT have taken custody or stored the bundle.
+    let store = relay_store.lock().expect("store lock");
+    let pending = store.pending(snp_identity::now_unix());
+    assert!(
+        pending.is_empty(),
+        "relay must NOT store a bundle whose source ({}) does not match the authenticated peer ({})",
+        hex_short(&victim_identity.node_id),
+        hex_short(&attacker_identity.node_id)
+    );
+    eprintln!(
+        "[test] provenance mismatch correctly rejected: peer={} != source={}",
+        hex_short(&attacker_identity.node_id),
+        hex_short(&victim_identity.node_id)
+    );
+
+    relay_handle.abort();
+}
+
+// ─── Test: valid first-hop identity binding passes ───────────────────────
+
+#[tokio::test]
+async fn r4_valid_first_hop_identity_binding() {
+    // An authenticated peer sends a bundle with source == peer NodeId.
+    // The relay MUST accept this — the first-hop identity binding is correct.
+    let relay_identity = test_identity(0x11);
+    let client_identity = test_identity(0x22);
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x11);
+    let (client_x_sk, client_x_pk) = test_x25519_keypair(0x22);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("local_addr").to_string();
+    drop(relay_listener);
+
+    let relay = Arc::new(ModeARelay::new(
+        relay_identity.clone(),
+        relay_x_sk,
+        relay_x_pk,
+        relay_addr.clone(),
+        "127.0.0.1:1".into(),
+        [0xFF; 32],
+    ));
+    let relay_store = relay.store();
+
+    let relay_handle = {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = relay.run() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Client connects with its own identity.
+    let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_addr,
+        relay_identity.node_id,
+        &client_identity.secret_key,
+        &client_identity.public_key,
+        &client_x_sk,
+        &client_x_pk,
+    )
+    .await
+    .expect("connect");
+
+    // Create a bundle with source = client_identity.node_id (CORRECT — matches authenticated peer).
+    let now = snp_identity::now_unix();
+    let bundle = Bundle::new(
+        client_identity.node_id,
+        [0xFF; 32],
+        BundlePayload::new(vec![0xDE, 0xAD]),
+        now,
+        now + 10_000,
+    )
+    .expect("valid bundle");
+
+    // Send the bundle.
+    carrier.send_bundle(&bundle).await.expect("send");
+
+    // Wait for the relay to process.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The relay MUST have taken custody and stored the bundle.
+    let store = relay_store.lock().expect("store lock");
+    let pending = store.pending(snp_identity::now_unix());
+    assert!(
+        !pending.is_empty(),
+        "relay must accept a bundle whose source matches the authenticated peer"
+    );
+    eprintln!(
+        "[test] valid first-hop identity binding accepted: peer == source = {}",
+        hex_short(&client_identity.node_id)
+    );
+
+    relay_handle.abort();
+}
+
+// ─── Test: valid chained custody identity binding ────────────────────────
+
+#[tokio::test]
+async fn r4_valid_chained_custody_identity_binding() {
+    // A bundle that has been through one custody hop (client → relay A)
+    // is forwarded to relay B. Relay B must verify that the authenticated
+    // peer (relay A) matches the last custody hop's next_custodian_id.
+    let relay_a_identity = test_identity(0x11);
+    let relay_b_identity = test_identity(0x22);
+    let client_identity = test_identity(0x33);
+    let (relay_b_x_sk, relay_b_x_pk) = test_x25519_keypair(0x22);
+    let (relay_a_x_sk, relay_a_x_pk) = test_x25519_keypair(0x11);
+
+    let relay_b_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay_b");
+    let relay_b_addr = relay_b_listener
+        .local_addr()
+        .expect("local_addr")
+        .to_string();
+    drop(relay_b_listener);
+
+    let relay_b = Arc::new(ModeARelay::new(
+        relay_b_identity.clone(),
+        relay_b_x_sk,
+        relay_b_x_pk,
+        relay_b_addr.clone(),
+        "127.0.0.1:1".into(),
+        [0xFF; 32],
+    ));
+    let relay_b_store = relay_b.store();
+
+    let relay_b_handle = {
+        let relay_b = relay_b.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = relay_b.run() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Relay A connects to relay B and sends a bundle that has already
+    // been through one custody hop (client → relay A).
+    let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_b_addr,
+        relay_b_identity.node_id,
+        &relay_a_identity.secret_key,
+        &relay_a_identity.public_key,
+        &relay_a_x_sk,
+        &relay_a_x_pk,
+    )
+    .await
+    .expect("connect");
+
+    // Create a bundle where relay A has already taken custody.
+    let now = snp_identity::now_unix();
+    let mut bundle = Bundle::new(
+        client_identity.node_id,
+        [0xFF; 32],
+        BundlePayload::new(vec![0xDE, 0xAD]),
+        now,
+        now + 10_000,
+    )
+    .expect("valid bundle");
+
+    // Relay A takes custody (simulated).
+    bundle
+        .take_custody(
+            client_identity.node_id,  // prev custodian = client
+            relay_a_identity.node_id, // next custodian = relay A (signer)
+            &relay_a_identity.secret_key,
+            now + 100,
+            now + 200,
+            [0x01; 16],
+        )
+        .expect("take custody");
+
+    // The last custody hop's next_custodian_id = relay_a_identity.node_id.
+    // Relay B should authenticate relay A and check that
+    // authenticated_peer (relay A) == last_hop.next_custodian_id (relay A).
+    // This should PASS.
+
+    carrier.send_bundle(&bundle).await.expect("send");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Relay B MUST have taken custody and stored the bundle.
+    let store = relay_b_store.lock().expect("store lock");
+    let pending = store.pending(snp_identity::now_unix());
+    assert!(
+        !pending.is_empty(),
+        "relay B must accept a bundle where the last custody hop's next_custodian_id matches the authenticated peer"
+    );
+    eprintln!(
+        "[test] valid chained custody identity binding accepted: peer == last_hop.next_custodian_id = {}",
+        hex_short(&relay_a_identity.node_id)
+    );
+
+    relay_b_handle.abort();
+}
+
+// ─── Test: relay rejects provenance mismatch on chained custody ──────────
+
+#[tokio::test]
+async fn r4_relay_rejects_provenance_mismatch_chained() {
+    // A bundle has been through one custody hop claiming next_custodian_id = A.
+    // But the authenticated peer is B (not A). The relay MUST reject.
+    let relay_identity = test_identity(0x11);
+    let attacker_identity = test_identity(0x22); // B — the actual peer
+    let victim_identity = test_identity(0x33); // A — claimed as next_custodian_id
+    let client_identity = test_identity(0x44);
+    let (relay_x_sk, relay_x_pk) = test_x25519_keypair(0x11);
+    let (attacker_x_sk, attacker_x_pk) = test_x25519_keypair(0x22);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("local_addr").to_string();
+    drop(relay_listener);
+
+    let relay = Arc::new(ModeARelay::new(
+        relay_identity.clone(),
+        relay_x_sk,
+        relay_x_pk,
+        relay_addr.clone(),
+        "127.0.0.1:1".into(),
+        [0xFF; 32],
+    ));
+    let relay_store = relay.store();
+
+    let relay_handle = {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = relay.run() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            }
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Attacker (B) connects to the relay.
+    let carrier = AuthenticatedBundleCarrier::connect_as_initiator(
+        &relay_addr,
+        relay_identity.node_id,
+        &attacker_identity.secret_key,
+        &attacker_identity.public_key,
+        &attacker_x_sk,
+        &attacker_x_pk,
+    )
+    .await
+    .expect("connect");
+
+    // Create a bundle with a custody chain claiming next_custodian_id = victim (A).
+    // But the actual sender is attacker (B).
+    let now = snp_identity::now_unix();
+    let mut bundle = Bundle::new(
+        client_identity.node_id,
+        [0xFF; 32],
+        BundlePayload::new(vec![0xDE, 0xAD]),
+        now,
+        now + 10_000,
+    )
+    .expect("valid bundle");
+
+    // Add a custody hop claiming the next custodian is victim_identity (A).
+    // But we sign it with attacker's key (B) — the signature won't verify
+    // against A's public key. That's fine for this test — the relay rejects
+    // at the provenance check, BEFORE signature verification.
+    bundle.custody_chain.push(snp_sync::CustodyHop {
+        bundle_id: *bundle.bundle_id(),
+        custodian_id: client_identity.node_id,
+        next_custodian_id: victim_identity.node_id, // CLAIMS A is the next custodian
+        received_at: 1_100,
+        forwarded_at: 1_200,
+        nonce: [0x01; 16],
+        next_sig: [0u8; 64], // dummy signature
+    });
+
+    carrier.send_bundle(&bundle).await.expect("send");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The relay MUST NOT have stored the bundle.
+    let store = relay_store.lock().expect("store lock");
+    let pending = store.pending(snp_identity::now_unix());
+    assert!(
+        pending.is_empty(),
+        "relay must reject bundle where authenticated peer ({}) != last custody hop next_custodian_id ({})",
+        hex_short(&attacker_identity.node_id),
+        hex_short(&victim_identity.node_id)
+    );
+    eprintln!(
+        "[test] provenance mismatch on chained custody correctly rejected: peer={} != next_custodian_id={}",
+        hex_short(&attacker_identity.node_id),
+        hex_short(&victim_identity.node_id)
+    );
+
+    relay_handle.abort();
 }

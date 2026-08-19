@@ -592,11 +592,25 @@ impl ModeARelay {
                         continue;
                     }
                     // Request bundle: take custody + store + forward.
-                    let prev_custodian = bundle
+                    // PROVENANCE BINDING: the authenticated SNP-IK peer MUST
+                    // equal the bundle's expected previous custodian.
+                    // - If custody_chain is empty: expected = bundle.source
+                    // - If custody_chain is non-empty: expected = last hop's next_custodian_id
+                    let expected_prev_custodian = bundle
                         .custody_chain
                         .last()
                         .map(|h| h.next_custodian_id)
                         .unwrap_or(bundle.source);
+                    if hs.peer_node_id != expected_prev_custodian {
+                        eprintln!(
+                            "[mode-a-relay {}] PROVENANCE MISMATCH: authenticated peer {} != expected previous custodian {} — rejecting bundle",
+                            hex_short(&self.identity.node_id),
+                            hex_short(&hs.peer_node_id),
+                            hex_short(&expected_prev_custodian)
+                        );
+                        continue;
+                    }
+                    let prev_custodian = expected_prev_custodian;
                     let mut bundle = bundle;
                     let received_at = now;
                     let nonce = generate_nonce();
@@ -994,12 +1008,24 @@ impl ModeAGateway {
                 hex_short(&req.req_id),
                 &req.url.get(..60).unwrap_or(&req.url)
             );
-            // Take custody (the gateway is the final custodian for this request).
-            let prev_custodian = bundle
+            // PROVENANCE BINDING: the authenticated SNP-IK peer MUST
+            // equal the bundle's expected previous custodian.
+            let expected_prev_custodian = bundle
                 .custody_chain
                 .last()
                 .map(|h| h.next_custodian_id)
                 .unwrap_or(bundle.source);
+            if hs.peer_node_id != expected_prev_custodian {
+                eprintln!(
+                    "[mode-a-gateway {}] PROVENANCE MISMATCH: authenticated peer {} != expected previous custodian {} — rejecting bundle",
+                    hex_short(&self.identity.node_id),
+                    hex_short(&hs.peer_node_id),
+                    hex_short(&expected_prev_custodian)
+                );
+                continue;
+            }
+            // Take custody (the gateway is the final custodian for this request).
+            let prev_custodian = expected_prev_custodian;
             let mut custody_bundle = bundle.clone();
             let nonce = generate_nonce();
             if let Err(e) = custody_bundle.take_custody(

@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.3 hardening)
+**Date:** 2026-08-19 (updated R4.3 provenance binding)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) + authenticated transport | R4.3: store-carry-forward with **authenticated L8 transport** (SNP-IK handshake + AEAD-encrypted link layer). `AuthenticatedBundleCarrier` uses `AsyncLink::send_raw`/`recv_raw`. Peer identity pinned + verified during handshake. Identity substitution rejected. No MultiplexedCircuit/StreamHandle. Deliberate interruption test passes. |
+| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) + authenticated transport + provenance binding | R4.3: store-carry-forward with **authenticated L8 transport** (SNP-IK + AEAD). **Provenance binding**: authenticated peer NodeId MUST equal bundle's expected previous custodian (source on first hop, last custody hop's next_custodian_id thereafter). Mismatch → no custody, no forwarding, no store insertion. Identity substitution rejected. 9 tests pass. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -219,3 +219,4 @@ advertisements.
 18. **(R4.2) Anti-entropy is deterministic.** `compute_sync_diff` uses `BTreeSet` for set membership — no `HashMap` iteration order leaks into the diff output. CBOR encoding is canonical (RFC 8949 §4.2.1). Encode→decode→re-encode produces identical bytes.
 19. **(R4.2) Anti-entropy respects expiry.** `bundle_ids_for_have_vector` excludes bundles where `now >= deadline` (R4.1 expiry semantics). Expired bundles MUST NOT be offered as active work.
 20. **(R4.2) Anti-entropy preserves the L5 dependency boundary.** snp-sync still depends only on `snp-cbor` + `snp-crypto` + `snp-identity` + `snp-object` + `thiserror`. No L7/L6/L8/L4 dependency was added (verified via `cargo tree`). The `ObjectStore`/`DescriptorStore` traits are L5 contracts — the composition layer adapts L2 `Cas` → `ObjectStore` and L4 discovery → `DescriptorStore`.
+21. **(R4.3) Authenticated transport identity MUST equal bundle provenance.** For every received Mode-A bundle, the authenticated SNP-IK peer NodeId MUST equal the bundle's expected previous custodian (source on first hop, last custody hop's `next_custodian_id` thereafter). This check occurs BEFORE `take_custody()`. Mismatch → no custody, no `BundleStore` insertion, no forwarding. This is a permanent architecture invariant — the transport identity and bundle provenance must agree.
