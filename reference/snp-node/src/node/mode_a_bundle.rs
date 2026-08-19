@@ -1,4 +1,4 @@
-//! Mode-A store-carry-forward bundle composition layer (R4.3).
+//! Mode-A store-carry-forward bundle composition layer (R4.3/R4.4).
 //!
 //! This module bridges the L5 bundle layer (`snp-sync`: `Bundle`,
 //! `BundleStore`, `CustodyHop`) with the L7 gateway layer (`snp-gateway`:
@@ -11,10 +11,10 @@
 //!     domain: Bundle, BundleStore, custody, anti-entropy
 //!
 //! L6 / routing
-//!     chooses: next carrier / next route
+//!     chooses: next carrier / next route (Route / RouteHop)
 //!
 //! L8 / transport
-//!     moves: one-hop bytes (AsyncLink)
+//!     moves: one-hop bytes (AsyncLink with SNP-IK + AEAD)
 //!
 //! L7 / gateway
 //!     interprets: TransitRequest / TransitResponse, Internet egress
@@ -23,32 +23,17 @@
 //!     composition: combines all of the above
 //! ```
 //!
-//! This module does NOT add sockets or route logic to `snp-sync`.
-//! It does NOT put bundle semantics inside `snp-link`.
-//! It does NOT put route selection into `snp-gateway`.
+//! # R4.4 multi-hop
 //!
-//! # Bundle payload encoding
-//!
-//! A Mode-A request bundle carries an opaque `BundlePayload` whose bytes are
-//! the canonical CBOR encoding of a `TransitRequest` (via
-//! `snp_gateway::encode_transit_request`). L5 does NOT interpret these
-//! bytes — it carries them. This module is the composition layer that
-//! encodes/decodes the L7 types into/out of `BundlePayload`.
-//!
-//! A Mode-A response bundle carries an opaque `BundlePayload` whose bytes
-//! are the canonical CBOR encoding of a `TransitEnvelope` (response + body,
-//! via `snp_gateway::encode_transit_response_envelope`).
+//! The `BundleForwarder` operates at a route position and forwards to the
+//! next hop in the route. It does NOT choose routes — the route is supplied
+//! by L6/composition. The forwarder uses `AuthenticatedBundleCarrier` at
+//! every hop, with peer identity binding (provenance check) before custody.
 //!
 //! # Process-lifetime honesty
 //!
 //! The `BundleStore` is in-memory. Bundles are NOT persisted across process
-//! restarts. This is honestly classified as:
-//!
-//! ```text
-//! runtime store-carry-forward: process-lifetime only
-//! ```
-//!
-//! Do NOT call this durable custody storage.
+//! restarts.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -445,8 +430,9 @@ pub struct ModeARelay {
     /// The relay's X25519 static keypair (for SNP-IK handshake).
     x25519_secret: X25519Secret,
     x25519_public: X25519PubKey,
-    /// In-memory bundle store (NOT persistent).
-    store: Arc<StdMutex<BundleStore>>,
+    /// In-memory bundle store (NOT persistent). Uses tokio::sync::Mutex
+    /// because the relay's run() method is async.
+    store: Arc<tokio::sync::Mutex<BundleStore>>,
     /// The relay's listen address (for receiving bundles from the previous hop).
     listen_addr: String,
     /// The next hop's address (for forwarding bundles).
@@ -470,7 +456,7 @@ impl ModeARelay {
             identity,
             x25519_secret,
             x25519_public,
-            store: Arc::new(StdMutex::new(BundleStore::new())),
+            store: Arc::new(tokio::sync::Mutex::new(BundleStore::new())),
             listen_addr,
             next_hop_addr,
             next_hop_node_id,
@@ -478,7 +464,7 @@ impl ModeARelay {
     }
 
     /// Get a reference to the bundle store (for testing).
-    pub fn store(&self) -> Arc<StdMutex<BundleStore>> {
+    pub fn store(&self) -> Arc<tokio::sync::Mutex<BundleStore>> {
         self.store.clone()
     }
 
@@ -632,7 +618,7 @@ impl ModeARelay {
                         hex_short(&prev_custodian)
                     );
                     {
-                        let mut store = self.store.lock().expect("store mutex poisoned");
+                        let mut store = self.store.lock().await;
                         if let Err(e) = store.add(bundle.clone()) {
                             eprintln!("[mode-a-relay] store error: {e}");
                             continue;
@@ -665,7 +651,7 @@ impl ModeARelay {
         client_carrier: &Arc<tokio::sync::Mutex<Option<Arc<dyn BundleCarrier>>>>,
     ) {
         let response_bundle = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = self.store.lock().await;
             let all_pending: Vec<_> = store.pending(now_unix()).into_iter().cloned().collect();
             all_pending
                 .into_iter()
@@ -682,7 +668,7 @@ impl ModeARelay {
                     eprintln!("[mode-a-relay] response send error: {e}");
                 } else {
                     // Remove the response from the store.
-                    let mut store = self.store.lock().expect("store mutex poisoned");
+                    let mut store = self.store.lock().await;
                     store.remove(resp.bundle_id());
                 }
             }
@@ -700,7 +686,7 @@ impl ModeARelay {
     /// Returns `ModeAError` if the forward fails (but bundles are retained).
     pub async fn forward_pending_bundles(&self, now: u64) {
         let bundles_to_forward: Vec<Bundle> = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = self.store.lock().await;
             // Only forward REQUEST bundles (destined to the next hop).
             // RESPONSE bundles (destined to the client) are handled by
             // try_send_response_back() which sends them through the client
@@ -758,7 +744,7 @@ impl ModeARelay {
                     hex_short(&self.identity.node_id),
                     bundle_id.to_hex().get(..16).unwrap_or("?")
                 );
-                let mut store = self.store.lock().expect("store mutex poisoned");
+                let mut store = self.store.lock().await;
                 let _ = store.add(bundle);
                 return;
             }
@@ -769,7 +755,7 @@ impl ModeARelay {
                     hex_short(&self.identity.node_id),
                     bundle_id.to_hex().get(..16).unwrap_or("?")
                 );
-                let mut store = self.store.lock().expect("store mutex poisoned");
+                let mut store = self.store.lock().await;
                 store.remove(&bundle_id);
                 continue;
             }
@@ -781,7 +767,7 @@ impl ModeARelay {
                         hex_short(&self.identity.node_id),
                         bundle_id.to_hex().get(..16).unwrap_or("?")
                     );
-                    let mut store = self.store.lock().expect("store mutex poisoned");
+                    let mut store = self.store.lock().await;
                     store.remove(&bundle_id);
                 }
                 Err(e) => {
@@ -789,7 +775,7 @@ impl ModeARelay {
                         "[mode-a-relay {}] custody ack error: {e}",
                         hex_short(&self.identity.node_id)
                     );
-                    let mut store = self.store.lock().expect("store mutex poisoned");
+                    let mut store = self.store.lock().await;
                     let _ = store.add(bundle);
                     return;
                 }
@@ -803,7 +789,7 @@ impl ModeARelay {
                     );
                     // Store the response bundle for forwarding to the client.
                     // The response is addressed to the original client.
-                    let mut store = self.store.lock().expect("store mutex poisoned");
+                    let mut store = self.store.lock().await;
                     let _ = store.add(response_bundle);
                     // Trigger forwarding of the response back to the client.
                     // For the test, we'll handle this via a separate mechanism.
@@ -1241,4 +1227,593 @@ fn generate_nonce() -> [u8; CUSTODY_NONCE_BYTES] {
 fn hex_short(bytes: &[u8]) -> String {
     let hex: String = bytes.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("{hex}..")
+}
+
+// ─── BundleForwarder (R4.4 multi-hop) ─────────────────────────────────────
+
+/// A multi-hop Mode-A relay that operates at a route position.
+///
+/// The forwarder receives bundles, checks provenance binding (authenticated
+/// peer == expected previous custodian), takes custody, stores, and forwards
+/// to the next hop from the route. It does NOT choose routes — the route
+/// is supplied by L6/composition.
+///
+/// # Route position
+///
+/// The forwarder knows its position in the route (0-indexed, excluding the
+/// source). The next hop is `route.hop(position + 1)`. If the forwarder is
+/// at the last position (before the gateway), it forwards directly to the
+/// gateway.
+///
+/// # Store-carry-forward
+///
+/// If the next hop is unavailable, the bundle stays in the `BundleStore`.
+/// The forwarder retries periodically via `tokio::select!`.
+///
+/// # Provenance binding (frozen invariant #21)
+///
+/// For every received bundle, BEFORE take_custody():
+/// - If custody_chain is empty: authenticated peer MUST == bundle.source
+/// - If custody_chain is non-empty: authenticated peer MUST == last hop's next_custodian_id
+pub struct BundleForwarder {
+    /// The forwarder's identity.
+    identity: NodeIdentity,
+    /// The forwarder's X25519 keypair (for SNP-IK).
+    x25519_secret: X25519Secret,
+    x25519_public: X25519PubKey,
+    /// The forwarder's listen address.
+    listen_addr: String,
+    /// In-memory bundle store (NOT persistent). Uses tokio::sync::Mutex
+    /// because the forwarder's run() method is async and needs to hold
+    /// the lock across await points.
+    store: Arc<tokio::sync::Mutex<BundleStore>>,
+    /// The route (hop_details[0] = first hop after source, ..., last = gateway).
+    route: Arc<crate::node::route::Route>,
+    /// This forwarder's position in the route (0-indexed).
+    /// position=0 means this forwarder IS hop[0] in the route.
+    position: usize,
+    /// The source's (client's) listen address + NodeId. Only used at
+    /// position 0 to reconnect to the client when delivering the response.
+    /// For positions > 0, this is None (the previous hop is in the route).
+    source_addr: Option<String>,
+    source_node_id: Option<NodeId>,
+}
+
+impl BundleForwarder {
+    /// Create a new multi-hop forwarder.
+    ///
+    /// # Parameters
+    /// - `identity`: the forwarder's NodeIdentity.
+    /// - `x25519_secret`/`x25519_public`: X25519 keypair for SNP-IK.
+    /// - `listen_addr`: address to listen for incoming connections.
+    /// - `route`: the full route (source → ... → gateway).
+    /// - `position`: this forwarder's 0-indexed position in `route.hop_details()`.
+    #[must_use]
+    pub fn new(
+        identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
+        listen_addr: String,
+        route: Arc<crate::node::route::Route>,
+        position: usize,
+    ) -> Self {
+        Self {
+            identity,
+            x25519_secret,
+            x25519_public,
+            listen_addr,
+            store: Arc::new(tokio::sync::Mutex::new(BundleStore::new())),
+            route,
+            position,
+            source_addr: None,
+            source_node_id: None,
+        }
+    }
+
+    /// Set the source (client) address + NodeId. Only for position 0.
+    pub fn with_source(mut self, addr: String, node_id: NodeId) -> Self {
+        self.source_addr = Some(addr);
+        self.source_node_id = Some(node_id);
+        self
+    }
+
+    /// Get a reference to the bundle store (for testing).
+    pub fn store(&self) -> Arc<tokio::sync::Mutex<BundleStore>> {
+        self.store.clone()
+    }
+
+    /// Get the next hop's address + NodeId from the route.
+    fn next_hop_info(&self) -> Option<(String, NodeId)> {
+        let next_idx = self.position + 1;
+        let hop = self.route.hop(next_idx)?;
+        let addr = hop.first_endpoint()?.as_tcp()?.to_string();
+        let node_id = hop.node_id();
+        Some((addr, node_id))
+    }
+
+    /// Run the forwarder loop: listen for incoming bundles, check provenance,
+    /// take custody, store, and forward to the next hop.
+    ///
+    /// # Errors
+    /// Returns `ModeAError` if the listener fails to bind.
+    pub async fn run(&self) -> ModeAResult<()> {
+        let listener = TcpListener::bind(&self.listen_addr)
+            .await
+            .map_err(|e| ModeAError::Transport(format!("bind {}: {e}", self.listen_addr)))?;
+        eprintln!(
+            "[mode-a-fwd {}] listening on {} (position {})",
+            hex_short(&self.identity.node_id),
+            self.listen_addr,
+            self.position
+        );
+        // Track the carrier for the current client connection.
+        let client_carrier: Arc<tokio::sync::Mutex<Option<Arc<dyn BundleCarrier>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        loop {
+            tokio::select! {
+                // Accept a new connection.
+                accept_result = listener.accept() => {
+                    let (mut stream, _peer_addr) = match accept_result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[mode-a-fwd] accept error: {e}");
+                            continue;
+                        }
+                    };
+                    // Perform SNP-IK handshake as responder.
+                    let hs = match perform_snp_ik_handshake_async(
+                        &mut stream, false,
+                        &self.identity.secret_key, &self.identity.public_key,
+                        &self.x25519_secret, &self.x25519_public,
+                        None, // accept any authenticated peer
+                    ).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("[mode-a-fwd] handshake error: {e}");
+                            continue;
+                        }
+                    };
+                    eprintln!(
+                        "[mode-a-fwd {}] accepted authenticated link from peer {}",
+                        hex_short(&self.identity.node_id),
+                        hex_short(&hs.peer_node_id)
+                    );
+                    let carrier = Arc::new(AuthenticatedBundleCarrier {
+                        link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
+                        peer_id: hs.peer_node_id,
+                    });
+                    // Only store the carrier as prev_hop_carrier if the peer
+                    // is the previous hop (NOT the next hop reconnecting
+                    // to deliver a response).
+                    let next_node_id_check = self.route.hop(self.position + 1)
+                        .map(|h| h.node_id())
+                        .unwrap_or([0u8; 32]);
+                    if hs.peer_node_id != next_node_id_check {
+                        // This is a connection from the previous hop.
+                        let mut cc = client_carrier.lock().await;
+                        *cc = Some(carrier.clone());
+                    }
+                    // If the peer IS the next hop, we don't store the carrier —
+                    // it's a temporary connection to deliver a response.
+                    // Receive the bundle.
+                    let bundle = match carrier.recv_bundle().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[mode-a-fwd] recv error: {e}");
+                            continue;
+                        }
+                    };
+                    // Validate the bundle.
+                    if let Err(e) = bundle.validate() {
+                        eprintln!("[mode-a-fwd] invalid bundle: {e}");
+                        continue;
+                    }
+                    // Check expiry.
+                    let now = now_unix();
+                    if bundle.is_expired(now) {
+                        eprintln!("[mode-a-fwd] bundle expired, dropping");
+                        continue;
+                    }
+                    // Check if this is a response bundle (going back to client).
+                    // A response bundle's source is the gateway (next hop).
+                    let next_node_id = self.route.hop(self.position + 1)
+                        .map(|h| h.node_id())
+                        .unwrap_or([0u8; 32]);
+                    let is_response = bundle.source == self.route.destination()
+                        || bundle.source == next_node_id;
+                    if is_response {
+                        // Response bundle: store it and trigger delivery
+                        // to the previous hop via try_send_response_back.
+                        // Do NOT send it back through the incoming carrier —
+                        // that would send it to the wrong peer.
+                        eprintln!(
+                            "[mode-a-fwd {}] received response bundle, storing for delivery to previous hop",
+                            hex_short(&self.identity.node_id)
+                        );
+                        let mut store = self.store.lock().await;
+                        let _ = store.add(bundle);
+                        drop(store);
+                        self.try_send_response_back(&client_carrier).await;
+                        continue;
+                    }
+                    // PROVENANCE BINDING (invariant #21):
+                    // authenticated peer MUST == expected previous custodian.
+                    let expected_prev_custodian = bundle
+                        .custody_chain
+                        .last()
+                        .map(|h| h.next_custodian_id)
+                        .unwrap_or(bundle.source);
+                    if hs.peer_node_id != expected_prev_custodian {
+                        eprintln!(
+                            "[mode-a-fwd {}] PROVENANCE MISMATCH: authenticated peer {} != expected previous custodian {} — rejecting bundle",
+                            hex_short(&self.identity.node_id),
+                            hex_short(&hs.peer_node_id),
+                            hex_short(&expected_prev_custodian)
+                        );
+                        continue;
+                    }
+                    let prev_custodian = expected_prev_custodian;
+                    // Take custody.
+                    let mut bundle = bundle;
+                    let nonce = generate_nonce();
+                    if let Err(e) = bundle.take_custody(
+                        prev_custodian,
+                        self.identity.node_id,
+                        &self.identity.secret_key,
+                        now, now, nonce,
+                    ) {
+                        eprintln!("[mode-a-fwd] custody error: {e}");
+                        continue;
+                    }
+                    eprintln!(
+                        "[mode-a-fwd {}] took custody of bundle {} (from {})",
+                        hex_short(&self.identity.node_id),
+                        bundle.bundle_id().to_hex().get(..16).unwrap_or("?"),
+                        hex_short(&prev_custodian)
+                    );
+                    // Store the bundle.
+                    {
+                        let mut store = self.store.lock().await;
+                        if let Err(e) = store.add(bundle.clone()) {
+                            eprintln!("[mode-a-fwd] store error: {e}");
+                            continue;
+                        }
+                    }
+                    // Send custody ack.
+                    if let Err(e) = carrier.send_bundle(&bundle).await {
+                        eprintln!("[mode-a-fwd] custody ack send error: {e}");
+                        continue;
+                    }
+                    // Forward to next hop.
+                    self.forward_pending_bundles(now).await;
+                    // Check for response + send back.
+                    self.try_send_response_back(&client_carrier).await;
+                }
+                // Periodic retry.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    let now = now_unix();
+                    self.forward_pending_bundles(now).await;
+                    self.try_send_response_back(&client_carrier).await;
+                }
+            }
+        }
+    }
+
+    /// Forward pending bundles to the next hop. If unavailable, retain.
+    pub async fn forward_pending_bundles(&self, now: u64) {
+        let (next_addr, next_node_id) = match self.next_hop_info() {
+            Some(info) => info,
+            None => return, // No next hop — this forwarder is the last before gateway
+        };
+        let bundles_to_forward: Vec<Bundle> = {
+            let store = self.store.lock().await;
+            store
+                .pending(now)
+                .into_iter()
+                .filter(|b| b.destination == next_node_id || b.destination != self.identity.node_id)
+                .cloned()
+                .collect()
+        };
+        if bundles_to_forward.is_empty() {
+            return;
+        }
+        let carrier = match AuthenticatedBundleCarrier::connect_as_initiator(
+            &next_addr,
+            next_node_id,
+            &self.identity.secret_key,
+            &self.identity.public_key,
+            &self.x25519_secret,
+            &self.x25519_public,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[mode-a-fwd {}] next hop {} unavailable: {} (retaining {} bundles)",
+                    hex_short(&self.identity.node_id),
+                    next_addr,
+                    e,
+                    bundles_to_forward.len()
+                );
+                return;
+            }
+        };
+        eprintln!(
+            "[mode-a-fwd {}] connected to next hop {} (peer NodeId={}) — forwarding {} bundles",
+            hex_short(&self.identity.node_id),
+            next_addr,
+            hex_short(&next_node_id),
+            bundles_to_forward.len()
+        );
+        for bundle in bundles_to_forward {
+            let bundle_id = *bundle.bundle_id();
+            let is_response = bundle.destination != next_node_id;
+            if let Err(e) = carrier.send_bundle(&bundle).await {
+                eprintln!(
+                    "[mode-a-fwd {}] forward error: {e}",
+                    hex_short(&self.identity.node_id)
+                );
+                let mut store = self.store.lock().await;
+                let _ = store.add(bundle);
+                return;
+            }
+            if is_response {
+                let mut store = self.store.lock().await;
+                store.remove(&bundle_id);
+                continue;
+            }
+            // Wait for custody ack.
+            match carrier.recv_bundle().await {
+                Ok(_) => {
+                    eprintln!(
+                        "[mode-a-fwd {}] bundle {} forwarded (custody acknowledged)",
+                        hex_short(&self.identity.node_id),
+                        bundle_id.to_hex().get(..16).unwrap_or("?")
+                    );
+                    let mut store = self.store.lock().await;
+                    store.remove(&bundle_id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[mode-a-fwd {}] custody ack error: {e}",
+                        hex_short(&self.identity.node_id)
+                    );
+                    let mut store = self.store.lock().await;
+                    let _ = store.add(bundle);
+                    return;
+                }
+            }
+            // Wait for response bundle.
+            match carrier.recv_bundle().await {
+                Ok(response_bundle) => {
+                    eprintln!(
+                        "[mode-a-fwd {}] response bundle received from next hop",
+                        hex_short(&self.identity.node_id)
+                    );
+                    let mut store = self.store.lock().await;
+                    let _ = store.add(response_bundle);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[mode-a-fwd {}] response recv error: {e}",
+                        hex_short(&self.identity.node_id)
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Check for a response bundle in the store and send it back
+    /// to the previous hop. If the previous-hop connection is broken,
+    /// reconnect to the previous hop from the route.
+    async fn try_send_response_back(
+        &self,
+        prev_hop_carrier: &Arc<tokio::sync::Mutex<Option<Arc<dyn BundleCarrier>>>>,
+    ) {
+        let next_node_id = self
+            .route
+            .hop(self.position + 1)
+            .map(|h| h.node_id())
+            .unwrap_or([0u8; 32]);
+        let response_bundle = {
+            let store = self.store.lock().await;
+            store
+                .pending(now_unix())
+                .into_iter()
+                .find(|b| b.source == self.route.destination())
+                .cloned()
+        };
+        if let Some(resp) = response_bundle {
+            // Try the stored carrier first.
+            let send_result = {
+                let cc = prev_hop_carrier.lock().await;
+                if let Some(carrier) = cc.as_ref() {
+                    eprintln!(
+                        "[mode-a-fwd {}] sending response bundle to previous hop (existing carrier)",
+                        hex_short(&self.identity.node_id)
+                    );
+                    Some(carrier.send_bundle(&resp).await)
+                } else {
+                    None
+                }
+            };
+            // If the stored carrier failed or doesn't exist, reconnect.
+            let success = match send_result {
+                Some(Ok(())) => true,
+                Some(Err(_)) => {
+                    eprintln!(
+                        "[mode-a-fwd {}] existing carrier broken — reconnecting to previous hop",
+                        hex_short(&self.identity.node_id)
+                    );
+                    // Get the previous hop's address + NodeId from the route.
+                    // position - 1 = previous hop's index in hop_details.
+                    // But position 0 has no previous hop in the route — its
+                    // previous hop is the source (client). The client's
+                    // address is NOT in the route (source is excluded from
+                    // hop_details). So position 0 can't reconnect.
+                    if self.position == 0 {
+                        // Position 0: previous hop is the source (client).
+                        // Use the stored source_addr + source_node_id.
+                        if let (Some(ref addr), Some(ref node_id)) =
+                            (&self.source_addr, &self.source_node_id)
+                        {
+                            match AuthenticatedBundleCarrier::connect_as_initiator(
+                                addr,
+                                *node_id,
+                                &self.identity.secret_key,
+                                &self.identity.public_key,
+                                &self.x25519_secret,
+                                &self.x25519_public,
+                            )
+                            .await
+                            {
+                                Ok(new_carrier) => {
+                                    eprintln!(
+                                        "[mode-a-fwd {}] reconnected to source {} — sending response",
+                                        hex_short(&self.identity.node_id),
+                                        hex_short(node_id)
+                                    );
+                                    new_carrier.send_bundle(&resp).await.is_ok()
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[mode-a-fwd {}] reconnect to source failed: {e}",
+                                        hex_short(&self.identity.node_id)
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "[mode-a-fwd {}] no source address — cannot send response back",
+                                hex_short(&self.identity.node_id)
+                            );
+                            false
+                        }
+                    } else {
+                        // Reconnect to the previous hop.
+                        let prev_hop = match self.route.hop(self.position - 1) {
+                            Some(h) => h,
+                            None => return,
+                        };
+                        let prev_addr = match prev_hop.first_endpoint().and_then(|ep| ep.as_tcp()) {
+                            Some(a) => a.to_string(),
+                            None => return,
+                        };
+                        let prev_node_id = prev_hop.node_id();
+                        match AuthenticatedBundleCarrier::connect_as_initiator(
+                            &prev_addr,
+                            prev_node_id,
+                            &self.identity.secret_key,
+                            &self.identity.public_key,
+                            &self.x25519_secret,
+                            &self.x25519_public,
+                        )
+                        .await
+                        {
+                            Ok(new_carrier) => {
+                                eprintln!(
+                                    "[mode-a-fwd {}] reconnected to previous hop {} — sending response",
+                                    hex_short(&self.identity.node_id),
+                                    hex_short(&prev_node_id)
+                                );
+                                new_carrier.send_bundle(&resp).await.is_ok()
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[mode-a-fwd {}] reconnect to previous hop failed: {e}",
+                                    hex_short(&self.identity.node_id)
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // No stored carrier — reconnect.
+                    if self.position == 0 {
+                        // Position 0: previous hop is the source (client).
+                        if let (Some(ref addr), Some(ref node_id)) =
+                            (&self.source_addr, &self.source_node_id)
+                        {
+                            match AuthenticatedBundleCarrier::connect_as_initiator(
+                                addr,
+                                *node_id,
+                                &self.identity.secret_key,
+                                &self.identity.public_key,
+                                &self.x25519_secret,
+                                &self.x25519_public,
+                            )
+                            .await
+                            {
+                                Ok(new_carrier) => {
+                                    eprintln!(
+                                        "[mode-a-fwd {}] connected to source {} — sending response",
+                                        hex_short(&self.identity.node_id),
+                                        hex_short(node_id)
+                                    );
+                                    new_carrier.send_bundle(&resp).await.is_ok()
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[mode-a-fwd {}] connect to source failed: {e}",
+                                        hex_short(&self.identity.node_id)
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "[mode-a-fwd {}] no source address — cannot send response back",
+                                hex_short(&self.identity.node_id)
+                            );
+                            false
+                        }
+                    } else {
+                        let prev_hop = match self.route.hop(self.position - 1) {
+                            Some(h) => h,
+                            None => return,
+                        };
+                        let prev_addr = match prev_hop.first_endpoint().and_then(|ep| ep.as_tcp()) {
+                            Some(a) => a.to_string(),
+                            None => return,
+                        };
+                        let prev_node_id = prev_hop.node_id();
+                        match AuthenticatedBundleCarrier::connect_as_initiator(
+                            &prev_addr,
+                            prev_node_id,
+                            &self.identity.secret_key,
+                            &self.identity.public_key,
+                            &self.x25519_secret,
+                            &self.x25519_public,
+                        )
+                        .await
+                        {
+                            Ok(new_carrier) => {
+                                eprintln!(
+                                    "[mode-a-fwd {}] connected to previous hop {} — sending response",
+                                    hex_short(&self.identity.node_id),
+                                    hex_short(&prev_node_id)
+                                );
+                                new_carrier.send_bundle(&resp).await.is_ok()
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[mode-a-fwd {}] connect to previous hop failed: {e}",
+                                    hex_short(&self.identity.node_id)
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+            };
+            if success {
+                let mut store = self.store.lock().await;
+                store.remove(resp.bundle_id());
+            }
+        }
+    }
 }

@@ -214,7 +214,7 @@ async fn r4_mode_a_store_forward_with_interruption() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // ─── Step 3: Verify the relay took custody + stored the bundle ────
-    let store = relay_store.lock().expect("store lock");
+    let store = relay_store.lock().await;
     let pending_count = store.pending(snp_identity::now_unix()).len();
     assert!(
         pending_count >= 1,
@@ -227,7 +227,7 @@ async fn r4_mode_a_store_forward_with_interruption() {
     // The relay's run loop already attempted to forward and failed.
     // Verify the bundle is STILL in the store.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let store = relay_store.lock().expect("store lock");
+    let store = relay_store.lock().await;
     let pending_after_fail = store.pending(snp_identity::now_unix()).len();
     assert!(
         pending_after_fail >= 1,
@@ -493,7 +493,7 @@ async fn r4_relay_holds_bundle_when_gateway_unavailable() {
 
     // Verify the relay STORED the bundle (gateway is unavailable).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let store = relay_store.lock().expect("store");
+    let store = relay_store.lock().await;
     let pending = store.pending(snp_identity::now_unix());
     assert!(
         !pending.is_empty(),
@@ -699,7 +699,7 @@ async fn r4_bundle_source_must_match_authenticated_peer() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The relay MUST NOT have taken custody or stored the bundle.
-    let store = relay_store.lock().expect("store lock");
+    let store = relay_store.lock().await;
     let pending = store.pending(snp_identity::now_unix());
     assert!(
         pending.is_empty(),
@@ -784,7 +784,7 @@ async fn r4_valid_first_hop_identity_binding() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The relay MUST have taken custody and stored the bundle.
-    let store = relay_store.lock().expect("store lock");
+    let store = relay_store.lock().await;
     let pending = store.pending(snp_identity::now_unix());
     assert!(
         !pending.is_empty(),
@@ -887,7 +887,7 @@ async fn r4_valid_chained_custody_identity_binding() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Relay B MUST have taken custody and stored the bundle.
-    let store = relay_b_store.lock().expect("store lock");
+    let store = relay_b_store.lock().await;
     let pending = store.pending(snp_identity::now_unix());
     assert!(
         !pending.is_empty(),
@@ -984,7 +984,7 @@ async fn r4_relay_rejects_provenance_mismatch_chained() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The relay MUST NOT have stored the bundle.
-    let store = relay_store.lock().expect("store lock");
+    let store = relay_store.lock().await;
     let pending = store.pending(snp_identity::now_unix());
     assert!(
         pending.is_empty(),

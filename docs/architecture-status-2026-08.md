@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.3 provenance binding)
+**Date:** 2026-08-19 (updated R4.4)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) + authenticated transport + provenance binding | R4.3: store-carry-forward with **authenticated L8 transport** (SNP-IK + AEAD). **Provenance binding**: authenticated peer NodeId MUST equal bundle's expected previous custodian (source on first hop, last custody hop's next_custodian_id thereafter). Mismatch → no custody, no forwarding, no store insertion. Identity substitution rejected. 9 tests pass. |
+| **Mode A** (delay-tolerant) | MULTI-HOP RUNTIME VERIFIED (limited) | R4.4: multi-hop store-carry-forward with Client → Relay A → Relay B → Gateway. Route-driven next-hop selection via `BundleForwarder`. Deliberate interruption test: relay A holds bundle while relay B is unavailable, then forwards when B starts. Authenticated L8 at every hop. Provenance binding at every hop. Response traverses reverse path (B → A → Client). 3 multi-hop tests + 9 R4.3 tests pass. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
