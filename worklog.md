@@ -9270,3 +9270,62 @@ Stage Summary:
   - [x] commit pushed to origin/main — (SHA reported after push)
 - Pre-existing breakage NOT fixed by R4.1 (out of scope): `snp-stack/tests/circuit_lifecycle_tests.rs` (calls private `from_establishment`). This exists at baseline HEAD 9618980 and is NOT caused by R4.1.
 - Pre-existing fmt diff in `snp-cbor/src/lib.rs` (NOT fixed by R4.1 — out of scope, verified pre-existing at baseline).
+
+---
+Task ID: R4.2
+Agent: Z.ai (main — R4.2 anti-entropy implementation)
+Task: Implement the frozen L5 anti-entropy primitives (HaveVector, SyncRequest, SyncResponse, SyncDiff, SyncSession) using the existing TypeScript reference semantics, while preserving the L5 dependency boundary (no L7/L6/L8 deps). Do NOT implement runtime forwarding (R4.3+).
+
+Work Log:
+- Step 1: Verified repo state. HEAD = origin/main = f9d84d4 (R4.1). Working tree clean.
+- Step 2: Re-read frozen sync semantics. Read `src/lib/snp/sync.ts` lines 904-2316 comprehensively — HaveVector (4 fields: knownNodes/knownGateways/knownObjects/generatedAt), SyncRequest (5 fields: want/offer/wantDescriptors/requesterNodeId/generatedAt), SyncResponse (objects[{objectId,manifest,chunkCount}] + descriptors + complete), SyncDiff (localWants/localOffers — object-only), computeSyncDiff (set difference with dedup, preserves input order), SyncSession (buildLocalHaveVector + buildSyncRequest + handleSyncRequest + applySyncResponse + pendingManifests + commitPendingObject). Checked for frozen conformance vectors — NONE exist for sync (no `15-sync.json`). Documented this gap per Step 16.
+- Step 3: Audited current Rust skeleton via Explore subagent. Found: snp-sync has Bundle/BundleId/BundlePayload/CustodyHop/BundleStore (R4.1 real) + SyncRequest/SyncResponse/SyncObject (R4.1 skeleton, wrong field names). snp-object has ContentHash (= [u8;32], the ObjectId), Manifest (skeleton, fields: publisher/content_type/size/chunks/merkle_root/encryption_key, NO chunkCount field, NO signature), Cas trait (put/get/has, NO list method), InMemoryCas (skeleton todo!()). snp-identity has NodeId, NodeDescriptor (skeleton: node_id/identity_key/device_cert/capabilities/seq/issued_at/signature, NO to_cbor method), VerifiedNodeDescriptor (real, private fields). snp-discovery has a DIFFERENT HaveVector (Bloom filter: filter/k/m/n — NOT the TS structured vector). Decision: implement the TS-style HaveVector in snp-sync (where it logically belongs — L5 anti-entropy primitive). Do NOT touch snp-discovery's Bloom HaveVector (different concept). Use existing snp-object::ContentHash as ObjectId. Use existing snp-identity::NodeDescriptor skeleton (don't duplicate). Define ObjectStore + DescriptorStore traits in snp-sync (L5 contracts — NOT the L2 Cas trait, NOT the L4 runtime).
+- Steps 4-10: Implemented all anti-entropy primitives in `reference/snp-sync/src/lib.rs`. Replaced the R4.1 skeleton SyncRequest/SyncResponse/SyncObject with frozen-semantics versions. Added: `ObjectId` type alias (= `snp_object::ContentHash`), `HaveVector` (4 fields, new/empty/contains_node/contains_gateway/contains_object/validate/to_cbor/from_cbor), `SyncRequest` (5 fields, new/validate/to_cbor/from_cbor), `SyncObjectEntry` (object_id + manifest + chunk_count), `SyncResponse` (objects + descriptors + complete, new/empty_complete/validate/to_cbor/from_cbor), `SyncDiff` (local_wants + local_offers), `compute_sync_diff(local, remote)` (BTreeSet-based, dedup, preserves input order), `ObjectStore` trait (has/get_manifest/put/list), `DescriptorStore` trait (add_node_descriptor/get_node_descriptor/active_node_descriptors/known_gateways), `SyncSession` (new/build_local_have_vector/build_sync_request/handle_sync_request/apply_sync_response/pending_object_ids/get_pending_manifest/commit_pending_object/bundle_store/local_node_id), `bundle_ids_for_have_vector(store, now)` (excludes expired bundles). Added CBOR helpers: `bstr_array`, `decode_node_id_array`, `decode_object_id_array`, `decode_object_entries`, `manifest_to_cbor_value`, `decode_manifest`.
+- Step 11 (idempotence): `apply_sync_response` uses `object_store.has()` check + BTreeMap key collision → re-applying the same response is a no-op. Test `sync_session_apply_response_idempotent` verifies this. `DescriptorStore::add_node_descriptor` checks seq — older descriptors are rejected.
+- Step 12 (expiry): `bundle_ids_for_have_vector` uses `BundleStore::pending(now)` which already filters out expired bundles (R4.1 `now >= deadline` semantics). Test `bundle_ids_for_have_vector_excludes_expired` verifies at now=1500/2000/5000.
+- Step 13 (determinism): `compute_sync_diff` uses `BTreeSet` for set membership (deterministic iteration). `SyncSession::build_local_have_vector` sorts + dedups the arrays. CBOR encoder sorts map keys per RFC 8949 §4.2.1. Tests: `have_vector_deterministic_encoding`, `have_vector_encoding_deterministic_across_construction_order`, `request_canonical_encoding` (encode→decode→re-encode identical), `sync_request_encoding_deterministic`, `sync_response_encoding_deterministic`, `sync_diff_ordering_deterministic`, `sync_diff_duplicate_ids_deterministic`.
+- Step 14 (dep graph): `cargo tree -p snp-sync --depth 1` confirms: snp-cbor, snp-crypto, snp-identity, snp-object, thiserror. NO snp-gateway/snp-node/snp-routing/snp-frames/snp-link/snp-discovery. Source has only `use std::collections::HashMap; use thiserror::Error;`. PASS.
+- Step 15 (no runtime forwarding): SyncSession does NOT import TcpStream/AsyncLink/Route/MultiplexedCircuit. It is transport-neutral — the composition layer (R4.3+) wires it to a transport. STOP after R4.2 — do NOT implement R4.3.
+- Step 16 (conformance): No frozen TS sync vectors exist (no `15-sync.json`). Per Step 16 instruction, did NOT create Rust-only golden vectors. Documented the gap in the architecture-status doc. The 138/138 existing conformance vectors remain green (sync primitives are not covered by them — this is an honest gap).
+- Step 17 (full test suite):
+  - snp-sync: 82/82 pass (51 R4.1 + 31 R4.2)
+  - snp-object: 18/18 pass
+  - snp-identity: 3/3 pass
+  - snp-discovery: 1 + 6 = 7 pass
+  - snp-frames: 13 + 7 = 20 pass
+  - snp-gateway: 23/23 pass
+  - snp-node --lib: 97/97 pass
+  - snp-conformance: 138/138 vectors independently verified
+  - snp-stack --features 'circuit-upstream test-utils' --lib: 185/185 pass
+  - Focused regression: transparent_tcp 7/7, n3a_bridge_tests 5/5, endpoint_binding 3/3, any_ip_verification 5/5, placeholder_route_source 1/1, traffic_class_separation 7/7
+  - `cargo fmt -p snp-sync -- --check`: clean
+  - `cargo clippy -p snp-sync --all-targets`: 0 snp-sync warnings
+- Step 18 (architecture-status): Updated L5 row (51→82 tests, added R4.2 audit details). Added new "R4.2 Anti-Entropy Domain Protocol" section with implemented primitives table + frozen semantics verified + transport-neutral note + known gaps (descriptor CBOR encoding, no sync vectors, manifest signature). Added 5 new invariants (#16 transport-neutral, #17 idempotent, #18 deterministic, #19 respects expiry, #20 preserves L5 dep boundary).
+
+Stage Summary:
+- R4.2 Definition of Done — all 15 boxes checked:
+  - [x] HaveVector implemented (4 frozen fields, CBOR encode/decode, contains_* helpers)
+  - [x] SyncRequest implemented (5 frozen fields, CBOR encode/decode)
+  - [x] SyncResponse implemented (objects + descriptors + complete, CBOR encode/decode, chunkCount validation)
+  - [x] SyncDiff implemented (compute_sync_diff with BTreeSet, dedup, order-preserving)
+  - [x] SyncSession semantic exchange implemented (build_local_have_vector + build_sync_request + handle_sync_request + apply_sync_response + pending_object_ids + get_pending_manifest + commit_pending_object)
+  - [x] bundle synchronization integrated (bundle_ids_for_have_vector, excludes expired)
+  - [x] idempotence verified (re-apply is no-op, BTreeMap key collision)
+  - [x] deterministic encoding verified (BTreeSet, canonical CBOR, encode→decode→re-encode identical)
+  - [x] expiry semantics preserved (now >= deadline, excludes expired from HAVE)
+  - [x] no L7 dependency in L5 (verified: cargo tree)
+  - [x] no L6 dependency in L5 (verified: cargo tree)
+  - [x] no L8 dependency in L5 (verified: cargo tree)
+  - [x] no runtime socket/network code in L5 (SyncSession is transport-neutral)
+  - [x] existing R4.1 tests remain green (51/51 R4.1 tests still pass)
+  - [x] 138/138 conformance remains green
+  - [x] architecture status accurately updated (L5 row + new R4.2 section + 5 new invariants)
+- Known gaps documented (NOT normative):
+  - Descriptor CBOR encoding: skeleton NodeDescriptor has no to_cbor — R4.2 carries placeholders. R4.x+ will wire.
+  - No frozen sync conformance vectors: documented gap, no Rust-only golden vectors created.
+  - Manifest signature: skeleton Manifest has no signature field — R4.2 carries fields but does not verify. L2/L3 concern.
+- Files changed (3):
+  1. `reference/snp-sync/src/lib.rs` — added ~700 lines of R4.2 anti-entropy implementation + 31 new tests. Updated module-level doc (R4.2 status). Added clippy pedantic allows. Replaced R4.1 skeleton SyncRequest/SyncResponse/SyncObject with frozen-semantics versions.
+  2. `docs/architecture-status-2026-08.md` — updated L5 row (51→82 tests, R4.2 details), added new "R4.2 Anti-Entropy Domain Protocol" section, added 5 new invariants (#16-#20).
+  3. `worklog.md` — this work record.
+- STOP after R4.2. Runtime store-carry-forward (R4.3), Mode-A gateway adapter (R4.3+), client Mode-A runtime (R4.3+) are explicitly NOT implemented. Awaiting review before R4.3.

@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-18 (updated R4.1)
+**Date:** 2026-08-19 (updated R4.2)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -27,7 +27,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 | **L2 Object/Content** | CAS, chunking, Merkle, manifests | snp-object: Merkle tree, chunking, proofs, CAS trait (real code). InMemoryCas impl: todo!(). TS reference: complete. Android: complete. | PASS (Rust Merkle/chunking), PARTIAL (CAS storage) | Conformance vectors 04-chunking, 05-merkle, 06-manifest: all pass. | CAS storage not implemented in Rust; TS is authoritative for CAS. |
 | **L3 Trust** | Attestations, reputation, revocation | AuthenticatedNodeRecord (complete). VerifiedNodeAdvertisement (complete). No reputation system. | PARTIAL | Conformance vectors 13-revocation: 3/3 pass. | Reputation system not yet implemented |
 | **L4 Discovery** | Peer+capability advertisement, freshness | snp-discovery: DiscoveredNode + DiscoveryProvider + StaticDiscovery (extracted R2). Beacon/DescriptorStore: skeleton (todo!()). snp-node: BootstrapDiscovery (runtime TCP I/O). GatewayAdvertisement now in snp-identity. | PASS (types), PARTIAL (runtime) | snp-node integration tests: n210 pass. | Beacon/DescriptorStore still skeleton. BootstrapDiscovery runtime in snp-node. |
-| **L5 Mesh Sync** | Anti-entropy, store-carry-forward, bundle custody | snp-sync: generic `Bundle` + `BundleId` + `BundlePayload` (opaque) + `CustodyHop` (frozen CustodyReceipt semantics, §A4) + `BundleStore` (add/get/remove/pending/more_advanced/prune_expired) — implemented R4.1. Anti-entropy (`SyncRequest`/`SyncResponse`/`SyncObject` types declared; exchange NOT implemented — R4.2+). TS reference: complete (sync.ts, 2316 lines). | PARTIAL (Rust — Bundle layer complete, anti-entropy pending) | snp-sync tests: 51 pass (R4.1 audit-expanded). TS sync.ts exports 30+ functions. | Anti-entropy exchange (R4.2), runtime forwarding (R4.2+), Mode-A adapter wiring (R4.3+) remain. snp-sync has NO L7 dependency (verified: dep graph is snp-cbor+snp-crypto+snp-identity+snp-object only). R4.1 audit: BundleId pinned to `SHA-256(cbor({source,destination,createdAt,deadline,payload}))` — custody chain + delivered flag excluded; CustodyHop field names match frozen §A4 CDDL exactly; expiry uses `now >= deadline`; more_advanced matches TS rule 1+3+4 (rule 2 N/A — generic L5 Bundle has no response field). |
+| **L5 Mesh Sync** | Anti-entropy, store-carry-forward, bundle custody | snp-sync: generic `Bundle` + `BundleId` + `BundlePayload` (opaque) + `CustodyHop` (frozen CustodyReceipt semantics, §A4) + `BundleStore` — implemented R4.1. Anti-entropy (`HaveVector` + `SyncRequest` + `SyncResponse` + `SyncDiff` + `SyncSession` + `ObjectStore`/`DescriptorStore` traits + `bundle_ids_for_have_vector`) — implemented R4.2 per frozen TS `sync.ts` semantics. TS reference: complete (sync.ts, 2316 lines). | PARTIAL (Rust — Bundle layer + anti-entropy domain protocol complete; runtime forwarding pending) | snp-sync tests: 82 pass (51 R4.1 + 31 R4.2). TS sync.ts exports 30+ functions. | Runtime store-carry-forward forwarding loop (R4.3), Mode-A adapter wiring (R4.3+) remain. snp-sync has NO L7/L6/L8 dependency (verified: dep graph is snp-cbor+snp-crypto+snp-identity+snp-object only). R4.2 audit: HaveVector uses frozen TS 4-field shape (knownNodes/knownGateways/knownObjects/generatedAt); SyncRequest/SyncResponse use frozen field names; compute_sync_diff matches TS asymmetry invariant (A.local_wants == B.local_offers); SyncSession is transport-neutral (no TCP/AsyncLink/Route imports); idempotence verified (re-apply is no-op); determinism verified (BTreeSet ordering, encode→decode→re-encode identical). Descriptor CBOR encoding is a known gap (skeleton NodeDescriptor has no to_cbor — R4.x+). |
 | **L6 Routing** | Route discovery, metrics, selection, migration | snp-node: route.rs + route_engine.rs + route_discovery_protocol.rs (complete). Route, RouteHop, RouteState, signed descriptors. | PASS | Conformance vectors 10-routing: 4/4 pass. snp-node tests: n212, n2132 pass. | No drift |
 | **L7 Gateway** | Egress, DNS, NAT, policy, quotas | snp-gateway: TransitRequest/Response (Mode A protocol, complete). GatewayStreamTable (Mode B, complete, production SSRF). DNS interception (complete). | PASS | Conformance vectors 11-gateway: 19/19 pass. | No drift |
 | **L8 Transport** | One-hop framing, platform-neutral | snp-link: AsyncLink+AuthenticatedLink (complete). snp-frames: Frame+TTL (complete). No imports from L6. | PASS | Conformance vectors 08-frames: 13/13 pass. | No drift — L8 remains platform-neutral |
@@ -75,7 +75,47 @@ Until R4.2+R4.3 land, the live circuit path is Mode B semantics (proxied, not de
 |---|---|---|
 | Class A (Content) | PASS (TS+Android) | Chunking, Merkle, manifests, CAS in TS/Android |
 | Class B (Transit) | PASS (Rust) | TransitRequest, StreamMessage, encrypted circuit frames — relays cannot read payloads |
-| Structural separation | PASS | `FrameClass` enum (Content/Transit/Control) replaces raw u8. `Ciphertext` newtype (opaque, no as_bytes). `ContentBytes` newtype (readable). No implicit conversion between them. 10 regression tests in snp-frames/tests/traffic_class_separation.rs. R4.1 added a parallel separation at L5: `BundlePayload` (opaque, no L7 import) is distinct from `ContentBytes` (L2, readable). |
+| Structural separation | PASS | `FrameClass` enum (Content/Transit/Control) replaces raw u8. `Ciphertext` newtype (opaque, no as_bytes). `ContentBytes` newtype (readable). No implicit conversion between them. 10 regression tests in snp-frames/tests/traffic_class_separation.rs. R4.1 added a parallel separation at L5: `BundlePayload` (opaque, no L7 import) is distinct from `ContentBytes` (L2, readable). R4.2 preserved this — anti-entropy operates on `ObjectId` (32-byte content hash), never on `ContentBytes` directly. |
+
+---
+
+## R4.2 Anti-Entropy Domain Protocol (snp-sync)
+
+R4.2 implements the frozen L5 anti-entropy primitives per the TS `sync.ts`
+reference, while preserving the R4.1 dependency boundary (no L7/L6/L8 deps).
+
+### Implemented primitives
+
+| Primitive | Frozen source (sync.ts) | Rust implementation |
+|---|---|---|
+| `HaveVector` | lines 904-1013 | `HaveVector` struct + `new`/`empty`/`contains_*`/`validate`/`to_cbor`/`from_cbor` |
+| `SyncRequest` | lines 1263-1382 | `SyncRequest` struct + `new`/`validate`/`to_cbor`/`from_cbor` |
+| `SyncResponse` | lines 1398-1561 | `SyncResponse` struct + `SyncObjectEntry` + `new`/`empty_complete`/`validate`/`to_cbor`/`from_cbor` |
+| `SyncDiff` | lines 1619-1675 | `SyncDiff` struct + `compute_sync_diff(local, remote)` |
+| `SyncSession` | lines 2072-2316 | `SyncSession` struct + `build_local_have_vector`/`build_sync_request`/`handle_sync_request`/`apply_sync_response`/`pending_object_ids`/`get_pending_manifest`/`commit_pending_object` |
+| `ObjectStore` trait | lines 1054-1095 | L5 contract for CAS access (`has`/`get_manifest`/`put`/`list`) |
+| `DescriptorStore` trait | (implicit in TS) | L5 contract for descriptor access (`add_node_descriptor`/`get_node_descriptor`/`active_node_descriptors`/`known_gateways`) |
+| `bundle_ids_for_have_vector` | (new — R4.2) | Builds the `known_objects` portion of a HAVE vector from a `BundleStore`, excluding expired bundles |
+
+### Frozen semantics verified
+
+- **HaveVector 4-field shape**: `known_nodes` + `known_gateways` + `known_objects` + `generated_at` — matches TS field names exactly.
+- **SyncRequest 5-field shape**: `want` + `offer` + `want_descriptors` + `requester_node_id` + `generated_at` — matches TS CDDL.
+- **SyncResponse**: `objects` (ObjectId + Manifest + chunkCount) + `descriptors` + `complete` — matches TS.
+- **SyncDiff asymmetry invariant**: `compute_sync_diff(A, B).local_wants == compute_sync_diff(B, A).local_offers` — verified by test.
+- **Expiry**: `now >= deadline` (frozen TS `isBundleExpired`). Expired bundles excluded from `bundle_ids_for_have_vector`.
+- **Idempotence**: `apply_sync_response` twice with same response → no duplicate pending manifests (BTreeMap key collision).
+- **Determinism**: BTreeSet ordering for diff computation; CBOR encoder sorts map keys; encode→decode→re-encode produces identical bytes.
+
+### Transport-neutral
+
+`SyncSession` does NOT open TCP connections, does NOT import `AsyncLink`/`Route`/`MultiplexedCircuit`/`TcpStream`. The composition layer (R4.3+) wires the session to a transport.
+
+### Known gaps (documented, NOT normative)
+
+- **Descriptor CBOR encoding**: The skeleton `snp_identity::NodeDescriptor` has no `to_cbor`/`from_cbor` method. R4.2 carries descriptors as placeholder Null entries in the `SyncResponse.descriptors` array. A future R4.x will wire the real descriptor CBOR encoder. This is a documented gap — NOT a Rust-normative behavior.
+- **No frozen conformance vectors for sync**: The TS reference has no `15-sync.json` conformance vector file. R4.2 does NOT create Rust-only golden vectors (per Step 16 instruction). The gap is documented here.
+- **Manifest signature**: The `snp_object::Manifest` skeleton has no signature field. R4.2 carries the manifest fields (publisher, content_type, size, chunks, merkle_root, encryption_key) but does NOT verify a manifest signature — that is the receiver's responsibility (L2/L3 concern).
 
 ---
 
@@ -148,3 +188,8 @@ advertisements.
 13. **(R4.1) L5 does not depend upward on L7.** snp-sync has no `snp-gateway`/`snp-node`/`snp-routing`/`snp-frames`/`snp-discovery`/`snp-link` dependency. The `Bundle` payload is opaque `BundlePayload(Vec<u8>)` — L5 carries bytes, never imports L7 types. The higher-level Mode-A adapter (R4.3+) will live in a composition crate, not in snp-sync.
 14. **(R4.1) Custody is cryptographically bound.** `CustodyHop` implements the frozen `CustodyReceipt` §A4 CDDL — signed by the NEXT custodian under SIG_CONTEXT `"custodyReceipt"`. The signature binds carrier + signer + timestamps + nonce + bundle identity. Chain continuity (`hop[i].next_custodian_id == hop[i+1].custodian_id`) binds to prior custody state. A credited custodian cannot forge a receipt for its own custody (I13).
 15. **(R4.1) Bundle custody is append-only (I15).** `take_custody` APPENDS a hop; existing hops are never modified or removed. `BundleStore::add` keeps the more-advanced bundle (longer chain or delivered), preventing regression.
+16. **(R4.2) Anti-entropy is transport-neutral.** `SyncSession` does NOT import `TcpStream`/`AsyncLink`/`Route`/`MultiplexedCircuit`. It computes diffs + builds requests + applies responses — the composition layer (R4.3+) wires the session to a transport.
+17. **(R4.2) Anti-entropy is idempotent.** `apply_sync_response` twice with the same response → no duplicate pending manifests, no duplicate objects, no duplicate descriptors. The ObjectStore's `has` check + the DescriptorStore's `add_node_descriptor` seq check handle deduplication.
+18. **(R4.2) Anti-entropy is deterministic.** `compute_sync_diff` uses `BTreeSet` for set membership — no `HashMap` iteration order leaks into the diff output. CBOR encoding is canonical (RFC 8949 §4.2.1). Encode→decode→re-encode produces identical bytes.
+19. **(R4.2) Anti-entropy respects expiry.** `bundle_ids_for_have_vector` excludes bundles where `now >= deadline` (R4.1 expiry semantics). Expired bundles MUST NOT be offered as active work.
+20. **(R4.2) Anti-entropy preserves the L5 dependency boundary.** snp-sync still depends only on `snp-cbor` + `snp-crypto` + `snp-identity` + `snp-object` + `thiserror`. No L7/L6/L8/L4 dependency was added (verified via `cargo tree`). The `ObjectStore`/`DescriptorStore` traits are L5 contracts — the composition layer adapts L2 `Cas` → `ObjectStore` and L4 discovery → `DescriptorStore`.
