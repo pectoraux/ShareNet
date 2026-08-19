@@ -131,23 +131,19 @@ impl Ciphertext {
     }
 }
 
-// ─── ContentBytes (re-exported from snp-object) ────────────────────────────
+// ─── ContentBytes ──────────────────────────────────────────────────────────
 //
-// ContentBytes is owned by the content layer (snp-object, L2), not the
-// transport layer (snp-frames, L8). We re-export it here so existing
-// code that imports from snp_frames continues to work, but the
-// authoritative definition lives in snp_object.
+// ContentBytes is owned by the content layer (snp-object, L2), NOT by
+// the transport layer (snp-frames, L8).
 //
-// The dependency direction is:
-//   snp-object (owns ContentBytes)
-//       ↓
-//   snp-frames (re-exports for convenience)
-//   snp-node (uses both)
+// snp-frames does NOT re-export ContentBytes. Consumers that need
+// content semantics should import directly from snp-object:
 //
-// NOT:
-//   snp-object → snp-frames (this was the old, incorrect direction)
-
-pub use snp_object::ContentBytes;
+//   use snp_object::ContentBytes;
+//
+// The transport layer (L8) does not need to know what ContentBytes means.
+// Higher-level composition layers (snp-node, applications) depend on
+// both snp-object and snp-frames and can compose them.
 
 #[cfg(test)]
 mod tests {
@@ -186,24 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn content_bytes_exposes_inner() {
-        let cb = ContentBytes::new(vec![4, 5, 6]);
-        // Content bytes CAN be read (for hashing, CAS, etc.)
-        assert_eq!(cb.as_bytes(), &[4, 5, 6]);
-        assert_eq!(cb.len(), 3);
+    fn ciphertext_consumed_at_endpoint() {
+        // The only way to get the plaintext is via into_bytes(), which consumes
+        // the Ciphertext. This models the circuit endpoint decryption.
+        let ct = Ciphertext::from_encrypted(vec![1, 2, 3, 4]);
+        let bytes = ct.into_bytes();
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+
+        // After into_bytes(), the Ciphertext is gone — you can't use it again.
+        // This prevents accidental reuse of decrypted data.
     }
 
-    #[test]
-    fn ciphertext_cannot_be_converted_to_content_bytes() {
-        // There is no From<Ciphertext> for ContentBytes.
-        // This is by design — transit data must not become content.
-        // This test exists to document the type-level barrier.
-        let ct = Ciphertext::from_encrypted(vec![1, 2, 3]);
-        let bytes = ct.into_bytes();
-        // The only way to get bytes out of Ciphertext is via into_bytes()
-        // (consuming it). This is only done at the circuit endpoint.
-        // A relay never calls into_bytes() — it forwards the Frame.body
-        // as opaque bytes without constructing a Ciphertext at all.
-        assert_eq!(bytes, vec![1, 2, 3]);
-    }
+    // Note: ContentBytes tests have been moved to snp-object's test suite,
+    // since ContentBytes is now owned by snp-object (L2), not snp-frames (L8).
+    // snp-frames tests only cover Ciphertext (L8-owned) and FrameClass.
 }

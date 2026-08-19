@@ -963,7 +963,6 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "snp-cbor",
- "snp-object",
  "thiserror 1.0.69",
 ]
 

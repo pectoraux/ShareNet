@@ -2,15 +2,16 @@
 //!
 //! Proves that:
 //! 1. `Ciphertext` is opaque — relays cannot read transit payload content.
-//! 2. `ContentBytes` is distinct from `Ciphertext` — content APIs cannot
-//!    accidentally receive transit data.
-//! 3. The relay forwarding path clones frames without inspecting the body.
-//! 4. `Ciphertext` cannot be passed to CAS/content APIs.
-//! 5. `FrameClass` correctly distinguishes A/B/C on the wire.
+//! 2. The relay forwarding path clones frames without inspecting the body.
+//! 3. `Ciphertext` cannot be passed to CAS/content APIs (no as_bytes).
+//! 4. `FrameClass` correctly distinguishes A/B/C on the wire.
+//!
+//! Note: ContentBytes tests live in snp-object's test suite (L2 owns them).
+//! snp-frames tests only cover Ciphertext (L8-owned) and FrameClass.
 
 #![cfg(test)]
 
-use snp_frames::{Ciphertext, ContentBytes, Frame, FrameClass, FRAME_TTL_MAX, FRAME_VERSION};
+use snp_frames::{Ciphertext, Frame, FrameClass, FRAME_TTL_MAX};
 
 // ─── Ciphertext opacity ────────────────────────────────────────────────────
 
@@ -41,31 +42,15 @@ fn test_ciphertext_consumed_at_endpoint() {
 }
 
 // ─── Content vs Transit type barrier ───────────────────────────────────────
-
-#[test]
-fn test_content_bytes_exposes_inner_for_cas() {
-    let cb = ContentBytes::new(vec![0xAA, 0xBB, 0xCC]);
-    // Content bytes CAN be read — for hashing, CAS storage, Merkle, etc.
-    assert_eq!(cb.as_bytes(), &[0xAA, 0xBB, 0xCC]);
-}
-
-#[test]
-fn test_ciphertext_cannot_become_content_bytes() {
-    // There is no From<Ciphertext> for ContentBytes.
-    // There is no AsRef<[u8]> on Ciphertext.
-    // This is the type-level barrier: transit data cannot enter the
-    // content pipeline without an explicit (and auditable) conversion.
-    let ct = Ciphertext::from_encrypted(vec![1, 2, 3]);
-
-    // The ONLY way to get bytes out is into_bytes() (consuming):
-    let raw = ct.into_bytes();
-
-    // To create ContentBytes, you must explicitly construct it:
-    let _cb = ContentBytes::new(raw);
-
-    // This explicit construction is the semantic conversion point.
-    // It cannot happen accidentally.
-}
+//
+// ContentBytes tests live in snp-object's test suite (L2 owns ContentBytes).
+// snp-frames tests only cover Ciphertext (L8-owned) and FrameClass.
+//
+// The type-level barrier between Ciphertext and ContentBytes is documented
+// here: Ciphertext has no as_bytes(), so it cannot be directly passed to
+// CAS::put() which accepts &ContentBytes. The only path is:
+//   Ciphertext::into_bytes() → ContentBytes::new(raw)
+// This is an explicit, consuming, auditable conversion.
 
 // ─── Frame class on the wire ────────────────────────────────────────────────
 
@@ -154,29 +139,25 @@ fn test_relay_forwarding_clones_without_inspection() {
 
 #[test]
 fn test_transit_cannot_enter_cas_through_normal_api() {
-    // The CAS trait accepts &[u8]. A careless caller COULD pass transit
-    // bytes to it. However, the Ciphertext type prevents this at the
-    // type level: there is no Ciphertext::as_bytes() method.
+    // The CAS trait (in snp-object) accepts &ContentBytes.
+    // Ciphertext has no as_bytes() method and no AsRef<[u8]>.
+    // Therefore Ciphertext CANNOT be passed to CAS::put().
     //
     // To pass transit data to CAS, you would need to:
     // 1. Construct a Ciphertext (from encrypt_circuit_payload)
     // 2. Call into_bytes() (consuming it — only at the endpoint)
-    // 3. Explicitly pass the raw bytes to CAS
+    // 3. Explicitly construct ContentBytes::new(raw)
+    // 4. Pass &ContentBytes to CAS::put()
     //
-    // Step 2 is the explicit semantic conversion. It cannot happen
+    // Steps 2-3 are the explicit semantic conversion. They cannot happen
     // accidentally because into_bytes() consumes the Ciphertext and
-    // is only called at the circuit endpoint.
+    // ContentBytes::new() is a separate construction call.
 
     let ct = Ciphertext::from_encrypted(vec![0xDE, 0xAD]);
 
-    // This would NOT compile if CAS::put accepted Ciphertext:
-    // cas.put(&ct.as_bytes())  // ERROR: no method as_bytes
-    //
-    // You would need:
-    // let raw = ct.into_bytes();  // explicit conversion
-    // cas.put(&raw);              // now it's raw bytes, not Ciphertext
-    //
-    // This explicit conversion is the audit point.
+    // Ciphertext has NO as_bytes() — this would not compile:
+    // cas.put(&ContentBytes::new(ct.as_bytes().to_vec()))
+    //                                ^^^^^^^^^^^^ ERROR: no method as_bytes
 
     let raw = ct.into_bytes();
     // At this point, `raw` is just Vec<u8>. The semantic information
@@ -184,26 +165,4 @@ fn test_transit_cannot_enter_cas_through_normal_api() {
     // transit data can enter a content API — through an explicit,
     // consuming conversion that a code reviewer can grep for.
     assert_eq!(raw, vec![0xDE, 0xAD]);
-}
-
-// ─── Content and transit are distinct at the type level ───────────────────
-
-#[test]
-fn test_content_and_transit_types_are_distinct() {
-    let content = ContentBytes::new(vec![1, 2, 3]);
-    let transit = Ciphertext::from_encrypted(vec![1, 2, 3]);
-
-    // They are different types:
-    // content: ContentBytes — has as_bytes(), can be hashed/CAS'd
-    // transit: Ciphertext — has NO as_bytes(), only into_bytes() (consuming)
-
-    // Content can be read:
-    assert_eq!(content.as_bytes(), &[1, 2, 3]);
-
-    // Transit can only be consumed:
-    let raw = transit.into_bytes();
-    assert_eq!(raw, vec![1, 2, 3]);
-
-    // There is no implicit conversion between them.
-    // This is the structural enforcement of Class A ≠ Class B.
 }

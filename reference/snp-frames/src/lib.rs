@@ -581,4 +581,4 @@ mod tests {
 pub mod traffic_class;
 
 // Re-export the traffic class types for convenience.
-pub use traffic_class::{Ciphertext, ContentBytes, FrameClass};
+pub use traffic_class::{Ciphertext, FrameClass};

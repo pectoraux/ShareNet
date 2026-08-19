@@ -421,6 +421,36 @@ pub fn chunk(data: &[u8]) -> Vec<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    // ─── ContentBytes tests (R3) ─────────────────────────────────────────
+
+    #[test]
+    fn content_bytes_exposes_inner_for_cas() {
+        let cb = ContentBytes::new(vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(cb.as_bytes(), &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(cb.len(), 3);
+        assert!(!cb.is_empty());
+    }
+
+    #[test]
+    fn content_bytes_from_vec() {
+        let cb = ContentBytes::from(vec![1, 2, 3]);
+        assert_eq!(cb.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn content_bytes_from_slice() {
+        let cb = ContentBytes::from(&[1, 2, 3][..]);
+        assert_eq!(cb.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn content_bytes_into_bytes() {
+        let cb = ContentBytes::new(vec![4, 5, 6]);
+        let raw = cb.into_bytes();
+        assert_eq!(raw, vec![4, 5, 6]);
+    }
+
     use super::*;
 
     fn hex_to_bytes(s: &str) -> Vec<u8> {

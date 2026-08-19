@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 snp-cbor.workspace = true
-snp-object.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
