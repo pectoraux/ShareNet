@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.4 correction)
+**Date:** 2026-08-19 (updated R4.5 live discovery)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | CONFIGURED SIGNED-ROUTE MULTI-HOP (limited) — NOT live discovery | R4.4 (corrected): multi-hop store-carry-forward Client → Relay A → Relay B → Gateway. The route is constructed from **configured, signed** `NodeAdvertisement` + `GatewayAdvertisement` descriptors (`verify_into_verified()` → `VerifiedNodeDescriptor` → `RouteHop`); the `BundleForwarder` does NOT call a live peer discovery service. Direction is routing-derived: forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client (route.source)`. Response bundles can NEVER enter the forward path. Authenticated L8 (SNP-IK + AEAD) at every hop. Provenance binding (#21) at every hop. Deliberate interruption test passes. 8 multi-hop tests (incl. 4 R4.4-correction regression tests) + 9 R4.3 tests pass. **Live peer discovery (runtime relay selection from a peer graph) is NOT implemented — it is R4.5.** |
+| **Mode A** (delay-tolerant) | DISCOVERY-BACKED MULTI-HOP (limited) | R4.5: multi-hop store-carry-forward Client → Relay A → Relay B → Gateway. **Live discovery is now used at runtime** — `LiveNodeAdvertDiscovery` queries bootstrap discovery addresses over TCP, receives signed `NodeAdvertisement`s, and verifies each (`verify_into_verified()`: signature + NodeId↔pubkey + expiry + role/key). Verified candidates are accepted into `AdvertisementAcceptanceStore`; `build_mode_a_route` (L6 route builder) selects the gateway by `Capability::Gateway` + circuit key, validates each relay by `Capability::Relay`, enforces freshness (`expiry <= now` rejected), and builds the immutable `Route` from signed descriptors + signed `listen_addr` endpoints. `BundleForwarder` is UNCHANGED — it receives the route. The route is NOT manually constructed by the test. 13 R4.5 tests (integration + discovery-matters + tampering + route-selection). Direction routing-derived (#22): forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client`. Authenticated L8 (SNP-IK + AEAD) + provenance binding (#21) at every hop. **Still limited:** in-memory `BundleStore` (process-lifetime), no durable persistence, host-local egress, no Civic. Bootstrap is a configured discovery seed (NOT decentralized); the route itself is built from discovered/verified candidates (NOT manual per-hop config). |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -163,6 +163,96 @@ regression tests:
 
 **STOP after R4.4.** No durable persistence, no Civic. Next: R4.5 live peer
 discovery.
+
+### Mode A — R4.5 live discovery
+
+R4.5 replaces the R4.4 **configured signed-descriptor bootstrap** with a
+**live discovery** path. The `Route` is now constructed from candidates
+obtained at runtime over TCP discovery, verified, and accepted into the
+candidate store — NOT manually assembled from per-hop advertisements.
+
+```text
+bootstrap discovery addresses  (configured seed — NOT manual per-hop config)
+    ↓
+LiveNodeAdvertDiscovery::discover_candidates  (TCP → decode → verify)
+    ↓
+Vec<VerifiedNodeAdvertisement>  (signature + NodeId↔pubkey + expiry + role/key)
+    ↓
+accept_discovered  →  AdvertisementAcceptanceStore  (verified candidate set)
+    ↓
+build_mode_a_route  (L6 route builder: capability-gated, expiry-enforced)
+    ↓
+Route / RouteHop  (endpoint == signed advert listen_addr)
+    ↓
+BundleForwarder  (UNCHANGED — receives the immutable Route)
+```
+
+**Bootstrap ≠ manual per-hop config (Step 21).** R4.5 permits a configured
+bootstrap *discovery seed* (the TCP address of an initial discovery peer).
+This is NOT the same as R4.4's manual per-hop advertisement configuration.
+The bootstrap supplies a discovery entry point; discovery then learns Relay
+A, Relay B, and Gateway; the route is built from the discovered/verified
+candidates. Decentralized bootstrap is NOT required by R4.5.
+
+**Discovery ≠ Routing ≠ Sync (Steps 15–16).**
+- **Discovery** (`mode_a_discovery::LiveNodeAdvertDiscovery` +
+  `serve_node_advertisement_async`) finds/advertises candidates and verifies
+  them. It does NOT choose a route, order hops, or pick a gateway. It only
+  populates the candidate store.
+- **Routing** (`build_mode_a_route`) reads the candidate store, filters by
+  capability + expiry + endpoint, selects the gateway by
+  `Capability::Gateway` + circuit key, validates each relay by
+  `Capability::Relay`, and builds the immutable `Route`.
+- **L5** (`snp-sync`) is untouched — no discovery/routing/transport import
+  (verified: `cargo tree -p snp-sync` is clean of snp-discovery/snp-node).
+- **L4** (`snp-discovery`) is untouched — no routing import (verified:
+  `cargo tree -p snp-discovery` is clean of snp-routing/snp-node). The
+  R4.5 discovery seam (`mode_a_discovery`) lives in the composition layer
+  (snp-node), reusing the existing `NodeAdvertisement` verification + the
+  existing discovery wire framing, NOT the gateway-only
+  `snp_discovery::DiscoveryProvider` (which wraps
+  `VerifiedGatewayAdvertisement` and is unsuitable for relay discovery).
+- **L8** (`AuthenticatedBundleCarrier`) remains the authority for transport
+  identity; a discovered candidate is only a candidate until the L8
+  handshake authenticates it. `RouteHop.node_id ==
+  AuthenticatedBundleCarrier.peer_id` (verified by test).
+
+**Freshness (Step 6).** `NodeAdvertisement::verify_into_verified()` enforces
+`expiry > now` at discovery time; `build_mode_a_route` re-checks
+`is_expired(now)` at route-construction time (a descriptor can expire
+between discovery and route construction). Stale descriptors are NEVER
+silently used — an expired candidate is excluded; an empty store yields
+`NoEligibleRoute`; a missing gateway yields `NoGateway`.
+
+**Failure behavior (Step 14).** `build_mode_a_route` returns explicit errors:
+`NoEligibleRoute` (empty store), `NoGateway`, `RelayNotDiscovered`,
+`RelayIneligible` (wrong capability/expired/no endpoint), `ExpiredCandidate`,
+`NoTcpEndpoint`, `RouteValidationFailed`. No silent stale use.
+
+**R4.5 tests** (`r4_5_live_discovery.rs`, 13 tests):
+- `r4_5_live_discovery_multihop` — full Client → A → B → Gateway with the
+  route built from live discovery (NOT manual). Response returns.
+- `r4_5_discovery_matters_route_cannot_build_without_discovery` — proves
+  the route CANNOT be constructed until discovered candidates exist
+  (Phase 1: no services → `NoEligibleRoute`; Phase 2: start → route OK).
+- Tampering: tampered signature / expired advert / wrong NodeId / wrong
+  capability / freshness boundary (`expiry == now` → expired) / route uses
+  signed `listen_addr` (not discovery address).
+- Route selection: 3 discovered relays → route from a subset; gateway
+  missing → `NoGateway`; undiscovered relay → `RelayNotDiscovered`.
+- `r4_5_no_l5_or_l4_dependency_from_mode_a_discovery` — static assertion
+  the composition layer imports neither snp-sync nor snp-discovery.
+
+**Honest limitations (unchanged):**
+- In-memory `BundleStore` (process-lifetime only; no durable persistence —
+  R4.6).
+- Configured bootstrap discovery seed (NOT decentralized bootstrap).
+- Host-local egress (mock HTTP server on 127.0.0.1).
+- No live route migration/repair (a route may remain fixed after
+  construction — Step 13).
+- No Civic / settlement.
+
+**STOP after R4.5.** Next: R4.6 durable `BundleStore` / restart recovery.
 
 ---
 
@@ -293,3 +383,4 @@ advertisements.
 20. **(R4.2) Anti-entropy preserves the L5 dependency boundary.** snp-sync still depends only on `snp-cbor` + `snp-crypto` + `snp-identity` + `snp-object` + `thiserror`. No L7/L6/L8/L4 dependency was added (verified via `cargo tree`). The `ObjectStore`/`DescriptorStore` traits are L5 contracts — the composition layer adapts L2 `Cas` → `ObjectStore` and L4 discovery → `DescriptorStore`.
 21. **(R4.3) Authenticated transport identity MUST equal bundle provenance.** For every received Mode-A bundle, the authenticated SNP-IK peer NodeId MUST equal the bundle's expected previous custodian (source on first hop, last custody hop's `next_custodian_id` thereafter). This check occurs BEFORE `take_custody()`. Mismatch → no custody, no `BundleStore` insertion, no forwarding. This is a permanent architecture invariant — the transport identity and bundle provenance must agree.
 22. **(R4.4) Bundle direction is routing-derived, never identity-negated.** `BundleForwarder` partitions bundles by direction using the route's source/destination NodeIds — NOT a catch-all `destination != self.identity.node_id`. Forward direction: `destination == next_hop || destination == route.destination()` (gateway). Reverse direction: `destination == route.source()` (client). A response bundle (destination == client) can therefore NEVER enter the forward path (`forward_pending_bundles`), and a request bundle (destination == gateway) can never enter the reverse path (`try_send_response_back`). The previous-hop carrier retained for reverse delivery is set ONLY when the authenticated peer equals the route-derived previous hop (`route.hop(position - 1)` / `route.source()`), so an unrelated peer cannot overwrite the reverse-path connection.
+23. **(R4.5) Discovery ≠ Routing ≠ Sync.** Live candidate discovery, route construction, and bundle sync are structurally separate. Discovery (`mode_a_discovery::LiveNodeAdvertDiscovery`) finds/advertises candidates and verifies them — it does NOT choose a route, order hops, or pick a gateway. Routing (`build_mode_a_route`) reads the candidate store and builds the `Route` — it does NOT query discovery. `snp-sync` (L5) imports neither (`cargo tree -p snp-sync` is clean). A discovered candidate is only a candidate until the L8 `AuthenticatedBundleCarrier` handshake authenticates it — discovery never replaces cryptographic transport identity. The route endpoint is the signed `listen_addr` from the verified advertisement (`RouteHop.endpoint == advert.endpoints`, NOT the discovery address). Stale descriptors (`expiry <= now`) are never silently used — `verify_into_verified()` rejects at discovery time; `build_mode_a_route` re-checks `is_expired(now)` at route-construction time.

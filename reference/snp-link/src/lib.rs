@@ -118,7 +118,7 @@ use snp_crypto::{
     ed25519_verify, hkdf_sha256, sha256, sig_contexts, x25519_dh, x25519_ephemeral_keypair,
     x25519_public_from_bytes, SymmetricKey, X25519PubKey, X25519Secret,
 };
-use snp_frames::Frame;
+use snp_frames::{Frame, FrameClass};
 use thiserror::Error;
 
 // N2.0.6 — canonical async production transport.
@@ -1707,7 +1707,7 @@ mod tests {
             t.copy_from_slice(tag);
             let pt = aead_decrypt(&gw_keys.recv_key, &n, ct, &t, b"").unwrap();
             let frame = Frame::decode_cbor(&pt).unwrap();
-            assert_eq!(frame.cls, b'B');
+            assert_eq!(frame.cls, FrameClass::Transit);
             // Echo back.
             let mut echo = frame.clone();
             echo.seq += 1;

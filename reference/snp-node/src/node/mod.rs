@@ -108,6 +108,7 @@ pub mod gateway_stream;
 pub mod identity;
 pub mod link;
 pub mod mode_a_bundle;
+pub mod mode_a_discovery;
 pub mod node_advert;
 pub mod peer_directory;
 pub mod route;
