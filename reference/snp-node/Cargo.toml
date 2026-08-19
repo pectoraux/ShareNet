@@ -50,6 +50,7 @@ snp-link.workspace = true
 snp-routing.workspace = true
 snp-gateway.workspace = true
 snp-discovery.workspace = true
+snp-sync.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

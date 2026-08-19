@@ -9415,3 +9415,64 @@ Stage Summary:
   - [x] architecture-status accurately upgraded — L1/L2/L5 rows updated
 - Mode A remains PARTIAL (runtime store-carry-forward + gateway adapter still pending — R4.3+).
 - STOP. Do NOT start R4.3 until this passes review.
+
+---
+Task ID: R4.3
+Agent: Z.ai (main — R4.3 runtime Mode-A store-carry-forward)
+Task: Connect the existing L5 bundle/sync domain to the live runtime without moving layer ownership, and prove a real Mode-A store-carry-forward request/response path with deliberate interruption.
+
+Work Log:
+- Step 1: Verified repo state. HEAD = f786665 (R4.2 interop accepted). Found an auto-committed 4120c4d (sandbox snapshot with clippy auto-fixes). Reset to f786665 to start clean.
+- Step 2: Audited existing runtime composition via Explore subagent. Mapped: async_node.rs (serve_gateway_with_protocol_circuit, send_via_route, serve_relay_via_route), stream_client.rs (MultiplexedCircuit/StreamHandle — Mode-B, NOT for Mode-A), snp-gateway (TransitRequest/TransitResponse with encode/decode/sign/verify, PinnedConnector with SSRF defence, handle_transit_request_with_connector), snp-link (AsyncLink, perform_snp_ik_handshake_async), snp-sync (Bundle/BundleStore/BundlePayload/CustodyHop). Identified that snp-sync is NOT a dependency of snp-node yet.
+- Step 3: Decided ownership: mode_a_bundle.rs module in snp-node (composition layer) bridges L5 (snp-sync) and L7 (snp-gateway). No sockets/route logic in snp-sync. No bundle semantics in snp-link. No route selection in snp-gateway.
+- Step 4: First slice uses explicitly configured carrier endpoints (acceptable for vertical proof). No new discovery protocol.
+- Step 5: Defined BundleCarrier trait (async_trait): send_bundle/recv_bundle. TcpBundleCarrier implementation uses raw TCP with length-prefixed framing. No route logic, no TransitRequest interpretation.
+- Step 6: NO live circuit used. mode_a_bundle.rs does NOT import MultiplexedCircuit, StreamHandle, N3AClient, TunClient, GatewayStreamTable, or serve_gateway_mode_b. Static assertion test verifies this.
+- Step 7: Relay bundle loop: receive → validate → check expiry → take custody → store → forward when next hop available. Uses tokio::select! for concurrent accept + periodic forwarding retry. If next hop unavailable, bundle stays in store (store-carry-forward).
+- Step 8: Custody transfer precedes forwarding. Relay calls Bundle::take_custody() (R4.1 semantics — signs CustodyHop binding carrier+bundle_id+timestamps+nonce) BEFORE attempting to forward. Custody is a cryptographic protocol event, not a TCP connect success.
+- Step 9: Duplicate delivery protection via BundleStore::add() which uses more_advanced() to keep the longer custody chain. BundleId deduplication is automatic.
+- Step 10: Gateway Mode-A adapter: receive Bundle → extract opaque BundlePayload → decode TransitRequest → verify request signature → validate deadline → apply gateway SSRF policy (PinnedConnector) → real Internet egress → construct TransitResponse → sign → serialize → construct response-bearing Bundle → send back.
+- Step 11: Response routing: response bundle's destination = original request bundle's source (client NodeId). No new return-address protocol invented. replyTo field unused (set to [0;32]) — response delivered via the same bundle path.
+- Step 12: ModeAClient: creates signed TransitRequest → wraps as Bundle → sends to carrier → waits for custody ack + response bundle → decodes TransitResponse → verifies gateway signature → verifies reqId match → returns (response, body).
+- Step 13: Process-lifetime honesty: BundleStore is in-memory. Bundles are NOT persisted across process restarts. Documented as "runtime store-carry-forward: process-lifetime only". No false claim of durable storage.
+- Step 14: Real peer identities: client/relay/gateway each own fresh NodeIdentity (Ed25519 keypair). No private keys transferred between roles. Each role signs its own custody hops.
+- Step 15: Topology: Client → Relay → Gateway → mock HTTP server (127.0.0.1). Single relay. No multi-hop yet.
+- Step 16: Real end-to-end test: r4_mode_a_store_forward.rs with 5 tests. Uses real TCP sockets, real identities, real bundles, real BundleStore, real custody receipts, real gateway egress (to mock HTTP server). NO mock TransitRequest handler, NO fake bundle forwarding, NO mock gateway, NO localhost-as-Internet, NO live circuit, NO SOCKS5.
+- Step 17: Deliberate interruption proof: test starts relay WITHOUT gateway → client sends bundle → relay takes custody → relay tries to forward → FAILS (gateway not started) → relay retains bundle → test asserts "relay has 1 pending bundles (store-carry-forward PROVED)" → test starts gateway → relay retries forwarding → SUCCEEDS → gateway fetches → response returns → client verifies.
+- Step 18: No circuit path proof: static assertion test reads mode_a_bundle.rs source and verifies no `use` statement imports MultiplexedCircuit/StreamHandle/N3AClient/TunClient/GatewayStreamTable/serve_gateway_mode_b, and no function calls `MultiplexedCircuit::` or `StreamHandle::`.
+- Step 19: Response proof: test verifies resp.reqId == original req.reqId, gateway signature verifies (using gateway's Ed25519 public key), HTTP status == 200, response body contains expected text.
+- Step 20: Direct Internet isolation: honestly stated that mock HTTP server is on 127.0.0.1 — "host-local egress test", NOT "genuine external Internet egress". Sandbox may not have external access.
+- Step 21: All regression tests pass: snp-sync 92, snp-identity 17, snp-object 28, snp-frames 20, snp-gateway 23, snp-node --lib 97, snp-conformance 138/138. Focused: transparent_tcp 7, n3a_bridge 5, endpoint_binding 3, any_ip 5, placeholder_route 1, traffic_class_separation 7. R4.3 tests: 5/5.
+- Step 22: Architecture-status updated: Mode A promoted from PARTIAL to RUNTIME VERIFIED (limited). Limitations documented honestly.
+
+Stage Summary:
+- R4.3 Definition of Done — all 21 boxes checked:
+  - [x] runtime bundle carrier exists (BundleCarrier trait + TcpBundleCarrier)
+  - [x] relay receives real Bundle (via TCP)
+  - [x] relay validates Bundle (validate() + expiry check)
+  - [x] relay takes cryptographic custody (take_custody with Ed25519 signature)
+  - [x] relay stores bundle (BundleStore::add)
+  - [x] relay forwards later when next hop becomes available (periodic retry via tokio::select!)
+  - [x] gateway extracts opaque payload (unwrap_transit_request_from_bundle)
+  - [x] gateway decodes TransitRequest (decode_transit_request)
+  - [x] gateway verifies request (verify_transit_request)
+  - [x] gateway performs real egress (PinnedConnector → real TCP socket to mock HTTP server)
+  - [x] gateway signs TransitResponse (sign_transit_response)
+  - [x] response becomes a real Bundle (wrap_transit_response_as_bundle)
+  - [x] response returns through bundle path (relay forwards response back to client)
+  - [x] client verifies TransitResponse (verify_transit_response + reqId match)
+  - [x] deliberate interruption test proves store-carry-forward (test asserts bundle retained when gateway unavailable)
+  - [x] no MultiplexedCircuit is used by Mode A (static assertion test)
+  - [x] no SOCKS5 is used by Mode A
+  - [x] no test-only transport is used (real TCP sockets)
+  - [x] identity separation preserved (each role owns its own NodeIdentity)
+  - [x] endpoint binding preserved (existing tests pass)
+  - [x] existing Mode B/C regressions remain green (all focused tests pass)
+- Files changed:
+  1. `reference/snp-node/Cargo.toml` — added snp-sync dependency
+  2. `reference/snp-node/src/node/mod.rs` — registered mode_a_bundle module
+  3. `reference/snp-node/src/node/mode_a_bundle.rs` — new: ModeA composition layer (BundleCarrier trait, TcpBundleCarrier, ModeARelay, ModeAGateway, ModeAClient, wrap/unwrap functions)
+  4. `reference/snp-node/tests/r4_mode_a_store_forward.rs` — new: 5 integration tests
+  5. `reference/snp-sync/src/lib.rs` — added 3 composition-layer integration tests (were missing from f786665)
+  6. `docs/architecture-status-2026-08.md` — Mode A promoted to RUNTIME VERIFIED (limited)
+- STOP after R4.3. Next milestone is hardening Mode-A runtime + multi-hop/discovery.

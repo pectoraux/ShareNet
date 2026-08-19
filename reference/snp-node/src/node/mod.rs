@@ -107,6 +107,7 @@ pub mod gateway;
 pub mod gateway_stream;
 pub mod identity;
 pub mod link;
+pub mod mode_a_bundle;
 pub mod node_advert;
 pub mod peer_directory;
 pub mod route;
@@ -966,7 +967,9 @@ impl Node {
         if resp_frame.cls != snp_frames::FrameClass::Transit {
             // Class C (or other) — this is a control frame, likely an
             // upstream-failure NACK from the relay.
-            if resp_frame.cls == snp_frames::FrameClass::Control && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER {
+            if resp_frame.cls == snp_frames::FrameClass::Control
+                && resp_frame.body.as_slice() == UPSTREAM_FAILURE_MARKER
+            {
                 return Err(NodeError::UpstreamFailure);
             }
             return Err(NodeError::Other(format!(

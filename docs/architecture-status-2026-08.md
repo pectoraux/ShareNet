@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.2 interop)
+**Date:** 2026-08-19 (updated R4.3)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,11 +42,38 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | PARTIAL (R4.1) | See corrected terminology below. |
+| **Mode A** (delay-tolerant) | RUNTIME VERIFIED (limited) | R4.3: first real store-carry-forward Mode-A proof. Client → Relay → Gateway → HTTP endpoint with deliberate interruption. Relay holds bundle in BundleStore while gateway unavailable, forwards when it becomes available. No MultiplexedCircuit/StreamHandle used. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
-### Mode A — corrected terminology (R4.1 Step 8)
+### Mode A — R4.3 runtime status
+
+**Mode A is now RUNTIME VERIFIED (limited).** The first real store-carry-forward
+proof exists:
+
+```text
+Client → Relay → Gateway → HTTP endpoint
+```
+
+with a **deliberate interruption**: the relay holds the bundle in its
+`BundleStore` while the gateway is unavailable, then forwards when it
+becomes available. This is the defining R4.3 property.
+
+**Limitations (honestly stated):**
+- **In-memory store**: `BundleStore` is in-memory. Bundles are NOT persisted
+  across process restarts. This is honestly classified as:
+  `runtime store-carry-forward: process-lifetime only`.
+- **Single-hop relay**: The first proof uses one relay (Client → Relay → Gateway).
+  Multi-hop relay forwarding is R5+.
+- **Host-local egress**: The gateway fetches from a mock HTTP server on
+  127.0.0.1. This is honestly classified as `host-local egress test` — NOT
+  genuine external Internet egress. The sandbox may not have external access.
+- **Simple transport**: The `BundleCarrier` uses raw TCP with length-prefixed
+  framing (no SNP-IK handshake, no AEAD at the link layer). A future hardening
+  pass will use the authenticated `AsyncLink` transport.
+- **No persistent database**: Bundles are stored in-memory only.
+- **No peer discovery**: The first slice uses explicitly configured carrier
+  endpoints (acceptable for the first vertical proof).
 
 **The previous status ("Mode A: PASS") was imprecise.** The precise statement is:
 

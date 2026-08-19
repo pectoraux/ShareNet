@@ -5007,4 +5007,184 @@ mod tests {
         assert_eq!(decoded.descriptors[1], d2);
         assert!(!decoded.complete);
     }
+
+    // ─── R4.2 interop: composition-layer integration tests ──────────────────
+    //
+    // These tests demonstrate the full round-trip:
+    //   NodeDescriptor/Manifest → owner encode_cbor → opaque L5 payload →
+    //   SyncResponse encode/decode → opaque L5 payload → owner decode_cbor
+
+    #[test]
+    fn composition_descriptor_full_roundtrip() {
+        let (node_secret, node_pubkey) = test_keypair(0xBB);
+        let desc_unsigned = snp_identity::NodeDescriptorUnsigned {
+            node_id: [0xAA; 32],
+            node_pub_key: node_pubkey,
+            rendezvous_pub: [0xCC; 32],
+            capabilities: vec!["MESH_RELAY".into(), "DISCOVERY".into()],
+            platform: "linux".into(),
+            proto_version: snp_identity::PROTO_VERSION.into(),
+            epoch: 1,
+            expires_at: 9_000,
+            links: vec!["tcp://1.2.3.4:5678".into()],
+            device_cert: None,
+        };
+        let sig = snp_identity::NodeDescriptor::sign(&desc_unsigned, &node_secret).expect("sign");
+        let desc = snp_identity::NodeDescriptor {
+            signature: sig,
+            node_id: desc_unsigned.node_id,
+            node_pub_key: desc_unsigned.node_pub_key,
+            rendezvous_pub: desc_unsigned.rendezvous_pub,
+            capabilities: desc_unsigned.capabilities,
+            platform: desc_unsigned.platform,
+            proto_version: desc_unsigned.proto_version,
+            epoch: desc_unsigned.epoch,
+            expires_at: desc_unsigned.expires_at,
+            links: desc_unsigned.links,
+            device_cert: desc_unsigned.device_cert,
+        };
+        let desc_bytes = desc.encode_cbor().expect("owner encode");
+        let payload = DescriptorPayload::new(desc_bytes);
+        let response = SyncResponse::new(vec![], vec![payload], true);
+        let wire = response.to_cbor().expect("L5 encode");
+        let decoded_response = SyncResponse::from_cbor(&wire).expect("L5 decode");
+        assert_eq!(decoded_response.descriptors.len(), 1);
+        let recovered_desc =
+            snp_identity::NodeDescriptor::decode_cbor(decoded_response.descriptors[0].as_bytes())
+                .expect("owner decode");
+        assert_eq!(desc, recovered_desc);
+        assert!(
+            recovered_desc.verify(&node_pubkey),
+            "signature must verify after round-trip"
+        );
+    }
+
+    #[test]
+    fn composition_manifest_full_roundtrip() {
+        let (pub_secret, pub_key) = test_keypair(0x99);
+        let manifest_unsigned = snp_object::ManifestUnsigned {
+            object_id: [0x42; 32],
+            chunks: vec![[0x11; 32], [0x22; 32]],
+            chunk_count: 2,
+            total_bytes: 512,
+            mime_type: "application/octet-stream".into(),
+            class: "content".into(),
+            publisher_id: [0xAA; 32],
+            published_at: 1_000,
+            expires_at: Some(10_000),
+        };
+        let sig = snp_object::Manifest::sign(&manifest_unsigned, &pub_secret).expect("sign");
+        let manifest = snp_object::Manifest {
+            signature: sig,
+            object_id: manifest_unsigned.object_id,
+            chunks: manifest_unsigned.chunks.clone(),
+            chunk_count: manifest_unsigned.chunk_count,
+            total_bytes: manifest_unsigned.total_bytes,
+            mime_type: manifest_unsigned.mime_type.clone(),
+            class: manifest_unsigned.class.clone(),
+            publisher_id: manifest_unsigned.publisher_id,
+            published_at: manifest_unsigned.published_at,
+            expires_at: manifest_unsigned.expires_at,
+        };
+        let manifest_bytes = manifest.encode_cbor().expect("owner encode");
+        let payload = ManifestPayload::new(manifest_bytes);
+        let entry = SyncObjectEntry {
+            object_id: [0x42; 32],
+            manifest: payload,
+            chunk_count: 2,
+        };
+        let response = SyncResponse::new(vec![entry], vec![], true);
+        let wire = response.to_cbor().expect("L5 encode");
+        let decoded_response = SyncResponse::from_cbor(&wire).expect("L5 decode");
+        assert_eq!(decoded_response.objects.len(), 1);
+        let recovered_manifest =
+            snp_object::Manifest::decode_cbor(decoded_response.objects[0].manifest.as_bytes())
+                .expect("owner decode");
+        assert_eq!(manifest, recovered_manifest);
+        assert!(
+            recovered_manifest.verify(&pub_key),
+            "signature must verify after round-trip"
+        );
+    }
+
+    #[test]
+    fn composition_full_sync_response_roundtrip() {
+        let (node_secret, node_pubkey) = test_keypair(0xBB);
+        let (pub_secret, pub_key) = test_keypair(0x99);
+        let desc_unsigned = snp_identity::NodeDescriptorUnsigned {
+            node_id: [0xAA; 32],
+            node_pub_key: node_pubkey,
+            rendezvous_pub: [0xCC; 32],
+            capabilities: vec!["MESH_RELAY".into()],
+            platform: "android".into(),
+            proto_version: snp_identity::PROTO_VERSION.into(),
+            epoch: 1,
+            expires_at: 9_000,
+            links: vec![],
+            device_cert: None,
+        };
+        let desc_sig =
+            snp_identity::NodeDescriptor::sign(&desc_unsigned, &node_secret).expect("sign");
+        let desc = snp_identity::NodeDescriptor {
+            signature: desc_sig,
+            node_id: desc_unsigned.node_id,
+            node_pub_key: desc_unsigned.node_pub_key,
+            rendezvous_pub: desc_unsigned.rendezvous_pub,
+            capabilities: desc_unsigned.capabilities,
+            platform: desc_unsigned.platform,
+            proto_version: desc_unsigned.proto_version,
+            epoch: desc_unsigned.epoch,
+            expires_at: desc_unsigned.expires_at,
+            links: desc_unsigned.links,
+            device_cert: desc_unsigned.device_cert,
+        };
+        let desc_payload = DescriptorPayload::new(desc.encode_cbor().expect("encode"));
+        let manifest_unsigned = snp_object::ManifestUnsigned {
+            object_id: [0x42; 32],
+            chunks: vec![[0x11; 32]],
+            chunk_count: 1,
+            total_bytes: 100,
+            mime_type: "text/plain".into(),
+            class: "app".into(),
+            publisher_id: [0xAA; 32],
+            published_at: 1_000,
+            expires_at: None,
+        };
+        let manifest_sig =
+            snp_object::Manifest::sign(&manifest_unsigned, &pub_secret).expect("sign");
+        let manifest = snp_object::Manifest {
+            signature: manifest_sig,
+            object_id: manifest_unsigned.object_id,
+            chunks: manifest_unsigned.chunks.clone(),
+            chunk_count: manifest_unsigned.chunk_count,
+            total_bytes: manifest_unsigned.total_bytes,
+            mime_type: manifest_unsigned.mime_type.clone(),
+            class: manifest_unsigned.class.clone(),
+            publisher_id: manifest_unsigned.publisher_id,
+            published_at: manifest_unsigned.published_at,
+            expires_at: manifest_unsigned.expires_at,
+        };
+        let manifest_payload = ManifestPayload::new(manifest.encode_cbor().expect("encode"));
+        let response = SyncResponse::new(
+            vec![SyncObjectEntry {
+                object_id: [0x42; 32],
+                manifest: manifest_payload,
+                chunk_count: 1,
+            }],
+            vec![desc_payload],
+            true,
+        );
+        let wire = response.to_cbor().expect("L5 encode");
+        let decoded = SyncResponse::from_cbor(&wire).expect("L5 decode");
+        let recovered_desc =
+            snp_identity::NodeDescriptor::decode_cbor(decoded.descriptors[0].as_bytes())
+                .expect("owner decode desc");
+        let recovered_manifest =
+            snp_object::Manifest::decode_cbor(decoded.objects[0].manifest.as_bytes())
+                .expect("owner decode manifest");
+        assert_eq!(desc, recovered_desc);
+        assert_eq!(manifest, recovered_manifest);
+        assert!(recovered_desc.verify(&node_pubkey));
+        assert!(recovered_manifest.verify(&pub_key));
+    }
 }
