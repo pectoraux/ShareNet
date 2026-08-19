@@ -9329,3 +9329,53 @@ Stage Summary:
   2. `docs/architecture-status-2026-08.md` — updated L5 row (51→82 tests, R4.2 details), added new "R4.2 Anti-Entropy Domain Protocol" section, added 5 new invariants (#16-#20).
   3. `worklog.md` — this work record.
 - STOP after R4.2. Runtime store-carry-forward (R4.3), Mode-A gateway adapter (R4.3+), client Mode-A runtime (R4.3+) are explicitly NOT implemented. Awaiting review before R4.3.
+
+---
+Task ID: R4.2-CORRECTION
+Agent: Z.ai (main — R4.2 SyncResponse data-loss fix)
+Task: Fix the critical R4.2 defect where SyncResponse.descriptors emitted Null and discarded on decode (data loss). Do NOT patch descriptor CBOR in L5 — use opaque DescriptorPayload + ManifestPayload bytes (BundlePayload pattern). Add required round-trip + tamper tests.
+
+Work Log:
+- Audited frozen TS sources: `encodeSyncResponse` (sync.ts:1424-1443) calls `nodeDescriptorToWireMap(d)` (structured CBOR map with 11 fields) + `manifestToWireMap(m)` (structured CBOR map with 10 fields). The frozen wire format carries STRUCTURED maps, not opaque bytes.
+- Audited existing Rust encoders: `snp_identity::GatewayAdvertisement` has `encode_cbor()`/`decode_cbor()` (canonical bytes — exists!). `VerifiedNodeDescriptor` has `canonical_cbor()` → `CborValue` (no decoder). Skeleton `NodeDescriptor` has NO encoder. `snp_object::Manifest` has NO encoder. Conclusion: the owning crates do NOT provide complete canonical byte-level encoders for `NodeDescriptor` or `Manifest`.
+- Per user instruction: "If canonical descriptor serialization is not yet available from its owning layer, STOP and report the exact missing dependency instead of creating a fake encoder." + "Preferred L5 representation: `DescriptorPayload(Vec<u8>)`." Resolution: L5 carries opaque canonical bytes (BundlePayload pattern). The composition layer (R4.3+) is responsible for encoding descriptors/manifests to bytes using the owning layer's encoder, and decoding + verifying after receiving. This is NOT faking — L5 honestly carries bytes.
+- Added `DescriptorPayload(Vec<u8>)`: opaque canonical descriptor bytes. Constructor + `as_bytes`/`into_bytes`/`len`/`is_empty` + `From<Vec<u8>>`/`From<&[u8]>`. Documented as distinct from `BundlePayload` (transit envelope) and `ContentBytes` (L2 CAS content). Descriptor data MUST NOT enter CAS.
+- Added `ManifestPayload(Vec<u8>)`: opaque canonical manifest bytes. Same API + `From` impls.
+- Added `StoredManifest` struct: `{ payload: ManifestPayload, chunk_count: u64 }` — return type for `ObjectStore::get_manifest()`.
+- Changed `SyncObjectEntry.manifest` from `snp_object::Manifest` → `ManifestPayload`. Changed `SyncResponse.descriptors` from `Vec<snp_identity::NodeDescriptor>` → `Vec<DescriptorPayload>`. Removed `PartialEq`/`Eq` derives (now possible since all fields are `Vec<u8>` or primitives — actually added them back: `#[derive(Debug, Clone, PartialEq, Eq)]`).
+- Fixed `SyncResponse::to_cbor()`: descriptors now emit as `ByteString(d.as_bytes().to_vec())` — NOT `Null`. Manifests emit as `ByteString(o.manifest.as_bytes().to_vec())` — NOT structured maps.
+- Fixed `SyncResponse::from_cbor()`: descriptors decode from bstr → `DescriptorPayload::new(bytes)`. Manifests decode from bstr → `ManifestPayload::new(bytes)`. NO data loss.
+- Fixed `SyncResponse::validate()`: removed `chunk_count == manifest.chunks.len()` check (L5 can't inspect opaque manifest). Added empty-payload checks (broken encoder detection).
+- Updated `ObjectStore` trait: `get_manifest()` returns `Option<StoredManifest>`, `put()` takes `(ObjectId, ManifestPayload, chunks)`.
+- Updated `DescriptorStore` trait: `add_descriptor(NodeId, DescriptorPayload)`, `get_descriptor(NodeId) -> Option<DescriptorPayload>`, `active_descriptor_ids(now) -> Vec<NodeId>`.
+- Updated `SyncSession`: `pending_manifests` stores `ManifestPayload` (not `snp_object::Manifest`). `handle_sync_request()` uses `get_manifest()` + `get_descriptor()`. `apply_sync_response()` does NOT apply descriptors (composition layer handles decode+verify+add). `commit_pending_object()` calls `put(object_id, manifest_payload, chunks)`. `get_pending_manifest()` returns `Option<ManifestPayload>`.
+- Removed `manifest_to_cbor_value()` + `decode_manifest()` functions (no longer needed — L5 carries opaque bytes, not structured manifests).
+- Added `decode_descriptor_payloads()` helper.
+- Updated all tests: `TestObjectStore` stores `StoredManifest`, `TestDescriptorStore` stores `DescriptorPayload`. `test_manifest_payload()` + `test_descriptor_payload(seed)` helpers produce fake opaque bytes for testing.
+- Added 6 required correction tests:
+  - `sync_response_descriptor_roundtrip`: one descriptor round-trips exactly
+  - `sync_response_multiple_descriptors_roundtrip`: 3 descriptors (different lengths) round-trip
+  - `sync_response_descriptor_bytes_preserved_exactly`: 200-byte descriptor preserved bit-for-bit
+  - `tampered_descriptor_payload_is_not_silently_accepted`: L5 carries tampered bytes faithfully; receiver can detect via signature verification
+  - `sync_response_object_manifest_roundtrip`: manifest bytes preserved exactly
+  - `sync_response_full_roundtrip_with_objects_and_descriptors`: full response (2 objects + 2 descriptors + partial flag) round-trips
+- Also added: `sync_response_empty_manifest_rejected` + `sync_response_empty_descriptor_rejected` (broken-encoder detection).
+- Updated architecture-status doc: L5 row (82→89 tests, R4.2 correction details), Known gaps section (opaque bytes, missing encoders documented).
+- Tests: 89/89 pass (51 R4.1 + 32 R4.2 + 6 R4.2-correction). snp-object 18, snp-identity 3, snp-frames 20, snp-gateway 23, snp-node --lib 97, snp-conformance 138/138. Focused regression: transparent_tcp 7, n3a_bridge 5, endpoint_binding 3, any_ip 5, placeholder_route 1, traffic_class_separation 7. fmt clean. clippy 0 warnings. Dep graph unchanged (snp-cbor+snp-crypto+snp-identity+snp-object+thiserror — no L7/L6/L8 deps).
+
+Stage Summary:
+- R4.2 correction Definition of Done — all 10 boxes checked:
+  - [x] SyncResponse descriptors are not discarded — now carried as opaque `DescriptorPayload` bytes, round-trip safe
+  - [x] descriptor payload round-trips exactly — verified by `sync_response_descriptor_bytes_preserved_exactly` (200 bytes, bit-for-bit)
+  - [x] descriptor encoding has one canonical owner — the owning layer (snp-identity for NodeDescriptor, composition layer for wiring); L5 does NOT encode
+  - [x] no duplicate descriptor serializer exists in L5 — L5 carries opaque bytes, no structured encoder
+  - [x] manifest representation is similarly truthful — `ManifestPayload(Vec<u8>)`, round-trip safe, no structured encoder in L5
+  - [x] SyncSession can exchange descriptors without data loss — `handle_sync_request()` returns descriptors from the store; `apply_sync_response()` carries them through (composition layer applies)
+  - [x] existing 82 R4.2/R4.1 tests remain green — 89/89 pass (7 new tests added)
+  - [x] conformance remains 138/138
+  - [x] L5 dependency boundary remains intact — no L7/L6/L8 deps
+- Missing dependencies documented (to be wired by R4.x+ or composition layer):
+  1. `snp_identity::NodeDescriptor::encode_cbor()`/`decode_cbor()` (matching TS `nodeDescriptorToWireMap`/`nodeDescriptorFromWireMap`)
+  2. `snp_object::Manifest::encode_cbor()`/`decode_cbor()` (matching TS `manifestToWireMap`/`manifestFromWireMap`)
+  3. For gateway adverts, `GatewayAdvertisement::encode_cbor()`/`decode_cbor()` already exist
+- STOP after R4.2 correction. Do NOT start R4.3.

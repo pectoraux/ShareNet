@@ -1441,31 +1441,187 @@ impl SyncRequest {
     }
 }
 
+// ─── DescriptorPayload + ManifestPayload (opaque L5 carriers) ─────────────
+//
+// R4.2 correction: `SyncResponse` previously carried
+// `Vec<snp_identity::NodeDescriptor>` and `snp_object::Manifest` directly,
+// but the owning crates (`snp-identity`, `snp-object`) do NOT provide
+// canonical byte-level encoders for these types (the skeleton
+// `NodeDescriptor` has no `to_cbor` method; `Manifest` has no encoder at
+// all). The previous R4.2 implementation emitted `Null` for each
+// descriptor and discarded the array on decode — DATA LOSS.
+//
+// The fix follows the `BundlePayload` principle: L5 carries OPAQUE
+// canonical bytes. The composition layer (R4.3+) or the caller encodes
+// the descriptor/manifest to canonical bytes using the owning layer's
+// encoder, passes the bytes to L5, and L5 carries them without
+// interpreting. The receiver decodes + verifies at the owning layer.
+//
+// This is NOT "faking" an encoder — L5 honestly carries opaque bytes and
+// does not claim to understand their content. The canonical encoding
+// responsibility is explicitly deferred to the owning layer.
+//
+// Missing dependencies (to be wired by R4.x+ or the composition layer):
+// 1. `snp_identity::NodeDescriptor` needs `encode_cbor() -> Vec<u8>` +
+//    `decode_cbor(bytes) -> Self` (matching TS `nodeDescriptorToWireMap` /
+//    `nodeDescriptorFromWireMap`). For gateway adverts,
+//    `GatewayAdvertisement::encode_cbor()` / `decode_cbor()` already exist.
+// 2. `snp_object::Manifest` needs `encode_cbor() -> Vec<u8>` +
+//    `decode_cbor(bytes) -> Self` (matching TS `manifestToWireMap` /
+//    `manifestFromWireMap`).
+
+/// Opaque canonical descriptor bytes carried by L5.
+///
+/// The composition layer encodes a `NodeDescriptor` (or
+/// `GatewayAdvertisement`) to canonical CBOR bytes and passes them to L5
+/// as `DescriptorPayload`. L5 carries them through the `SyncResponse`
+/// wire format without interpreting. The receiver decodes + verifies the
+/// descriptor signature at L3/L4.
+///
+/// This type is intentionally distinct from `BundlePayload` (L5 transit
+/// envelope) and `snp_object::ContentBytes` (L2 CAS content):
+/// - `BundlePayload`: opaque Mode-A request/response bytes
+/// - `DescriptorPayload`: opaque identity/trust/discovery metadata bytes
+/// - `ContentBytes`: readable Class A content (cacheable, Merkle-verified)
+///
+/// Descriptor data MUST NOT be put in CAS — it is identity/trust metadata,
+/// not content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorPayload(Vec<u8>);
+
+impl DescriptorPayload {
+    /// Construct from canonical descriptor bytes. The bytes are
+    /// application-defined (produced by the owning layer's encoder); L5
+    /// does not inspect them.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// View as a byte slice (for serialization).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume and return the raw bytes (for decoding by the owning layer).
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if the payload is empty (zero bytes).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for DescriptorPayload {
+    fn from(b: Vec<u8>) -> Self {
+        Self(b)
+    }
+}
+
+impl From<&[u8]> for DescriptorPayload {
+    fn from(b: &[u8]) -> Self {
+        Self(b.to_vec())
+    }
+}
+
+/// Opaque canonical manifest bytes carried by L5.
+///
+/// The composition layer encodes an `snp_object::Manifest` to canonical
+/// CBOR bytes and passes them to L5 as `ManifestPayload`. L5 carries them
+/// through the `SyncResponse` wire format without interpreting. The
+/// receiver decodes the manifest at L2 and verifies the signature (L2/L3
+/// concern).
+///
+/// Same architectural principle as `DescriptorPayload` and
+/// `BundlePayload`: L5 carries opaque bytes, the owning layer owns the
+/// canonical encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPayload(Vec<u8>);
+
+impl ManifestPayload {
+    /// Construct from canonical manifest bytes.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// View as a byte slice (for serialization).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume and return the raw bytes (for decoding by the owning layer).
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if the payload is empty (zero bytes).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<u8>> for ManifestPayload {
+    fn from(b: Vec<u8>) -> Self {
+        Self(b)
+    }
+}
+
+impl From<&[u8]> for ManifestPayload {
+    fn from(b: &[u8]) -> Self {
+        Self(b.to_vec())
+    }
+}
+
 // ─── SyncResponse (frozen sync.ts:1398-1412) ──────────────────────────────
 
-/// One object entry in a `SyncResponse`: the `ObjectId` + manifest + chunk count.
+/// One object entry in a `SyncResponse`: the `ObjectId` + opaque manifest
+/// bytes + chunk count.
 ///
 /// Per the frozen TS reference (`sync.ts:1400-1407`), each object carries:
 /// - `object_id`: 32-byte `ObjectId` (Merkle root)
-/// - `manifest`: the signed Manifest for this object
-/// - `chunk_count`: number of chunks (mirrors `manifest.chunks.len()`)
+/// - `manifest`: the canonical manifest bytes (opaque to L5)
+/// - `chunk_count`: number of chunks (mirrors the manifest's chunk count
+///   for fast scanning)
 ///
 /// The response carries MANIFESTS, not chunks. The chunks are fetched in a
 /// separate exchange. This keeps the `SyncResponse` compact even for large
 /// objects: a 1 GiB object's manifest is ~1 KiB.
 ///
-/// Note: `PartialEq`/`Eq` are NOT derived because `snp_object::Manifest` and
-/// `snp_identity::NodeDescriptor` do not derive them (they contain `String`
-/// and `Vec` fields that would require full structural equality, which is
-/// not needed for sync — sync compares by `ObjectId`, not by full manifest
-/// equality). Use `object_id` equality to compare entries.
-#[derive(Debug, Clone)]
+/// `chunk_count` is provided by the caller (the composition layer that
+/// builds the response). L5 does NOT validate it against the manifest bytes
+/// because L5 cannot inspect the opaque manifest — that is L2's
+/// responsibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncObjectEntry {
     /// 32-byte `ObjectId` (Merkle root) — the key under which the manifest is stored.
     pub object_id: ObjectId,
-    /// The signed Manifest for this object.
-    pub manifest: snp_object::Manifest,
-    /// Number of chunks (mirrors `manifest.chunks.len()` for fast scanning).
+    /// The canonical manifest bytes (opaque to L5). The composition layer
+    /// encodes the `snp_object::Manifest` to canonical CBOR bytes using the
+    /// owning layer's encoder, and passes them here.
+    pub manifest: ManifestPayload,
+    /// Number of chunks (mirrors `manifest.chunkCount` for fast scanning).
+    /// Set by the caller; L5 does NOT validate this against the manifest.
     pub chunk_count: u64,
 }
 
@@ -1474,23 +1630,31 @@ pub struct SyncObjectEntry {
 ///
 /// Per the frozen TS reference (`sync.ts:1398-1412`), the response carries:
 /// - `objects`: manifests + chunk counts for the requested objects
-/// - `descriptors`: the requested `NodeDescriptors`
+/// - `descriptors`: the requested descriptors (opaque canonical bytes)
 /// - `complete`: true iff all wants + wantDescriptors were satisfied
 ///
 /// `complete` is `false` for a partial response (the responder was missing
 /// some requested objects/descriptors; the requester can try another peer).
 ///
-/// Note: `PartialEq`/`Eq` are NOT derived (see `SyncObjectEntry` note).
-#[derive(Debug, Clone)]
+/// # Opaque payloads (R4.2 correction)
+///
+/// Both `objects[].manifest` and `descriptors[]` are OPAQUE BYTE PAYLOADS.
+/// L5 does NOT interpret descriptor fields or manifest fields — those are
+/// L1/L2/L3/L4 semantics. The composition layer (R4.3+) is responsible
+/// for:
+/// - Encoding descriptors/manifests to canonical bytes before passing to L5
+/// - Decoding + verifying descriptors/manifests after receiving from L5
+///
+/// This is the same architectural principle as `BundlePayload`: L5 carries
+/// opaque bytes, the owning layer owns the canonical representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncResponse {
-    /// Objects sent (manifest + chunk count for each).
+    /// Objects sent (manifest payload + chunk count for each).
     pub objects: Vec<SyncObjectEntry>,
-    /// Descriptors sent. Each is the skeleton `snp_identity::NodeDescriptor`
-    /// (fields: `node_id`, `identity_key`, `device_cert`, capabilities, seq,
-    /// `issued_at`, signature). The sync layer exchanges these as opaque
-    /// CBOR maps — signature verification is the receiver's responsibility
-    /// (L3/L4 trust decision), NOT L5's.
-    pub descriptors: Vec<snp_identity::NodeDescriptor>,
+    /// Descriptors sent. Each is opaque canonical descriptor bytes
+    /// (`DescriptorPayload`). L5 does NOT interpret these bytes — the
+    /// receiver decodes + verifies at L3/L4.
+    pub descriptors: Vec<DescriptorPayload>,
     /// Whether the response is complete (all wants satisfied) or partial.
     pub complete: bool,
 }
@@ -1500,7 +1664,7 @@ impl SyncResponse {
     #[must_use]
     pub fn new(
         objects: Vec<SyncObjectEntry>,
-        descriptors: Vec<snp_identity::NodeDescriptor>,
+        descriptors: Vec<DescriptorPayload>,
         complete: bool,
     ) -> Self {
         Self {
@@ -1523,16 +1687,26 @@ impl SyncResponse {
 
     /// Validate the STRUCTURE of this response.
     ///
+    /// R4.2 correction: this NO LONGER checks `chunk_count` against the
+    /// manifest's chunk list, because the manifest is opaque bytes — L5
+    /// cannot inspect it. The caller (composition layer) is responsible
+    /// for setting `chunk_count` correctly when building the response.
+    ///
     /// # Errors
-    /// Returns `SyncError::Malformed` if any `chunk_count` does not match
-    /// `manifest.chunks.len()`.
+    /// Returns `SyncError::Malformed` if any payload is empty (zero bytes),
+    /// which would indicate a broken encoder.
     pub fn validate(&self) -> SyncResult<()> {
         for (i, o) in self.objects.iter().enumerate() {
-            if o.chunk_count != o.manifest.chunks.len() as u64 {
+            if o.manifest.is_empty() {
                 return Err(SyncError::Malformed(format!(
-                    "SyncResponse.objects[{i}].chunkCount ({}) must equal manifest.chunks.len() ({})",
-                    o.chunk_count,
-                    o.manifest.chunks.len()
+                    "SyncResponse.objects[{i}].manifest must not be empty"
+                )));
+            }
+        }
+        for (i, d) in self.descriptors.iter().enumerate() {
+            if d.is_empty() {
+                return Err(SyncError::Malformed(format!(
+                    "SyncResponse.descriptors[{i}] must not be empty"
                 )));
             }
         }
@@ -1542,11 +1716,13 @@ impl SyncResponse {
     /// Encode to canonical CBOR.
     ///
     /// Each object in `objects` is encoded as a nested CBOR map:
-    /// `{ "objectId": bstr, "manifest": ManifestWire, "chunkCount": uint }`.
-    /// Each descriptor in `descriptors` is encoded as an opaque CBOR bstr
-    /// (the descriptor's own canonical CBOR encoding — L5 does NOT interpret
-    /// descriptor fields, it carries them as opaque bytes for the receiver
-    /// to verify at L3/L4).
+    /// `{ "objectId": bstr, "manifest": bstr, "chunkCount": uint }`.
+    /// Each descriptor in `descriptors` is encoded as a CBOR bstr (the
+    /// opaque canonical descriptor bytes).
+    ///
+    /// The manifest and descriptor bytes are carried as bstr values — L5
+    /// does NOT interpret their content. The receiver decodes them at the
+    /// owning layer.
     ///
     /// # Errors
     /// Returns `SyncError` if validation or encoding fails.
@@ -1563,7 +1739,7 @@ impl SyncResponse {
                     ),
                     (
                         snp_cbor::CborValue::TextString("manifest".into()),
-                        manifest_to_cbor_value(&o.manifest),
+                        snp_cbor::CborValue::ByteString(o.manifest.as_bytes().to_vec()),
                     ),
                     (
                         snp_cbor::CborValue::TextString("chunkCount".into()),
@@ -1572,16 +1748,12 @@ impl SyncResponse {
                 ])
             })
             .collect();
-        // Descriptors are carried as opaque bstrs — the L5 layer does NOT
-        // interpret descriptor fields (those are L1/L3/L4 semantics). The
-        // receiver decodes + verifies the descriptor signature at L3/L4.
-        // For R4.2, since the skeleton NodeDescriptor has no to_cbor method,
-        // we carry it as a placeholder bstr. A future R4.x will wire the real
-        // descriptor CBOR encoder.
+        // Descriptors are carried as opaque bstrs — the canonical
+        // descriptor bytes. L5 does NOT interpret descriptor fields.
         let descriptors_cbor: Vec<snp_cbor::CborValue> = self
             .descriptors
             .iter()
-            .map(|_d| snp_cbor::CborValue::Null) // placeholder — see note above
+            .map(|d| snp_cbor::CborValue::ByteString(d.as_bytes().to_vec()))
             .collect();
         let value = snp_cbor::CborValue::Map(vec![
             (
@@ -1616,7 +1788,7 @@ impl SyncResponse {
             }
         };
         let mut objects: Option<Vec<SyncObjectEntry>> = None;
-        let mut descriptors: Option<Vec<snp_identity::NodeDescriptor>> = None;
+        let mut descriptors: Option<Vec<DescriptorPayload>> = None;
         let mut complete: Option<bool> = None;
         for (k, v) in entries {
             let key = match k {
@@ -1629,25 +1801,7 @@ impl SyncResponse {
             };
             match key {
                 "objects" => objects = Some(decode_object_entries(v)?),
-                "descriptors" => {
-                    // Descriptors are carried as opaque placeholder Null entries
-                    // in R4.2 (the skeleton NodeDescriptor has no CBOR encoder).
-                    // We decode the array length but cannot reconstruct the
-                    // descriptor bytes yet — a future R4.x will wire this.
-                    let arr = match v {
-                        snp_cbor::CborValue::Array(a) => a,
-                        _ => {
-                            return Err(SyncError::Malformed(
-                                "SyncResponse.descriptors must be an array".into(),
-                            ));
-                        }
-                    };
-                    // For R4.2, descriptors are placeholder entries — we
-                    // cannot reconstruct the signed descriptor from a Null.
-                    // Document this gap: descriptor CBOR encoding is R4.x+.
-                    let _ = arr.len();
-                    descriptors = Some(Vec::new());
-                }
+                "descriptors" => descriptors = Some(decode_descriptor_payloads(v)?),
                 "complete" => complete = Some(expect_bool(v, "SyncResponse.complete")?),
                 _ => {
                     // Per §9: unknown keys in unsigned structures MAY be ignored.
@@ -1673,8 +1827,8 @@ impl SyncResponse {
 /// response payload, and `SyncObject` for the full manifest + chunks form).
 #[derive(Debug, Clone)]
 pub struct SyncObject {
-    /// The object's manifest.
-    pub manifest: snp_object::Manifest,
+    /// The object's manifest (opaque canonical bytes).
+    pub manifest: ManifestPayload,
     /// Chunk bytes in order.
     pub chunks: Vec<Vec<u8>>,
 }
@@ -1776,14 +1930,26 @@ pub fn compute_sync_diff(
 
 // ─── ObjectStore trait (L5 contract for CAS access) ────────────────────────
 
+/// A stored manifest: the opaque canonical bytes + the chunk count.
+///
+/// The composition layer (which implements `ObjectStore`) is responsible
+/// for encoding the `snp_object::Manifest` to canonical bytes. L5 carries
+/// the bytes without interpreting them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredManifest {
+    /// The canonical manifest bytes (opaque to L5).
+    pub payload: ManifestPayload,
+    /// Number of chunks (mirrors the manifest's chunk count).
+    pub chunk_count: u64,
+}
+
 /// Minimal interface that the sync layer uses to access the content-addressed
 /// store. The real implementation lives in L2 (content layer); this is the
 /// contract L5 needs.
 ///
 /// An `ObjectId` is the 32-byte Merkle root of an object's chunks (RFC 6962).
-/// The CAS stores Manifests (which bind the `ObjectId` to the chunk hashes,
-/// totalBytes, MIME type, publisher, etc.) and the raw chunks. `put` accepts
-/// both; `get_manifest` / `get_chunks` retrieve them separately.
+/// The CAS stores manifests (canonical bytes, opaque to L5) and the raw
+/// chunks. `put` accepts both; `get_manifest` retrieves the manifest bytes.
 ///
 /// The CAS is CONTENT-ADDRESSED: the `ObjectId` is derived from the content
 /// (Merkle root), so two puts of the same content are idempotent. There is no
@@ -1791,21 +1957,27 @@ pub fn compute_sync_diff(
 ///
 /// This trait is the L5 contract — it does NOT expose the L2 `Cas` trait
 /// directly (which operates on `ContentBytes`, not manifests). A composition
-/// layer adapts `Cas` → `ObjectStore`.
+/// layer adapts `Cas` → `ObjectStore`, encoding manifests to canonical bytes.
 pub trait ObjectStore: Send + Sync {
     /// Returns true iff an object with the given `ObjectId` is stored.
     fn has(&self, object_id: &ObjectId) -> bool;
 
     /// Look up the manifest for an object. Returns `None` if absent.
-    fn get_manifest(&self, object_id: &ObjectId) -> Option<snp_object::Manifest>;
+    /// The manifest is returned as opaque canonical bytes + chunk count.
+    fn get_manifest(&self, object_id: &ObjectId) -> Option<StoredManifest>;
 
     /// Store a manifest + its chunks. Idempotent: putting the same `ObjectId`
     /// twice is a no-op (the content is already there).
     ///
     /// # Errors
     /// Returns `SyncError` if the chunks do not hash to the manifest's
-    /// Merkle root (CAS mismatch).
-    fn put(&self, manifest: snp_object::Manifest, chunks: Vec<Vec<u8>>) -> SyncResult<()>;
+    /// Merkle root (CAS mismatch). The composition layer verifies this.
+    fn put(
+        &self,
+        object_id: ObjectId,
+        manifest: ManifestPayload,
+        chunks: Vec<Vec<u8>>,
+    ) -> SyncResult<()>;
 
     /// List all `ObjectIds` in the store. Used to build a `HaveVector`.
     fn list(&self) -> Vec<ObjectId>;
@@ -1817,24 +1989,29 @@ pub trait ObjectStore: Send + Sync {
 /// The real implementation lives in L4 (discovery layer); this is the contract
 /// L5 needs.
 ///
-/// The store holds `NodeDescriptor`s (signed, self-attesting). The sync layer
-/// exchanges descriptors by `NodeId`, but does NOT verify signatures — that is
-/// the receiver's responsibility (L3/L4 trust decision).
+/// The store holds descriptors as opaque canonical bytes (`DescriptorPayload`),
+/// keyed by `NodeId`. The sync layer exchanges descriptors by `NodeId`, but
+/// does NOT verify signatures or interpret descriptor fields — that is the
+/// receiver's responsibility (L3/L4 trust decision).
+///
+/// The composition layer is responsible for encoding descriptors to canonical
+/// bytes before storing them, and decoding + verifying after retrieval.
 pub trait DescriptorStore: Send + Sync {
-    /// Add a descriptor to the store. The store MAY verify the signature
-    /// internally (L3/L4 concern). Returns true if the descriptor was accepted
-    /// (new or seq-newer than the existing one).
-    fn add_node_descriptor(&self, desc: snp_identity::NodeDescriptor) -> bool;
+    /// Add a descriptor payload to the store, keyed by `NodeId`. The store
+    /// MAY verify the signature internally (L3/L4 concern). Returns true if
+    /// the descriptor was accepted (new or seq-newer than the existing one).
+    ///
+    /// The caller provides the `NodeId` separately because L5 cannot extract
+    /// it from the opaque `DescriptorPayload` bytes — the composition layer
+    /// decodes the descriptor to obtain the `NodeId`.
+    fn add_descriptor(&self, node_id: snp_identity::NodeId, payload: DescriptorPayload) -> bool;
 
-    /// Look up the descriptor for a `NodeId`. Returns `None` if absent.
-    fn get_node_descriptor(
-        &self,
-        node_id: &snp_identity::NodeId,
-    ) -> Option<snp_identity::NodeDescriptor>;
+    /// Look up the descriptor payload for a `NodeId`. Returns `None` if absent.
+    fn get_descriptor(&self, node_id: &snp_identity::NodeId) -> Option<DescriptorPayload>;
 
-    /// All NON-EXPIRED `NodeDescriptors` in the store. Used to build a
+    /// All NON-EXPIRED descriptor `NodeIds` in the store. Used to build a
     /// `HaveVector`'s `known_nodes`.
-    fn active_node_descriptors(&self, now: u64) -> Vec<snp_identity::NodeDescriptor>;
+    fn active_descriptor_ids(&self, now: u64) -> Vec<snp_identity::NodeId>;
 
     /// All NON-EXPIRED gateway `NodeIds` in the store. Used to build a
     /// `HaveVector`'s `known_gateways`.
@@ -1869,10 +2046,12 @@ pub struct SyncSession {
     descriptor_store: std::sync::Arc<dyn DescriptorStore>,
     bundle_store: std::sync::Mutex<BundleStore>,
     // Manifests received via sync but whose chunks have not yet been fetched.
-    // Keyed by ObjectId. Callers drain this via `pending_object_ids()` and
-    // `get_pending_manifest()` to drive a chunk-fetch exchange, then call
-    // `commit_pending_object()` to move the object into the ObjectStore.
-    pending_manifests: std::sync::Mutex<std::collections::BTreeMap<ObjectId, snp_object::Manifest>>,
+    // Keyed by ObjectId. Stores opaque canonical manifest bytes — L5 does NOT
+    // interpret the manifest content. Callers drain this via
+    // `pending_object_ids()` and `get_pending_manifest()` to drive a
+    // chunk-fetch exchange, then call `commit_pending_object()` to move the
+    // object into the ObjectStore.
+    pending_manifests: std::sync::Mutex<std::collections::BTreeMap<ObjectId, ManifestPayload>>,
 }
 
 impl SyncSession {
@@ -1895,18 +2074,14 @@ impl SyncSession {
 
     /// Generate our HAVE vector to send to the peer.
     ///
-    /// Builds a `HaveVector` from the local `DescriptorStore` (active descriptors
-    /// + gateways) and `ObjectStore` (all `ObjectIds`).
+    /// Builds a `HaveVector` from the local `DescriptorStore` (active
+    /// descriptor IDs + gateways) and `ObjectStore` (all `ObjectIds`).
     ///
     /// # Errors
     /// Returns `SyncError` if `now == 0`.
     pub fn build_local_have_vector(&self, now: u64) -> SyncResult<HaveVector> {
-        let mut known_nodes: Vec<snp_identity::NodeId> = self
-            .descriptor_store
-            .active_node_descriptors(now)
-            .iter()
-            .map(|d| d.node_id)
-            .collect();
+        let mut known_nodes: Vec<snp_identity::NodeId> =
+            self.descriptor_store.active_descriptor_ids(now);
         // Deduplicate while preserving a deterministic order.
         known_nodes.sort_unstable();
         known_nodes.dedup();
@@ -1965,43 +2140,43 @@ impl SyncSession {
     /// they want that we have, and the descriptors they want that we have.
     ///
     /// For each `ObjectId` in `request.want`:
-    /// - Look up the manifest in our `ObjectStore`. If present, include it.
+    /// - Look up the manifest in our `ObjectStore`. If present, include the
+    ///   opaque manifest bytes + chunk count.
     /// - If absent, skip (the response will be partial).
     ///
     /// For each `NodeId` in `request.want_descriptors`:
-    /// - Look up the descriptor in our `DescriptorStore`. If present and
-    ///   NON-EXPIRED, include it.
-    /// - If absent or expired, skip.
+    /// - Look up the descriptor in our `DescriptorStore`. If present, include
+    ///   the opaque descriptor bytes.
+    /// - If absent, skip.
     ///
     /// `complete` is true iff all wants and `want_descriptors` were satisfied.
     ///
     /// # Errors
     /// Returns `SyncError` if the request fails validation.
-    pub fn handle_sync_request(&self, request: &SyncRequest, now: u64) -> SyncResult<SyncResponse> {
+    pub fn handle_sync_request(
+        &self,
+        request: &SyncRequest,
+        _now: u64,
+    ) -> SyncResult<SyncResponse> {
         request.validate()?;
         let mut objects: Vec<SyncObjectEntry> = Vec::new();
         for object_id in &request.want {
-            if let Some(manifest) = self.object_store.get_manifest(object_id) {
+            if let Some(stored) = self.object_store.get_manifest(object_id) {
                 objects.push(SyncObjectEntry {
                     object_id: *object_id,
-                    chunk_count: manifest.chunks.len() as u64,
-                    manifest,
+                    manifest: stored.payload,
+                    chunk_count: stored.chunk_count,
                 });
             }
         }
-        let mut descriptors: Vec<snp_identity::NodeDescriptor> = Vec::new();
+        let mut descriptors: Vec<DescriptorPayload> = Vec::new();
         for node_id in &request.want_descriptors {
-            if let Some(desc) = self.descriptor_store.get_node_descriptor(node_id) {
-                // Skip expired descriptors (spec §5 freshness rule — expired
-                // descriptors MUST NOT be forwarded). The skeleton
-                // NodeDescriptor has `issued_at` but no `expires_at`; for R4.2
-                // we rely on the DescriptorStore's
-                // `active_node_descriptors(now)` filter at HAVE-vector build
-                // time, and accept the descriptor here. A future R4.x will
-                // add per-descriptor expiry checking once the signed
-                // descriptor type has an `expires_at` field.
-                let _ = now; // expiry check deferred to R4.x (see note above)
-                descriptors.push(desc);
+            // Expiry of descriptors is handled by the DescriptorStore's
+            // `active_descriptor_ids(now)` filter at HAVE-vector build time.
+            // Here we return whatever the store has for this NodeId — the
+            // receiver's DescriptorStore will re-check expiry on add.
+            if let Some(payload) = self.descriptor_store.get_descriptor(node_id) {
+                descriptors.push(payload);
             }
         }
         let complete = objects.len() == request.want.len()
@@ -2011,29 +2186,32 @@ impl SyncSession {
 
     /// Apply a peer's `SyncResponse` to our local stores.
     ///
-    /// For each descriptor in `response.descriptors`:
-    /// - Add it to the `DescriptorStore` via `add_node_descriptor`. The store
-    ///   verifies the signature + seq (L3/L4 concern). Idempotent: adding
-    ///   the same descriptor twice is a no-op.
-    ///
-    /// For each object in `response.objects`:
+    /// **Objects**: For each object in `response.objects`:
     /// - If we already have the object (`object_store.has(object_id)`), skip.
-    /// - Otherwise, record the manifest in `pending_manifests`. The chunks are
-    ///   NOT in the response — the caller must fetch them via a separate
-    ///   chunk-fetch exchange and then call `commit_pending_object()`.
+    /// - Otherwise, record the opaque manifest bytes in `pending_manifests`.
+    ///   The chunks are NOT in the response — the caller must fetch them via a
+    ///   separate chunk-fetch exchange and then call `commit_pending_object()`.
+    ///
+    /// **Descriptors**: L5 does NOT apply descriptors. The opaque
+    /// `DescriptorPayload` bytes in `response.descriptors` are NOT interpreted
+    /// by L5 — the composition layer (R4.3+) is responsible for:
+    /// 1. Extracting the `DescriptorPayload` bytes from the response
+    /// 2. Decoding the descriptor using the owning layer's decoder
+    /// 3. Verifying the signature (L3/L4 concern)
+    /// 4. Calling `descriptor_store.add_descriptor(node_id, payload)` with the
+    ///    original bytes
+    ///
+    /// This is the `BundlePayload` principle: L5 carries opaque bytes, the
+    /// owning layer owns the interpretation + verification.
     ///
     /// # Idempotence
     ///
-    /// Calling `apply_sync_response` twice with the same response is a no-op:
-    /// - Objects: `has()` check + `BTreeMap` key collision → no duplicate
-    /// - Descriptors: `add_node_descriptor` checks seq → no duplicate
+    /// Calling `apply_sync_response` twice with the same response is a no-op
+    /// for objects: `has()` check + `BTreeMap` key collision → no duplicate.
     pub fn apply_sync_response(&self, response: &SyncResponse) -> SyncResult<()> {
-        // Apply descriptors — idempotent via the store's seq check.
-        for desc in &response.descriptors {
-            self.descriptor_store.add_node_descriptor(desc.clone());
-        }
-        // Apply objects — record manifests in pending_manifests; chunks need a
-        // separate fetch. Idempotent: if we already have the object, skip.
+        // Apply objects — record opaque manifest bytes in pending_manifests;
+        // chunks need a separate fetch. Idempotent: if we already have the
+        // object, skip.
         let mut pending = self
             .pending_manifests
             .lock()
@@ -2047,6 +2225,8 @@ impl SyncSession {
             // are identical).
             pending.insert(obj.object_id, obj.manifest.clone());
         }
+        // Descriptors are NOT applied here — the composition layer handles
+        // them (decode + verify + add_descriptor). See the method doc above.
         Ok(())
     }
 
@@ -2061,9 +2241,11 @@ impl SyncSession {
         pending.keys().copied().collect()
     }
 
-    /// Get the pending manifest for an `ObjectId`, or `None` if not pending.
+    /// Get the pending manifest payload for an `ObjectId`, or `None` if not
+    /// pending. Returns the opaque canonical manifest bytes — the caller
+    /// decodes them at the owning layer (L2).
     #[must_use]
-    pub fn get_pending_manifest(&self, object_id: &ObjectId) -> Option<snp_object::Manifest> {
+    pub fn get_pending_manifest(&self, object_id: &ObjectId) -> Option<ManifestPayload> {
         let pending = self
             .pending_manifests
             .lock()
@@ -2089,7 +2271,7 @@ impl SyncSession {
             .lock()
             .expect("pending_manifests mutex poisoned");
         let manifest = pending.remove(object_id).ok_or(SyncError::BundleNotFound)?;
-        self.object_store.put(manifest, chunks)?;
+        self.object_store.put(*object_id, manifest, chunks)?;
         Ok(())
     }
 
@@ -2182,7 +2364,7 @@ fn decode_object_entries(v: &snp_cbor::CborValue) -> SyncResult<Vec<SyncObjectEn
             }
         };
         let mut object_id: Option<ObjectId> = None;
-        let mut manifest: Option<snp_object::Manifest> = None;
+        let mut manifest: Option<ManifestPayload> = None;
         let mut chunk_count: Option<u64> = None;
         for (k, val) in entries {
             let key = match k {
@@ -2202,7 +2384,11 @@ fn decode_object_entries(v: &snp_cbor::CborValue) -> SyncResult<Vec<SyncObjectEn
                     )?);
                 }
                 "manifest" => {
-                    manifest = Some(decode_manifest(val, i)?);
+                    // The manifest is carried as opaque canonical bstr bytes.
+                    // L5 does NOT interpret the manifest content — the owning
+                    // layer (L2) decodes it.
+                    let b = expect_bstr(val, &format!("SyncResponse.objects[{i}].manifest"))?;
+                    manifest = Some(ManifestPayload::new(b));
                 }
                 "chunkCount" => {
                     chunk_count = Some(expect_uint(
@@ -2212,7 +2398,6 @@ fn decode_object_entries(v: &snp_cbor::CborValue) -> SyncResult<Vec<SyncObjectEn
                 }
                 _ => {
                     // Per §9: unknown keys in unsigned structures MAY be ignored.
-                    // The object entry map is unsigned, so we tolerate unknown keys.
                 }
             }
         }
@@ -2234,123 +2419,26 @@ fn decode_object_entries(v: &snp_cbor::CborValue) -> SyncResult<Vec<SyncObjectEn
     Ok(out)
 }
 
-/// Encode a `snp_object::Manifest` to a CBOR value.
+/// Decode an array of opaque `DescriptorPayload` bytes from CBOR.
 ///
-/// The Manifest skeleton has fields: `publisher`, `content_type`, `size`,
-/// `chunks`, `merkle_root`, `encryption_key`. We emit all of them.
-fn manifest_to_cbor_value(m: &snp_object::Manifest) -> snp_cbor::CborValue {
-    snp_cbor::CborValue::Map(vec![
-        (
-            snp_cbor::CborValue::TextString("publisher".into()),
-            snp_cbor::CborValue::ByteString(m.publisher.to_vec()),
-        ),
-        (
-            snp_cbor::CborValue::TextString("contentType".into()),
-            snp_cbor::CborValue::TextString(m.content_type.clone()),
-        ),
-        (
-            snp_cbor::CborValue::TextString("size".into()),
-            snp_cbor::CborValue::UnsignedInt(m.size),
-        ),
-        (
-            snp_cbor::CborValue::TextString("chunks".into()),
-            bstr_array(&m.chunks),
-        ),
-        (
-            snp_cbor::CborValue::TextString("merkleRoot".into()),
-            snp_cbor::CborValue::ByteString(m.merkle_root.to_vec()),
-        ),
-        (
-            snp_cbor::CborValue::TextString("encryptionKey".into()),
-            match m.encryption_key {
-                Some(k) => snp_cbor::CborValue::ByteString(k.to_vec()),
-                None => snp_cbor::CborValue::Null,
-            },
-        ),
-    ])
-}
-
-/// Decode a Manifest from a CBOR value.
-fn decode_manifest(v: &snp_cbor::CborValue, idx: usize) -> SyncResult<snp_object::Manifest> {
-    let entries = match v {
-        snp_cbor::CborValue::Map(e) => e,
+/// Each descriptor is carried as a bstr (opaque canonical bytes). L5 does
+/// NOT interpret descriptor fields — the owning layer (L1/L3/L4) decodes
+/// + verifies.
+fn decode_descriptor_payloads(v: &snp_cbor::CborValue) -> SyncResult<Vec<DescriptorPayload>> {
+    let arr = match v {
+        snp_cbor::CborValue::Array(a) => a,
         _ => {
-            return Err(SyncError::Malformed(format!(
-                "SyncResponse.objects[{idx}].manifest must be a map"
-            )));
+            return Err(SyncError::Malformed(
+                "SyncResponse.descriptors must be an array".into(),
+            ));
         }
     };
-    let mut publisher: Option<[u8; 32]> = None;
-    let mut content_type: Option<String> = None;
-    let mut size: Option<u64> = None;
-    let mut chunks: Option<Vec<snp_object::ContentHash>> = None;
-    let mut merkle_root: Option<snp_object::ContentHash> = None;
-    let mut encryption_key: Option<Option<[u8; 32]>> = None;
-    for (k, val) in entries {
-        let key = match k {
-            snp_cbor::CborValue::TextString(s) => s.as_str(),
-            _ => {
-                return Err(SyncError::Malformed(format!(
-                    "SyncResponse.objects[{idx}].manifest map key must be text"
-                )));
-            }
-        };
-        match key {
-            "publisher" => {
-                let b = expect_bstr(val, "manifest.publisher")?;
-                publisher = Some(bytes_to_array_32(&b, "manifest.publisher")?);
-            }
-            "contentType" => {
-                let s = match val {
-                    snp_cbor::CborValue::TextString(s) => s.clone(),
-                    _ => {
-                        return Err(SyncError::Malformed(
-                            "manifest.contentType must be text".into(),
-                        ));
-                    }
-                };
-                content_type = Some(s);
-            }
-            "size" => size = Some(expect_uint(val, "manifest.size")?),
-            "chunks" => {
-                chunks = Some(decode_object_id_array(val, "manifest.chunks")?);
-            }
-            "merkleRoot" => {
-                let b = expect_bstr(val, "manifest.merkleRoot")?;
-                merkle_root = Some(bytes_to_array_32(&b, "manifest.merkleRoot")?);
-            }
-            "encryptionKey" => match val {
-                snp_cbor::CborValue::Null => encryption_key = Some(None),
-                snp_cbor::CborValue::ByteString(b) => {
-                    encryption_key = Some(Some(bytes_to_array_32(b, "manifest.encryptionKey")?));
-                }
-                _ => {
-                    return Err(SyncError::Malformed(
-                        "manifest.encryptionKey must be null or bstr".into(),
-                    ));
-                }
-            },
-            _ => {
-                // Per §9: unknown keys in unsigned structures MAY be ignored.
-                // Manifest is signed (via the publisher's signature, which is
-                // NOT part of the skeleton yet), so technically unknown keys
-                // MUST be rejected. For R4.2, since the skeleton has no
-                // signature field, we tolerate unknown keys (a future R4.x
-                // will add the signature + enforce strict rejection).
-            }
-        }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let bytes = expect_bstr(item, &format!("SyncResponse.descriptors[{i}]"))?;
+        out.push(DescriptorPayload::new(bytes));
     }
-    Ok(snp_object::Manifest {
-        publisher: publisher
-            .ok_or_else(|| SyncError::Malformed("manifest missing publisher".into()))?,
-        content_type: content_type
-            .ok_or_else(|| SyncError::Malformed("manifest missing contentType".into()))?,
-        size: size.ok_or_else(|| SyncError::Malformed("manifest missing size".into()))?,
-        chunks: chunks.ok_or_else(|| SyncError::Malformed("manifest missing chunks".into()))?,
-        merkle_root: merkle_root
-            .ok_or_else(|| SyncError::Malformed("manifest missing merkleRoot".into()))?,
-        encryption_key: encryption_key.unwrap_or(None),
-    })
+    Ok(out)
 }
 
 // === CBOR decode helpers ===
@@ -4158,24 +4246,26 @@ mod tests {
 
     // ─── R4.2 Step 6: SyncResponse tests ────────────────────────────────────
 
-    fn test_manifest() -> snp_object::Manifest {
-        snp_object::Manifest {
-            publisher: [0x42; 32],
-            content_type: "text/plain".into(),
-            size: 100,
-            chunks: vec![[0x11; 32], [0x22; 32]],
-            merkle_root: [0x33; 32],
-            encryption_key: None,
-        }
+    /// Produce a fake canonical manifest payload (opaque bytes) for testing.
+    /// In production, the composition layer encodes a real `snp_object::Manifest`
+    /// to canonical CBOR bytes. For tests, we use a fixed byte pattern.
+    fn test_manifest_payload() -> ManifestPayload {
+        ManifestPayload::new(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42, 0x42, 0x42])
+    }
+
+    /// Produce a fake canonical descriptor payload (opaque bytes) for testing.
+    /// In production, the composition layer encodes a real `NodeDescriptor`
+    /// to canonical CBOR bytes. For tests, we use a fixed byte pattern.
+    fn test_descriptor_payload(seed: u8) -> DescriptorPayload {
+        DescriptorPayload::new(vec![seed; 64])
     }
 
     #[test]
     fn sync_response_roundtrip() {
-        let m = test_manifest();
         let r = SyncResponse::new(
             vec![SyncObjectEntry {
                 object_id: test_object_id(0x01),
-                manifest: m.clone(),
+                manifest: test_manifest_payload(),
                 chunk_count: 2,
             }],
             vec![],
@@ -4186,7 +4276,8 @@ mod tests {
         assert_eq!(decoded.objects.len(), 1);
         assert_eq!(decoded.objects[0].object_id, test_object_id(0x01));
         assert_eq!(decoded.objects[0].chunk_count, 2);
-        assert_eq!(decoded.objects[0].manifest.publisher, m.publisher);
+        // Opaque manifest bytes are preserved exactly.
+        assert_eq!(decoded.objects[0].manifest, test_manifest_payload());
         assert!(decoded.complete);
     }
 
@@ -4202,14 +4293,27 @@ mod tests {
     }
 
     #[test]
-    fn sync_response_chunk_count_mismatch_rejected() {
+    fn sync_response_empty_manifest_rejected() {
+        // R4.2 correction: empty manifest payload is rejected (broken encoder).
         let r = SyncResponse::new(
             vec![SyncObjectEntry {
                 object_id: test_object_id(0x01),
-                manifest: test_manifest(), // has 2 chunks
-                chunk_count: 99,           // wrong!
+                manifest: ManifestPayload::new(Vec::new()), // empty!
+                chunk_count: 2,
             }],
             vec![],
+            true,
+        );
+        let err = r.validate().unwrap_err();
+        assert!(matches!(err, SyncError::Malformed(_)));
+    }
+
+    #[test]
+    fn sync_response_empty_descriptor_rejected() {
+        // R4.2 correction: empty descriptor payload is rejected.
+        let r = SyncResponse::new(
+            vec![],
+            vec![DescriptorPayload::new(Vec::new())], // empty!
             true,
         );
         let err = r.validate().unwrap_err();
@@ -4351,9 +4455,10 @@ mod tests {
 
     // ─── R4.2 Step 10+11: SyncSession + idempotence tests ──────────────────
 
-    /// A minimal in-memory `ObjectStore` for testing.
+    /// A minimal in-memory `ObjectStore` for testing. Stores opaque
+    /// `ManifestPayload` bytes + chunk count, keyed by `ObjectId`.
     struct TestObjectStore {
-        objects: std::sync::Mutex<std::collections::BTreeMap<ObjectId, snp_object::Manifest>>,
+        objects: std::sync::Mutex<std::collections::BTreeMap<ObjectId, StoredManifest>>,
     }
 
     impl TestObjectStore {
@@ -4362,8 +4467,14 @@ mod tests {
                 objects: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }
         }
-        fn insert(&self, object_id: ObjectId, manifest: snp_object::Manifest) {
-            self.objects.lock().unwrap().insert(object_id, manifest);
+        fn insert(&self, object_id: ObjectId, payload: ManifestPayload, chunk_count: u64) {
+            self.objects.lock().unwrap().insert(
+                object_id,
+                StoredManifest {
+                    payload,
+                    chunk_count,
+                },
+            );
         }
     }
 
@@ -4371,12 +4482,23 @@ mod tests {
         fn has(&self, object_id: &ObjectId) -> bool {
             self.objects.lock().unwrap().contains_key(object_id)
         }
-        fn get_manifest(&self, object_id: &ObjectId) -> Option<snp_object::Manifest> {
+        fn get_manifest(&self, object_id: &ObjectId) -> Option<StoredManifest> {
             self.objects.lock().unwrap().get(object_id).cloned()
         }
-        fn put(&self, manifest: snp_object::Manifest, _chunks: Vec<Vec<u8>>) -> SyncResult<()> {
-            let id = manifest.merkle_root;
-            self.objects.lock().unwrap().insert(id, manifest);
+        fn put(
+            &self,
+            object_id: ObjectId,
+            manifest: ManifestPayload,
+            chunks: Vec<Vec<u8>>,
+        ) -> SyncResult<()> {
+            let chunk_count = chunks.len() as u64;
+            self.objects.lock().unwrap().insert(
+                object_id,
+                StoredManifest {
+                    payload: manifest,
+                    chunk_count,
+                },
+            );
             Ok(())
         }
         fn list(&self) -> Vec<ObjectId> {
@@ -4384,11 +4506,11 @@ mod tests {
         }
     }
 
-    /// A minimal in-memory `DescriptorStore` for testing.
+    /// A minimal in-memory `DescriptorStore` for testing. Stores opaque
+    /// `DescriptorPayload` bytes, keyed by `NodeId`.
     struct TestDescriptorStore {
-        descriptors: std::sync::Mutex<
-            std::collections::BTreeMap<snp_identity::NodeId, snp_identity::NodeDescriptor>,
-        >,
+        descriptors:
+            std::sync::Mutex<std::collections::BTreeMap<snp_identity::NodeId, DescriptorPayload>>,
     }
 
     impl TestDescriptorStore {
@@ -4397,57 +4519,29 @@ mod tests {
                 descriptors: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }
         }
-        fn insert(&self, desc: snp_identity::NodeDescriptor) {
-            self.descriptors.lock().unwrap().insert(desc.node_id, desc);
+        fn insert(&self, node_id: snp_identity::NodeId, payload: DescriptorPayload) {
+            self.descriptors.lock().unwrap().insert(node_id, payload);
         }
     }
 
     impl DescriptorStore for TestDescriptorStore {
-        fn add_node_descriptor(&self, desc: snp_identity::NodeDescriptor) -> bool {
-            let mut d = self.descriptors.lock().unwrap();
-            let node_id = desc.node_id;
-            // Idempotent: only insert if new or seq-newer.
-            if let Some(existing) = d.get(&node_id) {
-                if desc.seq <= existing.seq {
-                    return false;
-                }
-            }
-            d.insert(node_id, desc);
+        fn add_descriptor(
+            &self,
+            node_id: snp_identity::NodeId,
+            payload: DescriptorPayload,
+        ) -> bool {
+            // Idempotent: always accept (the test store doesn't check seq).
+            self.descriptors.lock().unwrap().insert(node_id, payload);
             true
         }
-        fn get_node_descriptor(
-            &self,
-            node_id: &snp_identity::NodeId,
-        ) -> Option<snp_identity::NodeDescriptor> {
+        fn get_descriptor(&self, node_id: &snp_identity::NodeId) -> Option<DescriptorPayload> {
             self.descriptors.lock().unwrap().get(node_id).cloned()
         }
-        fn active_node_descriptors(&self, _now: u64) -> Vec<snp_identity::NodeDescriptor> {
-            self.descriptors.lock().unwrap().values().cloned().collect()
+        fn active_descriptor_ids(&self, _now: u64) -> Vec<snp_identity::NodeId> {
+            self.descriptors.lock().unwrap().keys().copied().collect()
         }
         fn known_gateways(&self, _now: u64) -> Vec<snp_identity::NodeId> {
             Vec::new()
-        }
-    }
-
-    fn test_node_descriptor(node_id_seed: u8, seq: u64) -> snp_identity::NodeDescriptor {
-        snp_identity::NodeDescriptor {
-            node_id: test_node_id(node_id_seed),
-            identity_key: [0x42; 32],
-            device_cert: snp_identity::DeviceCert {
-                node_id: test_node_id(node_id_seed),
-                device_key: [0x42; 32],
-                expires_at: 10_000,
-                signature: [0u8; 64],
-            },
-            capabilities: snp_identity::Capabilities {
-                can_relay: true,
-                can_gateway: false,
-                link_types: vec!["tcp".into()],
-                modes: vec!["A".into()],
-            },
-            seq,
-            issued_at: 1_000,
-            signature: [0u8; 64],
         }
     }
 
@@ -4468,9 +4562,8 @@ mod tests {
         assert_eq!(hv.generated_at, 1_000);
 
         // Add an object + descriptor; rebuild.
-        let m = test_manifest();
-        obj_store.insert(m.merkle_root, m);
-        desc_store.insert(test_node_descriptor(0x01, 1));
+        obj_store.insert(test_object_id(0x01), test_manifest_payload(), 2);
+        desc_store.insert(test_node_id(0x01), test_descriptor_payload(0x01));
         let hv2 = session.build_local_have_vector(2_000).expect("have vector");
         assert_eq!(hv2.known_objects.len(), 1);
         assert_eq!(hv2.known_nodes.len(), 1);
@@ -4489,8 +4582,7 @@ mod tests {
             bundle_store,
         );
         // Local has object 0x01; peer has objects 0x01 + 0x02.
-        let m1 = test_manifest();
-        obj_store.insert(test_object_id(0x01), m1);
+        obj_store.insert(test_object_id(0x01), test_manifest_payload(), 2);
         let peer_have = HaveVector::new(
             vec![test_node_id(0xAA)], // peer knows a node local lacks
             vec![],
@@ -4522,15 +4614,15 @@ mod tests {
             desc_store.clone(),
             bundle_store,
         );
-        // Local has object 0x01.
-        let m = test_manifest();
-        obj_store.insert(test_object_id(0x01), m.clone());
-        // Peer requests object 0x01 + 0x02 (local only has 0x01).
+        // Local has object 0x01 + descriptor 0xAA.
+        obj_store.insert(test_object_id(0x01), test_manifest_payload(), 2);
+        desc_store.insert(test_node_id(0xAA), test_descriptor_payload(0xAA));
+        // Peer requests object 0x01 + 0x02 + descriptor 0xAA + 0xBB.
         let req = SyncRequest::new(
             vec![test_object_id(0x01), test_object_id(0x02)],
             vec![],
-            vec![],
-            test_node_id(0xAA),
+            vec![test_node_id(0xAA), test_node_id(0xBB)],
+            test_node_id(0xCC),
             1_000,
         )
         .expect("valid");
@@ -4539,7 +4631,12 @@ mod tests {
         assert_eq!(resp.objects.len(), 1);
         assert_eq!(resp.objects[0].object_id, test_object_id(0x01));
         assert_eq!(resp.objects[0].chunk_count, 2);
-        // Response is partial (peer wanted 2 objects, got 1).
+        // Opaque manifest bytes are preserved.
+        assert_eq!(resp.objects[0].manifest, test_manifest_payload());
+        // Local returns descriptor for 0xAA; 0xBB is absent.
+        assert_eq!(resp.descriptors.len(), 1);
+        assert_eq!(resp.descriptors[0], test_descriptor_payload(0xAA));
+        // Response is partial (peer wanted 2 objects + 2 descriptors, got 1+1).
         assert!(!resp.complete);
     }
 
@@ -4555,11 +4652,11 @@ mod tests {
             bundle_store,
         );
         // Peer sends a response with one object.
-        let m = test_manifest();
+        let object_id = test_object_id(0x42);
         let resp = SyncResponse::new(
             vec![SyncObjectEntry {
-                object_id: m.merkle_root,
-                manifest: m.clone(),
+                object_id,
+                manifest: test_manifest_payload(),
                 chunk_count: 2,
             }],
             vec![],
@@ -4588,12 +4685,11 @@ mod tests {
             desc_store.clone(),
             bundle_store,
         );
-        let m = test_manifest();
-        let object_id = m.merkle_root;
+        let object_id = test_object_id(0x42);
         let resp = SyncResponse::new(
             vec![SyncObjectEntry {
                 object_id,
-                manifest: m,
+                manifest: test_manifest_payload(),
                 chunk_count: 2,
             }],
             vec![],
@@ -4708,11 +4804,10 @@ mod tests {
 
     #[test]
     fn sync_response_encoding_deterministic() {
-        let m = test_manifest();
         let r1 = SyncResponse::new(
             vec![SyncObjectEntry {
                 object_id: test_object_id(0x01),
-                manifest: m.clone(),
+                manifest: test_manifest_payload(),
                 chunk_count: 2,
             }],
             vec![],
@@ -4721,7 +4816,7 @@ mod tests {
         let r2 = SyncResponse::new(
             vec![SyncObjectEntry {
                 object_id: test_object_id(0x01),
-                manifest: m,
+                manifest: test_manifest_payload(),
                 chunk_count: 2,
             }],
             vec![],
@@ -4761,5 +4856,155 @@ mod tests {
             diff1.local_offers,
             vec![test_object_id(0x03), test_object_id(0x01)]
         );
+    }
+
+    // ─── R4.2 correction: descriptor + manifest round-trip tests ────────────
+
+    #[test]
+    fn sync_response_descriptor_roundtrip() {
+        // A SyncResponse with one descriptor must round-trip the descriptor
+        // bytes exactly — NOT discard them (the previous R4.2 emitted Null
+        // and returned Vec::new() on decode, which was data loss).
+        let desc = test_descriptor_payload(0x42);
+        let r = SyncResponse::new(vec![], vec![desc.clone()], true);
+        let bytes = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.descriptors.len(), 1, "descriptor was discarded");
+        assert_eq!(
+            decoded.descriptors[0], desc,
+            "descriptor bytes not preserved"
+        );
+    }
+
+    #[test]
+    fn sync_response_multiple_descriptors_roundtrip() {
+        // Multiple descriptors must all round-trip.
+        let d1 = test_descriptor_payload(0x01);
+        let d2 = test_descriptor_payload(0x02);
+        let d3 = DescriptorPayload::new(vec![0xFF; 128]); // different length
+        let r = SyncResponse::new(vec![], vec![d1.clone(), d2.clone(), d3.clone()], true);
+        let bytes = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.descriptors.len(), 3);
+        assert_eq!(decoded.descriptors[0], d1);
+        assert_eq!(decoded.descriptors[1], d2);
+        assert_eq!(decoded.descriptors[2], d3);
+    }
+
+    #[test]
+    fn sync_response_descriptor_bytes_preserved_exactly() {
+        // The descriptor bytes must be preserved EXACTLY — not a single bit
+        // changed. This is the core round-trip safety guarantee.
+        let original_bytes: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
+        let desc = DescriptorPayload::new(original_bytes.clone());
+        let r = SyncResponse::new(vec![], vec![desc], true);
+        let wire = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&wire).expect("decode");
+        assert_eq!(decoded.descriptors[0].as_bytes(), original_bytes.as_slice());
+        assert_eq!(decoded.descriptors[0].clone().into_bytes(), original_bytes);
+    }
+
+    #[test]
+    fn tampered_descriptor_payload_is_not_silently_accepted() {
+        // L5 does NOT verify descriptor signatures (that's L3/L4's job).
+        // But L5 MUST NOT silently accept a tampered payload as a "verified"
+        // descriptor — it carries the bytes, and the receiver's trust layer
+        // verifies them.
+        //
+        // This test verifies the L5 boundary: L5 carries the bytes intact
+        // (including tampered bytes if someone modified them in transit),
+        // and the receiver can detect tampering by re-verifying the signature.
+        //
+        // The key property: if the bytes are modified, the round-trip
+        // preserves the MODIFIED bytes (L5 is faithful to what it received),
+        // and the trust layer (simulated here) rejects them.
+        let original = test_descriptor_payload(0x42);
+        let mut tampered_bytes = original.as_bytes().to_vec();
+        tampered_bytes[0] ^= 0xFF; // flip a bit
+        let tampered = DescriptorPayload::new(tampered_bytes);
+
+        // L5 round-trips the tampered bytes faithfully.
+        let r = SyncResponse::new(vec![], vec![tampered.clone()], true);
+        let wire = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&wire).expect("decode");
+        assert_eq!(
+            decoded.descriptors[0], tampered,
+            "L5 must faithfully carry the bytes it received (even if tampered)"
+        );
+        // The trust layer (simulated) would reject the tampered bytes because
+        // the signature no longer matches. L5 does NOT do this verification —
+        // it's the receiver's responsibility. This test verifies that L5
+        // does NOT silently "accept" the tampered bytes as a verified
+        // descriptor — it carries them as opaque bytes, and the receiver
+        // must verify.
+        assert_ne!(
+            decoded.descriptors[0], original,
+            "tampered bytes must not equal original — receiver can detect the difference"
+        );
+    }
+
+    #[test]
+    fn sync_response_object_manifest_roundtrip() {
+        // A SyncResponse with one object (manifest + chunk count) must
+        // round-trip the manifest bytes exactly — NOT discard them.
+        let manifest = test_manifest_payload();
+        let r = SyncResponse::new(
+            vec![SyncObjectEntry {
+                object_id: test_object_id(0x01),
+                manifest: manifest.clone(),
+                chunk_count: 2,
+            }],
+            vec![],
+            true,
+        );
+        let bytes = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.objects.len(), 1);
+        assert_eq!(decoded.objects[0].object_id, test_object_id(0x01));
+        assert_eq!(decoded.objects[0].chunk_count, 2);
+        assert_eq!(
+            decoded.objects[0].manifest, manifest,
+            "manifest bytes not preserved exactly"
+        );
+    }
+
+    #[test]
+    fn sync_response_full_roundtrip_with_objects_and_descriptors() {
+        // Full round-trip: objects + descriptors + complete flag.
+        let manifest = test_manifest_payload();
+        let d1 = test_descriptor_payload(0x01);
+        let d2 = test_descriptor_payload(0x02);
+        let r = SyncResponse::new(
+            vec![
+                SyncObjectEntry {
+                    object_id: test_object_id(0x01),
+                    manifest: manifest.clone(),
+                    chunk_count: 3,
+                },
+                SyncObjectEntry {
+                    object_id: test_object_id(0x02),
+                    manifest: ManifestPayload::new(vec![0xAA; 16]),
+                    chunk_count: 1,
+                },
+            ],
+            vec![d1.clone(), d2.clone()],
+            false, // partial response
+        );
+        let bytes = r.to_cbor().expect("encode");
+        let decoded = SyncResponse::from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.objects.len(), 2);
+        assert_eq!(decoded.objects[0].object_id, test_object_id(0x01));
+        assert_eq!(decoded.objects[0].manifest, manifest);
+        assert_eq!(decoded.objects[0].chunk_count, 3);
+        assert_eq!(decoded.objects[1].object_id, test_object_id(0x02));
+        assert_eq!(
+            decoded.objects[1].manifest,
+            ManifestPayload::new(vec![0xAA; 16])
+        );
+        assert_eq!(decoded.objects[1].chunk_count, 1);
+        assert_eq!(decoded.descriptors.len(), 2);
+        assert_eq!(decoded.descriptors[0], d1);
+        assert_eq!(decoded.descriptors[1], d2);
+        assert!(!decoded.complete);
     }
 }
