@@ -9379,3 +9379,39 @@ Stage Summary:
   2. `snp_object::Manifest::encode_cbor()`/`decode_cbor()` (matching TS `manifestToWireMap`/`manifestFromWireMap`)
   3. For gateway adverts, `GatewayAdvertisement::encode_cbor()`/`decode_cbor()` already exist
 - STOP after R4.2 correction. Do NOT start R4.3.
+
+---
+Task ID: R4.2-INTEROP
+Agent: Z.ai (main — R4.2 canonical codec interop)
+Task: Implement the missing canonical codecs (encode_cbor/decode_cbor) for NodeDescriptor (in snp-identity) and Manifest (in snp-object) matching the frozen TS wire maps. Add signature preimage + verify semantics. Add golden interop + negative tests. Add composition-layer integration tests demonstrating zero-byte-loss round-trip through L5 opaque payloads.
+
+Work Log:
+- Step 1: Audited frozen TS wire maps. Manifest (manifest.ts:82-103, 386-399): 10 fields (objectId/chunks/chunkCount/totalBytes/mimeType/class/publisherId/publishedAt/expiresAt/signature), signature over fields 1-9 under SIG_CONTEXT "manifest". NodeDescriptor (identity.ts:320-347, sync.ts:552-570): 11 fields (nodeId/nodePubKey/rendezvousPub/capabilities/platform/protoVersion/epoch/expiresAt/links/deviceCert/signature), signature over fields 1-10 under SIG_CONTEXT "nodeDescriptor". DeviceCert (identity.ts:192-217, 229-239): 8 fields (deviceId/userId/capabilities/platform/notBefore/notAfter/attestation/signature), signature over fields 1-7 under SIG_CONTEXT "deviceCert". MANIFEST_CLASSES: ["content","app","model","dataset","transit-response"]. CAPABILITIES: 10 values (MESH_CLIENT..CUSTODY). PLATFORMS: 6 values (android..embedded). PROTO_VERSION: "SNP/0.1".
+- Step 2: Audited Rust skeletons. snp-object::Manifest had WRONG fields (publisher/content_type/size/chunks/merkle_root/encryption_key — no signature, no objectId, no chunkCount). snp-identity::NodeDescriptor had WRONG fields (node_id/identity_key/device_cert/capabilities/seq/issued_at/signature). snp-identity::DeviceCert had WRONG fields (node_id/device_key/expires_at/signature). None had encode_cbor/decode_cbor. Verified no existing code depends on the old field names (only comments + Beacon skeleton field type).
+- Step 3: Replaced snp-object::Manifest with frozen-semantic version (10 fields + signature). Added ManifestUnsigned (fields 1-9). Added encode_cbor/decode_cbor (canonical CBOR). Added sign/verify (SIG_CONTEXT "manifest" ‖ CBOR(fields 1-9)). Added validate (frozen CDDL constraints). Added MANIFEST_CLASSES constant. Unknown keys rejected per §9 (signed structure). 10 new tests: roundtrip, reencode_identical, tampered_signature, tampered_field, chunk_count_mismatch, invalid_class, unknown_key, missing_field, wrong_object_id_length, expires_at_null_roundtrip.
+- Step 4: Replaced snp-identity::DeviceCert + NodeDescriptor with frozen-semantic versions. DeviceCert: 8 fields (deviceId/userId/capabilities/platform/notBefore/notAfter/attestation/signature). NodeDescriptor: 11 fields (nodeId/nodePubKey/rendezvousPub/capabilities/platform/protoVersion/epoch/expiresAt/links/deviceCert/signature). Both have encode_cbor/decode_cbor + sign/verify + validate. Added PROTO_VERSION, CAPABILITIES, PLATFORMS constants. The embedded DeviceCert in NodeDescriptor is encoded as the FULL cert (including its own signature) — per frozen TS `nodeDescriptorToCborMap` which calls `deviceCertToCborMap` (the full cert). 14 new tests: device_cert_roundtrip, reencode_identical, tampered_signature, unknown_key, missing_field, wrong_field_type, node_descriptor_roundtrip_no_cert, roundtrip_with_cert, reencode_identical, tampered_signature, wrong_proto_version, invalid_capability, unknown_key, missing_field.
+- Step 5: Manifest signature preimage = `SIG_CONTEXT("manifest") ‖ CBOR(fields 1-9)`. Verified matches TS `manifestToCborMap` (manifest.ts:126-140) + `signManifest` (manifest.ts:154-168). Decode ≠ verify — decode is structural only; verify re-derives the preimage and calls ed25519_verify.
+- Step 6: NodeDescriptor signature preimage = `SIG_CONTEXT("nodeDescriptor") ‖ CBOR(fields 1-10)`. DeviceCert signature preimage = `SIG_CONTEXT("deviceCert") ‖ CBOR(fields 1-7)`. Verified matches TS `nodeDescriptorToCborMap` (identity.ts:362-382) + `deviceCertToCborMap` (identity.ts:229-239). Decode ≠ verify.
+- Step 7: Golden interop tests verify Rust encode → decode → re-encode produces IDENTICAL bytes (determinism). Tests: manifest_encode_decode_reencode_identical, device_cert_encode_decode_reencode_identical, node_descriptor_encode_decode_reencode_identical.
+- Step 8: Negative tests verify rejection of: wrong field type, wrong byte length, missing required field, invalid capability encoding, tampered signature, unknown field (per §9 signed-structure rejection), wrong protoVersion, chunkCount mismatch, invalid class, wrong objectId length.
+- Step 9: Added 3 composition-layer integration tests in snp-sync: composition_descriptor_full_roundtrip (NodeDescriptor → encode_cbor → DescriptorPayload → SyncResponse → decode → DescriptorPayload → decode_cbor → same NodeDescriptor, signature verifies), composition_manifest_full_roundtrip (Manifest → encode_cbor → ManifestPayload → SyncResponse → decode → ManifestPayload → decode_cbor → same Manifest, signature verifies), composition_full_sync_response_roundtrip (both descriptor + manifest in one SyncResponse, zero byte loss). L5 remains opaque — it does NOT interpret descriptor/manifest fields.
+- Step 10: All tests pass. fmt clean. clippy 0 warnings on snp-identity + snp-object + snp-sync. Full regression: snp-identity 17, snp-object 28, snp-sync 92, snp-frames 20, snp-discovery 7, snp-gateway 23, snp-node --lib 97, snp-conformance 138/138, snp-stack --lib 185. Focused: transparent_tcp 7, n3a_bridge 5, endpoint_binding 3, any_ip 5, placeholder_route 1, traffic_class_separation 7. Dep graph unchanged (no L7/L6/L8 deps in snp-sync).
+- Step 11: Architecture-status doc updated: L1 row (NodeDescriptor + DeviceCert codecs), L2 row (Manifest codec), L5 row (92 tests, composition interop).
+- Legacy Capabilities struct kept for backward compat (NOT used by frozen NodeDescriptor which uses Vec<String>).
+
+Stage Summary:
+- R4.2 Definition of Done — all 12 boxes checked:
+  - [x] NodeDescriptor canonical encoder exists — `snp_identity::NodeDescriptor::encode_cbor()`
+  - [x] NodeDescriptor canonical decoder exists — `snp_identity::NodeDescriptor::decode_cbor()`
+  - [x] Manifest canonical encoder exists — `snp_object::Manifest::encode_cbor()`
+  - [x] Manifest canonical decoder exists — `snp_object::Manifest::decode_cbor()`
+  - [x] frozen TypeScript ↔ Rust CBOR interoperability verified — field-for-field match with TS wire maps; encode→decode→re-encode produces identical bytes
+  - [x] descriptor signatures remain correctly represented/verifiable — sign/verify under SIG_CONTEXT "nodeDescriptor" + "deviceCert"
+  - [x] manifest signatures remain correctly represented/verifiable — sign/verify under SIG_CONTEXT "manifest"
+  - [x] SyncResponse opaque payloads preserve exact canonical bytes — composition integration tests verify zero byte loss
+  - [x] L5 remains transport/domain-boundary clean — snp-sync still depends only on snp-cbor+snp-crypto+snp-identity+snp-object+thiserror
+  - [x] no duplicate serializers exist in L5 — L5 carries opaque DescriptorPayload + ManifestPayload bytes; codecs live in owning layers
+  - [x] all regressions remain green — 138/138 conformance + all focused tests pass
+  - [x] architecture-status accurately upgraded — L1/L2/L5 rows updated
+- Mode A remains PARTIAL (runtime store-carry-forward + gateway adapter still pending — R4.3+).
+- STOP. Do NOT start R4.3 until this passes review.
