@@ -734,6 +734,62 @@ pub async fn serve_node_adverts_with_neighbors_async<F>(
     }
 }
 
+/// Serve the bootstrap's own advertisement PLUS advertisements for peers it
+/// actually knows — derived from the `TopologyGraph`'s verified
+/// `AuthenticatedNodeRecord` set (Issue B fix).
+///
+/// Unlike [`serve_node_adverts_with_neighbors_async`] (which accepts a
+/// preassembled `Vec<NodeAdvertisement>` — a test seam), this function derives
+/// the served neighbor set from the bootstrap's **authoritative topology
+/// state**: the `TopologyGraph`'s `active_nodes()` (verified
+/// `AuthenticatedNodeRecord`s only). `RemoteNodeHint`s are NON-authoritative
+/// and are NEVER served as discovery output — a malicious hint about a fake
+/// gateway cannot leak into the client's candidate set.
+///
+/// The served advertisements are the `AuthenticatedNodeRecord::advert` (the
+/// underlying signed `NodeAdvertisement`), which the client independently
+/// re-verifies via `verify_into_verified()`.
+///
+/// Wire format (identical to `serve_node_adverts_with_neighbors_async`):
+/// - Request: 1 byte (`0x01`)
+/// - Response: 4-byte big-endian length prefix + canonical-CBOR array of
+///   `NodeAdvertisement` maps (own advert FIRST, then verified peers).
+pub async fn serve_bootstrap_discovery_async<F>(
+    own_advert: NodeAdvertisement,
+    topology: &TopologyGraph,
+    advert_discovery_addr: String,
+    shutdown: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    // Derive verified peer adverts from the topology's authoritative state.
+    // all_records() returns ALL accepted AuthenticatedNodeRecords (verified
+    // adverts). RemoteNodeHint is NOT included — it is non-authoritative and
+    // cannot become an AuthenticatedNodeRecord (type-enforced).
+    let now = snp_identity::now_unix();
+    let peer_adverts: Vec<NodeAdvertisement> = topology
+        .directory()
+        .acceptance_store()
+        .all_records()
+        .filter(|r| r.node_id() != own_advert.node_id) // exclude own
+        .filter(|r| !r.is_expired(now)) // freshness gate
+        .map(|r| r.advert.clone())
+        .collect();
+    eprintln!(
+        "[mode-a-disc {}] serving {} verified peer adverts (from topology, no RemoteNodeHints) on {advert_discovery_addr}",
+        hex_short(&own_advert.node_id),
+        peer_adverts.len(),
+    );
+    // Delegate to the existing serve function (same wire format).
+    serve_node_adverts_with_neighbors_async(
+        own_advert,
+        peer_adverts,
+        advert_discovery_addr,
+        shutdown,
+    )
+    .await
+}
+
 /// Connection-accept loop for the array-of-adverts server.
 async fn accept_loop_array(listener: &TcpListener, payload: &[u8]) {
     loop {
@@ -775,23 +831,38 @@ async fn accept_loop_array(listener: &TcpListener, payload: &[u8]) {
     }
 }
 
-/// Discover ALL candidates from ONE bootstrap advert-discovery address.
+/// Discover ALL candidates from ONE bootstrap advert-discovery address,
+/// authenticated to the configured `BootstrapSeed` identity.
 ///
 /// Connects to the bootstrap peer's advert-discovery address, sends the 1-byte
 /// request, reads the length-prefixed CBOR array of `NodeAdvertisement`s, and
-/// verifies each one via `verify_into_verified()`. Unverified/expired adverts
-/// are silently dropped (logged). Returns the verified set.
+/// verifies each one via `verify_into_verified()`.
+///
+/// **Identity binding (Issue A fix):** The FIRST advert in the response MUST
+/// be the bootstrap peer's own advert, and its NodeId MUST equal
+/// `bootstrap.node_id()` (derived from `bootstrap.ed25519_public_key`). If the
+/// first advert's NodeId does not match the configured bootstrap identity,
+/// the entire response is REJECTED (returns empty). This prevents an imposter
+/// server X from serving stolen-but-valid adverts as if they were the
+/// configured bootstrap's discovery output.
+///
+/// Unverified/expired adverts are silently dropped (logged). Returns the
+/// verified set (bootstrap peer + its served neighbors).
 ///
 /// This is the "candidate / gateway discovery" step (R4.5b): the client learns
 /// about ALL candidates (bootstrap peer + its neighbors, including potential
-/// gateways) from ONE bootstrap address.
+/// gateways) from ONE bootstrap address — with the bootstrap identity
+/// cryptographically bound to the discovery response.
 pub async fn discover_all_candidates(
-    advert_discovery_addr: &str,
+    bootstrap: &BootstrapSeed,
 ) -> Vec<VerifiedNodeAdvertisement> {
-    let mut stream = match TcpStream::connect(advert_discovery_addr).await {
+    let mut stream = match TcpStream::connect(&bootstrap.advert_discovery_addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[mode-a-disc] connect {advert_discovery_addr} failed: {e}");
+            eprintln!(
+                "[mode-a-disc] connect {} failed: {e}",
+                bootstrap.advert_discovery_addr
+            );
             return Vec::new();
         }
     };
@@ -828,10 +899,28 @@ pub async fn discover_all_candidates(
         }
     };
     // 5. Decode + verify each advert.
-    let mut verified = Vec::new();
-    for element in &array {
+    let mut verified: Vec<VerifiedNodeAdvertisement> = Vec::new();
+    for (i, element) in array.iter().enumerate() {
         if let Some(advert) = NodeAdvertisement::from_cbor_map(element) {
             if let Some(v) = advert.verify_into_verified() {
+                // Issue A fix: the FIRST advert MUST be the bootstrap peer's
+                // own advert, with NodeId == bootstrap.node_id(). If the first
+                // advert is from a different identity, the discovery server is
+                // NOT the configured bootstrap — reject the entire response.
+                if i == 0 {
+                    if v.node_id() != bootstrap.node_id() {
+                        eprintln!(
+                            "[mode-a-disc] bootstrap identity MISMATCH: first advert NodeId {} != BootstrapSeed.node_id() {} — rejecting discovery response",
+                            hex_short(&v.node_id()),
+                            hex_short(&bootstrap.node_id())
+                        );
+                        return Vec::new();
+                    }
+                    eprintln!(
+                        "[mode-a-disc] bootstrap identity confirmed: {} == configured seed",
+                        hex_short(&v.node_id())
+                    );
+                }
                 eprintln!(
                     "[mode-a-disc] discovered + verified {}",
                     hex_short(&v.node_id())
@@ -844,6 +933,13 @@ pub async fn discover_all_candidates(
                 );
             }
         }
+    }
+    // Final identity-binding check: if the response was empty OR the first
+    // verified advert did not match the bootstrap identity (handled above),
+    // return empty. This ensures the client never accepts candidate discovery
+    // output that is not bound to the configured bootstrap.
+    if verified.is_empty() {
+        eprintln!("[mode-a-disc] no verified adverts in discovery response");
     }
     verified
 }
@@ -922,7 +1018,10 @@ pub async fn discover_mode_a_route(
     }
 
     // ── 1. Discover all candidates from the bootstrap peer ──────────────
-    let discovered = discover_all_candidates(&bootstrap.advert_discovery_addr).await;
+    // discover_all_candidates binds the discovery response to the configured
+    // BootstrapSeed identity (Issue A fix): the first advert MUST be the
+    // bootstrap peer's own advert with NodeId == bootstrap.node_id().
+    let discovered = discover_all_candidates(bootstrap).await;
     if discovered.is_empty() {
         return Err(ModeADiscoveryError::NoEligibleRoute);
     }

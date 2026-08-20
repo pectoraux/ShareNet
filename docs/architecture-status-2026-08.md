@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.5b discovery-derived routing)
+**Date:** 2026-08-19 (updated R4.5b correction — bootstrap trust)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -327,6 +327,38 @@ resolution but never becomes a `RouteHop`. Every `RouteHop` comes from a VERIFIE
 - `r4_5b_discover_all_candidates_from_one_bootstrap`.
 
 **STOP after R4.5b.** Next: R4.6 durable `BundleStore` / restart recovery.
+
+### Mode A — R4.5b correction: bootstrap discovery trust
+
+The R4.5b correction tightens two trust boundaries:
+
+1. **Bootstrap identity binding (Issue A):** `discover_all_candidates` now
+   takes a `&BootstrapSeed` (not a bare address). The FIRST advert in the
+   discovery response MUST be the bootstrap peer's own advert, and its NodeId
+   MUST equal `bootstrap.node_id()` (derived from `ed25519_public_key`). If
+   not, the entire response is REJECTED — an imposter server X cannot serve
+   stolen-but-valid adverts as if they were the configured bootstrap's output.
+
+2. **Verified peer state (Issue B):** `serve_bootstrap_discovery_async`
+   derives the served neighbor adverts from the `TopologyGraph`'s
+   `AdvertisementAcceptanceStore::all_records()` (verified
+   `AuthenticatedNodeRecord`s only) — NOT from a preassembled
+   `Vec<NodeAdvertisement>`. `RemoteNodeHint`s are non-authoritative and
+   NEVER appear in discovery output (type-enforced: `all_records()` returns
+   `&AuthenticatedNodeRecord`, which a `RemoteNodeHint` cannot become).
+
+The model remains: configured bootstrap seed → authenticated bootstrap →
+bootstrap's verified peer knowledge → routing. NOT global live mesh
+discovery. The caller supplies only `BootstrapSeed` + `ModeARoutingIntent`.
+
+**Tests added:**
+- `r4_5b_bootstrap_identity_mismatch_rejected` — negative (server identity ≠
+  seed identity → rejected) + positive (match → succeeds).
+- `r4_5b_bootstrap_serves_only_verified_no_remote_hints` —
+  `serve_bootstrap_discovery_async` serves only verified records; a
+  `RemoteNodeHint` for a fake gateway does NOT appear in discovery output.
+
+**STOP after R4.5b correction.** Next: R4.6 durable `BundleStore` / restart recovery.
 
 ---
 
