@@ -1008,3 +1008,260 @@ async fn r4_6_restart_quota_accounting_restored() {
     );
     eprintln!("[test] PASS: quota accounting restored after restart");
 }
+
+// ─── 15. Remove failure preserves memory custody (BUG #1 fix) ──────────
+
+/// If the durable file deletion fails, the L5 in-memory store MUST still
+/// contain the bundle. The transaction order is: durable delete → L5 remove.
+/// On failure, L5 is NOT mutated.
+#[tokio::test]
+async fn r4_6_remove_failure_preserves_memory_custody() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x40);
+    let now = snp_identity::now_unix();
+
+    let bundle = Bundle::new(
+        identity.node_id,
+        [0x41; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("bundle");
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+    store.add(bundle.clone()).expect("add");
+
+    // Make the directory read-only → file deletion will fail.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set read-only");
+    }
+
+    // Attempt remove — should fail.
+    let result = store.remove(bundle.bundle_id());
+    assert!(
+        result.is_err(),
+        "remove must fail when durable deletion fails"
+    );
+
+    // Restore permissions for cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+    }
+
+    // The L5 in-memory store MUST still contain the bundle.
+    assert!(
+        store.get(bundle.bundle_id()).is_some(),
+        "L5 store MUST still contain the bundle after durable remove failure"
+    );
+    eprintln!("[test] PASS: remove failure → L5 memory custody preserved");
+}
+
+// ─── 16. Mark_delivered failure preserves state (BUG #2 fix) ───────────
+
+/// If the durable persistence of the `delivered=true` state fails, the L5
+/// in-memory store MUST NOT have `delivered=true`. Transaction order: build
+/// new state → durable write → L5 commit.
+#[tokio::test]
+async fn r4_6_mark_delivered_failure_preserves_state() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x42);
+    let now = snp_identity::now_unix();
+
+    let bundle = Bundle::new(
+        identity.node_id,
+        [0x43; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("bundle");
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+    store.add(bundle.clone()).expect("add");
+
+    // Make the directory read-only → file write will fail.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set read-only");
+    }
+
+    // Attempt mark_delivered — should fail.
+    let result = store.mark_delivered(bundle.bundle_id());
+    assert!(
+        result.is_err(),
+        "mark_delivered must fail when durable write fails"
+    );
+
+    // Restore permissions for cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+    }
+
+    // The L5 in-memory store MUST still have delivered=false.
+    let recovered = store.get(bundle.bundle_id()).expect("bundle still in store");
+    assert!(
+        !recovered.delivered,
+        "L5 store MUST NOT have delivered=true after durable write failure"
+    );
+    eprintln!("[test] PASS: mark_delivered failure → L5 state preserved (delivered=false)");
+}
+
+// ─── 17. Prune_expired removes actual expired bundles (BUG #3 fix) ─────
+
+/// `prune_expired` must actually find and remove expired bundles. The old
+/// code used `pending(now)` which excludes expired bundles → no-op. The fix
+/// uses `expired_ids(now)` which iterates ALL bundles.
+#[tokio::test]
+async fn r4_6_prune_expired_removes_actual_expired_bundles() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x44);
+    let now = snp_identity::now_unix();
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+
+    // Add a non-expired bundle.
+    let fresh = Bundle::new(
+        identity.node_id,
+        [0x45; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("fresh");
+    store.add(fresh.clone()).expect("add fresh");
+
+    // Add an expired bundle (deadline in the past).
+    let expired = Bundle::new(
+        identity.node_id,
+        [0x46; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now - 100,
+        now - 1, // expired
+    )
+    .expect("expired");
+    store.add(expired.clone()).expect("add expired");
+
+    // The store has 2 bundles.
+    assert_eq!(store.len(), 2, "store has 2 bundles before prune");
+
+    // Prune — should remove 1 (the expired one).
+    let count = store.prune_expired(now).expect("prune");
+    assert_eq!(count, 1, "prune_expired must remove 1 expired bundle");
+
+    // The fresh bundle is still there; the expired one is gone.
+    assert!(store.get(fresh.bundle_id()).is_some(), "fresh bundle survives");
+    assert!(store.get(expired.bundle_id()).is_none(), "expired bundle removed");
+    eprintln!("[test] PASS: prune_expired actually finds + removes expired bundles");
+}
+
+// ─── 18. Prune_expired failure preserves custody ────────────────────────
+
+/// If durable deletion fails during prune, remaining bundles stay in memory.
+#[tokio::test]
+async fn r4_6_prune_expired_failure_preserves_custody() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x47);
+    let now = snp_identity::now_unix();
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+
+    // Add an expired bundle.
+    let expired = Bundle::new(
+        identity.node_id,
+        [0x48; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now - 100,
+        now - 1, // expired
+    )
+    .expect("expired");
+    store.add(expired.clone()).expect("add expired");
+
+    // Make the directory read-only → file deletion will fail.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set read-only");
+    }
+
+    // Attempt prune — should fail (durable delete fails).
+    let result = store.prune_expired(now);
+    assert!(
+        result.is_err(),
+        "prune_expired must fail when durable deletion fails"
+    );
+
+    // Restore permissions for cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+    }
+
+    // The expired bundle is still in the L5 store (custody intact).
+    assert!(
+        store.get(expired.bundle_id()).is_some(),
+        "L5 store MUST still contain the bundle after prune failure"
+    );
+    eprintln!("[test] PASS: prune failure → custody preserved");
+}
+
+// ─── 19. Recovery expiry cleanup is durable ─────────────────────────────
+
+/// During `open()`, expired records are unlinked + directory fsync'd. Verify
+/// the expired record is actually removed from the filesystem.
+#[tokio::test]
+async fn r4_6_recovery_expiry_cleanup_is_durable() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x49);
+    let now = snp_identity::now_unix();
+
+    let expired = Bundle::new(
+        identity.node_id,
+        [0x4A; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now - 100,
+        now - 1, // expired
+    )
+    .expect("expired");
+
+    // Persist the expired bundle.
+    {
+        let mut store = PersistentBundleStore::open(&dir).expect("open");
+        store.add(expired.clone()).expect("add expired");
+    }
+
+    // The file exists on disk.
+    let id_hex = expired.bundle_id().to_hex();
+    let file_path = dir.join(format!("{id_hex}.cbor"));
+    assert!(file_path.exists(), "expired bundle file exists before recovery");
+
+    // Advance time + reopen — the expired record should be pruned.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let store = PersistentBundleStore::open(&dir).expect("reopen");
+
+    // The expired bundle is NOT in the recovered store.
+    assert!(
+        store.get(expired.bundle_id()).is_none(),
+        "expired bundle must not be in recovered store"
+    );
+    // The file is gone from disk (durable cleanup).
+    assert!(
+        !file_path.exists(),
+        "expired bundle file must be removed from disk during recovery"
+    );
+    eprintln!("[test] PASS: recovery expiry cleanup is durable (file removed)");
+}

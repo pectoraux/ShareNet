@@ -389,7 +389,19 @@ impl PersistentBundleStore {
             }
             // Prune expired records during recovery.
             if bundle.is_expired(now) {
-                let _ = std::fs::remove_file(&path);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!(
+                        "[mode-a-store] WARNING: failed to remove expired record {}: {e} — continuing",
+                        bundle.bundle_id().to_hex().get(..16).unwrap_or("?")
+                    );
+                } else {
+                    // fsync the directory to make the cleanup durable.
+                    if let Some(dir_path) = path.parent() {
+                        if let Ok(dir_file) = std::fs::File::open(dir_path) {
+                            let _ = dir_file.sync_all();
+                        }
+                    }
+                }
                 eprintln!(
                     "[mode-a-store] pruned expired bundle during recovery: {}",
                     bundle.bundle_id().to_hex().get(..16).unwrap_or("?")
@@ -588,19 +600,29 @@ impl PersistentBundleStore {
     }
 
     /// Remove a bundle (durable if file-backed). Returns the removed bundle.
+    ///
+    /// **Transaction order (R4.6 correction):** durable deletion FIRST, then
+    /// L5 in-memory removal. If the durable deletion fails, the L5 store is
+    /// NOT mutated — the bundle remains in memory + the caller can retry.
     pub fn remove(&mut self, id: &BundleId) -> Result<Option<Bundle>, PersistentStoreError> {
+        // Check if the bundle exists in the authoritative L5 store.
+        if self.store.get(id).is_none() {
+            return Ok(None);
+        }
         // Get the existing bundle's size for accounting before removing.
         let existing_size = self
             .store
             .get(id)
             .and_then(|b| b.to_cbor().ok())
             .map_or(0usize, |bytes| bytes.len());
+        // ── Durable deletion FIRST (fsync) ─────────────────────────────────
+        // If this fails, the L5 store is unchanged — the bundle remains in
+        // memory and the caller can retry.
+        self.remove_bundle_file(id)?;
+        // ── L5 in-memory removal (only after durable success) ─────────────
         let removed = self.store.remove(id);
-        if removed.is_some() {
-            self.remove_bundle_file(id)?;
-            // Update accounting: subtract the removed bundle's size.
-            self.used_bytes = self.used_bytes.saturating_sub(existing_size);
-        }
+        // Update accounting: subtract the removed bundle's size.
+        self.used_bytes = self.used_bytes.saturating_sub(existing_size);
         Ok(removed)
     }
 
@@ -617,51 +639,54 @@ impl PersistentBundleStore {
     }
 
     /// Mark a bundle as delivered (durable if file-backed).
+    ///
+    /// **Transaction order (R4.6 correction):** build the new state, durable
+    /// write it, THEN commit to the L5 in-memory store. If the durable write
+    /// fails, the L5 store is NOT mutated — `delivered` remains `false`.
     pub fn mark_delivered(&mut self, id: &BundleId) -> Result<(), PersistentStoreError> {
-        // Get the old size for accounting.
-        let old_size = self
-            .store
-            .get(id)
-            .and_then(|b| b.to_cbor().ok())
-            .map_or(0usize, |bytes| bytes.len());
+        // Get the existing bundle + clone it (don't mutate L5 yet).
+        let existing = match self.store.get(id) {
+            Some(b) => b.clone(),
+            None => return Ok(()), // not in store — no-op
+        };
+        let old_size = existing
+            .to_cbor()
+            .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?
+            .len();
+        // Build the new state (delivered = true).
+        let mut updated = existing;
+        updated.delivered = true;
+        let new_bytes = updated
+            .to_cbor()
+            .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
+        // ── Durable persist (fsync) BEFORE L5 mutation ─────────────────────
+        self.persist_bundle_bytes_to_file(id, &new_bytes)?;
+        // ── L5 in-memory commit (only after durable success) ───────────────
         self.store.mark_delivered(id);
-        // Re-persist the updated bundle (delivered=true) + update accounting.
-        if let Some(bundle) = self.store.get(id) {
-            let new_bytes = bundle
-                .to_cbor()
-                .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
-            self.persist_bundle_bytes_to_file(id, &new_bytes)?;
-            // Update accounting: replace old size with new size.
-            self.used_bytes = self
-                .used_bytes
-                .saturating_sub(old_size)
-                .saturating_add(new_bytes.len());
-        }
+        // Update accounting: replace old size with new size.
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(old_size)
+            .saturating_add(new_bytes.len());
         Ok(())
     }
 
     /// Prune expired bundles (durable delete). Returns count removed.
+    ///
+    /// **R4.6 correction:** uses `BundleStore::expired_ids(now)` (which
+    /// iterates ALL bundles, including delivered ones) — NOT `pending(now)`
+    /// (which excludes expired + delivered, making the old code a no-op).
+    ///
+    /// **Transaction order:** for each expired bundle, durable delete FIRST
+    /// (fsync), then L5 in-memory removal. If any durable deletion fails,
+    /// the function returns `Err` — remaining bundles stay in memory.
     pub fn prune_expired(&mut self, now: u64) -> Result<usize, PersistentStoreError> {
-        let to_prune: Vec<BundleId> = self
-            .store
-            .pending(now)
-            .iter()
-            .filter(|b| b.is_expired(now))
-            .map(|b| *b.bundle_id())
-            .collect();
+        let to_prune = self.store.expired_ids(now);
         let mut count = 0;
         for id in &to_prune {
             self.remove(id)?;
             count += 1;
         }
-        // Also prune expired non-pending bundles (delivered but expired).
-        let all_expired: Vec<BundleId> = self
-            .store
-            .pending(now)
-            .iter()
-            .map(|b| *b.bundle_id())
-            .collect();
-        let _ = all_expired; // pending() already excludes expired
         Ok(count)
     }
 

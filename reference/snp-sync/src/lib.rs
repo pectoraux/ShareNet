@@ -984,6 +984,23 @@ impl BundleStore {
         n
     }
 
+    /// Return the `BundleId`s of all expired bundles in the store (including
+    /// delivered ones). Unlike `pending(now)` (which excludes expired +
+    /// delivered), this iterates ALL bundles — for use by a persistence
+    /// adapter that needs to identify expired records for durable deletion.
+    ///
+    /// This is a read-only method — it does not mutate the store. The
+    /// adapter is responsible for durably deleting each record BEFORE
+    /// calling `remove()` on this store.
+    #[must_use]
+    pub fn expired_ids(&self, now: u64) -> Vec<BundleId> {
+        self.bundles
+            .iter()
+            .filter(|(_, b)| b.is_expired(now))
+            .map(|(_, b)| b.bundle_id)
+            .collect()
+    }
+
     /// Number of bundles currently in the store.
     #[must_use]
     pub fn len(&self) -> usize {
