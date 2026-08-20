@@ -56,6 +56,7 @@
 
 use super::*;
 
+use snp_crypto::{derive_node_id, X25519PubKey, X25519Secret};
 use snp_identity::NodeId;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,6 +72,12 @@ use crate::node::node_advert::{
     VerifiedNodeAdvertisement,
 };
 use crate::node::route::{Route, RouteHop};
+use crate::node::route_discovery_protocol::{
+    DistributedRouteResolution, ForwardedQuery, ForwardingNode, InMemoryNextHopTransport,
+    NextHopResolver, RecursiveNextHopTransport,
+};
+use crate::node::tcp_route_transport::TcpRecursiveTransport;
+use crate::node::topology::{RemoteNodeHint, TopologyGraph};
 
 /// Short hex representation of a byte slice (first 8 hex chars + "..") for
 /// log/error messages. Defined locally to avoid depending on a private
@@ -146,6 +153,21 @@ pub enum ModeADiscoveryError {
     /// The route failed structural validation after construction.
     #[error("route validation failed: {0}")]
     RouteValidationFailed(String),
+    /// The recursive distributed route-discovery protocol could not reach the
+    /// selected gateway (no path, budget exhausted, advertisement
+    /// verification failed, etc.).
+    #[error("route resolution failed: {reason}")]
+    RouteResolutionFailed {
+        /// Why the resolution failed.
+        reason: String,
+    },
+    /// `DistributedRouteResolution::into_route()` failed verification or
+    /// route construction.
+    #[error("route construction failed: {reason}")]
+    RouteConstructionFailed {
+        /// Why construction failed.
+        reason: String,
+    },
 }
 
 /// Convenience alias.
@@ -433,6 +455,16 @@ pub fn accept_discovered(
 /// - Which candidates exist (discovery's job).
 /// - Transport identity (L8's job — `AuthenticatedBundleCarrier.peer_id`).
 /// - Bundle forwarding (the unchanged `BundleForwarder`'s job).
+///
+/// # Deprecated (R4.5b)
+///
+/// This function takes a **caller-supplied** `relay_order`, which makes path
+/// selection an application decision rather than a routing-layer decision.
+/// R4.5b replaces it with [`discover_mode_a_route`], where the routing layer
+/// autonomously selects both the gateway and the relay path via the existing
+/// recursive distributed route-discovery protocol. This function is retained
+/// for backward compatibility with R4.5a tests.
+#[deprecated(since = "R4.5b", note = "caller-supplied relay_order — use discover_mode_a_route for autonomous path selection")]
 #[must_use]
 pub fn build_mode_a_route(
     source: NodeId,
@@ -561,7 +593,450 @@ pub fn build_mode_a_route(
     Ok(route)
 }
 
-// ─── Test helpers (shared with integration tests) ────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// R4.5b — Discovery-derived autonomous route selection
+//
+// Replaces the R4.5a caller-supplied `relay_order` with a routing intent.
+// The routing layer autonomously selects:
+//   1. the destination gateway (from verified candidates, deterministic)
+//   2. the relay path (via the existing recursive distributed route-discovery
+//      protocol — ForwardedQuery → ForwardingNode chain → into_route())
+//
+// The caller supplies:
+//   - a bootstrap seed (one verified peer's advert-discovery + route-discovery
+//     addresses + public key)
+//   - a routing intent (e.g. AnyInternetGateway)
+//
+// The caller does NOT supply:
+//   - relay_order
+//   - gateway_node_id
+//   - a manually constructed Route
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A bootstrap seed: the minimum information the client needs to start live
+/// discovery. This is a CONFIGURED SEED (one peer's addresses + public key),
+/// NOT a manual per-hop route configuration.
+///
+/// The seed has two addresses because the advert-discovery service
+/// (NodeAdvertisement query) and the route-discovery service
+/// (`TcpForwardingServer` / `ForwardedQuery`) are separate TCP protocols on
+/// separate ports — matching the n223 architecture where the discovery plane
+/// and data plane are separate.
+///
+/// The `ed25519_public_key` is the bootstrap peer's identity key. The NodeId is
+/// derived from it via `derive_node_id` — the caller does NOT need to supply
+/// it separately.
+#[derive(Debug, Clone)]
+pub struct BootstrapSeed {
+    /// The advert-discovery TCP address (to query for NodeAdvertisements).
+    pub advert_discovery_addr: String,
+    /// The route-discovery TCP address (`TcpForwardingServer` — to send
+    /// `ForwardedQuery` messages for recursive route discovery).
+    pub route_discovery_addr: String,
+    /// The bootstrap peer's Ed25519 public key. The NodeId is derived from
+    /// this via `derive_node_id`.
+    pub ed25519_public_key: [u8; 32],
+}
+
+impl BootstrapSeed {
+    /// The bootstrap peer's NodeId (derived from `ed25519_public_key`).
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        derive_node_id(&self.ed25519_public_key)
+    }
+}
+
+/// The routing intent: what the routing layer should select. This is the
+/// caller's ONLY input to path selection (beyond the bootstrap seed).
+///
+/// The caller does NOT supply:
+/// - a specific gateway NodeId
+/// - a relay order
+/// - a manually constructed Route
+///
+/// The routing layer interprets the intent and selects both the destination
+/// gateway and the relay path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeARoutingIntent {
+    /// Select any currently valid INTERNET_GATEWAY (a verified candidate with
+    /// `Capability::Gateway` + X25519 circuit key + not expired + a usable
+    /// TCP endpoint). If multiple gateways are eligible, the routing layer
+    /// selects one deterministically (lowest NodeId).
+    ///
+    /// The relay path to the selected gateway is discovered via the existing
+    /// recursive distributed route-discovery protocol (`resolve_route`).
+    AnyInternetGateway,
+}
+
+/// Serve a node's own advertisement PLUS its known neighbors' advertisements
+/// over the advert-discovery wire protocol.
+///
+/// This extends the R4.5a `serve_node_advertisement_async` to return a CBOR
+/// **array** of `NodeAdvertisement`s (own + neighbors), so the client can
+/// discover ALL candidates from ONE bootstrap address — without the caller
+/// supplying per-hop addresses.
+///
+/// Wire format:
+/// - Request: 1 byte (`0x01`)
+/// - Response: 4-byte big-endian length prefix + canonical-CBOR array of
+///   `NodeAdvertisement` maps.
+///
+/// The neighbor adverts are the neighbors' OWN signed adverts (each
+/// individually verifiable via `verify_into_verified()`). The server does NOT
+/// sign the list itself — each advert carries its own signature. This means
+/// the client independently verifies every advert, and a tampering relay
+/// cannot forge a neighbor advert.
+///
+/// The served adverts carry the nodes' transport `listen_addr` (the data-plane
+/// bundle delivery address), NOT the advert-discovery or route-discovery
+/// addresses. This preserves the frozen invariant: `RouteHop.endpoint ==
+/// signed advert listen_addr`.
+pub async fn serve_node_adverts_with_neighbors_async<F>(
+    own_advert: NodeAdvertisement,
+    neighbor_adverts: Vec<NodeAdvertisement>,
+    advert_discovery_addr: String,
+    shutdown: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    // Encode the full list as a CBOR array.
+    let mut elements: Vec<snp_cbor::CborValue> = Vec::with_capacity(1 + neighbor_adverts.len());
+    elements.push(own_advert.to_cbor_map());
+    for neighbour in &neighbor_adverts {
+        elements.push(neighbour.to_cbor_map());
+    }
+    let array = snp_cbor::CborValue::Array(elements);
+    let payload = match snp_cbor::encode(&array) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[mode-a-disc] encode advert array failed: {e:?}");
+            return;
+        }
+    };
+    let listener = match TcpListener::bind(&advert_discovery_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[mode-a-disc] bind {advert_discovery_addr} failed: {e}");
+            return;
+        }
+    };
+    eprintln!(
+        "[mode-a-disc {}] serving {} adverts (own + {} neighbors) on {advert_discovery_addr}",
+        hex_short(&own_advert.node_id),
+        1 + neighbor_adverts.len(),
+        neighbor_adverts.len()
+    );
+    tokio::select! {
+        _ = accept_loop_array(&listener, &payload) => {}
+        _ = shutdown => {
+            eprintln!("[mode-a-disc {}] shutting down advert discovery service", hex_short(&own_advert.node_id));
+        }
+    }
+}
+
+/// Connection-accept loop for the array-of-adverts server.
+async fn accept_loop_array(listener: &TcpListener, payload: &[u8]) {
+    loop {
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[mode-a-disc] accept error: {e}");
+                continue;
+            }
+        };
+        let payload = payload.to_vec();
+        tokio::spawn(async move {
+            let mut req = [0u8; 1];
+            if let Err(e) = stream.read_exact(&mut req).await {
+                eprintln!("[mode-a-disc] recv request error: {e}");
+                return;
+            }
+            if req[0] != MODE_A_DISCOVERY_REQUEST_BYTE {
+                eprintln!("[mode-a-disc] unexpected request byte 0x{:02x}", req[0]);
+                return;
+            }
+            let len = match u32::try_from(payload.len()) {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("[mode-a-disc] payload too large: {}", payload.len());
+                    return;
+                }
+            };
+            if let Err(e) = stream.write_all(&len.to_be_bytes()).await {
+                eprintln!("[mode-a-disc] send length error: {e}");
+                return;
+            }
+            if let Err(e) = stream.write_all(&payload).await {
+                eprintln!("[mode-a-disc] send adverts error: {e}");
+                return;
+            }
+            let _ = stream.flush().await;
+        });
+    }
+}
+
+/// Discover ALL candidates from ONE bootstrap advert-discovery address.
+///
+/// Connects to the bootstrap peer's advert-discovery address, sends the 1-byte
+/// request, reads the length-prefixed CBOR array of `NodeAdvertisement`s, and
+/// verifies each one via `verify_into_verified()`. Unverified/expired adverts
+/// are silently dropped (logged). Returns the verified set.
+///
+/// This is the "candidate / gateway discovery" step (R4.5b): the client learns
+/// about ALL candidates (bootstrap peer + its neighbors, including potential
+/// gateways) from ONE bootstrap address.
+pub async fn discover_all_candidates(
+    advert_discovery_addr: &str,
+) -> Vec<VerifiedNodeAdvertisement> {
+    let mut stream = match TcpStream::connect(advert_discovery_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[mode-a-disc] connect {advert_discovery_addr} failed: {e}");
+            return Vec::new();
+        }
+    };
+    let _ = stream.set_nodelay(true);
+    // 1. Send discovery request byte.
+    if let Err(e) = stream.write_all(&[MODE_A_DISCOVERY_REQUEST_BYTE]).await {
+        eprintln!("[mode-a-disc] send request error: {e}");
+        return Vec::new();
+    }
+    let _ = stream.flush().await;
+    // 2. Read 4-byte BE length prefix.
+    let mut len_buf = [0u8; 4];
+    if let Err(e) = stream.read_exact(&mut len_buf).await {
+        eprintln!("[mode-a-disc] recv length error: {e}");
+        return Vec::new();
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_ADVERTISEMENT_LEN {
+        eprintln!("[mode-a-disc] payload too large: {len}");
+        return Vec::new();
+    }
+    // 3. Read CBOR array body.
+    let mut buf = vec![0u8; len];
+    if let Err(e) = stream.read_exact(&mut buf).await {
+        eprintln!("[mode-a-disc] recv adverts error: {e}");
+        return Vec::new();
+    }
+    // 4. Decode the CBOR array.
+    let array = match snp_cbor::decode(&buf) {
+        Ok(snp_cbor::CborValue::Array(elements)) => elements,
+        _ => {
+            eprintln!("[mode-a-disc] expected CBOR array, got non-array");
+            return Vec::new();
+        }
+    };
+    // 5. Decode + verify each advert.
+    let mut verified = Vec::new();
+    for element in &array {
+        if let Some(advert) = NodeAdvertisement::from_cbor_map(element) {
+            if let Some(v) = advert.verify_into_verified() {
+                eprintln!(
+                    "[mode-a-disc] discovered + verified {}",
+                    hex_short(&v.node_id())
+                );
+                verified.push(v);
+            } else {
+                eprintln!(
+                    "[mode-a-disc] advert from {} failed verification — dropping",
+                    hex_short(&advert.node_id)
+                );
+            }
+        }
+    }
+    verified
+}
+
+/// Discover a Mode-A `Route` via live discovery + autonomous route selection.
+///
+/// This is the R4.5b composition entry point. The caller supplies:
+/// - `client_identity`: the client's `NodeIdentity`.
+/// - `client_x_sk` / `client_x_pk`: the client's X25519 keypair (for
+///   `TcpRecursiveTransport` SNP-IK handshake).
+/// - `bootstrap`: a [`BootstrapSeed`] (one verified peer's advert-discovery +
+///   route-discovery addresses + public key).
+/// - `intent`: a [`ModeARoutingIntent`] (e.g. `AnyInternetGateway`).
+///
+/// The caller does NOT supply:
+/// - a relay order
+/// - a gateway NodeId
+/// - a manually constructed `Route`
+///
+/// # Pipeline
+///
+/// ```text
+/// bootstrap seed
+///     ↓
+/// discover_all_candidates (TCP → decode CBOR array → verify each)
+///     ↓
+/// TopologyGraph (verified candidate set)
+///     ↓
+/// routing layer: select eligible gateway (Capability::Gateway + circuit key
+///   + not expired + TCP endpoint, lowest NodeId — deterministic)
+///     ↓
+/// RemoteNodeHint { target: gateway_node_id, learned_from: bootstrap_node_id }
+///     ↓
+/// TcpRecursiveTransport (bootstrap peer registered at route_discovery_addr)
+///     ↓
+/// NextHopResolver::resolve_route(gateway_node_id, hint)
+///     ↓
+/// DistributedRouteResolution::into_route()
+///     ↓
+/// immutable Route
+/// ```
+///
+/// The recursive protocol discovers the relay path (A → B → … → Gateway) via
+/// the existing `ForwardingNode` chain — the client does NOT specify the relay
+/// order. The `ForwardedQuery` traverses the route-discovery TCP plane; the
+/// `Route`'s hop endpoints are the signed `listen_addr` values from the
+/// verified adverts (the data plane).
+///
+/// # Trust boundaries
+///
+/// - Every `RouteHop` comes from a VERIFIED `AuthenticatedNodeRecord` (obtained
+///   during recursive discovery + included in the `RecursiveRouteResponse`).
+///   A `RemoteNodeHint` triggers resolution but never itself becomes a
+///   `RouteHop`.
+/// - `RouteHop.endpoint == signed advert listen_addr` (the data-plane address,
+///   NOT the route-discovery address).
+/// - The L8 `AuthenticatedBundleCarrier` handshake at forward time verifies
+///   `route.hop(pos+1).node_id == authenticated_peer`.
+///
+/// # Errors
+/// - `NoEligibleRoute` — discovery returned no candidates.
+/// - `NoGateway` — no eligible gateway (Capability::Gateway + circuit key).
+/// - `RouteResolutionFailed` — the recursive protocol could not reach the
+///   selected gateway.
+/// - `RouteConstructionFailed` — `into_route()` failed verification.
+pub async fn discover_mode_a_route(
+    client_identity: &snp_identity::NodeIdentity,
+    client_x_sk: &X25519Secret,
+    client_x_pk: &X25519PubKey,
+    bootstrap: &BootstrapSeed,
+    intent: ModeARoutingIntent,
+) -> ModeADiscoveryResult<Route> {
+    // Match the intent. For R4.5b, only AnyInternetGateway is supported.
+    match intent {
+        ModeARoutingIntent::AnyInternetGateway => { /* proceed */ }
+    }
+
+    // ── 1. Discover all candidates from the bootstrap peer ──────────────
+    let discovered = discover_all_candidates(&bootstrap.advert_discovery_addr).await;
+    if discovered.is_empty() {
+        return Err(ModeADiscoveryError::NoEligibleRoute);
+    }
+    eprintln!(
+        "[mode-a-r4.5b {}] discovered {} candidates from bootstrap {}",
+        hex_short(&client_identity.node_id),
+        discovered.len(),
+        hex_short(&bootstrap.node_id()),
+    );
+
+    // ── 2. Accept all verified candidates into a TopologyGraph ───────────
+    let mut topology = TopologyGraph::new();
+    for verified in &discovered {
+        let _ = topology.accept_advertisement(verified.clone());
+    }
+
+    // ── 3. Routing layer: select the eligible gateway ───────────────────
+    // Deterministic selection: lowest NodeId among eligible gateways.
+    let now = snp_identity::now_unix();
+    let mut gateway_candidates: Vec<&AuthenticatedNodeRecord> = topology
+        .all_gateway_records()
+        .into_iter()
+        .filter(|r| !r.is_expired(now))
+        .filter(|r| r.endpoints.iter().any(|ep| ep.as_tcp().is_some()))
+        .collect();
+    if gateway_candidates.is_empty() {
+        return Err(ModeADiscoveryError::NoGateway);
+    }
+    gateway_candidates.sort_by_key(|r| r.node_id());
+    let gateway_node_id = gateway_candidates[0].node_id();
+    eprintln!(
+        "[mode-a-r4.5b {}] routing layer selected gateway {} (lowest NodeId, {} eligible)",
+        hex_short(&client_identity.node_id),
+        hex_short(&gateway_node_id),
+        gateway_candidates.len(),
+    );
+
+    // ── 4. Construct the RemoteNodeHint ──────────────────────────────────
+    // The hint is NOT manufactured from an arbitrary NodeId — it is derived
+    // from the ACTUAL verified bootstrap neighbor. `learned_from` is the
+    // bootstrap peer's NodeId (verified in step 2). `target` is the gateway
+    // NodeId (selected by the routing layer from verified candidates).
+    let bootstrap_node_id = bootstrap.node_id();
+    let hint = RemoteNodeHint {
+        target_node_id: gateway_node_id,
+        claimed_sequence: 1,
+        claimed_capabilities: vec!["gateway".to_string()],
+        claimed_visibility: "active".to_string(),
+        claimed_last_seen: now,
+        distance_hint: 1,
+        learned_from: bootstrap_node_id,
+        received_at: now,
+        source_propagation_sequence: 0,
+    };
+
+    // ── 5. Set up the recursive transport ───────────────────────────────
+    // The client's transport knows ONLY the bootstrap peer's route-discovery
+    // address. The recursive protocol discovers the rest of the path through
+    // the ForwardingNode chain (each relay's transport knows its own next hop).
+    let mut transport = TcpRecursiveTransport::new(
+        client_identity.secret_key,
+        client_identity.public_key,
+    );
+    // Register the bootstrap peer at its route-discovery address.
+    transport.add_peer(bootstrap.ed25519_public_key, &bootstrap.route_discovery_addr);
+    let transport = Arc::new(transport);
+
+    // ── 6. Create the NextHopResolver + resolve_route ────────────────────
+    // NextHopResolver::new requires a &dyn NextHopTransport (single-step).
+    // We only use resolve_route (recursive), so the single-step transport is
+    // a placeholder that is never called. We own it locally (no Box::leak).
+    let single_step = InMemoryNextHopTransport::new();
+    let mut resolver = NextHopResolver::new(
+        &topology,
+        &single_step,
+        client_identity.secret_key,
+        client_identity.public_key,
+        client_identity.node_id,
+    )
+    .with_recursive_transport(&*transport);
+
+    eprintln!(
+        "[mode-a-r4.5b {}] starting recursive route discovery → gateway {}",
+        hex_short(&client_identity.node_id),
+        hex_short(&gateway_node_id),
+    );
+    let resolution: Option<DistributedRouteResolution> = resolver
+        .resolve_route(&gateway_node_id, &hint)
+        .await;
+    let resolution = resolution.ok_or(ModeADiscoveryError::RouteResolutionFailed {
+        reason: "recursive discovery returned None (no path to gateway)".into(),
+    })?;
+
+    // ── 7. Verify the resolution + convert to Route ──────────────────────
+    resolution.verify().map_err(|e| {
+        ModeADiscoveryError::RouteConstructionFailed {
+            reason: format!("resolution.verify() failed: {e:?}"),
+        }
+    })?;
+    let route = resolution.into_route().map_err(|e| {
+        ModeADiscoveryError::RouteConstructionFailed {
+            reason: format!("into_route() failed: {e:?}"),
+        }
+    })?;
+
+    eprintln!(
+        "[mode-a-r4.5b {}] route discovered: {} hops, destination {}",
+        hex_short(&client_identity.node_id),
+        route.hop_details().len(),
+        hex_short(&route.destination()),
+    );
+
+    Ok(route)
+}
 
 /// A handle to a running discovery service (for test teardown).
 pub struct DiscoveryServiceHandle {

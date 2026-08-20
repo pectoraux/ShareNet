@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.5 live discovery)
+**Date:** 2026-08-19 (updated R4.5b discovery-derived routing)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | DISCOVERY-BACKED MULTI-HOP (limited) | R4.5: multi-hop store-carry-forward Client → Relay A → Relay B → Gateway. **Live discovery is now used at runtime** — `LiveNodeAdvertDiscovery` queries bootstrap discovery addresses over TCP, receives signed `NodeAdvertisement`s, and verifies each (`verify_into_verified()`: signature + NodeId↔pubkey + expiry + role/key). Verified candidates are accepted into `AdvertisementAcceptanceStore`; `build_mode_a_route` (L6 route builder) selects the gateway by `Capability::Gateway` + circuit key, validates each relay by `Capability::Relay`, enforces freshness (`expiry <= now` rejected), and builds the immutable `Route` from signed descriptors + signed `listen_addr` endpoints. `BundleForwarder` is UNCHANGED — it receives the route. The route is NOT manually constructed by the test. 13 R4.5 tests (integration + discovery-matters + tampering + route-selection). Direction routing-derived (#22): forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client`. Authenticated L8 (SNP-IK + AEAD) + provenance binding (#21) at every hop. **Still limited:** in-memory `BundleStore` (process-lifetime), no durable persistence, host-local egress, no Civic. Bootstrap is a configured discovery seed (NOT decentralized); the route itself is built from discovered/verified candidates (NOT manual per-hop config). |
+| **Mode A** (delay-tolerant) | DISCOVERY-DERIVED AUTONOMOUS MULTI-HOP (limited) | R4.5b: the routing layer autonomously selects both the gateway (from verified candidates, deterministic — lowest NodeId) and the relay path (via the existing recursive distributed route-discovery protocol). **The caller supplies only a `BootstrapSeed` + `ModeARoutingIntent`** — NOT a `relay_order`, NOT a `gateway_node_id`. `discover_mode_a_route(client, bootstrap, AnyInternetGateway)` → `discover_all_candidates` (TCP → CBOR array → verify each) → `TopologyGraph` → routing selects gateway → `NextHopResolver::resolve_route` (ForwardedQuery → ForwardingNode chain) → `DistributedRouteResolution::into_route()` → immutable `Route` → `BundleForwarder` (UNCHANGED). 12 R4.5b tests (autonomous route selection, discovery bypass, gateway selection, capability enforcement, advert security, remote-hint security, endpoint binding, API signature). R4.5a's `build_mode_a_route(source, store, relay_order)` is deprecated. Direction routing-derived (#22): forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client`. Authenticated L8 (SNP-IK + AEAD) + provenance binding (#21) at every hop. `RouteHop.endpoint == signed advert listen_addr` (NOT the route-discovery address — separate TCP planes). **Still limited:** in-memory `BundleStore` (process-lifetime), no durable persistence, host-local egress, no Civic, no route migration. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -253,6 +253,80 @@ silently used — an expired candidate is excluded; an empty store yields
 - No Civic / settlement.
 
 **STOP after R4.5.** Next: R4.6 durable `BundleStore` / restart recovery.
+
+### Mode A — R4.5b discovery-derived autonomous route selection
+
+R4.5b corrects the R4.5a architectural defect: `build_mode_a_route(source,
+store, relay_order)` took a **caller-supplied** `relay_order`, which made path
+selection an application decision rather than a routing-layer decision.
+
+R4.5b introduces `discover_mode_a_route(client, bootstrap, intent)`:
+
+```text
+BootstrapSeed { advert_discovery_addr, route_discovery_addr, ed25519_public_key }
+    ↓
+discover_all_candidates (TCP → CBOR array → verify each)
+    ↓
+TopologyGraph (verified candidate set)
+    ↓
+routing layer: select gateway (Capability::Gateway + circuit key
+    + not expired + TCP endpoint, lowest NodeId — deterministic)
+    ↓
+RemoteNodeHint { target: gateway_node_id, learned_from: bootstrap_node_id }
+    ↓
+TcpRecursiveTransport (bootstrap peer at route_discovery_addr)
+    ↓
+NextHopResolver::resolve_route(gateway_node_id, hint)
+    ↓
+ForwardedQuery → Relay A → Relay B → Gateway (ForwardingNode chain)
+    ↓
+DistributedRouteResolution::verify() + into_route()
+    ↓
+immutable Route (endpoint == signed advert listen_addr)
+    ↓
+BundleForwarder (UNCHANGED — receives the Route)
+```
+
+**The caller does NOT supply:**
+- `relay_order` — the relay path is discovered by the recursive protocol.
+- `gateway_node_id` — the routing layer selects the gateway from verified
+  candidates.
+- A manually constructed `Route`.
+
+**R4.5a vs R4.5b distinction:**
+- R4.5a — live signed-advertisement candidate discovery (caller supplies
+  `relay_order`).
+- R4.5b — discovery-derived route selection (caller supplies `ModeARoutingIntent`).
+
+**Discovery ≠ Routing ≠ Sync (#23 preserved):**
+- Discovery (`discover_all_candidates` + `serve_node_adverts_with_neighbors_async`)
+  finds candidates and verifies them.
+- Routing (`discover_mode_a_route` + `resolve_route` + `into_route`) selects
+  the gateway and the relay path.
+- L5 (`snp-sync`) is untouched.
+- `BundleForwarder` is discovery-blind (unchanged).
+
+**Remote-hint security:** `RemoteNodeHint` is non-authoritative — it triggers
+resolution but never becomes a `RouteHop`. Every `RouteHop` comes from a VERIFIED
+`AuthenticatedNodeRecord` obtained during recursive discovery.
+
+**R4.5b tests** (`r4_5b_discovery_derived_routing.rs`, 12 tests):
+- `r4_5b_autonomous_route_selection_multihop` — full Client → A → B → Gateway
+  round-trip with route built by routing layer (NOT caller-supplied).
+- `r4_5b_discovery_bypass_route_fails_without_discovery` — Phase 1: no
+  discovery → `NoEligibleRoute`; Phase 2: start → route succeeds (no
+  relay_order or gateway_node_id).
+- `r4_5b_gateway_selection_deterministic` — multiple gateways → routing
+  selects lowest NodeId.
+- `r4_5b_non_gateway_cannot_be_destination` — no gateway → `NoGateway`.
+- Advertisement security: tampered signature / wrong NodeId / expired /
+  valid accepted.
+- `r4_5b_remote_hint_cannot_become_route_hop_directly` — structural proof.
+- `r4_5b_route_endpoint_is_signed_listen_addr_not_discovery_addr`.
+- `r4_5b_api_does_not_accept_relay_order_or_gateway_nodeid`.
+- `r4_5b_discover_all_candidates_from_one_bootstrap`.
+
+**STOP after R4.5b.** Next: R4.6 durable `BundleStore` / restart recovery.
 
 ---
 
