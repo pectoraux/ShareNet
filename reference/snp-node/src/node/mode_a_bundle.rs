@@ -535,30 +535,78 @@ impl PersistentBundleStore {
     /// Add a bundle (durable if file-backed). Returns `Err` if persistence OR
     /// quota check fails — the caller MUST NOT send a custody ACK in that case.
     ///
-    /// **Quota check (R4.6 hardening):** BEFORE any filesystem mutation, the
-    /// bundle's serialized size is checked against `max_bundle_size_bytes`
-    /// and the projected total against `max_store_bytes`. If either limit is
-    /// exceeded, `Err` is returned WITHOUT touching the filesystem or the
-    /// in-memory store — the forwarder does NOT ack, and the previous hop
-    /// re-sends.
+    /// **Dedup-aware durability (R4.6 correction):** the L5 `BundleStore::add()`
+    /// uses `more_advanced(existing, incoming)` to determine which bundle wins.
+    /// This adapter MUST determine the winner BEFORE persisting to disk —
+    /// otherwise a stale incoming bundle could overwrite the durable record of
+    /// an advanced existing bundle, causing custody-state regression after
+    /// restart.
     ///
-    /// **Update semantics:** if a bundle with the same `bundle_id` already
-    /// exists (e.g., a re-send with a longer custody chain), the old record's
-    /// size is subtracted from `used_bytes` before the new record is counted,
-    /// so the accounting is correct (no double-count).
+    /// The correct flow:
+    /// ```text
+    /// incoming Bundle
+    ///     ↓
+    /// consult existing L5 BundleStore state
+    ///     ↓
+    /// determine winner using BundleStore::more_advanced
+    ///     ↓
+    /// if incoming loses (existing wins):
+    ///     NO disk mutation, NO L5 mutation, NO quota change → Ok(())
+    ///     (the existing authoritative state is already durable on disk)
     ///
-    /// Delegates to the authoritative L5 `BundleStore::add()` (dedup via
-    /// `more_advanced`), then mirrors to the filesystem.
+    /// if incoming wins (or no existing):
+    ///     quota check the WINNING bundle
+    ///     ↓
+    ///     durably persist WINNING Bundle (fsync)
+    ///     ↓
+    ///     commit WINNING Bundle to L5 BundleStore
+    ///     ↓
+    ///     update used_bytes
+    /// ```
+    ///
+    /// This guarantees `filesystem == L5 authoritative state` after every
+    /// successful mutation.
     pub fn add(&mut self, bundle: Bundle) -> Result<(), PersistentStoreError> {
-        // Serialize the bundle once (needed for both the size check + the
-        // file write). Bundle::to_cbor calls validate(), so a validation
-        // failure is caught here (before any quota check or file mutation).
-        let bytes = bundle
+        let bundle_id = *bundle.bundle_id();
+
+        // ── Step 1: Determine the winner using L5 more_advanced semantics ──
+        // If an existing bundle is more advanced, the incoming bundle is
+        // stale — NO mutation of disk, memory, or quota. The existing
+        // authoritative state is already durable on disk (from a previous
+        // successful add). Returning Ok(()) mirrors the L5 behavior (a
+        // stale add is a no-op, not an error).
+        let winner = match self.store.get(&bundle_id) {
+            Some(existing) => {
+                let winning = BundleStore::more_advanced(existing, &bundle);
+                // If the winner is the existing bundle (same pointer identity
+                // by content equality), the incoming is stale → no-op.
+                if winning.bundle_id == existing.bundle_id
+                    && winning.custody_chain.len() == existing.custody_chain.len()
+                    && winning.delivered == existing.delivered
+                    && winning.created_at == existing.created_at
+                {
+                    // Existing wins — no mutation needed.
+                    eprintln!(
+                        "[mode-a-store] incoming bundle {} is stale (existing is more advanced) — no mutation",
+                        hex_short(bundle_id.as_bytes())
+                    );
+                    return Ok(());
+                }
+                // Incoming wins → persist the incoming bundle.
+                bundle
+            }
+            None => bundle,
+        };
+
+        // ── Step 2: Serialize the WINNING bundle ───────────────────────────
+        // Bundle::to_cbor calls validate(), so a validation failure is caught
+        // here (before any quota check or file mutation).
+        let bytes = winner
             .to_cbor()
             .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
         let bundle_size = bytes.len();
 
-        // ── Quota check (BEFORE any filesystem mutation) ──────────────────
+        // ── Step 3: Quota check (BEFORE any filesystem mutation) ───────────
         // 1. Per-bundle size limit.
         if bundle_size > self.limits.max_bundle_size_bytes {
             return Err(PersistentStoreError::BundleTooLarge {
@@ -571,7 +619,7 @@ impl PersistentBundleStore {
         //    double-count.
         let existing_size = self
             .store
-            .get(bundle.bundle_id())
+            .get(&bundle_id)
             .and_then(|b| b.to_cbor().ok())
             .map_or(0usize, |old_bytes| old_bytes.len());
         let projected = self
@@ -586,15 +634,20 @@ impl PersistentBundleStore {
             });
         }
 
-        // ── Durable persist (fsync) BEFORE in-memory mutation ───────────
-        // If the file write fails, the in-memory store is unchanged and the
-        // caller knows not to ack.
-        self.persist_bundle_bytes_to_file(bundle.bundle_id(), &bytes)?;
-        // Then update the authoritative L5 in-memory store.
+        // ── Step 4: Durable persist (fsync) BEFORE L5 mutation ─────────────
+        // The WINNING bundle is persisted to disk. If the file write fails,
+        // the L5 store is unchanged and the caller knows not to ack.
+        self.persist_bundle_bytes_to_file(&bundle_id, &bytes)?;
+
+        // ── Step 5: Commit the WINNING bundle to the L5 BundleStore ────────
+        // BundleStore::add() will run more_advanced again — but since we
+        // already determined the winner, the result is the same: the incoming
+        // (winning) bundle replaces the existing one.
         self.store
-            .add(bundle)
+            .add(winner)
             .map_err(|e| PersistentStoreError::ValidationFailed(format!("{e:?}")))?;
-        // Update accounting: subtract old (if any), add new.
+
+        // ── Step 6: Update accounting ────────────────────────────────────────
         self.used_bytes = projected;
         Ok(())
     }
