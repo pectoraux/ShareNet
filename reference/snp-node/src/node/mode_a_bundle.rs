@@ -136,6 +136,29 @@ pub enum PersistentStoreError {
     /// A bundle failed `Bundle::validate()` during recovery.
     #[allow(dead_code)]
     ValidationFailed(String),
+    /// A bundle exceeds the per-bundle size limit (`max_bundle_size_bytes`).
+    /// The node MUST NOT acknowledge custody for a bundle it cannot store.
+    #[allow(dead_code)]
+    BundleTooLarge {
+        /// The bundle's serialized size (bytes).
+        bundle_size: usize,
+        /// The configured limit (bytes).
+        limit: usize,
+    },
+    /// Accepting the bundle would exceed the store-wide byte quota
+    /// (`max_store_bytes`). The node MUST NOT acknowledge custody for a
+    /// bundle it cannot durably retain within its configured budget.
+    /// Existing custody is NEVER silently evicted to make room — the new
+    /// custody is rejected before ACK.
+    #[allow(dead_code)]
+    StoreQuotaExceeded {
+        /// The store's current usage (bytes).
+        used_bytes: usize,
+        /// The incoming bundle's serialized size (bytes).
+        bundle_size: usize,
+        /// The configured store-wide limit (bytes).
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for PersistentStoreError {
@@ -146,11 +169,62 @@ impl std::fmt::Display for PersistentStoreError {
                 write!(f, "corrupt custody record {file}: {reason}")
             }
             Self::ValidationFailed(e) => write!(f, "validation failed: {e}"),
+            Self::BundleTooLarge {
+                bundle_size,
+                limit,
+            } => write!(f, "bundle too large: {bundle_size} bytes > limit {limit}"),
+            Self::StoreQuotaExceeded {
+                used_bytes,
+                bundle_size,
+                limit,
+            } => write!(
+                f,
+                "store quota exceeded: used {used_bytes} + new {bundle_size} > limit {limit}"
+            ),
         }
     }
 }
 
 impl std::error::Error for PersistentStoreError {}
+
+/// Storage limits for a `PersistentBundleStore`. **R4.6 hardening.**
+///
+/// A node MUST NOT acknowledge custody for a bundle it cannot durably retain
+/// within its configured budget. These limits are checked BEFORE the custody
+/// ACK is sent — a rejection returns `Err`, and the `BundleForwarder` does
+/// NOT ack (the previous hop re-sends).
+///
+/// Existing custody is NEVER silently evicted to make room for a new bundle.
+/// Expired bundles may be reclaimed (via `prune_expired` or during `open`)
+/// according to R4.2 expiry semantics.
+///
+/// # Defaults
+///
+/// `StorageLimits::default()` sets generous limits suitable for tests:
+/// - `max_bundle_size_bytes`: 1 MiB
+/// - `max_store_bytes`: 64 MiB
+///
+/// Production deployments should configure tighter limits based on the
+/// node's storage capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageLimits {
+    /// Maximum serialized size of a single bundle (bytes). A bundle exceeding
+    /// this is rejected with `BundleTooLarge` before any filesystem mutation.
+    pub max_bundle_size_bytes: usize,
+    /// Maximum total serialized size of all bundles in the store (bytes).
+    /// Accepting a bundle that would push the total over this limit is
+    /// rejected with `StoreQuotaExceeded` before any filesystem mutation.
+    pub max_store_bytes: usize,
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self {
+            max_bundle_size_bytes: 1024 * 1024, // 1 MiB per bundle
+            max_store_bytes: 64 * 1024 * 1024,  // 64 MiB total
+        }
+    }
+}
 
 /// A persistent bundle store — an adapter around the L5 `BundleStore` that
 /// adds file-backed durability. **R4.6.**
@@ -207,17 +281,45 @@ pub struct PersistentBundleStore {
     store: BundleStore,
     /// The directory for file-backed persistence. `None` = in-memory only.
     dir: Option<std::path::PathBuf>,
+    /// The current total serialized size of all bundles in the store (bytes).
+    /// Recalculated during `open()` from the loaded records. Updated on every
+    /// `add`/`remove`/`mark_delivered`.
+    used_bytes: usize,
+    /// Storage limits (per-bundle + store-wide quota). Checked BEFORE any
+    /// filesystem mutation in `add()`.
+    limits: StorageLimits,
 }
 
 impl PersistentBundleStore {
-    /// Create an in-memory-only store (no persistence). Backward compatible
-    /// with R4.3–R4.5b tests.
+    /// Create an in-memory-only store (no persistence) with default limits.
+    /// Backward compatible with R4.3–R4.5b tests.
     #[must_use]
     pub fn new() -> Self {
         Self {
             store: BundleStore::new(),
             dir: None,
+            used_bytes: 0,
+            limits: StorageLimits::default(),
         }
+    }
+
+    /// Set custom storage limits. Chainable.
+    #[must_use]
+    pub fn with_limits(mut self, limits: StorageLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The current total serialized size of all bundles (bytes).
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    /// The configured storage limits.
+    #[must_use]
+    pub fn limits(&self) -> StorageLimits {
+        self.limits
     }
 
     /// Open a durable store from a directory. **Fail-closed on corruption.**
@@ -230,10 +332,24 @@ impl PersistentBundleStore {
     /// - `Io` if the directory cannot be read/created.
     /// - `Corrupt` if any custody record fails decode/validate.
     pub fn open(dir: impl AsRef<std::path::Path>) -> Result<Self, PersistentStoreError> {
+        Self::open_with_limits(dir, StorageLimits::default())
+    }
+
+    /// Open a durable store with custom storage limits. **Fail-closed on
+    /// corruption.** Recalculates `used_bytes` from the loaded records.
+    ///
+    /// # Errors
+    /// - `Io` if the directory cannot be read/created.
+    /// - `Corrupt` if any custody record fails decode/validate.
+    pub fn open_with_limits(
+        dir: impl AsRef<std::path::Path>,
+        limits: StorageLimits,
+    ) -> Result<Self, PersistentStoreError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)
             .map_err(|e| PersistentStoreError::Io(format!("create_dir_all: {e}")))?;
         let mut store = BundleStore::new();
+        let mut used_bytes: usize = 0;
         let now = now_unix();
         let entries = std::fs::read_dir(&dir)
             .map_err(|e| PersistentStoreError::Io(format!("read_dir: {e}")))?;
@@ -280,19 +396,24 @@ impl PersistentBundleStore {
                 );
                 continue;
             }
+            // Recalculate used_bytes from the actual persisted record size.
+            used_bytes = used_bytes.saturating_add(bytes.len());
             // Insert into the authoritative L5 store.
             store
                 .add(bundle)
                 .map_err(|e| PersistentStoreError::ValidationFailed(format!("{e:?}")))?;
         }
         eprintln!(
-            "[mode-a-store] opened durable store at {} — {} bundles recovered",
+            "[mode-a-store] opened durable store at {} — {} bundles recovered, {} bytes used",
             dir.display(),
-            store.len()
+            store.len(),
+            used_bytes
         );
         Ok(Self {
             store,
             dir: Some(dir),
+            used_bytes,
+            limits,
         })
     }
 
@@ -339,6 +460,45 @@ impl PersistentBundleStore {
         Ok(())
     }
 
+    /// Persist pre-serialized bundle bytes to a file (atomic temp-write +
+    /// fsync + rename + dir-fsync). No-op when `dir` is `None`. Used by
+    /// `add()` which already serialized the bytes for the quota check.
+    fn persist_bundle_bytes_to_file(
+        &self,
+        id: &BundleId,
+        bytes: &[u8],
+    ) -> Result<(), PersistentStoreError> {
+        let dir = match &self.dir {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let id_hex = id.to_hex();
+        let final_path = dir.join(format!("{id_hex}.cbor"));
+        let tmp_path = dir.join(format!("{id_hex}.tmp"));
+        // 1. Write to temp file.
+        std::fs::write(&tmp_path, bytes)
+            .map_err(|e| PersistentStoreError::Io(format!("write tmp: {e}")))?;
+        // 2. fsync the temp file.
+        {
+            let file = std::fs::File::open(&tmp_path)
+                .map_err(|e| PersistentStoreError::Io(format!("open tmp for fsync: {e}")))?;
+            file.sync_all()
+                .map_err(|e| PersistentStoreError::Io(format!("fsync tmp: {e}")))?;
+        }
+        // 3. Atomic rename.
+        std::fs::rename(&tmp_path, &final_path)
+            .map_err(|e| PersistentStoreError::Io(format!("rename: {e}")))?;
+        // 4. fsync the directory.
+        {
+            let dir_file = std::fs::File::open(dir)
+                .map_err(|e| PersistentStoreError::Io(format!("open dir for fsync: {e}")))?;
+            dir_file
+                .sync_all()
+                .map_err(|e| PersistentStoreError::Io(format!("fsync dir: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Remove a bundle's file (durable delete). No-op when `dir` is `None`.
     fn remove_bundle_file(&self, id: &BundleId) -> Result<(), PersistentStoreError> {
         let dir = match &self.dir {
@@ -360,28 +520,86 @@ impl PersistentBundleStore {
         Ok(())
     }
 
-    /// Add a bundle (durable if file-backed). Returns `Err` if persistence
-    /// fails — the caller MUST NOT send a custody ACK in that case.
+    /// Add a bundle (durable if file-backed). Returns `Err` if persistence OR
+    /// quota check fails — the caller MUST NOT send a custody ACK in that case.
+    ///
+    /// **Quota check (R4.6 hardening):** BEFORE any filesystem mutation, the
+    /// bundle's serialized size is checked against `max_bundle_size_bytes`
+    /// and the projected total against `max_store_bytes`. If either limit is
+    /// exceeded, `Err` is returned WITHOUT touching the filesystem or the
+    /// in-memory store — the forwarder does NOT ack, and the previous hop
+    /// re-sends.
+    ///
+    /// **Update semantics:** if a bundle with the same `bundle_id` already
+    /// exists (e.g., a re-send with a longer custody chain), the old record's
+    /// size is subtracted from `used_bytes` before the new record is counted,
+    /// so the accounting is correct (no double-count).
     ///
     /// Delegates to the authoritative L5 `BundleStore::add()` (dedup via
     /// `more_advanced`), then mirrors to the filesystem.
     pub fn add(&mut self, bundle: Bundle) -> Result<(), PersistentStoreError> {
-        // Persist to file FIRST (so the bundle is durable before we mutate
-        // in-memory state). If the file write fails, the in-memory store is
-        // unchanged and the caller knows not to ack.
-        self.persist_bundle_to_file(&bundle)?;
+        // Serialize the bundle once (needed for both the size check + the
+        // file write). Bundle::to_cbor calls validate(), so a validation
+        // failure is caught here (before any quota check or file mutation).
+        let bytes = bundle
+            .to_cbor()
+            .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
+        let bundle_size = bytes.len();
+
+        // ── Quota check (BEFORE any filesystem mutation) ──────────────────
+        // 1. Per-bundle size limit.
+        if bundle_size > self.limits.max_bundle_size_bytes {
+            return Err(PersistentStoreError::BundleTooLarge {
+                bundle_size,
+                limit: self.limits.max_bundle_size_bytes,
+            });
+        }
+        // 2. Store-wide byte quota. If the bundle already exists (update),
+        //    subtract the old record's size first so updates don't
+        //    double-count.
+        let existing_size = self
+            .store
+            .get(bundle.bundle_id())
+            .and_then(|b| b.to_cbor().ok())
+            .map_or(0usize, |old_bytes| old_bytes.len());
+        let projected = self
+            .used_bytes
+            .saturating_sub(existing_size)
+            .saturating_add(bundle_size);
+        if projected > self.limits.max_store_bytes {
+            return Err(PersistentStoreError::StoreQuotaExceeded {
+                used_bytes: self.used_bytes,
+                bundle_size,
+                limit: self.limits.max_store_bytes,
+            });
+        }
+
+        // ── Durable persist (fsync) BEFORE in-memory mutation ───────────
+        // If the file write fails, the in-memory store is unchanged and the
+        // caller knows not to ack.
+        self.persist_bundle_bytes_to_file(bundle.bundle_id(), &bytes)?;
         // Then update the authoritative L5 in-memory store.
         self.store
             .add(bundle)
             .map_err(|e| PersistentStoreError::ValidationFailed(format!("{e:?}")))?;
+        // Update accounting: subtract old (if any), add new.
+        self.used_bytes = projected;
         Ok(())
     }
 
     /// Remove a bundle (durable if file-backed). Returns the removed bundle.
     pub fn remove(&mut self, id: &BundleId) -> Result<Option<Bundle>, PersistentStoreError> {
+        // Get the existing bundle's size for accounting before removing.
+        let existing_size = self
+            .store
+            .get(id)
+            .and_then(|b| b.to_cbor().ok())
+            .map_or(0usize, |bytes| bytes.len());
         let removed = self.store.remove(id);
         if removed.is_some() {
             self.remove_bundle_file(id)?;
+            // Update accounting: subtract the removed bundle's size.
+            self.used_bytes = self.used_bytes.saturating_sub(existing_size);
         }
         Ok(removed)
     }
@@ -400,10 +618,24 @@ impl PersistentBundleStore {
 
     /// Mark a bundle as delivered (durable if file-backed).
     pub fn mark_delivered(&mut self, id: &BundleId) -> Result<(), PersistentStoreError> {
+        // Get the old size for accounting.
+        let old_size = self
+            .store
+            .get(id)
+            .and_then(|b| b.to_cbor().ok())
+            .map_or(0usize, |bytes| bytes.len());
         self.store.mark_delivered(id);
-        // Re-persist the updated bundle (delivered=true).
+        // Re-persist the updated bundle (delivered=true) + update accounting.
         if let Some(bundle) = self.store.get(id) {
-            self.persist_bundle_to_file(bundle)?;
+            let new_bytes = bundle
+                .to_cbor()
+                .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
+            self.persist_bundle_bytes_to_file(id, &new_bytes)?;
+            // Update accounting: replace old size with new size.
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(old_size)
+                .saturating_add(new_bytes.len());
         }
         Ok(())
     }

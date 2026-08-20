@@ -40,6 +40,7 @@ use snp_node::node::descriptor::TransportEndpoint;
 use snp_node::node::identity::Capability;
 use snp_node::node::mode_a_bundle::{
     BundleForwarder, ModeAClient, ModeAGateway, PersistentBundleStore, PersistentStoreError,
+    StorageLimits,
 };
 use snp_node::node::node_advert::NodeAdvertisement;
 use snp_node::node::route::{Route, RouteHop, RouteState};
@@ -808,4 +809,202 @@ async fn r4_6_in_memory_backward_compat() {
     assert!(store.is_empty(), "new forwarder store should be empty");
     assert!(store.dir().is_none(), "in-memory store should have no dir");
     eprintln!("[test] PASS: new() creates in-memory store (backward compat)");
+}
+
+// ─── 11. Storage quota — reject before ACK (R4.6 hardening) ────────────
+
+/// A bundle that would exceed `max_store_bytes` is rejected with
+/// `StoreQuotaExceeded` BEFORE any filesystem mutation. The caller MUST NOT
+/// send a custody ACK in that case.
+#[tokio::test]
+async fn r4_6_quota_rejects_before_ack() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x30);
+    let now = snp_identity::now_unix();
+
+    // Small quota: enough for one small bundle but not two.
+    let limits = StorageLimits {
+        max_bundle_size_bytes: 1024, // generous per-bundle
+        max_store_bytes: 300,        // small store
+    };
+    let mut store = PersistentBundleStore::open_with_limits(&dir, limits)
+        .expect("open with limits");
+
+    // First bundle: small enough to fit.
+    let bundle1 = Bundle::new(
+        identity.node_id,
+        [0x31; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("bundle1");
+    store.add(bundle1.clone()).expect("bundle1 fits");
+
+    // Second bundle: would exceed the 300-byte quota.
+    let bundle2 = Bundle::new(
+        identity.node_id,
+        [0x32; 32],
+        BundlePayload::new(vec![0u8; 200]),
+        now,
+        now + 300,
+    )
+    .expect("bundle2");
+    let result = store.add(bundle2);
+    assert!(
+        matches!(result, Err(PersistentStoreError::StoreQuotaExceeded { .. })),
+        "must reject with StoreQuotaExceeded, got {result:?}"
+    );
+    eprintln!("[test] PASS: quota exceeded → rejected before ACK");
+
+    // The first bundle is still present (no eviction).
+    assert!(store.get(bundle1.bundle_id()).is_some(), "existing custody NOT evicted");
+    eprintln!("[test] PASS: existing custody NOT evicted to make room");
+}
+
+// ─── 12. Bundle too large — reject before ACK ──────────────────────────
+
+/// A single bundle exceeding `max_bundle_size_bytes` is rejected with
+/// `BundleTooLarge` before any filesystem mutation.
+#[tokio::test]
+async fn r4_6_bundle_too_large_rejected() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x33);
+    let now = snp_identity::now_unix();
+
+    // Tiny per-bundle limit: 100 bytes.
+    let limits = StorageLimits {
+        max_bundle_size_bytes: 100,
+        max_store_bytes: 64 * 1024 * 1024,
+    };
+    let mut store = PersistentBundleStore::open_with_limits(&dir, limits)
+        .expect("open with limits");
+
+    // Large payload → exceeds 100 bytes when serialized.
+    let bundle = Bundle::new(
+        identity.node_id,
+        [0x34; 32],
+        BundlePayload::new(vec![0u8; 200]),
+        now,
+        now + 300,
+    )
+    .expect("bundle");
+    let result = store.add(bundle);
+    assert!(
+        matches!(result, Err(PersistentStoreError::BundleTooLarge { .. })),
+        "must reject with BundleTooLarge, got {result:?}"
+    );
+    eprintln!("[test] PASS: bundle too large → rejected before ACK");
+}
+
+// ─── 13. Update accounting — no double-count ────────────────────────────
+
+/// When a bundle with the same `bundle_id` is re-added (update with a longer
+/// custody chain), `used_bytes` must reflect only the new record, not both.
+#[tokio::test]
+async fn r4_6_update_accounting_no_double_count() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x35);
+    let relay_a = test_identity(0x36);
+    let relay_b = test_identity(0x37);
+    let now = snp_identity::now_unix();
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+
+    // v1: 1-hop chain.
+    let mut v1 = Bundle::new(
+        client.node_id,
+        [0x38; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("v1");
+    v1.take_custody(
+        client.node_id,
+        relay_a.node_id,
+        &relay_a.secret_key,
+        now,
+        now,
+        custody_nonce(),
+    )
+    .expect("v1 custody");
+    store.add(v1.clone()).expect("add v1");
+    let used_after_v1 = store.used_bytes();
+    eprintln!("[test] used_bytes after v1: {used_after_v1}");
+
+    // v2: 2-hop chain (same bundle_id, more advanced).
+    let mut v2 = v1.clone();
+    v2.take_custody(
+        relay_a.node_id,
+        relay_b.node_id,
+        &relay_b.secret_key,
+        now + 1,
+        now + 1,
+        custody_nonce(),
+    )
+    .expect("v2 custody");
+    store.add(v2.clone()).expect("add v2 (update)");
+    let used_after_v2 = store.used_bytes();
+    eprintln!("[test] used_bytes after v2 update: {used_after_v2}");
+
+    // v2 is larger than v1 (extra CustodyHop), so used_bytes should have
+    // increased by the size difference — NOT by the full v2 size.
+    let v1_size = v1.to_cbor().unwrap().len();
+    let v2_size = v2.to_cbor().unwrap().len();
+    assert!(
+        v2_size > v1_size,
+        "v2 (2-hop) must be larger than v1 (1-hop)"
+    );
+    assert_eq!(
+        used_after_v2,
+        used_after_v1 - v1_size + v2_size,
+        "update must subtract old size + add new size (no double-count)"
+    );
+    eprintln!("[test] PASS: update accounting correct (no double-count)");
+}
+
+// ─── 14. Restart quota recovery — accounting restored ──────────────────
+
+/// After restart, `used_bytes` must match the actual loaded records.
+#[tokio::test]
+async fn r4_6_restart_quota_accounting_restored() {
+    let dir = ephemeral_dir();
+    let identity = test_identity(0x39);
+    let now = snp_identity::now_unix();
+
+    // Persist two bundles.
+    let bundle1 = Bundle::new(
+        identity.node_id,
+        [0x3A; 32],
+        BundlePayload::new(vec![0u8; 20]),
+        now,
+        now + 300,
+    )
+    .expect("bundle1");
+    let bundle2 = Bundle::new(
+        identity.node_id,
+        [0x3B; 32],
+        BundlePayload::new(vec![0u8; 30]),
+        now,
+        now + 300,
+    )
+    .expect("bundle2");
+
+    let expected_used;
+    {
+        let mut store = PersistentBundleStore::open(&dir).expect("open");
+        store.add(bundle1.clone()).expect("add 1");
+        store.add(bundle2.clone()).expect("add 2");
+        expected_used = store.used_bytes();
+        eprintln!("[test] used_bytes before restart: {expected_used}");
+    }
+    // Restart.
+    let store = PersistentBundleStore::open(&dir).expect("reopen");
+    assert_eq!(
+        store.used_bytes(),
+        expected_used,
+        "used_bytes must be exactly restored after restart"
+    );
+    eprintln!("[test] PASS: quota accounting restored after restart");
 }
