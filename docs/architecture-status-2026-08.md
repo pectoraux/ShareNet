@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.6 durable custody)
+**Date:** 2026-08-19 (updated R4.7 real Internet egress)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | DISCOVERY-DERIVED AUTONOMOUS MULTI-HOP + DURABLE CUSTODY (limited) | R4.6: `PersistentBundleStore` (snp-node composition adapter) adds file-backed durability to the L5 `BundleStore`. **The L5 `BundleStore` remains the authoritative custody model** — the adapter owns + mirrors it, not a second authority. Durable write: `write(tmp)` → `fsync(tmp)` → `rename` → `fsync(dir)` before custody ACK. **Fail-closed corruption:** `open(dir)` returns `Err` if any `.cbor` record is corrupt — the node does not silently forget acknowledged custody. Restart recovery: `open()` loads durable bundles → the existing `forward_pending_bundles()` retry loop resumes. 10 R4.6 tests (basic durability, custody durability, crash-before-ACK, crash-after-ACK, expiry recovery, duplicate insertion, corruption fail-closed, full restart integration). R4.5b autonomous routing + R4.4 direction (#22) + R4.3 provenance (#21) preserved. `BundleForwarder::new()` defaults to in-memory (backward compat); `new_with_durable_store()` takes a `PersistentBundleStore`. **Custody dedup ≠ application exactly-once** (L7 reqId dedup is separate). **Still limited:** host-local egress, no Civic, no route migration, no hard storage quota. |
+| **Mode A** (delay-tolerant) | DISCOVERY-DERIVED MULTI-HOP + DURABLE CUSTODY + REAL INTERNET EGRESS (limited) | R4.7: Mode-A `BundleForwarder` path proven with real Internet egress via the production `PinnedConnector::new()` (SSRF defence + DNS pinning + rustls TLS + IP validation). Deadline-aware timeout: Bundle `deadline` maps to connect/read timeouts. Chunked `Transfer-Encoding` explicitly rejected (R4.7 limitation: HTTP/1.1, non-chunked, GET-oriented, ports 80/443, redirects disabled). 10 R4.7 tests (local integration, chunked rejection, expired deadline, 7 SSRF rejections) + 1 opt-in `#[ignore]` real-Internet HTTPS test. R4.6 durable custody preserved. R4.5b autonomous routing preserved. R4.4 direction (#22) + R4.3 provenance (#21) preserved. **R4.7 limitations honestly stated:** no POST body, no HTTP/2, no streaming, no chunked transfer, no arbitrary egress ports. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -435,6 +435,73 @@ is an L7 concern, outside `BundleStore`.
 - Discovery, routing, Civic
 
 **STOP after R4.6.** No Civic. No route migration. No hard storage quota.
+
+### Mode A — R4.7 real Internet egress
+
+R4.7 proves that the Mode-A `BundleForwarder` path can reach a real public
+HTTPS endpoint via the gateway's production `PinnedConnector::new()` egress.
+
+```text
+Client (ModeAClient)
+  ↓ send_request(https://example.com/, relay, gateway)
+BundleForwarder (Relay A)
+  ↓
+BundleForwarder (Relay B)
+  ↓
+ModeAGateway
+  ↓ PinnedConnector::new(url) — production path
+  → URL validation (scheme, port, length)
+  → SSRF literal-host check
+  → DNS resolution → validate EVERY IP (DNS rebinding defence)
+  → IP pinning
+  → TCP connect to pinned IP (deadline-aware timeout)
+  → TLS handshake (rustls + webpki-roots, SNI=hostname)
+  → HTTP/1.1 request (GET, Connection: close)
+  → Response parsing (status, headers, Content-Length body)
+  → Chunked Transfer-Encoding: REJECTED explicitly
+  → Response body capped at max_response_bytes (read-time)
+  → TransitResponse (signed by gateway)
+  ↓ response Bundle
+BundleForwarder (Relay B → Relay A)
+  ↓
+ModeAClient
+  ↓ verify_transit_response (gateway signature + reqId match)
+```
+
+**R4.7 changes:**
+- `fetch_with_limit` now takes a `deadline` parameter → maps to
+  `connect_timeout = min(remaining, CONNECT_TIMEOUT_SECS)` and
+  `read_timeout = min(remaining, READ_TIMEOUT_SECS)`. Expired deadline →
+  rejected before TCP connect.
+- Chunked `Transfer-Encoding` is explicitly rejected with a clear error
+  (the HTTP/1.1 parser does NOT implement chunked decoding — silently
+  treating chunked bytes as a normal body would corrupt data).
+
+**R4.7 limitations (honestly stated):**
+- HTTP/1.1 only (no HTTP/2)
+- GET-oriented (no request body support — `TransitRequest` has no `body` field)
+- Non-chunked responses only (chunked is explicitly rejected)
+- Ports 80/443 only (fail-closed on non-standard)
+- Redirects disabled (3xx returned verbatim)
+- No POST/PUT/PATCH/DELETE body support
+
+**R4.7 tests** (`r4_7_real_internet_egress.rs`, 10 + 1 ignored):
+- `r4_7_mode_a_local_egress_integration` — Client → A → B → Gateway →
+  local mock HTTP → response → B → A → Client (uses `from_parts` test bypass)
+- `r4_7_chunked_transfer_encoding_rejected` — chunked explicitly rejected
+- `r4_7_expired_deadline_prevents_egress` — expired Bundle deadline →
+  egress rejected before TCP
+- 7 SSRF rejection tests (loopback, private IP, metadata endpoint,
+  unsupported scheme, non-standard port, IPv6 loopback, link-local)
+- `r4_7_production_real_internet_egress` (#[ignore]) — opt-in real HTTPS
+  via `PinnedConnector::new()` through the full Mode-A mesh
+
+**Preserved:** all SSRF defences, DNS rebinding protection, IP pinning,
+rustls TLS SNI/cert validation, response/header size limits, redirect
+disabling, gateway signature integrity, reqId binding, provenance #21,
+direction #22, durable custody #24.
+
+**STOP after R4.7.**
 
 ---
 

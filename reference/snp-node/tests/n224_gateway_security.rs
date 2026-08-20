@@ -198,9 +198,18 @@ fn test_connector_factory(url: &str) -> Result<PinnedConnector, snp_node::legacy
 }
 
 fn hex_short(b: &[u8]) -> String {
-    let n = b.len().min(8);
-    b[..n].iter().map(|x| format!("{x:02x}")).collect::<String>() + "…"
+    let hex: String = b.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{hex}..")
 }
+
+/// R4.7: far-future deadline for test fetches that don't have a Bundle deadline.
+fn far_future() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() + 300)
+        .unwrap_or(u64::MAX)
+}
+
 // `hex_short` is intentionally kept for debugging; suppress the dead-code
 // warning so the test file compiles cleanly.
 #[allow(dead_code)]
@@ -939,7 +948,7 @@ async fn response_size_limit_enforced_at_read_time() {
     let connector = test_connector_for_port(port);
 
     let result = tokio::task::spawn_blocking(move || {
-        connector.fetch_with_limit("GET", &[], 50)
+        connector.fetch_with_limit("GET", &[], 50, far_future())
     })
     .await
     .expect("spawn_blocking join");
@@ -969,7 +978,7 @@ async fn response_size_limit_boundary_at_cap() {
     let connector_ok = test_connector_for_port(port_ok);
 
     let result_ok = tokio::task::spawn_blocking(move || {
-        connector_ok.fetch_with_limit("GET", &[], 50)
+        connector_ok.fetch_with_limit("GET", &[], 50, far_future())
     })
     .await
     .expect("spawn_blocking join");
@@ -991,7 +1000,7 @@ async fn response_size_limit_boundary_at_cap() {
     let connector_over = test_connector_for_port(port_over);
 
     let result_over = tokio::task::spawn_blocking(move || {
-        connector_over.fetch_with_limit("GET", &[], 50)
+        connector_over.fetch_with_limit("GET", &[], 50, far_future())
     })
     .await
     .expect("spawn_blocking join");
@@ -1018,7 +1027,7 @@ async fn huge_content_length_rejected_before_body_read() {
     let connector = test_connector_for_port(port);
 
     let result = tokio::task::spawn_blocking(move || {
-        connector.fetch_with_limit("GET", &[], 1024)
+        connector.fetch_with_limit("GET", &[], 1024, far_future())
     })
     .await
     .expect("spawn_blocking join");
@@ -1049,7 +1058,7 @@ async fn huge_close_delimited_response_rejected() {
     let connector = test_connector_for_port(port);
 
     let result = tokio::task::spawn_blocking(move || {
-        connector.fetch_with_limit("GET", &[], 100)
+        connector.fetch_with_limit("GET", &[], 100, far_future())
     })
     .await
     .expect("spawn_blocking join");

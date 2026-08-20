@@ -1122,7 +1122,12 @@ impl PinnedConnector {
     /// Returns [`GatewayError::Upstream`] on TCP or TLS failure, or
     /// [`GatewayError::MalformedHttp`] if the response cannot be parsed.
     pub fn fetch(&self, method: &str, headers: &[(String, String)]) -> GatewayResult<HttpResponse> {
-        self.fetch_with_limit(method, headers, u64::MAX)
+        // Deprecated: no deadline → use a far-future deadline (300s from now).
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + 300)
+            .unwrap_or(u64::MAX);
+        self.fetch_with_limit(method, headers, u64::MAX, far_future)
     }
 
     /// **N2.2.4-hardening.** Issue a single HTTP/1.1 request to the pinned IP
@@ -1163,16 +1168,34 @@ impl PinnedConnector {
         method: &str,
         headers: &[(String, String)],
         max_response_bytes: u64,
+        deadline: u64,
     ) -> GatewayResult<HttpResponse> {
+        // R4.7: Deadline-aware timeout. Map the Bundle's deadline to the
+        // remaining egress lifetime. The gateway MUST NOT continue a blocking
+        // upstream request beyond the Bundle's usable deadline.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if deadline <= now {
+            return Err(GatewayError::MalformedRequest(format!(
+                "Bundle deadline {deadline} has already passed (now={now}) — egress rejected"
+            )));
+        }
+        let remaining = deadline - now;
+        // Clamp timeouts to the remaining Bundle lifetime.
+        let connect_timeout = Duration::from_secs(remaining.min(CONNECT_TIMEOUT_SECS));
+        let read_write_timeout = Duration::from_secs(remaining.min(READ_TIMEOUT_SECS));
+
         // Connect TCP to the EXACT validated IP. This is the core of the N1.9
         // DNS pinning: the TCP connection goes to the IP we validated, NOT
         // to a re-resolved hostname.
         let sock_addr = SocketAddr::new(self.resolved_ip, self.port);
-        let mut tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        let mut tcp = TcpStream::connect_timeout(&sock_addr, connect_timeout)
             .map_err(|e| GatewayError::Upstream(format!("TCP connect to {sock_addr}: {e}")))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        tcp.set_read_timeout(Some(read_write_timeout))
             .map_err(|e| GatewayError::Upstream(format!("set_read_timeout: {e}")))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        tcp.set_write_timeout(Some(read_write_timeout))
             .map_err(|e| GatewayError::Upstream(format!("set_write_timeout: {e}")))?;
         tcp.set_nodelay(true).ok();
 
@@ -1479,6 +1502,7 @@ fn parse_http_status_and_headers(
 
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -1491,7 +1515,21 @@ fn parse_http_status_and_headers(
         if name.eq_ignore_ascii_case("content-length") {
             content_length = value.parse().ok();
         }
+        // R4.7: Reject chunked Transfer-Encoding explicitly. The gateway's
+        // HTTP/1.1 parser does NOT implement chunked decoding — silently
+        // treating chunked bytes as a normal body would produce corrupted
+        // data. Reject with a clear error rather than misparse.
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            is_chunked = true;
+        }
         headers.push((name, value));
+    }
+    if is_chunked {
+        return Err(GatewayError::MalformedHttp(
+            "Transfer-Encoding: chunked is NOT supported by the gateway HTTP/1.1 parser (R4.7 limitation) — request rejected to prevent data corruption".into(),
+        ));
     }
     Ok((status, headers, content_length))
 }
@@ -1855,7 +1893,7 @@ fn fetch_and_sign_with_connector(
     // GatewayError::ResponseTooLarge (or HeadersTooLarge) — NOT a truncated
     // body. This is the correct behaviour: an oversized response is an error,
     // not a silently-truncated success.
-    let http_response = connector.fetch_with_limit(req.method.as_str(), &[], req.max_response_bytes)?;
+    let http_response = connector.fetch_with_limit(req.method.as_str(), &[], req.max_response_bytes, req.deadline)?;
     let status = http_response.status;
     let headers = http_response.headers;
     let body = http_response.body;
