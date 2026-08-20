@@ -920,6 +920,37 @@ impl BundleStore {
         Ok(())
     }
 
+    /// Determine the authoritative winning Bundle when merging `bundle` into
+    /// the store, WITHOUT mutating the store. Returns the bundle that WOULD
+    /// become authoritative if `add(bundle)` were called.
+    ///
+    /// This is the SINGLE authoritative implementation of the merge semantics.
+    /// Persistence adapters MUST use this (not a field-comparison heuristic)
+    /// to determine which bundle to durably persist — ensuring
+    /// `filesystem == L5 authoritative state`.
+    ///
+    /// - If no existing bundle: returns `bundle` (the incoming wins by
+    ///   default).
+    /// - If an existing bundle exists: returns `more_advanced(existing,
+    ///   bundle)` — which uses the exact L5 tie-break rules:
+    ///   1. delivered beats undelivered
+    ///   2. longer custody chain beats shorter
+    ///   3. later `created_at` wins; **on equal `created_at`, the incoming
+    ///      bundle wins** (`b.created_at >= a.created_at → b`).
+    ///
+    /// The caller can compare the returned winner with the incoming bundle
+    /// by identity (same `bundle_id` + same `custody_chain` content) to
+    /// determine whether the incoming won or lost. If the incoming lost, no
+    /// persistence mutation is needed (the existing authoritative state is
+    /// already durable).
+    #[must_use]
+    pub fn merge_bundle(&self, bundle: &Bundle) -> Bundle {
+        match self.bundles.get(bundle.bundle_id().as_bytes()) {
+            Some(existing) => Self::more_advanced(existing, bundle),
+            None => bundle.clone(),
+        }
+    }
+
     /// Get the bundle for a given `bundle_id`, or `None` if not present.
     #[must_use]
     pub fn get(&self, id: &BundleId) -> Option<&Bundle> {

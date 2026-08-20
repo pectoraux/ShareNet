@@ -44,7 +44,7 @@ use snp_node::node::mode_a_bundle::{
 };
 use snp_node::node::node_advert::NodeAdvertisement;
 use snp_node::node::route::{Route, RouteHop, RouteState};
-use snp_sync::{Bundle, BundlePayload, CUSTODY_NONCE_BYTES};
+use snp_sync::{Bundle, BundlePayload, BundleStore, CUSTODY_NONCE_BYTES};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1623,4 +1623,312 @@ async fn r4_6_quota_on_stale_bundle_no_rejection() {
         "memory must be unchanged (chain=2) — stale did not overwrite"
     );
     eprintln!("[test] PASS: stale bundle not rejected for quota — existing wins (no mutation)");
+}
+
+// ─── 26. Equal created_at uses L5 tie-break (incoming wins) ───────────
+
+/// When existing and incoming have the same `created_at`, same chain length,
+/// same delivered state — L5's `more_advanced` gives the tie to the INCOMING
+/// bundle (`b.created_at >= a.created_at → b`). The persistent adapter MUST
+/// produce the same result.
+///
+/// This is the exact bug that was fixed: the previous heuristic treated
+/// equal-created_at as "existing wins", which is the OPPOSITE of L5.
+#[tokio::test]
+async fn r4_6_equal_created_at_uses_l5_tie_break() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x64);
+    let relay_a = test_identity(0x65);
+    let now = snp_identity::now_unix();
+
+    // Existing: 1-hop chain, created_at = now.
+    let mut existing = Bundle::new(
+        client.node_id,
+        [0x66; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now, // same created_at
+        now + 300,
+    )
+    .expect("existing");
+    existing
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+
+    // Incoming: 1-hop chain (same bundle_id, same created_at, but different
+    // nonce → different custody_chain content). L5: incoming wins the tie.
+    let mut incoming = Bundle::new(
+        client.node_id,
+        [0x66; 32], // same destination → same bundle_id
+        BundlePayload::new(vec![0u8; 10]),
+        now, // same created_at → L5 tie → incoming wins
+        now + 300,
+    )
+    .expect("incoming");
+    incoming
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+
+    // Verify L5 behavior: more_advanced(existing, incoming) → incoming.
+    let l5_winner = BundleStore::more_advanced(&existing, &incoming);
+    // The winner should be `incoming` (different nonce → different chain bytes).
+    // We can verify by comparing the custody chain nonce.
+    assert_ne!(
+        l5_winner.custody_chain[0].nonce,
+        existing.custody_chain[0].nonce,
+        "L5 more_advanced must return the incoming bundle on created_at tie"
+    );
+
+    let mut store = PersistentBundleStore::open(&dir).expect("open");
+    store.add(existing.clone()).expect("add existing");
+    store.add(incoming.clone()).expect("add incoming (tie → incoming wins)");
+
+    // Memory MUST be the incoming bundle (L5 tie-break: incoming wins).
+    let in_memory = store.get(existing.bundle_id()).expect("bundle in store");
+    assert_ne!(
+        in_memory.custody_chain[0].nonce,
+        existing.custody_chain[0].nonce,
+        "L5 memory must have the INCOMING bundle (tie → incoming wins)"
+    );
+    eprintln!("[test] PASS: equal created_at → L5 tie-break (incoming wins) in memory");
+
+    // Disk MUST also be the incoming bundle.
+    drop(store);
+    let reopened = PersistentBundleStore::open(&dir).expect("reopen");
+    let recovered = reopened.get(existing.bundle_id()).expect("bundle recovered");
+    assert_ne!(
+        recovered.custody_chain[0].nonce,
+        existing.custody_chain[0].nonce,
+        "disk must have the INCOMING bundle (tie → incoming wins) after restart"
+    );
+    eprintln!("[test] PASS: equal created_at → L5 tie-break (incoming wins) on disk");
+}
+
+// ─── 27. Equal created_at restart preserves winner ─────────────────────
+
+/// After the tie-break (incoming wins) + restart, the recovered bundle must
+/// be the incoming (winner), not the existing (loser).
+#[tokio::test]
+async fn r4_6_equal_created_at_restart_preserves_winner() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x67);
+    let relay_a = test_identity(0x68);
+    let now = snp_identity::now_unix();
+
+    // Both have same created_at, same chain length → L5 tie → incoming wins.
+    let mut existing = Bundle::new(
+        client.node_id,
+        [0x69; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("existing");
+    existing
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody");
+
+    let mut incoming = Bundle::new(
+        client.node_id,
+        [0x69; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("incoming");
+    incoming
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody");
+
+    {
+        let mut store = PersistentBundleStore::open(&dir).expect("open");
+        store.add(existing.clone()).expect("add existing");
+        store.add(incoming.clone()).expect("add incoming (wins tie)");
+    }
+    // Restart.
+    let store = PersistentBundleStore::open(&dir).expect("reopen");
+    let recovered = store.get(existing.bundle_id()).expect("bundle recovered");
+    // The winner is the incoming (different nonce).
+    assert_ne!(
+        recovered.custody_chain[0].nonce,
+        existing.custody_chain[0].nonce,
+        "restart must recover the incoming (winner) — not the existing (loser)"
+    );
+    eprintln!("[test] PASS: equal created_at restart preserves the incoming winner");
+}
+
+// ─── 28. Existing winner persists unchanged ─────────────────────────────
+
+/// When existing has a longer chain (existing wins), the disk must remain
+/// unchanged after a stale incoming add.
+#[tokio::test]
+async fn r4_6_existing_winner_persists_unchanged() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x6A);
+    let relay_a = test_identity(0x6B);
+    let relay_b = test_identity(0x6C);
+    let now = snp_identity::now_unix();
+
+    // Existing: 2-hop chain.
+    let mut existing = Bundle::new(
+        client.node_id,
+        [0x6D; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("existing");
+    existing
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+    existing
+        .take_custody(relay_a.node_id, relay_b.node_id, &relay_b.secret_key, now + 1, now + 1, custody_nonce())
+        .expect("custody 2");
+
+    // Stale incoming: 1-hop chain (same bundle_id, shorter → existing wins).
+    let mut stale = Bundle::new(
+        client.node_id,
+        [0x6D; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("stale");
+    stale
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+
+    let existing_nonce = existing.custody_chain[0].nonce;
+
+    {
+        let mut store = PersistentBundleStore::open(&dir).expect("open");
+        store.add(existing.clone()).expect("add existing");
+        store.add(stale.clone()).expect("add stale (no-op)");
+    }
+    // Restart — disk must have the existing (chain=2, same nonce).
+    let store = PersistentBundleStore::open(&dir).expect("reopen");
+    let recovered = store.get(existing.bundle_id()).expect("bundle recovered");
+    assert_eq!(
+        recovered.custody_chain.len(),
+        2,
+        "disk must have the existing (chain=2) — stale did not overwrite"
+    );
+    assert_eq!(
+        recovered.custody_chain[0].nonce,
+        existing_nonce,
+        "disk must have the existing bundle's nonce — unchanged"
+    );
+    eprintln!("[test] PASS: existing winner persists unchanged after stale add");
+}
+
+// ─── 29. Incoming winner persists ──────────────────────────────────────
+
+/// When incoming has a longer chain (incoming wins), the disk must have the
+/// incoming bundle.
+#[tokio::test]
+async fn r4_6_incoming_winner_persists() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x6E);
+    let relay_a = test_identity(0x6F);
+    let relay_b = test_identity(0x70);
+    let now = snp_identity::now_unix();
+
+    // Existing: 1-hop chain.
+    let mut existing = Bundle::new(
+        client.node_id,
+        [0x71; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("existing");
+    existing
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+
+    // Incoming: 2-hop chain (same bundle_id, longer → incoming wins).
+    let mut incoming = existing.clone();
+    incoming
+        .take_custody(relay_a.node_id, relay_b.node_id, &relay_b.secret_key, now + 1, now + 1, custody_nonce())
+        .expect("custody 2");
+
+    {
+        let mut store = PersistentBundleStore::open(&dir).expect("open");
+        store.add(existing.clone()).expect("add existing");
+        store.add(incoming.clone()).expect("add incoming (wins)");
+    }
+    // Restart — disk must have the incoming (chain=2).
+    let store = PersistentBundleStore::open(&dir).expect("reopen");
+    let recovered = store.get(existing.bundle_id()).expect("bundle recovered");
+    assert_eq!(
+        recovered.custody_chain.len(),
+        2,
+        "disk must have the incoming (chain=2) — incoming winner persisted"
+    );
+    eprintln!("[test] PASS: incoming winner persisted to disk");
+}
+
+// ─── 30. Quota applies only to authoritative winner ────────────────────
+
+/// A stale incoming bundle that is larger than the quota is NOT rejected if
+/// the existing bundle wins. The quota check is only applied to the winner.
+/// This is already tested in r4_6_quota_on_stale_bundle_no_rejection — this
+/// test additionally verifies that used_bytes is unchanged after a stale add.
+#[tokio::test]
+async fn r4_6_quota_applies_only_to_authoritative_winner() {
+    let dir = ephemeral_dir();
+    let client = test_identity(0x72);
+    let relay_a = test_identity(0x73);
+    let relay_b = test_identity(0x74);
+    let now = snp_identity::now_unix();
+
+    let limits = StorageLimits {
+        max_bundle_size_bytes: 1024,
+        max_store_bytes: 2048,
+    };
+    let mut store = PersistentBundleStore::open_with_limits(&dir, limits)
+        .expect("open with limits");
+
+    // Advanced existing: 2-hop chain.
+    let mut advanced = Bundle::new(
+        client.node_id,
+        [0x75; 32],
+        BundlePayload::new(vec![0u8; 10]),
+        now,
+        now + 300,
+    )
+    .expect("advanced");
+    advanced
+        .take_custody(client.node_id, relay_a.node_id, &relay_a.secret_key, now, now, custody_nonce())
+        .expect("custody 1");
+    advanced
+        .take_custody(relay_a.node_id, relay_b.node_id, &relay_b.secret_key, now + 1, now + 1, custody_nonce())
+        .expect("custody 2");
+    store.add(advanced.clone()).expect("add advanced");
+
+    let used_before = store.used_bytes();
+
+    // Stale incoming: 0-hop chain (same bundle_id = same source/dest/
+    // created_at/deadline/payload → no custody chain → existing (2-hop)
+    // wins by chain length). The bundle has the same identity as `advanced`
+    // but no custody chain, making it stale.
+    let stale = Bundle::new(
+        client.node_id,
+        [0x75; 32],
+        BundlePayload::new(vec![0u8; 10]), // SAME payload → same bundle_id
+        now,
+        now + 300,
+    )
+    .expect("stale");
+
+    // Add the stale bundle — it loses (0-hop < 2-hop). No quota check,
+    // no mutation.
+    store.add(stale).expect("stale add (no-op)");
+
+    // used_bytes MUST be unchanged (no mutation).
+    assert_eq!(
+        store.used_bytes(),
+        used_before,
+        "used_bytes must be unchanged after stale add (no mutation)"
+    );
+    eprintln!("[test] PASS: quota applies only to authoritative winner — used_bytes unchanged");
 }
