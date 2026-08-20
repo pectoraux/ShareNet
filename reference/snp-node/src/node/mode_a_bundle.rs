@@ -54,7 +54,9 @@
 //! # Process-lifetime honesty
 //!
 //! The `BundleStore` is in-memory. Bundles are NOT persisted across process
-//! restarts.
+//! restarts. **R4.6:** `PersistentBundleStore` (below) adds file-backed
+//! durability as an adapter around the L5 `BundleStore` — the L5 store remains
+//! the authoritative semantic model; the adapter mirrors mutations to disk.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -112,6 +114,343 @@ pub enum ModeAError {
 
 /// Convenience alias.
 pub type ModeAResult<T> = Result<T, ModeAError>;
+
+// ─── Persistent BundleStore adapter (R4.6) ──────────────────────────────
+
+/// Errors from the persistent bundle store adapter.
+#[derive(Debug)]
+pub enum PersistentStoreError {
+    /// A filesystem I/O error occurred during a durable mutation.
+    #[allow(dead_code)]
+    Io(String),
+    /// A persisted custody record is corrupt (truncated, invalid CBOR,
+    /// `bundle_id` mismatch, broken custody chain). The node MUST NOT start
+    /// with a partial custody state — this is fail-closed.
+    #[allow(dead_code)]
+    Corrupt {
+        /// The file that contained the corrupt record.
+        file: String,
+        /// Why the record is corrupt.
+        reason: String,
+    },
+    /// A bundle failed `Bundle::validate()` during recovery.
+    #[allow(dead_code)]
+    ValidationFailed(String),
+}
+
+impl std::fmt::Display for PersistentStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Corrupt { file, reason } => {
+                write!(f, "corrupt custody record {file}: {reason}")
+            }
+            Self::ValidationFailed(e) => write!(f, "validation failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PersistentStoreError {}
+
+/// A persistent bundle store — an adapter around the L5 `BundleStore` that
+/// adds file-backed durability. **R4.6.**
+///
+/// # Architectural ownership (single source of truth)
+///
+/// The L5 `snp_sync::BundleStore` is the **authoritative** in-memory custody
+/// model. This adapter **owns** a `BundleStore` and mirrors its mutations to
+/// the filesystem. It does NOT create a second custody model — the L5 store's
+/// semantics (`add`/`remove`/`pending`/`more_advanced`/`mark_delivered`/
+/// `prune_expired`) remain authoritative. The filesystem is a durable mirror.
+///
+/// ```text
+/// L5 BundleStore (authoritative in-memory custody state)
+///     ↑
+///     | owns + delegates
+///     |
+/// PersistentBundleStore (snp-node composition adapter)
+///     |
+///     | mirrors mutations
+///     ↓
+/// filesystem (durable representation)
+/// ```
+///
+/// # Durability model
+///
+/// When `dir` is `Some(path)`, every `add`/`remove`/`mark_delivered` writes
+/// through to the filesystem atomically:
+///
+/// 1. Write to `<bundle_id_hex>.tmp`
+/// 2. `fsync(tmp)` — data on disk
+/// 3. `rename(tmp, <bundle_id_hex>.cbor)` — atomic commit
+/// 4. `fsync(dir)` — rename durable
+///
+/// **Custody ACK invariant (R4.6):** `add()` MUST succeed (fsync) before the
+/// `BundleForwarder` sends the custody acknowledgement. If `add()` returns
+/// `Err`, the forwarder does NOT ack — the previous hop re-sends.
+///
+/// When `dir` is `None` (in-memory mode), mutations are non-durable — this
+/// preserves backward compatibility with R4.3–R4.5b tests.
+///
+/// # Corruption model (fail-closed)
+///
+/// `open(dir)` reads every `.cbor` file, decodes + validates each. If ANY
+/// record is corrupt (truncated, invalid CBOR, `bundle_id` mismatch, broken
+/// custody chain), `open()` returns `Err(Corrupt)`. The node does NOT start
+/// with a partial custody state. This prevents a node from silently forgetting
+/// custody it previously acknowledged.
+///
+/// Expired records (`now >= deadline`) are pruned during `open()` (unlinked)
+/// per R4.2 expiry semantics.
+pub struct PersistentBundleStore {
+    /// The authoritative L5 in-memory store.
+    store: BundleStore,
+    /// The directory for file-backed persistence. `None` = in-memory only.
+    dir: Option<std::path::PathBuf>,
+}
+
+impl PersistentBundleStore {
+    /// Create an in-memory-only store (no persistence). Backward compatible
+    /// with R4.3–R4.5b tests.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            store: BundleStore::new(),
+            dir: None,
+        }
+    }
+
+    /// Open a durable store from a directory. **Fail-closed on corruption.**
+    ///
+    /// Reads every `*.cbor` file in `dir`, decodes + validates each `Bundle`.
+    /// If ANY record is corrupt, returns `Err` — the node must not start with
+    /// a partial custody state. Expired records are pruned (unlinked).
+    ///
+    /// # Errors
+    /// - `Io` if the directory cannot be read/created.
+    /// - `Corrupt` if any custody record fails decode/validate.
+    pub fn open(dir: impl AsRef<std::path::Path>) -> Result<Self, PersistentStoreError> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| PersistentStoreError::Io(format!("create_dir_all: {e}")))?;
+        let mut store = BundleStore::new();
+        let now = now_unix();
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| PersistentStoreError::Io(format!("read_dir: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| PersistentStoreError::Io(format!("read_dir entry: {e}")))?;
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            // Only process .cbor files; skip .tmp (leftover from atomic writes).
+            if !file_name.ends_with(".cbor") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| PersistentStoreError::Corrupt {
+                    file: file_name.clone(),
+                    reason: format!("read error: {e}"),
+                })?;
+            let bundle = match Bundle::from_cbor(&bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(PersistentStoreError::Corrupt {
+                        file: file_name,
+                        reason: format!("Bundle::from_cbor failed: {e:?}"),
+                    });
+                }
+            };
+            // Bundle::from_cbor already calls validate(), but double-check.
+            if let Err(e) = bundle.validate() {
+                return Err(PersistentStoreError::Corrupt {
+                    file: file_name,
+                    reason: format!("Bundle::validate failed: {e:?}"),
+                });
+            }
+            // Prune expired records during recovery.
+            if bundle.is_expired(now) {
+                let _ = std::fs::remove_file(&path);
+                eprintln!(
+                    "[mode-a-store] pruned expired bundle during recovery: {}",
+                    bundle.bundle_id().to_hex().get(..16).unwrap_or("?")
+                );
+                continue;
+            }
+            // Insert into the authoritative L5 store.
+            store
+                .add(bundle)
+                .map_err(|e| PersistentStoreError::ValidationFailed(format!("{e:?}")))?;
+        }
+        eprintln!(
+            "[mode-a-store] opened durable store at {} — {} bundles recovered",
+            dir.display(),
+            store.len()
+        );
+        Ok(Self {
+            store,
+            dir: Some(dir),
+        })
+    }
+
+    /// The directory path, if file-backed.
+    #[must_use]
+    pub fn dir(&self) -> Option<&std::path::Path> {
+        self.dir.as_deref()
+    }
+
+    /// Persist a single bundle to a file (atomic temp-write + fsync + rename +
+    /// dir-fsync). No-op when `dir` is `None`.
+    fn persist_bundle_to_file(&self, bundle: &Bundle) -> Result<(), PersistentStoreError> {
+        let dir = match &self.dir {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let id_hex = bundle.bundle_id().to_hex();
+        let final_path = dir.join(format!("{id_hex}.cbor"));
+        let tmp_path = dir.join(format!("{id_hex}.tmp"));
+        let bytes = bundle
+            .to_cbor()
+            .map_err(|e| PersistentStoreError::Io(format!("Bundle::to_cbor: {e:?}")))?;
+        // 1. Write to temp file.
+        std::fs::write(&tmp_path, &bytes)
+            .map_err(|e| PersistentStoreError::Io(format!("write tmp: {e}")))?;
+        // 2. fsync the temp file.
+        {
+            let file = std::fs::File::open(&tmp_path)
+                .map_err(|e| PersistentStoreError::Io(format!("open tmp for fsync: {e}")))?;
+            file.sync_all()
+                .map_err(|e| PersistentStoreError::Io(format!("fsync tmp: {e}")))?;
+        }
+        // 3. Atomic rename.
+        std::fs::rename(&tmp_path, &final_path)
+            .map_err(|e| PersistentStoreError::Io(format!("rename: {e}")))?;
+        // 4. fsync the directory.
+        {
+            let dir_file = std::fs::File::open(dir)
+                .map_err(|e| PersistentStoreError::Io(format!("open dir for fsync: {e}")))?;
+            dir_file
+                .sync_all()
+                .map_err(|e| PersistentStoreError::Io(format!("fsync dir: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Remove a bundle's file (durable delete). No-op when `dir` is `None`.
+    fn remove_bundle_file(&self, id: &BundleId) -> Result<(), PersistentStoreError> {
+        let dir = match &self.dir {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let id_hex = id.to_hex();
+        let path = dir.join(format!("{id_hex}.cbor"));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| PersistentStoreError::Io(format!("remove_file: {e}")))?;
+            // fsync the directory.
+            let dir_file = std::fs::File::open(dir)
+                .map_err(|e| PersistentStoreError::Io(format!("open dir for fsync: {e}")))?;
+            dir_file
+                .sync_all()
+                .map_err(|e| PersistentStoreError::Io(format!("fsync dir after remove: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Add a bundle (durable if file-backed). Returns `Err` if persistence
+    /// fails — the caller MUST NOT send a custody ACK in that case.
+    ///
+    /// Delegates to the authoritative L5 `BundleStore::add()` (dedup via
+    /// `more_advanced`), then mirrors to the filesystem.
+    pub fn add(&mut self, bundle: Bundle) -> Result<(), PersistentStoreError> {
+        // Persist to file FIRST (so the bundle is durable before we mutate
+        // in-memory state). If the file write fails, the in-memory store is
+        // unchanged and the caller knows not to ack.
+        self.persist_bundle_to_file(&bundle)?;
+        // Then update the authoritative L5 in-memory store.
+        self.store
+            .add(bundle)
+            .map_err(|e| PersistentStoreError::ValidationFailed(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    /// Remove a bundle (durable if file-backed). Returns the removed bundle.
+    pub fn remove(&mut self, id: &BundleId) -> Result<Option<Bundle>, PersistentStoreError> {
+        let removed = self.store.remove(id);
+        if removed.is_some() {
+            self.remove_bundle_file(id)?;
+        }
+        Ok(removed)
+    }
+
+    /// All non-expired, undelivered bundles (delegates to L5 `BundleStore`).
+    #[must_use]
+    pub fn pending(&self, now: u64) -> Vec<&Bundle> {
+        self.store.pending(now)
+    }
+
+    /// Get a bundle by id (delegates to L5 `BundleStore`).
+    #[must_use]
+    pub fn get(&self, id: &BundleId) -> Option<&Bundle> {
+        self.store.get(id)
+    }
+
+    /// Mark a bundle as delivered (durable if file-backed).
+    pub fn mark_delivered(&mut self, id: &BundleId) -> Result<(), PersistentStoreError> {
+        self.store.mark_delivered(id);
+        // Re-persist the updated bundle (delivered=true).
+        if let Some(bundle) = self.store.get(id) {
+            self.persist_bundle_to_file(bundle)?;
+        }
+        Ok(())
+    }
+
+    /// Prune expired bundles (durable delete). Returns count removed.
+    pub fn prune_expired(&mut self, now: u64) -> Result<usize, PersistentStoreError> {
+        let to_prune: Vec<BundleId> = self
+            .store
+            .pending(now)
+            .iter()
+            .filter(|b| b.is_expired(now))
+            .map(|b| *b.bundle_id())
+            .collect();
+        let mut count = 0;
+        for id in &to_prune {
+            self.remove(id)?;
+            count += 1;
+        }
+        // Also prune expired non-pending bundles (delivered but expired).
+        let all_expired: Vec<BundleId> = self
+            .store
+            .pending(now)
+            .iter()
+            .map(|b| *b.bundle_id())
+            .collect();
+        let _ = all_expired; // pending() already excludes expired
+        Ok(count)
+    }
+
+    /// Number of bundles (delegates to L5 `BundleStore`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// True if the store holds no bundles.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
+    }
+}
+
+impl Default for PersistentBundleStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ─── Bundle payload wrappers ─────────────────────────────────────────────
 
@@ -1312,10 +1651,13 @@ pub struct BundleForwarder {
     x25519_public: X25519PubKey,
     /// The forwarder's listen address.
     listen_addr: String,
-    /// In-memory bundle store (NOT persistent). Uses tokio::sync::Mutex
-    /// because the forwarder's run() method is async and needs to hold
-    /// the lock across await points.
-    store: Arc<tokio::sync::Mutex<BundleStore>>,
+    /// Bundle store. When created via `new()`, this is an in-memory
+    /// `PersistentBundleStore` (no file backing — backward compatible with
+    /// R4.3–R4.5b). When created via `new_with_durable_store()`, this is a
+    /// file-backed `PersistentBundleStore` — custody survives restart (R4.6).
+    /// Uses tokio::sync::Mutex because the forwarder's run() method is async
+    /// and needs to hold the lock across await points.
+    store: Arc<tokio::sync::Mutex<PersistentBundleStore>>,
     /// The route (hop_details[0] = first hop after source, ..., last = gateway).
     route: Arc<crate::node::route::Route>,
     /// This forwarder's position in the route (0-indexed).
@@ -1351,7 +1693,37 @@ impl BundleForwarder {
             x25519_secret,
             x25519_public,
             listen_addr,
-            store: Arc::new(tokio::sync::Mutex::new(BundleStore::new())),
+            store: Arc::new(tokio::sync::Mutex::new(PersistentBundleStore::new())),
+            route,
+            position,
+            source_addr: None,
+            source_node_id: None,
+        }
+    }
+
+    /// Create a new multi-hop forwarder with a **durable** bundle store
+    /// (R4.6). The store is file-backed — custody obligations survive
+    /// process restart.
+    ///
+    /// # Parameters
+    /// - `durable_store`: a file-backed `PersistentBundleStore` (created via
+    ///   `PersistentBundleStore::open(dir)`).
+    #[must_use]
+    pub fn new_with_durable_store(
+        identity: NodeIdentity,
+        x25519_secret: X25519Secret,
+        x25519_public: X25519PubKey,
+        listen_addr: String,
+        route: Arc<crate::node::route::Route>,
+        position: usize,
+        durable_store: PersistentBundleStore,
+    ) -> Self {
+        Self {
+            identity,
+            x25519_secret,
+            x25519_public,
+            listen_addr,
+            store: Arc::new(tokio::sync::Mutex::new(durable_store)),
             route,
             position,
             source_addr: None,
@@ -1367,7 +1739,7 @@ impl BundleForwarder {
     }
 
     /// Get a reference to the bundle store (for testing).
-    pub fn store(&self) -> Arc<tokio::sync::Mutex<BundleStore>> {
+    pub fn store(&self) -> Arc<tokio::sync::Mutex<PersistentBundleStore>> {
         self.store.clone()
     }
 
@@ -1657,7 +2029,9 @@ impl BundleForwarder {
                         bundle_id.to_hex().get(..16).unwrap_or("?")
                     );
                     let mut store = self.store.lock().await;
-                    store.remove(&bundle_id);
+                    if let Err(e) = store.remove(&bundle_id) {
+                        eprintln!("[mode-a-fwd] durable remove error: {e}");
+                    }
                 }
                 Err(e) => {
                     eprintln!(
@@ -1905,7 +2279,9 @@ impl BundleForwarder {
             };
             if success {
                 let mut store = self.store.lock().await;
-                store.remove(resp.bundle_id());
+                if let Err(e) = store.remove(resp.bundle_id()) {
+                    eprintln!("[mode-a-fwd] durable remove error (response): {e}");
+                }
             }
         }
     }

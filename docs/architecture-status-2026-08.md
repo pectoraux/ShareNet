@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.5b correction — bootstrap trust)
+**Date:** 2026-08-19 (updated R4.6 durable custody)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -42,7 +42,7 @@ executed in a privileged Linux environment. The sandbox lacks:
 
 | Mode | Status | Evidence |
 |---|---|---|
-| **Mode A** (delay-tolerant) | DISCOVERY-DERIVED AUTONOMOUS MULTI-HOP (limited) | R4.5b: the routing layer autonomously selects both the gateway (from verified candidates, deterministic — lowest NodeId) and the relay path (via the existing recursive distributed route-discovery protocol). **The caller supplies only a `BootstrapSeed` + `ModeARoutingIntent`** — NOT a `relay_order`, NOT a `gateway_node_id`. `discover_mode_a_route(client, bootstrap, AnyInternetGateway)` → `discover_all_candidates` (TCP → CBOR array → verify each) → `TopologyGraph` → routing selects gateway → `NextHopResolver::resolve_route` (ForwardedQuery → ForwardingNode chain) → `DistributedRouteResolution::into_route()` → immutable `Route` → `BundleForwarder` (UNCHANGED). 12 R4.5b tests (autonomous route selection, discovery bypass, gateway selection, capability enforcement, advert security, remote-hint security, endpoint binding, API signature). R4.5a's `build_mode_a_route(source, store, relay_order)` is deprecated. Direction routing-derived (#22): forward = `destination == next_hop \|\| destination == gateway`; reverse = `destination == client`. Authenticated L8 (SNP-IK + AEAD) + provenance binding (#21) at every hop. `RouteHop.endpoint == signed advert listen_addr` (NOT the route-discovery address — separate TCP planes). **Still limited:** in-memory `BundleStore` (process-lifetime), no durable persistence, host-local egress, no Civic, no route migration. |
+| **Mode A** (delay-tolerant) | DISCOVERY-DERIVED AUTONOMOUS MULTI-HOP + DURABLE CUSTODY (limited) | R4.6: `PersistentBundleStore` (snp-node composition adapter) adds file-backed durability to the L5 `BundleStore`. **The L5 `BundleStore` remains the authoritative custody model** — the adapter owns + mirrors it, not a second authority. Durable write: `write(tmp)` → `fsync(tmp)` → `rename` → `fsync(dir)` before custody ACK. **Fail-closed corruption:** `open(dir)` returns `Err` if any `.cbor` record is corrupt — the node does not silently forget acknowledged custody. Restart recovery: `open()` loads durable bundles → the existing `forward_pending_bundles()` retry loop resumes. 10 R4.6 tests (basic durability, custody durability, crash-before-ACK, crash-after-ACK, expiry recovery, duplicate insertion, corruption fail-closed, full restart integration). R4.5b autonomous routing + R4.4 direction (#22) + R4.3 provenance (#21) preserved. `BundleForwarder::new()` defaults to in-memory (backward compat); `new_with_durable_store()` takes a `PersistentBundleStore`. **Custody dedup ≠ application exactly-once** (L7 reqId dedup is separate). **Still limited:** host-local egress, no Civic, no route migration, no hard storage quota. |
 | **Mode B** (proxied) | PASS (Rust) | MultiplexedCircuit, StreamHandle, serve_gateway_mode_b_multiplexed, N3AClient. |
 | **Mode C** (transparent) | PARTIAL | TunClient with any_ip + destination extraction + split-tunnel. NOT RUNTIME-VERIFIED. TCP-only, Linux-only. |
 
@@ -360,6 +360,82 @@ discovery. The caller supplies only `BootstrapSeed` + `ModeARoutingIntent`.
 
 **STOP after R4.5b correction.** Next: R4.6 durable `BundleStore` / restart recovery.
 
+### Mode A — R4.6 durable bundle custody
+
+R4.6 adds file-backed durability to the Mode-A bundle store. The L5
+`snp_sync::BundleStore` remains the **authoritative** in-memory custody
+model — `PersistentBundleStore` (in `snp-node`, the composition layer) OWNS a
+`BundleStore` and mirrors its mutations to the filesystem. It does NOT create
+a second custody authority.
+
+```text
+L5 BundleStore (authoritative in-memory custody state)
+    ↑
+    | owns + delegates
+    |
+PersistentBundleStore (snp-node composition adapter)
+    |
+    | mirrors mutations (atomic write + fsync + rename + dir-fsync)
+    ↓
+filesystem (durable representation: <bundle_id_hex>.cbor per bundle)
+```
+
+**Critical transaction (R4.6 invariant #24):**
+
+```text
+take_custody()
+    ↓
+PersistentBundleStore::add() — persist bundle (fsync)
+    ↓
+if Err: do NOT ack → previous hop re-sends
+    ↓
+carrier.send_bundle() — custody ACK
+    ↓
+forward_pending_bundles()
+    ↓
+[next hop acks] → PersistentBundleStore::remove() — release custody
+```
+
+**Corruption model (fail-closed):** `PersistentBundleStore::open(dir)` reads
+every `.cbor` file, decodes + validates. If ANY record is corrupt (truncated,
+invalid CBOR, `bundle_id` mismatch, broken custody chain), `open()` returns
+`Err(Corrupt)`. The node does NOT start with a partial custody state. This
+prevents a node from silently forgetting custody it previously acknowledged.
+
+**Restart recovery:** `open()` loads durable bundles → the existing
+`forward_pending_bundles()` periodic retry (every 500ms in `run()`) resumes
+forwarding. Recovery is automatic — no separate `recover()` method needed.
+
+**Custody dedup ≠ application exactly-once:** `BundleStore::more_advanced()`
+prevents custody-state regression (a re-forwarded bundle with the same or
+shorter chain is deduped). This is custody deduplication, NOT application-
+level exactly-once execution. The L7 gateway may receive the same
+`TransitRequest` twice — application-level idempotence (e.g., reqId dedup)
+is an L7 concern, outside `BundleStore`.
+
+**R4.6 tests** (`r4_6_durable_bundle_store.rs`, 10 tests):
+- Basic durability (persist → drop → reopen → present)
+- Custody durability (chain survives restart)
+- Crash before ACK (bundle present → forwarder retries)
+- Crash after ACK (bundle present → forwarder resumes)
+- Expiry recovery (expired bundles pruned, not resurrected)
+- Duplicate insertion (`more_advanced` keeps longer chain)
+- Corruption (truncated → fail-closed)
+- Corruption (invalid CBOR → fail-closed)
+- Full Mode-A restart (Relay B crashes → restarts → forwards → gateway receives)
+- In-memory backward compat (`new()` = in-memory)
+
+**Preserved (untouched):**
+- `snp-sync` (L5) — no `tokio`/`std::fs`/`std::io` (invariant #13)
+- `Bundle`/`BundleStore`/`CustodyHop` types (frozen)
+- `Route`/`RouteHop` (L6)
+- `AuthenticatedBundleCarrier` (L8)
+- `BundleForwarder` direction/provenance logic (#21/#22)
+- `ModeARelay` (frozen R4.3 — uses in-memory `BundleStore`, unchanged)
+- Discovery, routing, Civic
+
+**STOP after R4.6.** No Civic. No route migration. No hard storage quota.
+
 ---
 
 ## Traffic Class Split
@@ -490,3 +566,4 @@ advertisements.
 21. **(R4.3) Authenticated transport identity MUST equal bundle provenance.** For every received Mode-A bundle, the authenticated SNP-IK peer NodeId MUST equal the bundle's expected previous custodian (source on first hop, last custody hop's `next_custodian_id` thereafter). This check occurs BEFORE `take_custody()`. Mismatch → no custody, no `BundleStore` insertion, no forwarding. This is a permanent architecture invariant — the transport identity and bundle provenance must agree.
 22. **(R4.4) Bundle direction is routing-derived, never identity-negated.** `BundleForwarder` partitions bundles by direction using the route's source/destination NodeIds — NOT a catch-all `destination != self.identity.node_id`. Forward direction: `destination == next_hop || destination == route.destination()` (gateway). Reverse direction: `destination == route.source()` (client). A response bundle (destination == client) can therefore NEVER enter the forward path (`forward_pending_bundles`), and a request bundle (destination == gateway) can never enter the reverse path (`try_send_response_back`). The previous-hop carrier retained for reverse delivery is set ONLY when the authenticated peer equals the route-derived previous hop (`route.hop(position - 1)` / `route.source()`), so an unrelated peer cannot overwrite the reverse-path connection.
 23. **(R4.5) Discovery ≠ Routing ≠ Sync.** Live candidate discovery, route construction, and bundle sync are structurally separate. Discovery (`mode_a_discovery::LiveNodeAdvertDiscovery`) finds/advertises candidates and verifies them — it does NOT choose a route, order hops, or pick a gateway. Routing (`build_mode_a_route`) reads the candidate store and builds the `Route` — it does NOT query discovery. `snp-sync` (L5) imports neither (`cargo tree -p snp-sync` is clean). A discovered candidate is only a candidate until the L8 `AuthenticatedBundleCarrier` handshake authenticates it — discovery never replaces cryptographic transport identity. The route endpoint is the signed `listen_addr` from the verified advertisement (`RouteHop.endpoint == advert.endpoints`, NOT the discovery address). Stale descriptors (`expiry <= now`) are never silently used — `verify_into_verified()` rejects at discovery time; `build_mode_a_route` re-checks `is_expired(now)` at route-construction time.
+24. **(R4.6) Custody acknowledgement implies durable recoverable custody.** `PersistentBundleStore::add()` (which persists the bundle to the filesystem via atomic write + `fsync` + `rename` + directory `fsync`) MUST complete successfully BEFORE `BundleForwarder::run()` sends the custody ACK to the previous hop. If `add()` returns `Err`, the forwarder does NOT ack — the previous hop re-sends. The L5 `snp_sync::BundleStore` remains the authoritative custody model; `PersistentBundleStore` (snp-node composition adapter) owns + mirrors it — it does NOT create a second custody authority. Corruption of a persisted custody record causes `PersistentBundleStore::open()` to return `Err` (fail-closed) — the node does NOT silently skip or fabricate partial custody state. Custody deduplication (`more_advanced`) is distinct from application-level exactly-once execution (L7 reqId dedup is separate).
