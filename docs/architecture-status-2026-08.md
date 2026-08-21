@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.9.1 identity lifecycle)
+**Date:** 2026-08-19 (updated R4.9.2 identity revocation)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -600,6 +600,47 @@ independently trusted from the file.
 - `r4_9_1_unsupported_version_fails_closed`
 
 **STOP after R4.9.1.**
+
+### R4.9.2 — Identity Revocation and Trust Update
+
+R4.9.2 makes revocation operationally meaningful by establishing a durable
+and fail-closed mechanism by which a revoked identity is no longer accepted
+for new authenticated sessions or new trust decisions.
+
+**New types in `snp-identity`:**
+- `RevocationStore` — a durable set of revoked NodeIds with atomic write +
+  fsync + rename persistence. Fail-closed on corruption.
+- `IdentityLifecycle::is_revoked()` — checks if the local identity is revoked.
+- `IdentityLifecycle::is_authorized_for_new_sessions()` — the authorization
+  boundary: returns `true` only for `Active` state.
+
+**Semantics:**
+- A revoked identity's historical signatures remain **cryptographically
+  valid** for verification (revocation ≠ cryptographic invalidation).
+- A revoked identity is **NOT authorized** for new authenticated sessions,
+  new trust decisions, or new advertisement authority.
+- The `RevocationStore` is the trust enforcement boundary for both local
+  and remote peer revocation.
+- Revocation is durable (survives restart).
+- Persistence failure leaves the identity `Active` (durable-state-first).
+
+**No distributed revocation protocol introduced** — R4.9.2 provides only
+the local trust enforcement boundary. Distributed revocation (gossip,
+consensus) is a later milestone.
+
+**R4.9.2 tests** (`r4_9_2_identity_revocation.rs`, 7 tests):
+- `r4_9_2_revocation_survives_restart` — reload after revoke → still revoked
+- `r4_9_2_revoked_identity_rejected` — lifecycle rejects rotation from Revoked
+- `r4_9_2_revoked_peer_not_trusted_for_new_session` — RevocationStore
+  rejects revoked peer, authorizes non-revoked peer
+- `r4_9_2_historical_signature_remains_verifiable` — signature created
+  while Active is still valid after revocation
+- `r4_9_2_revocation_persistence_failure_preserves_active_state` —
+  persistence failure → identity remains Active
+- `r4_9_2_revocation_store_corruption_fails_closed` — corrupt file → Err
+- `r4_9_2_idempotent_revocation` — revoking twice is a no-op
+
+**STOP after R4.9.2.**
 
 ---
 

@@ -374,6 +374,23 @@ impl IdentityLifecycle {
         self.state.is_active_for_new_operations()
     }
 
+    /// Returns `true` if the identity has been revoked.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.state == IdentityState::Revoked
+    }
+
+    /// Returns `true` if the identity is authorized for new authenticated
+    /// sessions. This is the authorization boundary — it combines the
+    /// lifecycle state with any external revocation store.
+    ///
+    /// For R4.9.2, this checks only the local lifecycle state.
+    /// A revoked or retired identity is NOT authorized.
+    #[must_use]
+    pub fn is_authorized_for_new_sessions(&self) -> bool {
+        self.state == IdentityState::Active
+    }
+
     /// Begin identity rotation. The old identity remains authoritative
     /// until `complete_rotation()` succeeds.
     ///
@@ -469,6 +486,237 @@ impl IdentityLifecycle {
     pub fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
         self.path = Some(path.as_ref().to_path_buf());
         self
+    }
+}
+
+// ─── Revocation Store (R4.9.2) ───────────────────────────────────────────
+
+/// The revocation store file format magic + version.
+const REVOCATION_FILE_MAGIC: &[u8; 4] = b"SNPR";
+const REVOCATION_FILE_VERSION: u8 = 1;
+
+/// A durable store of revoked NodeIds. **R4.9.2.**
+///
+/// This is the trust enforcement boundary: a NodeId in this store is
+/// NOT authorized for new authenticated sessions, new trust decisions,
+/// or new advertisement authority — even if its cryptographic signatures
+/// remain valid for historical verification.
+///
+/// # Persistence
+///
+/// Uses the same atomic write-to-temp-then-rename + fsync pattern as
+/// `IdentityLifecycle` and `PersistentBundleStore`. Revocation survives
+/// restart.
+///
+/// # Invariant
+///
+/// ```text
+/// Durable state FIRST
+/// Memory mutation SECOND
+/// ```
+///
+/// # Local vs Remote
+///
+/// - **Local revocation:** `IdentityLifecycle::revoke()` persists the
+///   local identity's revocation. The `RevocationStore` records the
+///   local NodeId for consistency.
+/// - **Remote revocation:** A peer is marked as revoked based on
+///   authoritative information available to the node. R4.9.2 does NOT
+///   implement distributed revocation — it provides the local trust
+///   enforcement boundary.
+pub struct RevocationStore {
+    /// The set of revoked NodeIds.
+    revoked: std::collections::HashSet<NodeId>,
+    /// The path to the revocation file (if file-backed).
+    path: Option<std::path::PathBuf>,
+}
+
+impl RevocationStore {
+    /// Create a new empty `RevocationStore` (in-memory only).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            revoked: std::collections::HashSet::new(),
+            path: None,
+        }
+    }
+
+    /// Open a durable `RevocationStore` from a file, or create a new empty
+    /// one if the file does not exist. **Fail-closed on corruption.**
+    ///
+    /// # Errors
+    /// - `Corrupt` if the file exists but is malformed.
+    /// - `Io` if the file cannot be read/written.
+    pub fn load_or_create(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, IdentityLifecycleError> {
+        let path = path.as_ref().to_path_buf();
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            Ok(Self {
+                revoked: std::collections::HashSet::new(),
+                path: Some(path),
+            })
+        }
+    }
+
+    /// Load a `RevocationStore` from a file. **Fail-closed on corruption.**
+    ///
+    /// # File format
+    /// ```text
+    /// [4 bytes: magic "SNPR"]
+    /// [1 byte: version = 1]
+    /// [4 bytes: count (u32 big-endian)]
+    /// [count × 32 bytes: NodeId entries]
+    /// ```
+    ///
+    /// # Errors
+    /// - `Corrupt` if the file is malformed.
+    /// - `Io` if the file cannot be read.
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, IdentityLifecycleError> {
+        let path = path.as_ref().to_path_buf();
+        let data = std::fs::read(&path)
+            .map_err(|e| IdentityLifecycleError::Io(format!("read {}: {e}", path.display())))?;
+        // Minimum: magic (4) + version (1) + count (4) = 9 bytes.
+        if data.len() < 9 {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "revocation file too short: {} bytes",
+                data.len()
+            )));
+        }
+        if &data[..4] != REVOCATION_FILE_MAGIC {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "invalid revocation file magic: expected {:?}, got {:?}",
+                REVOCATION_FILE_MAGIC,
+                &data[..4]
+            )));
+        }
+        if data[4] != REVOCATION_FILE_VERSION {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "unsupported revocation file version: expected {}, got {}",
+                REVOCATION_FILE_VERSION, data[4]
+            )));
+        }
+        let count = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
+        let expected_len = 9 + count * 32;
+        if data.len() != expected_len {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "revocation file length mismatch: expected {expected_len}, got {}",
+                data.len()
+            )));
+        }
+        let mut revoked = std::collections::HashSet::new();
+        for i in 0..count {
+            let offset = 9 + i * 32;
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(&data[offset..offset + 32]);
+            revoked.insert(node_id);
+        }
+        Ok(Self {
+            revoked,
+            path: Some(path),
+        })
+    }
+
+    /// Persist the revocation store to the file.
+    /// Uses atomic write-to-temp-then-rename + fsync.
+    ///
+    /// # Errors
+    /// - `Io` if persistence fails.
+    /// - No file path set → no-op (returns `Ok`).
+    pub fn save(&self) -> Result<(), IdentityLifecycleError> {
+        let path = match &self.path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let count = u32::try_from(self.revoked.len()).unwrap_or(u32::MAX);
+        let mut data = Vec::with_capacity(9 + self.revoked.len() * 32);
+        data.extend_from_slice(REVOCATION_FILE_MAGIC);
+        data.push(REVOCATION_FILE_VERSION);
+        data.extend_from_slice(&count.to_be_bytes());
+        for node_id in &self.revoked {
+            data.extend_from_slice(node_id);
+        }
+        // Atomic write: write to temp, fsync, rename, fsync dir.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)
+            .map_err(|e| IdentityLifecycleError::Io(format!("write tmp: {e}")))?;
+        {
+            let file = std::fs::File::open(&tmp_path)
+                .map_err(|e| IdentityLifecycleError::Io(format!("open tmp for fsync: {e}")))?;
+            file.sync_all()
+                .map_err(|e| IdentityLifecycleError::Io(format!("fsync tmp: {e}")))?;
+        }
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| IdentityLifecycleError::Io(format!("rename: {e}")))?;
+        if let Some(dir) = path.parent() {
+            let dir_file = std::fs::File::open(dir)
+                .map_err(|e| IdentityLifecycleError::Io(format!("open dir for fsync: {e}")))?;
+            dir_file
+                .sync_all()
+                .map_err(|e| IdentityLifecycleError::Io(format!("fsync dir: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Add a NodeId to the revocation set. **Durable — persists before
+    /// returning.**
+    ///
+    /// # Errors
+    /// - `Io` if persistence fails (the NodeId is NOT added to memory).
+    pub fn revoke(&mut self, node_id: NodeId) -> Result<(), IdentityLifecycleError> {
+        if self.revoked.contains(&node_id) {
+            return Ok(()); // Already revoked — idempotent.
+        }
+        self.revoked.insert(node_id);
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.revoked.remove(&node_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if a NodeId is revoked. Returns `true` if the NodeId is in
+    /// the revocation set.
+    #[must_use]
+    pub fn is_revoked(&self, node_id: &NodeId) -> bool {
+        self.revoked.contains(node_id)
+    }
+
+    /// Returns `true` if the NodeId is authorized for new authenticated
+    /// sessions. This is the trust enforcement boundary: a revoked NodeId
+    /// is NOT authorized.
+    #[must_use]
+    pub fn is_authorized_for_new_sessions(&self, node_id: &NodeId) -> bool {
+        !self.is_revoked(node_id)
+    }
+
+    /// Get the number of revoked NodeIds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.revoked.len()
+    }
+
+    /// Returns `true` if no NodeIds are revoked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.revoked.is_empty()
+    }
+
+    /// Set the file path for persistence. Chainable.
+    #[must_use]
+    pub fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.path = Some(path.as_ref().to_path_buf());
+        self
+    }
+}
+
+impl Default for RevocationStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
