@@ -80,7 +80,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 /// R4.8: Maximum concurrent gateway egress requests (Semaphore permits).
-const MAX_CONCURRENT_EGRESS: usize = 8;
+/// R4.9.5: re-exported `pub` so resource-governance tests can assert the
+/// default global concurrent-ops cap composes with (does not exceed) this
+/// existing R4.8 egress cap.
+pub const MAX_CONCURRENT_EGRESS: usize = 8;
 
 /// R4.8: Maintenance interval for periodic expired-bundle pruning (seconds).
 const MAINTENANCE_INTERVAL_SECS: u64 = 30;
@@ -185,10 +188,9 @@ impl std::fmt::Display for PersistentStoreError {
                 write!(f, "corrupt custody record {file}: {reason}")
             }
             Self::ValidationFailed(e) => write!(f, "validation failed: {e}"),
-            Self::BundleTooLarge {
-                bundle_size,
-                limit,
-            } => write!(f, "bundle too large: {bundle_size} bytes > limit {limit}"),
+            Self::BundleTooLarge { bundle_size, limit } => {
+                write!(f, "bundle too large: {bundle_size} bytes > limit {limit}")
+            }
             Self::StoreQuotaExceeded {
                 used_bytes,
                 bundle_size,
@@ -388,11 +390,10 @@ impl PersistentBundleStore {
             if !file_name.ends_with(".cbor") {
                 continue;
             }
-            let bytes = std::fs::read(&path)
-                .map_err(|e| PersistentStoreError::Corrupt {
-                    file: file_name.clone(),
-                    reason: format!("read error: {e}"),
-                })?;
+            let bytes = std::fs::read(&path).map_err(|e| PersistentStoreError::Corrupt {
+                file: file_name.clone(),
+                reason: format!("read error: {e}"),
+            })?;
             let bundle = match Bundle::from_cbor(&bytes) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1548,6 +1549,10 @@ pub struct ModeAGateway {
     /// The connector factory for egress (production: SSRF defence; test: mock).
     /// Wrapped in `Arc` so it can be cloned into spawned per-request tasks.
     connector_factory: Arc<dyn Fn(&str) -> GatewayResult<PinnedConnector> + Send + Sync>,
+    /// R4.9.5: Resource governor enforcing per-peer + global connection and
+    /// concurrency limits. Cloned (shared `Arc` state) into spawned tasks so
+    /// the per-peer operation permit can be held for the task's lifetime.
+    governor: crate::node::resource_governance::ResourceGovernor,
 }
 
 impl ModeAGateway {
@@ -1567,6 +1572,7 @@ impl ModeAGateway {
             listen_addr,
             gateway_secret,
             connector_factory: Arc::new(|url: &str| PinnedConnector::new(url)),
+            governor: crate::node::resource_governance::ResourceGovernor::new(),
         }
     }
 
@@ -1590,7 +1596,28 @@ impl ModeAGateway {
             listen_addr,
             gateway_secret,
             connector_factory: Arc::new(f),
+            governor: crate::node::resource_governance::ResourceGovernor::new(),
         }
+    }
+
+    /// R4.9.5: Install a custom `ResourceGovernor` (for tests / tuned
+    /// deployments). The default governor uses conservative static limits
+    /// (`DEFAULT_MAX_GLOBAL_CONNECTIONS`, etc.). This builder is intended for
+    /// resource-governance tests that need explicit limits.
+    #[must_use]
+    pub fn with_governor(
+        mut self,
+        governor: crate::node::resource_governance::ResourceGovernor,
+    ) -> Self {
+        self.governor = governor;
+        self
+    }
+
+    /// R4.9.5: Read-only access to the gateway's resource governor (for
+    /// tests / diagnostics).
+    #[must_use]
+    pub fn governor(&self) -> &crate::node::resource_governance::ResourceGovernor {
+        &self.governor
     }
 
     /// Run the gateway loop: listen for incoming request bundles, decode,
@@ -1669,6 +1696,26 @@ impl ModeAGateway {
                         peer_id = %hex_short(&hs.peer_node_id),
                         "ModeAGateway accepted authenticated link"
                     );
+                    // R4.9.5: Admission gate (post-handshake, pre-custody).
+                    // The peer identity is now known. If the global or
+                    // per-peer connection ceiling is exceeded, drop the
+                    // connection WITHOUT taking custody — the previous hop
+                    // retains the bundle durably and re-sends on its retry
+                    // schedule (invariant #24 preserved). This is a local
+                    // admission decision, NOT a peer failure (does not
+                    // increment RetryScheduler::failure_count or quarantine).
+                    let _conn_guard = match self.governor.admit_connection(hs.peer_node_id).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(
+                                node_id = %hex_short(&gateway_node_id),
+                                peer_id = %hex_short(&hs.peer_node_id),
+                                error = %e,
+                                "ModeAGateway connection admission rejected — dropping link (no custody taken)"
+                            );
+                            continue;
+                        }
+                    };
                     let carrier = AuthenticatedBundleCarrier {
                         link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
                         peer_id: hs.peer_node_id,
@@ -1746,6 +1793,29 @@ impl ModeAGateway {
                     }
                     // Acknowledge custody to the sender (inline — before spawning).
                     let _ = carrier.send_bundle(&custody_bundle).await;
+                    // R4.9.5: Per-peer + global operation admission. The
+                    // expensive operation is the egress task (Internet fetch
+                    // holding an egress permit). Admission is checked BEFORE
+                    // spawning — if rejected, the task is NOT created,
+                    // preventing unbounded JoinSet growth and one peer
+                    // monopolising the global egress pool. The guard moves into
+                    // the spawned task so it releases on completion, error,
+                    // panic, or cancellation (task drop). This is a local
+                    // admission decision — it does NOT increment the peer's
+                    // RetryScheduler::failure_count.
+                    let op_guard = match self.governor.admit_operation(hs.peer_node_id).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(
+                                node_id = %hex_short(&gateway_node_id),
+                                peer_id = %hex_short(&hs.peer_node_id),
+                                req_id = %req_id_hex,
+                                error = %e,
+                                "ModeAGateway operation admission rejected — egress task not spawned (custody already durable)"
+                            );
+                            continue;
+                        }
+                    };
                     // R4.8C: Spawn the egress task with the shared semaphore.
                     let sem = egress_semaphore.clone();
                     let cf = connector_factory.clone();
@@ -1755,6 +1825,10 @@ impl ModeAGateway {
                     let gw_id = identity.node_id;
                     let gw_secret = gateway_secret;
                     tasks.spawn(async move {
+                        // R4.9.5: hold the operation guard for the task's
+                        // lifetime — releases on drop (success/error/panic/
+                        // cancellation).
+                        let _op_guard = op_guard;
                         // R4.8C: Acquire egress permit (deadline-aware).
                         let remaining = req_deadline.saturating_sub(now_unix());
                         let permit_timeout = Duration::from_secs(remaining.min(READ_TIMEOUT_SECS));
@@ -2072,6 +2146,12 @@ pub struct BundleForwarder {
     /// scoring + terminal-bundle set). In-memory only — resets on restart.
     /// Durable bundle custody (the `store` above) remains authoritative.
     retry: StdMutex<crate::node::retry_policy::RetryScheduler>,
+    /// R4.9.5: Resource governor enforcing per-peer + global connection
+    /// limits. Ephemeral — in-memory only, resets on restart. The forwarder's
+    /// serial loop already bounds in-flight processing to one connection at a
+    /// time (implicit bound of 1); the governor adds an explicit admission
+    /// gate so a flood of inbound connections cannot queue unboundedly.
+    governor: crate::node::resource_governance::ResourceGovernor,
 }
 
 impl BundleForwarder {
@@ -2103,6 +2183,7 @@ impl BundleForwarder {
             source_addr: None,
             source_node_id: None,
             retry: StdMutex::new(crate::node::retry_policy::RetryScheduler::new()),
+            governor: crate::node::resource_governance::ResourceGovernor::new(),
         }
     }
 
@@ -2134,6 +2215,7 @@ impl BundleForwarder {
             source_addr: None,
             source_node_id: None,
             retry: StdMutex::new(crate::node::retry_policy::RetryScheduler::new()),
+            governor: crate::node::resource_governance::ResourceGovernor::new(),
         }
     }
 
@@ -2142,6 +2224,24 @@ impl BundleForwarder {
         self.source_addr = Some(addr);
         self.source_node_id = Some(node_id);
         self
+    }
+
+    /// R4.9.5: Install a custom `ResourceGovernor` (for tests / tuned
+    /// deployments). The default governor uses conservative static limits.
+    #[must_use]
+    pub fn with_governor(
+        mut self,
+        governor: crate::node::resource_governance::ResourceGovernor,
+    ) -> Self {
+        self.governor = governor;
+        self
+    }
+
+    /// R4.9.5: Read-only access to the forwarder's resource governor (for
+    /// tests / diagnostics).
+    #[must_use]
+    pub fn governor(&self) -> &crate::node::resource_governance::ResourceGovernor {
+        &self.governor
     }
 
     /// Get a reference to the bundle store (for testing).
@@ -2250,6 +2350,26 @@ impl BundleForwarder {
                         peer_id = %hex_short(&hs.peer_node_id),
                         "BundleForwarder accepted authenticated link"
                     );
+                    // R4.9.5: Admission gate (post-handshake, pre-custody).
+                    // The peer identity is now known. If the global or
+                    // per-peer connection ceiling is exceeded, drop the
+                    // connection WITHOUT taking custody — the previous hop
+                    // retains the bundle durably and re-sends on its retry
+                    // schedule (invariant #24 preserved). This is a local
+                    // admission decision, NOT a peer failure (does not
+                    // increment RetryScheduler::failure_count or quarantine).
+                    let _conn_guard = match self.governor.admit_connection(hs.peer_node_id).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(
+                                node_id = %hex_short(&self.identity.node_id),
+                                peer_id = %hex_short(&hs.peer_node_id),
+                                error = %e,
+                                "BundleForwarder connection admission rejected — dropping link (no custody taken)"
+                            );
+                            continue;
+                        }
+                    };
                     let carrier = Arc::new(AuthenticatedBundleCarrier {
                         link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
                         peer_id: hs.peer_node_id,
@@ -2473,12 +2593,8 @@ impl BundleForwarder {
                 match class {
                     crate::node::retry_policy::FailureClass::Retryable => {
                         let delay = {
-                            let mut retry =
-                                self.retry.lock().expect("retry scheduler poisoned");
-                            retry.record_retryable_failure(
-                                &next_node_id,
-                                std::time::Instant::now(),
-                            )
+                            let mut retry = self.retry.lock().expect("retry scheduler poisoned");
+                            retry.record_retryable_failure(&next_node_id, std::time::Instant::now())
                         };
                         tracing::warn!(
                             node_id = %hex_short(&self.identity.node_id),
@@ -2494,8 +2610,7 @@ impl BundleForwarder {
                         // bundles terminal — they cannot be delivered to a
                         // peer whose identity does not match the route.
                         {
-                            let mut retry =
-                                self.retry.lock().expect("retry scheduler poisoned");
+                            let mut retry = self.retry.lock().expect("retry scheduler poisoned");
                             for b in &bundles_to_forward {
                                 retry.record_terminal_failure(b.bundle_id());
                             }
@@ -2538,8 +2653,7 @@ impl BundleForwarder {
                 Ok(_) => {
                     // R4.9.4: genuine success — reset the peer's retry state.
                     {
-                        let mut retry =
-                            self.retry.lock().expect("retry scheduler poisoned");
+                        let mut retry = self.retry.lock().expect("retry scheduler poisoned");
                         retry.record_success(&next_node_id);
                     }
                     eprintln!(
@@ -2609,13 +2723,15 @@ impl BundleForwarder {
         match class {
             crate::node::retry_policy::FailureClass::Retryable => {
                 let (delay, score, fits) = {
-                    let mut retry =
-                        self.retry.lock().expect("retry scheduler poisoned");
+                    let mut retry = self.retry.lock().expect("retry scheduler poisoned");
                     let delay = retry.record_retryable_failure(peer, now_inst);
                     let score = retry.failure_score(peer);
-                    let fits = crate::node::retry_policy::RetryScheduler::retry_fits_before_deadline(
-                        delay, now_secs, bundle.deadline,
-                    );
+                    let fits =
+                        crate::node::retry_policy::RetryScheduler::retry_fits_before_deadline(
+                            delay,
+                            now_secs,
+                            bundle.deadline,
+                        );
                     (delay, score, fits)
                 };
                 tracing::warn!(
@@ -2632,8 +2748,7 @@ impl BundleForwarder {
             }
             crate::node::retry_policy::FailureClass::Terminal => {
                 {
-                    let mut retry =
-                        self.retry.lock().expect("retry scheduler poisoned");
+                    let mut retry = self.retry.lock().expect("retry scheduler poisoned");
                     retry.record_terminal_failure(&bundle_id);
                 }
                 tracing::warn!(

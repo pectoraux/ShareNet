@@ -798,6 +798,149 @@ R4.3: 9/9 · conformance: 138/138 · `cargo fmt -p snp-node --check`: clean.
 
 **STOP after R4.9.4.**
 
+### R4.9.5 — Resource Governance
+
+R4.9.5 prevents a single peer, request stream, or workload from exhausting
+the node's finite runtime resources while preserving the existing protocol
+semantics and R4.9.1–R4.9.4 behavior. It is an **operational layer** around
+the existing protocol — it does NOT alter `Bundle`/`Route`/`custody`
+semantics, does NOT select routes, and does NOT rank peers.
+
+**Audit findings (hotspots addressed):**
+- The gateway's `JoinSet` grew unboundedly — one peer could spawn unlimited
+  egress tasks (each holding carrier+bundle in memory).
+- The global 8-permit egress semaphore (R4.8) had no per-peer cap — one peer
+  could occupy all 8 permits indefinitely, starving others.
+- Inbound connections had no global or per-peer ceiling — a flood could queue
+  unboundedly.
+- Bundle store size was already bounded (`StorageLimits`: 1 MiB/bundle,
+  64 MiB/store, checked before ACK). Replay cache is per-link (64-slot
+  sliding window). `MAX_FRAME_LEN=16 MiB`, `ROUTE_MAX_HOPS=16`. These are
+  NOT duplicated.
+
+**New module** (`snp-node/src/node/resource_governance.rs`):
+- `ResourceGovernor` — global + per-peer connection and concurrency counters.
+  Ephemeral (in-memory `Arc<std::sync::Mutex<GovernorState>>`); resets on
+  restart. Cloned (shared `Arc`) into spawned tasks.
+- `GovernorConfig` — `max_global_connections`, `max_peer_connections`,
+  `max_global_concurrent_ops`, `max_peer_concurrent_ops`.
+- `ConnectionGuard` / `OperationGuard` — RAII guards that release counters
+  on `Drop` (success/error/panic/cancellation/shutdown). `std::sync::Mutex`
+  is used so `Drop` is fully sync and never panics under a single-threaded
+  runtime.
+- `AdmissionError` — `GlobalConnectionLimit` / `PeerConnectionLimit` /
+  `GlobalOperationLimit` / `PeerOperationLimit`.
+- `GatewayQuota` — composes a per-peer `Semaphore` with the existing R4.8
+  `MAX_CONCURRENT_EGRESS = 8` global egress semaphore.
+
+**Conservative static defaults** (do not silently increase existing limits):
+- `DEFAULT_MAX_GLOBAL_CONNECTIONS = 64` — bounds inbound connection flood.
+- `DEFAULT_MAX_PEER_CONNECTIONS = 4` — one peer cannot monopolise the global
+  connection budget.
+- `DEFAULT_MAX_GLOBAL_CONCURRENT_OPS = 8` — equals `MAX_CONCURRENT_EGRESS`
+  (admission does not reduce existing egress throughput).
+- `DEFAULT_MAX_PEER_CONCURRENT_OPS = 2` — strictly `<` the global cap, so one
+  peer cannot occupy the entire global egress pool.
+
+**Governed operation choice:**
+- *Gateway:* the expensive operation is the **egress task** (Internet fetch
+  holding an egress permit). Admission is checked BEFORE `tasks.spawn` — if
+  rejected, no task is created (prevents unbounded `JoinSet` growth). The
+  `OperationGuard` moves into the spawned task and releases on its drop.
+- *Forwarder:* the expensive operation is the **per-connection processing
+  cycle** (handshake → custody → forward). The forwarder's serial loop
+  already bounds in-flight to 1 (implicit); the governor adds an explicit
+  connection admission gate.
+
+**Admission semantics (check → acquire → perform → release):**
+- Admission is checked **after handshake** (peer identity known) but **before
+  `take_custody`/ACK** — the safe point per invariant #24. A rejection drops
+  the connection WITHOUT taking custody; the previous hop retains the bundle
+  durably and re-sends on its existing retry schedule. Custody state is never
+  corrupted; no speculative mutation; no new queueing protocol.
+- Backpressure over unbounded spawning: the gateway spawns a task only when
+  admission succeeds; rejected attempts are logged and the connection dropped.
+  No bounded queue was needed (the audit showed the `JoinSet` was the
+  unbounded resource, now capped by admission).
+
+**Per-peer fairness (isolation property):**
+- `global capacity = N` + `per-peer capacity = M` (with `M < N`). A peer
+  flooding requests can occupy at most `M` operations; other peers can still
+  acquire capacity. Validated by `r4_9_5_one_peer_cannot_monopolise_global_
+  capacity`. No weighted scheduling, no reputation, no latency-aware
+  scheduling (R5 territory).
+
+**Release guarantees (RAII, all exit paths):**
+- Success: guard dropped at end of scope → counters released.
+- Error: guard dropped on early-return → counters released.
+- Cancellation: task aborted → guard dropped → counters released.
+- Shutdown: `CancellationToken` + `JoinSet::join_next` drain → all task guards
+  dropped → all counters released. No resource guard prevents shutdown; no
+  permit is held forever.
+- Validated by `r4_9_5_resource_release_after_{success,error,cancellation}`
+  and `r4_9_5_shutdown_releases_resources`.
+
+**Interaction with R4.9.4 (RetryScheduler):**
+- A resource-limit rejection is a **local admission decision**, NOT a peer
+  failure. The integration code does NOT call
+  `RetryScheduler::record_retryable_failure` for an admission rejection —
+  `failure_count` is unchanged, no backoff is scheduled. Validated by
+  `r4_9_5_capacity_rejection_does_not_poison_retry_score`.
+- Retry state remains ephemeral and independent of resource governance.
+
+**Interaction with R4.9.3 (PeerLifecycleManager):**
+- Resource pressure does NOT quarantine or revoke a peer. The governor and
+  `PeerLifecycleManager` are independent domains. No new quarantine thresholds
+  are introduced. Resource-limit rejections are observable via `tracing` but
+  do not alter peer trust state.
+
+**Persistence:**
+- All counters and semaphores are **ephemeral** (in-memory). On restart, all
+  runtime capacity starts fresh. Durable protocol state (R4.6 custody,
+  R4.9.1–R4.9.3 identity/revocation/lifecycle) remains authoritative.
+
+**Observability:** existing `tracing` with fields `peer_id`, `node_id`,
+`resource`, `limit`, `current`. Events: `resource admission accepted`,
+`resource admission rejected`. No secrets/keys logged. No
+Prometheus/Grafana/OpenTelemetry.
+
+**Preserved (frozen — NOT modified):**
+- `Bundle`, `BundleId`, `CustodyHop`, `Route`, `RouteHop`, `RoutePolicy`,
+  `TransitRequest`, `TransitResponse`, `AuthenticatedBundleCarrier`,
+  `NodeIdentity`, all wire formats, custody semantics, SNP-IK, advertisement
+  signatures, NodeId derivation.
+- `MAX_CONCURRENT_EGRESS = 8` — NOT increased. The per-peer quota is layered
+  on top.
+- `StorageLimits`, `MAX_RESPONSE_BYTES_DEFAULT`, `MAX_HEADER_BYTES`,
+  `MAX_URL_LENGTH`, `MAX_FRAME_LEN`, `ROUTE_MAX_HOPS`, replay cache — NOT
+  duplicated.
+- `RetryScheduler` (R4.9.4) and `PeerLifecycleManager` (R4.9.3) — NOT
+  redesigned.
+- `ModeARelay` (R4.3 legacy in-memory relay) — intentionally untouched
+  (used only by R4.3 conformance tests; no shutdown/durable-store).
+
+**R4.9.5 tests** (`r4_9_5_resource_governance.rs`, 13 tests):
+- `r4_9_5_global_peer_connection_limit` — global ceiling rejects (N+1)-th
+- `r4_9_5_per_peer_connection_limit` — per-peer ceiling + peer isolation
+- `r4_9_5_per_peer_concurrency_limit` — per-peer operation ceiling
+- `r4_9_5_global_concurrency_limit` — global operation ceiling
+- `r4_9_5_gateway_quota_preserves_global_cap` — 8-egress cap unchanged
+- `r4_9_5_resource_release_after_success` — RAII release on success
+- `r4_9_5_resource_release_after_error` — RAII release on error path
+- `r4_9_5_resource_release_after_cancellation` — RAII release on task abort
+- `r4_9_5_shutdown_releases_resources` — shutdown + JoinSet drain
+- `r4_9_5_capacity_rejection_does_not_poison_retry_score` — domain isolation
+- `r4_9_5_bounded_in_flight_no_unbounded_growth` — load cannot overflow
+- `r4_9_5_one_peer_cannot_monopolise_global_capacity` — semantic fairness
+- `r4_9_5_defaults_preserve_egress_cap` — defaults sanity
+
+**Verification:** R4.9.5: 13/13 · R4.9.4: 9/9 · R4.9.3: 8/8 · R4.9.2: 7/7 ·
+R4.9.1: 9/9 · R4.8: 11/11 · R4.7: 10/10+1i · R4.6: 30/30 · R4.5b: 14/14 ·
+R4.4: 8/8 · R4.3: 9/9 · conformance: 138/138 · `cargo check --workspace`:
+clean · `cargo fmt -p snp-node --check`: clean (R4.9.5 files).
+
+**STOP after R4.9.5.**
+
 ---
 
 ## Traffic Class Split

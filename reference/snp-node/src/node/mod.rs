@@ -112,6 +112,7 @@ pub mod mode_a_discovery;
 pub mod node_advert;
 pub mod peer_directory;
 pub mod peer_lifecycle;
+pub mod resource_governance;
 pub mod retry_policy;
 pub mod route;
 pub mod route_discovery_protocol;
@@ -133,9 +134,6 @@ pub use descriptor::{
 pub use discovery::{BootstrapDiscovery, DiscoveredNode, DiscoveryProvider, StaticDiscovery};
 pub use gateway::GatewayAdvertisement;
 pub use identity::{Capability, NodeIdentity};
-pub use snp_identity::{
-    IdentityLifecycle, IdentityLifecycleError, IdentityState, RevocationStore,
-};
 pub use link::{
     AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
     TransportType,
@@ -148,6 +146,11 @@ pub use node_advert::{
 };
 pub use peer_directory::PeerDirectory;
 pub use peer_lifecycle::{PeerLifecycleManager, PeerOperationalState};
+pub use resource_governance::{
+    AdmissionError, ConnectionGuard, GatewayQuota, GovernorConfig, OperationGuard,
+    ResourceGovernor, DEFAULT_MAX_GLOBAL_CONCURRENT_OPS, DEFAULT_MAX_GLOBAL_CONNECTIONS,
+    DEFAULT_MAX_PEER_CONCURRENT_OPS, DEFAULT_MAX_PEER_CONNECTIONS,
+};
 pub use retry_policy::{
     classify_forwarding_error, DeterministicRetryRng, FailureClass, PeerRetryState, RetryPolicy,
     RetryRng, RetryScheduler, SystemRetryRng, BASE_DELAY, MAX_DELAY,
@@ -172,6 +175,7 @@ pub use session::{
     CircuitState, CircuitV2, FirstAvailableSelector, GatewayDirectory, GatewayDirectoryEntry,
     GatewaySelector, GatewayState, MetricSelector, PeerSession, PeerSessionState,
 };
+pub use snp_identity::{IdentityLifecycle, IdentityLifecycleError, IdentityState, RevocationStore};
 pub use tcp_route_transport::{
     PeerInfo, TcpForwardingServer, TcpRecursiveTransport, MAX_FRAME_SIZE,
 };
