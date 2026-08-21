@@ -68,7 +68,7 @@ use snp_gateway::{
     encode_transit_response_envelope, handle_transit_request_with_connector, sign_transit_request,
     sign_transit_response, verify_transit_request, verify_transit_response, FetchedResponse,
     GatewayError, GatewayResult, PinnedConnector, TransitEnvelope, TransitRequest, TransitResponse,
-    MAX_RESPONSE_BYTES_DEFAULT,
+    MAX_RESPONSE_BYTES_DEFAULT, READ_TIMEOUT_SECS,
 };
 use snp_identity::{now_unix, NodeId, NodeIdentity};
 use snp_link::async_link::{perform_snp_ik_handshake_async, AsyncLink, AsyncLinkError};
@@ -77,6 +77,16 @@ use snp_sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
+
+/// R4.8: Maximum concurrent gateway egress requests (Semaphore permits).
+const MAX_CONCURRENT_EGRESS: usize = 8;
+
+/// R4.8: Maintenance interval for periodic expired-bundle pruning (seconds).
+const MAINTENANCE_INTERVAL_SECS: u64 = 30;
+
+/// R4.8: Re-export `CancellationToken` for callers that need graceful shutdown.
+pub use tokio_util::sync::CancellationToken as ShutdownToken;
 
 // ─── Errors ───────────────────────────────────────────────────────────────
 
@@ -362,7 +372,13 @@ impl PersistentBundleStore {
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            // Only process .cbor files; skip .tmp (leftover from atomic writes).
+            // R4.8: Clean up orphaned .tmp files from interrupted writes.
+            if file_name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(&path);
+                tracing::warn!(file = %file_name, "cleaned up orphaned .tmp file during recovery");
+                continue;
+            }
+            // Only process .cbor files.
             if !file_name.ends_with(".cbor") {
                 continue;
             }
@@ -1576,177 +1592,211 @@ impl ModeAGateway {
     /// # Errors
     /// Returns `ModeAError` if the listener fails to bind.
     pub async fn run(&self) -> ModeAResult<()> {
+        self.run_with_shutdown(&CancellationToken::new()).await
+    }
+
+    /// Run the gateway loop with graceful shutdown + bounded concurrency (R4.8).
+    ///
+    /// - `shutdown`: cancellation token for graceful exit.
+    /// - Uses a `Semaphore` (`MAX_CONCURRENT_EGRESS = 8`) to bound concurrent
+    ///   upstream egress requests. Permit acquisition is deadline-aware — if
+    ///   the Bundle deadline expires while waiting, the request is rejected.
+    ///
+    /// # Errors
+    /// Returns `ModeAError` if the listener fails to bind.
+    pub async fn run_with_shutdown(&self, shutdown: &CancellationToken) -> ModeAResult<()> {
         let listener = TcpListener::bind(&self.listen_addr)
             .await
             .map_err(|e| ModeAError::Transport(format!("bind {}: {e}", self.listen_addr)))?;
-        eprintln!(
-            "[mode-a-gateway {}] listening on {}",
-            hex_short(&self.identity.node_id),
-            self.listen_addr
+        tracing::info!(
+            node_id = %hex_short(&self.identity.node_id),
+            listen_addr = %self.listen_addr,
+            "ModeAGateway listening"
         );
+        // R4.8C: Bounded concurrency for upstream egress.
+        let egress_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EGRESS));
         loop {
-            // Accept + perform SNP-IK handshake as responder.
-            let (mut stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] accept error: {e}");
-                    continue;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        "ModeAGateway shutdown requested — exiting"
+                    );
+                    break;
                 }
-            };
-            let hs = match perform_snp_ik_handshake_async(
-                &mut stream,
-                false,
-                &self.identity.secret_key,
-                &self.identity.public_key,
-                &self.x25519_secret,
-                &self.x25519_public,
-                None,
-            )
-            .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] handshake error: {e}");
-                    continue;
-                }
-            };
-            eprintln!(
-                "[mode-a-gateway {}] accepted authenticated link from peer {}",
-                hex_short(&self.identity.node_id),
-                hex_short(&hs.peer_node_id)
-            );
-            let carrier = AuthenticatedBundleCarrier {
-                link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
-                peer_id: hs.peer_node_id,
-            };
-            let bundle = match carrier.recv_bundle().await {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] recv error: {e}");
-                    continue;
-                }
-            };
-            // Validate the bundle.
-            if let Err(e) = bundle.validate() {
-                eprintln!("[mode-a-gateway] invalid bundle: {e}");
-                continue;
-            }
-            // Check expiry.
-            let now = now_unix();
-            if bundle.is_expired(now) {
-                eprintln!("[mode-a-gateway] bundle expired, dropping");
-                continue;
-            }
-            // Check destination: the bundle must be addressed to this gateway.
-            if bundle.destination != self.identity.node_id {
-                eprintln!(
-                    "[mode-a-gateway] destination mismatch: expected {}, got {}",
-                    hex_short(&self.identity.node_id),
-                    hex_short(&bundle.destination)
-                );
-                continue;
-            }
-            // Extract the opaque payload and decode the TransitRequest.
-            let req = match unwrap_transit_request_from_bundle(&bundle) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] decode TransitRequest error: {e}");
-                    continue;
-                }
-            };
-            // Verify the request signature.
-            if !verify_transit_request(&req) {
-                eprintln!("[mode-a-gateway] TransitRequest signature verification FAILED");
-                continue;
-            }
-            eprintln!(
-                "[mode-a-gateway {}] received TransitRequest reqId={} url={}",
-                hex_short(&self.identity.node_id),
-                hex_short(&req.req_id),
-                &req.url.get(..60).unwrap_or(&req.url)
-            );
-            // PROVENANCE BINDING: the authenticated SNP-IK peer MUST
-            // equal the bundle's expected previous custodian.
-            let expected_prev_custodian = bundle
-                .custody_chain
-                .last()
-                .map(|h| h.next_custodian_id)
-                .unwrap_or(bundle.source);
-            if hs.peer_node_id != expected_prev_custodian {
-                eprintln!(
-                    "[mode-a-gateway {}] PROVENANCE MISMATCH: authenticated peer {} != expected previous custodian {} — rejecting bundle",
-                    hex_short(&self.identity.node_id),
-                    hex_short(&hs.peer_node_id),
-                    hex_short(&expected_prev_custodian)
-                );
-                continue;
-            }
-            // Take custody (the gateway is the final custodian for this request).
-            let prev_custodian = expected_prev_custodian;
-            let mut custody_bundle = bundle.clone();
-            let nonce = generate_nonce();
-            if let Err(e) = custody_bundle.take_custody(
-                prev_custodian,
-                self.identity.node_id,
-                &self.identity.secret_key,
-                now,
-                now,
-                nonce,
-            ) {
-                eprintln!("[mode-a-gateway] custody error: {e}");
-                continue;
-            }
-            // Acknowledge custody to the sender.
-            let _ = carrier.send_bundle(&custody_bundle).await;
-            // Perform real Internet egress.
-            let connector = match (self.connector_factory)(&req.url) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] connector error: {e}");
-                    continue;
-                }
-            };
-            let fetched =
-                match handle_transit_request_with_connector(&req, &self.gateway_secret, &connector)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("[mode-a-gateway] egress error: {e}");
+                accept_result = listener.accept() => {
+                    let (mut stream, _) = match accept_result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway accept error");
+                            continue;
+                        }
+                    };
+                    let hs = match perform_snp_ik_handshake_async(
+                        &mut stream, false,
+                        &self.identity.secret_key, &self.identity.public_key,
+                        &self.x25519_secret, &self.x25519_public,
+                        None,
+                    ).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway handshake error");
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        peer_id = %hex_short(&hs.peer_node_id),
+                        "ModeAGateway accepted authenticated link"
+                    );
+                    let carrier = AuthenticatedBundleCarrier {
+                        link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
+                        peer_id: hs.peer_node_id,
+                    };
+                    let bundle = match carrier.recv_bundle().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway recv error");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = bundle.validate() {
+                        tracing::warn!(error = %e, "ModeAGateway invalid bundle");
                         continue;
                     }
-                };
-            eprintln!(
-                "[mode-a-gateway {}] egress complete: status={} body={} bytes",
-                hex_short(&self.identity.node_id),
-                fetched.response.status,
-                fetched.body.len()
-            );
-            // Construct the response bundle.
-            let response_bundle = match wrap_transit_response_as_bundle(
-                &fetched.response,
-                &fetched.body,
-                self.identity.node_id,
-                bundle.source, // destination = original client
-                now,
-                req.deadline,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[mode-a-gateway] response bundle error: {e}");
-                    continue;
+                    let now = now_unix();
+                    if bundle.is_expired(now) {
+                        tracing::warn!(
+                            bundle_id = %bundle.bundle_id().to_hex().get(..16).unwrap_or("?"),
+                            "ModeAGateway bundle expired, dropping"
+                        );
+                        continue;
+                    }
+                    if bundle.destination != self.identity.node_id {
+                        tracing::warn!(
+                            expected = %hex_short(&self.identity.node_id),
+                            got = %hex_short(&bundle.destination),
+                            "ModeAGateway destination mismatch"
+                        );
+                        continue;
+                    }
+                    let req = match unwrap_transit_request_from_bundle(&bundle) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway decode TransitRequest error");
+                            continue;
+                        }
+                    };
+                    if !verify_transit_request(&req) {
+                        tracing::warn!("ModeAGateway TransitRequest signature verification FAILED");
+                        continue;
+                    }
+                    let req_id_hex = hex_short(&req.req_id);
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        req_id = %req_id_hex,
+                        url = %&req.url.get(..60).unwrap_or(&req.url),
+                        "ModeAGateway received TransitRequest — egress starting"
+                    );
+                    let expected_prev_custodian = bundle
+                        .custody_chain
+                        .last()
+                        .map(|h| h.next_custodian_id)
+                        .unwrap_or(bundle.source);
+                    if hs.peer_node_id != expected_prev_custodian {
+                        tracing::warn!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            peer_id = %hex_short(&hs.peer_node_id),
+                            expected = %hex_short(&expected_prev_custodian),
+                            "ModeAGateway PROVENANCE MISMATCH — rejecting"
+                        );
+                        continue;
+                    }
+                    let prev_custodian = expected_prev_custodian;
+                    let mut custody_bundle = bundle.clone();
+                    let nonce = generate_nonce();
+                    if let Err(e) = custody_bundle.take_custody(
+                        prev_custodian,
+                        self.identity.node_id,
+                        &self.identity.secret_key,
+                        now, now, nonce,
+                    ) {
+                        tracing::warn!(error = %e, "ModeAGateway custody error");
+                        continue;
+                    }
+                    let _ = carrier.send_bundle(&custody_bundle).await;
+                    // R4.8C: Acquire egress permit (deadline-aware).
+                    let remaining = req.deadline.saturating_sub(now);
+                    let permit_timeout = Duration::from_secs(remaining.min(READ_TIMEOUT_SECS));
+                    let _permit = match tokio::time::timeout(
+                        permit_timeout,
+                        egress_semaphore.acquire(),
+                    ).await {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "ModeAGateway semaphore closed");
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                req_id = %req_id_hex,
+                                "ModeAGateway egress permit timeout — Bundle deadline expired while waiting"
+                            );
+                            continue;
+                        }
+                    };
+                    // Perform real Internet egress.
+                    let connector = match (self.connector_factory)(&req.url) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway connector error");
+                            continue;
+                        }
+                    };
+                    let fetched = match handle_transit_request_with_connector(
+                        &req, &self.gateway_secret, &connector
+                    ) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway egress error");
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        req_id = %req_id_hex,
+                        status = fetched.response.status,
+                        body_bytes = fetched.body.len(),
+                        "ModeAGateway egress completed"
+                    );
+                    let response_bundle = match wrap_transit_response_as_bundle(
+                        &fetched.response, &fetched.body,
+                        self.identity.node_id, bundle.source,
+                        now, req.deadline,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ModeAGateway response bundle error");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = carrier.send_bundle(&response_bundle).await {
+                        tracing::warn!(error = %e, "ModeAGateway send response error");
+                        continue;
+                    }
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        req_id = %req_id_hex,
+                        "ModeAGateway response bundle sent"
+                    );
                 }
-            };
-            // Send the response bundle back through the carrier.
-            if let Err(e) = carrier.send_bundle(&response_bundle).await {
-                eprintln!("[mode-a-gateway] send response error: {e}");
-                continue;
             }
-            eprintln!(
-                "[mode-a-gateway {}] response bundle sent (reqId={})",
-                hex_short(&self.identity.node_id),
-                hex_short(&req.req_id)
-            );
         }
+        tracing::info!(
+            node_id = %hex_short(&self.identity.node_id),
+            "ModeAGateway run loop exited"
+        );
+        Ok(())
     }
 }
 
@@ -2092,26 +2142,48 @@ impl BundleForwarder {
     /// # Errors
     /// Returns `ModeAError` if the listener fails to bind.
     pub async fn run(&self) -> ModeAResult<()> {
+        self.run_with_shutdown(&CancellationToken::new()).await
+    }
+
+    /// Run the forwarder loop with graceful shutdown support (R4.8).
+    ///
+    /// When the `shutdown` token is cancelled, the forwarder stops accepting
+    /// new connections, finishes any in-flight work, and returns. Durable
+    /// pending custody is preserved — it will be recovered on next startup.
+    ///
+    /// # Errors
+    /// Returns `ModeAError` if the listener fails to bind.
+    pub async fn run_with_shutdown(&self, shutdown: &CancellationToken) -> ModeAResult<()> {
         let listener = TcpListener::bind(&self.listen_addr)
             .await
             .map_err(|e| ModeAError::Transport(format!("bind {}: {e}", self.listen_addr)))?;
-        eprintln!(
-            "[mode-a-fwd {}] listening on {} (position {})",
-            hex_short(&self.identity.node_id),
-            self.listen_addr,
-            self.position
+        tracing::info!(
+            node_id = %hex_short(&self.identity.node_id),
+            listen_addr = %self.listen_addr,
+            position = self.position,
+            "BundleForwarder listening"
         );
         // Track the carrier for the current client connection.
         let client_carrier: Arc<tokio::sync::Mutex<Option<Arc<dyn BundleCarrier>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // R4.8: Maintenance timer for periodic expired-bundle pruning.
+        let mut last_maintenance: u64 = now_unix();
         loop {
             tokio::select! {
+                // R4.8: Graceful shutdown.
+                _ = shutdown.cancelled() => {
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        "BundleForwarder shutdown requested — exiting run loop"
+                    );
+                    break;
+                }
                 // Accept a new connection.
                 accept_result = listener.accept() => {
                     let (mut stream, _peer_addr) = match accept_result {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[mode-a-fwd] accept error: {e}");
+                            tracing::warn!(error = %e, "BundleForwarder accept error");
                             continue;
                         }
                     };
@@ -2124,14 +2196,14 @@ impl BundleForwarder {
                     ).await {
                         Ok(h) => h,
                         Err(e) => {
-                            eprintln!("[mode-a-fwd] handshake error: {e}");
+                            tracing::warn!(error = %e, "BundleForwarder handshake error");
                             continue;
                         }
                     };
-                    eprintln!(
-                        "[mode-a-fwd {}] accepted authenticated link from peer {}",
-                        hex_short(&self.identity.node_id),
-                        hex_short(&hs.peer_node_id)
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        peer_id = %hex_short(&hs.peer_node_id),
+                        "BundleForwarder accepted authenticated link"
                     );
                     let carrier = Arc::new(AuthenticatedBundleCarrier {
                         link: Arc::new(AsyncLink::new(stream, hs.link_keys)),
@@ -2139,10 +2211,7 @@ impl BundleForwarder {
                     });
                     // Only store the carrier as the PREVIOUS-HOP carrier if the
                     // authenticated peer IS the expected previous hop in the
-                    // route. This prevents an unrelated peer (or the next hop
-                    // reconnecting to deliver a response) from overwriting the
-                    // previous-hop carrier — the reverse-path connection must
-                    // always point at the genuine previous custodian.
+                    // route.
                     if Some(hs.peer_node_id) == self.prev_hop_node_id() {
                         let mut cc = client_carrier.lock().await;
                         *cc = Some(carrier.clone());
@@ -2151,37 +2220,31 @@ impl BundleForwarder {
                     let bundle = match carrier.recv_bundle().await {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("[mode-a-fwd] recv error: {e}");
+                            tracing::warn!(error = %e, "BundleForwarder recv error");
                             continue;
                         }
                     };
                     // Validate the bundle.
                     if let Err(e) = bundle.validate() {
-                        eprintln!("[mode-a-fwd] invalid bundle: {e}");
+                        tracing::warn!(error = %e, "BundleForwarder invalid bundle");
                         continue;
                     }
                     // Check expiry.
                     let now = now_unix();
                     if bundle.is_expired(now) {
-                        eprintln!("[mode-a-fwd] bundle expired, dropping");
+                        tracing::warn!(
+                            bundle_id = %bundle.bundle_id().to_hex().get(..16).unwrap_or("?"),
+                            "BundleForwarder bundle expired, dropping"
+                        );
                         continue;
                     }
                     // Check if this is a response bundle (travelling in the
-                    // REVERSE direction). A response's source is the route
-                    // destination (the gateway). A request's source is the route
-                    // source (the client) — those take the forward path. The
-                    // previous `|| bundle.source == next_node_id` clause was an
-                    // over-generalisation and is removed: only source ==
-                    // gateway identifies a response.
+                    // REVERSE direction).
                     let is_response = bundle.source == self.route.destination();
                     if is_response {
-                        // Response bundle: store it and trigger delivery
-                        // to the previous hop via try_send_response_back.
-                        // Do NOT send it back through the incoming carrier —
-                        // that would send it to the wrong peer.
-                        eprintln!(
-                            "[mode-a-fwd {}] received response bundle, storing for delivery to previous hop",
-                            hex_short(&self.identity.node_id)
+                        tracing::info!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            "BundleForwarder received response bundle, storing for reverse delivery"
                         );
                         let mut store = self.store.lock().await;
                         let _ = store.add(bundle);
@@ -2190,18 +2253,17 @@ impl BundleForwarder {
                         continue;
                     }
                     // PROVENANCE BINDING (invariant #21):
-                    // authenticated peer MUST == expected previous custodian.
                     let expected_prev_custodian = bundle
                         .custody_chain
                         .last()
                         .map(|h| h.next_custodian_id)
                         .unwrap_or(bundle.source);
                     if hs.peer_node_id != expected_prev_custodian {
-                        eprintln!(
-                            "[mode-a-fwd {}] PROVENANCE MISMATCH: authenticated peer {} != expected previous custodian {} — rejecting bundle",
-                            hex_short(&self.identity.node_id),
-                            hex_short(&hs.peer_node_id),
-                            hex_short(&expected_prev_custodian)
+                        tracing::warn!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            peer_id = %hex_short(&hs.peer_node_id),
+                            expected = %hex_short(&expected_prev_custodian),
+                            "BundleForwarder PROVENANCE MISMATCH — rejecting bundle"
                         );
                         continue;
                     }
@@ -2215,26 +2277,27 @@ impl BundleForwarder {
                         &self.identity.secret_key,
                         now, now, nonce,
                     ) {
-                        eprintln!("[mode-a-fwd] custody error: {e}");
+                        tracing::warn!(error = %e, "BundleForwarder custody error");
                         continue;
                     }
-                    eprintln!(
-                        "[mode-a-fwd {}] took custody of bundle {} (from {})",
-                        hex_short(&self.identity.node_id),
-                        bundle.bundle_id().to_hex().get(..16).unwrap_or("?"),
-                        hex_short(&prev_custodian)
+                    let bundle_id_hex = bundle.bundle_id().to_hex().get(..16).unwrap_or("?").to_string();
+                    tracing::info!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        bundle_id = %bundle_id_hex,
+                        from = %hex_short(&prev_custodian),
+                        "BundleForwarder took custody"
                     );
-                    // Store the bundle.
+                    // Store the bundle (durable — fsync before ACK).
                     {
                         let mut store = self.store.lock().await;
                         if let Err(e) = store.add(bundle.clone()) {
-                            eprintln!("[mode-a-fwd] store error: {e}");
+                            tracing::error!(error = %e, "BundleForwarder durable store error — NOT acking");
                             continue;
                         }
                     }
                     // Send custody ack.
                     if let Err(e) = carrier.send_bundle(&bundle).await {
-                        eprintln!("[mode-a-fwd] custody ack send error: {e}");
+                        tracing::warn!(error = %e, "BundleForwarder custody ack send error");
                         continue;
                     }
                     // Forward to next hop.
@@ -2242,14 +2305,52 @@ impl BundleForwarder {
                     // Check for response + send back.
                     self.try_send_response_back(&client_carrier).await;
                 }
-                // Periodic retry.
+                // Periodic retry + R4.8 maintenance.
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     let now = now_unix();
-                    self.forward_pending_bundles(now).await;
+                    // R4.8B: Route execution-expiry check.
+                    if self.route.is_expired(now) {
+                        tracing::warn!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            "route has expired — forwarding suspended (bundles remain durable)"
+                        );
+                        // Do NOT forward — bundles remain safely stored.
+                        // They will resume when a new valid route is supplied.
+                    } else {
+                        self.forward_pending_bundles(now).await;
+                    }
                     self.try_send_response_back(&client_carrier).await;
+                    // R4.8A: Periodic expired-bundle pruning (every ~30s).
+                    if now.saturating_sub(last_maintenance) >= MAINTENANCE_INTERVAL_SECS {
+                        last_maintenance = now;
+                        let mut store = self.store.lock().await;
+                        match store.prune_expired(now) {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::info!(
+                                        node_id = %hex_short(&self.identity.node_id),
+                                        pruned = count,
+                                        "runtime expired-bundle pruning completed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = %hex_short(&self.identity.node_id),
+                                    error = %e,
+                                    "runtime expired-bundle pruning failed — will retry"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
+        tracing::info!(
+            node_id = %hex_short(&self.identity.node_id),
+            "BundleForwarder run loop exited"
+        );
+        Ok(())
     }
 
     /// Forward pending bundles to the next hop. If unavailable, retain.

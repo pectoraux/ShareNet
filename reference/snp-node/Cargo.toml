@@ -54,6 +54,8 @@ snp-sync.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
 getrandom = "0.2"
 serde.workspace = true
 serde_json.workspace = true

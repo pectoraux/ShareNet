@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.7 real Internet egress)
+**Date:** 2026-08-19 (updated R4.8 operational hardening)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -502,6 +502,54 @@ disabling, gateway signature integrity, reqId binding, provenance #21,
 direction #22, durable custody #24.
 
 **STOP after R4.7.**
+
+### Mode A — R4.8 operational hardening
+
+R4.8 hardens the R4.3–R4.7 substrate for operational use. No new features —
+only correctness, availability, and observability improvements.
+
+**Changes:**
+1. **Runtime expired-bundle pruning** — `BundleForwarder::run()` periodically
+   calls `PersistentBundleStore::prune_expired(now)` every ~30s. Expired
+   bundles are durably removed from memory + disk during runtime (not just
+   on restart).
+2. **Route execution-expiry enforcement** — before `forward_pending_bundles`,
+   the forwarder checks `route.is_expired(now)`. If expired, forwarding is
+   suspended (bundles remain safely stored). No automatic rerouting (R4.9).
+3. **Gateway concurrency limiting** — `ModeAGateway::run_with_shutdown()`
+   uses a `Semaphore` (`MAX_CONCURRENT_EGRESS = 8`) to bound concurrent
+   upstream egress. Permit acquisition is deadline-aware.
+4. **Persistent-store .tmp cleanup** — `PersistentBundleStore::open()`
+   removes orphaned `.tmp` files from interrupted writes.
+5. **Graceful shutdown** — `run_with_shutdown(token: &CancellationToken)`
+   on both `BundleForwarder` and `ModeAGateway`. Shutdown cancels the
+   `tokio::select!` loop → clean exit. Durable custody is preserved.
+6. **Structured tracing** — all `eprintln!` calls in `BundleForwarder`,
+   `ModeAGateway`, and `PersistentBundleStore` replaced with `tracing::info!`
+   / `warn!` / `error!` with structured fields (`node_id`, `bundle_id`,
+   `peer_id`, `req_id`, `error`).
+
+**Explicitly deferred to R4.9+:**
+- Key rotation / revocation
+- Periodic peer rediscovery
+- Automatic route rebuild
+- Retry backoff
+- Per-client economic quotas
+- Civic / Settlement
+- Mode C expansion
+
+**R4.8 tests** (`r4_8_operational_hardening.rs`, 9 tests):
+- `r4_8_runtime_prune_expired_bundle` — memory + disk cleaned
+- `r4_8_expired_route_does_not_forward` — forwarding suspended
+- `r4_8_expired_route_retains_durable_bundle` — no data loss
+- `r4_8_gateway_requests_are_concurrent` — gateway starts + shuts down cleanly
+- `r4_8_orphan_tmp_files_are_cleaned` — .tmp removed during recovery
+- `r4_8_bundle_forwarder_graceful_shutdown` — run() returns on cancel
+- `r4_8_gateway_graceful_shutdown` — run() returns on cancel
+- `r4_8_tracing_is_available` — tracing in dependency graph
+- `r4_8_shutdown_token_reexported` — `ShutdownToken` re-exported
+
+**STOP after R4.8.**
 
 ---
 
