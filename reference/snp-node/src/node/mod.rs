@@ -111,6 +111,7 @@ pub mod mode_a_bundle;
 pub mod mode_a_discovery;
 pub mod node_advert;
 pub mod peer_directory;
+pub mod peer_lifecycle;
 pub mod route;
 pub mod route_discovery_protocol;
 pub mod route_engine;
@@ -145,6 +146,7 @@ pub use node_advert::{
     MAX_CLOCK_SKEW_SECS,
 };
 pub use peer_directory::PeerDirectory;
+pub use peer_lifecycle::{PeerLifecycleManager, PeerOperationalState};
 pub use route::RouteCommitment;
 pub use route::{Route, RouteError, RouteHop, RouteMetrics, RouteState};
 pub use route_discovery_protocol::{

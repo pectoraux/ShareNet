@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.9.2 identity revocation)
+**Date:** 2026-08-19 (updated R4.9.3 peer lifecycle)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -641,6 +641,57 @@ consensus) is a later milestone.
 - `r4_9_2_idempotent_revocation` — revoking twice is a no-op
 
 **STOP after R4.9.2.**
+
+### R4.9.3 — Peer Lifecycle Automation
+
+R4.9.3 makes peer state self-maintaining by introducing the
+`PeerLifecycleManager` — an additive operational layer around the existing
+`AdvertisementAcceptanceStore`.
+
+**New types in `snp-node`:**
+- `PeerLifecycleManager` — wraps `AdvertisementAcceptanceStore` +
+  `RevocationStore` + in-memory quarantine set
+- `PeerOperationalState` — `Active`, `Stale`, `Quarantined`, `Revoked`,
+  `Unknown`
+
+**Behavior:**
+- **Periodic expiry:** `maintain(now)` calls
+  `AdvertisementAcceptanceStore::purge_expired_records(now)` — transitions
+  ACTIVE → STALE without deleting identity history or sequence floors.
+- **Advertisement refresh:** `accept_advertisement(verified)` checks the
+  RevocationStore first (revoked peers cannot recover), then delegates to
+  the acceptance store, then clears quarantine (successful revalidation).
+- **Stale exclusion:** `is_eligible_for_forwarding(node_id)` returns `true`
+  only for `Active` peers.
+- **Quarantine:** `quarantine(node_id, reason)` adds the peer to an
+  in-memory set. Quarantine is NOT persisted — it clears on restart,
+  requiring fresh revalidation. Quarantine does NOT revoke the identity
+  or reset the sequence floor.
+- **Recovery:** A quarantined peer returns to `Active` after receiving a
+  fresh valid advertisement (revalidation) that passes all existing
+  verification + revocation check.
+- **Revocation integration:** `revoke_peer(node_id)` delegates to
+  `RevocationStore::revoke()` — durable, survives restart. Revoked peers
+  cannot recover through advertisement refresh.
+
+**Preserved:**
+- `AdvertisementAcceptanceStore` — authoritative peer state, sequence
+  floors, atomic writes
+- `PeerVisibility` — unchanged
+- `NodeAdvertisement` — unchanged
+- All protocol wire formats, `Route`/`RouteHop`, `Bundle`/`CustodyHop`
+
+**R4.9.3 tests** (`r4_9_3_peer_lifecycle.rs`, 8 tests):
+- `r4_9_3_peer_refresh_updates_liveness` — STALE → ACTIVE after refresh
+- `r4_9_3_expired_peer_becomes_stale` — expiry + maintain → STALE
+- `r4_9_3_stale_peer_not_selected` — stale NOT eligible
+- `r4_9_3_quarantined_peer_not_selected` — quarantined NOT eligible
+- `r4_9_3_peer_recovery_after_revalidation` — quarantine → ACTIVE
+- `r4_9_3_revoked_peer_cannot_recover_through_refresh` — revocation blocks
+- `r4_9_3_sequence_floor_survives_stale` — sequence persists
+- `r4_9_3_sequence_floor_survives_quarantine` — sequence persists
+
+**STOP after R4.9.3.**
 
 ---
 
