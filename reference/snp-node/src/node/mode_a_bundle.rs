@@ -1540,7 +1540,8 @@ pub struct ModeAGateway {
     /// The gateway's secret key for signing TransitResponses.
     gateway_secret: SecretKey,
     /// The connector factory for egress (production: SSRF defence; test: mock).
-    connector_factory: Box<dyn Fn(&str) -> GatewayResult<PinnedConnector> + Send + Sync>,
+    /// Wrapped in `Arc` so it can be cloned into spawned per-request tasks.
+    connector_factory: Arc<dyn Fn(&str) -> GatewayResult<PinnedConnector> + Send + Sync>,
 }
 
 impl ModeAGateway {
@@ -1559,7 +1560,7 @@ impl ModeAGateway {
             x25519_public,
             listen_addr,
             gateway_secret,
-            connector_factory: Box::new(|url: &str| PinnedConnector::new(url)),
+            connector_factory: Arc::new(|url: &str| PinnedConnector::new(url)),
         }
     }
 
@@ -1582,7 +1583,7 @@ impl ModeAGateway {
             x25519_public,
             listen_addr,
             gateway_secret,
-            connector_factory: Box::new(f),
+            connector_factory: Arc::new(f),
         }
     }
 
@@ -1615,12 +1616,24 @@ impl ModeAGateway {
         );
         // R4.8C: Bounded concurrency for upstream egress.
         let egress_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EGRESS));
+        // R4.8: Track spawned request tasks for graceful drain on shutdown.
+        let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Clone the gateway's shared state for spawned tasks.
+        let identity = self.identity.clone();
+        let ed25519_secret = self.identity.secret_key;
+        let ed25519_public = self.identity.public_key;
+        let x25519_secret = self.x25519_secret.clone();
+        let x25519_public = self.x25519_public.clone();
+        let gateway_secret = self.gateway_secret;
+        let connector_factory = self.connector_factory.clone();
+        let gateway_node_id = self.identity.node_id;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     tracing::info!(
-                        node_id = %hex_short(&self.identity.node_id),
-                        "ModeAGateway shutdown requested — exiting"
+                        node_id = %hex_short(&gateway_node_id),
+                        "ModeAGateway shutdown requested — draining {} active tasks",
+                        tasks.len()
                     );
                     break;
                 }
@@ -1632,10 +1645,11 @@ impl ModeAGateway {
                             continue;
                         }
                     };
+                    // Perform SNP-IK handshake inline (must complete before spawning).
                     let hs = match perform_snp_ik_handshake_async(
                         &mut stream, false,
-                        &self.identity.secret_key, &self.identity.public_key,
-                        &self.x25519_secret, &self.x25519_public,
+                        &ed25519_secret, &ed25519_public,
+                        &x25519_secret, &x25519_public,
                         None,
                     ).await {
                         Ok(h) => h,
@@ -1645,7 +1659,7 @@ impl ModeAGateway {
                         }
                     };
                     tracing::info!(
-                        node_id = %hex_short(&self.identity.node_id),
+                        node_id = %hex_short(&gateway_node_id),
                         peer_id = %hex_short(&hs.peer_node_id),
                         "ModeAGateway accepted authenticated link"
                     );
@@ -1672,9 +1686,9 @@ impl ModeAGateway {
                         );
                         continue;
                     }
-                    if bundle.destination != self.identity.node_id {
+                    if bundle.destination != identity.node_id {
                         tracing::warn!(
-                            expected = %hex_short(&self.identity.node_id),
+                            expected = %hex_short(&identity.node_id),
                             got = %hex_short(&bundle.destination),
                             "ModeAGateway destination mismatch"
                         );
@@ -1693,10 +1707,10 @@ impl ModeAGateway {
                     }
                     let req_id_hex = hex_short(&req.req_id);
                     tracing::info!(
-                        node_id = %hex_short(&self.identity.node_id),
+                        node_id = %hex_short(&gateway_node_id),
                         req_id = %req_id_hex,
                         url = %&req.url.get(..60).unwrap_or(&req.url),
-                        "ModeAGateway received TransitRequest — egress starting"
+                        "ModeAGateway received TransitRequest — spawning egress task"
                     );
                     let expected_prev_custodian = bundle
                         .custody_chain
@@ -1705,7 +1719,7 @@ impl ModeAGateway {
                         .unwrap_or(bundle.source);
                     if hs.peer_node_id != expected_prev_custodian {
                         tracing::warn!(
-                            node_id = %hex_short(&self.identity.node_id),
+                            node_id = %hex_short(&gateway_node_id),
                             peer_id = %hex_short(&hs.peer_node_id),
                             expected = %hex_short(&expected_prev_custodian),
                             "ModeAGateway PROVENANCE MISMATCH — rejecting"
@@ -1717,84 +1731,103 @@ impl ModeAGateway {
                     let nonce = generate_nonce();
                     if let Err(e) = custody_bundle.take_custody(
                         prev_custodian,
-                        self.identity.node_id,
-                        &self.identity.secret_key,
+                        identity.node_id,
+                        &identity.secret_key,
                         now, now, nonce,
                     ) {
                         tracing::warn!(error = %e, "ModeAGateway custody error");
                         continue;
                     }
+                    // Acknowledge custody to the sender (inline — before spawning).
                     let _ = carrier.send_bundle(&custody_bundle).await;
-                    // R4.8C: Acquire egress permit (deadline-aware).
-                    let remaining = req.deadline.saturating_sub(now);
-                    let permit_timeout = Duration::from_secs(remaining.min(READ_TIMEOUT_SECS));
-                    let _permit = match tokio::time::timeout(
-                        permit_timeout,
-                        egress_semaphore.acquire(),
-                    ).await {
-                        Ok(Ok(permit)) => permit,
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "ModeAGateway semaphore closed");
-                            continue;
+                    // R4.8C: Spawn the egress task with the shared semaphore.
+                    let sem = egress_semaphore.clone();
+                    let cf = connector_factory.clone();
+                    let bundle_source = bundle.source;
+                    let req_deadline = req.deadline;
+                    let req_clone = req.clone();
+                    let gw_id = identity.node_id;
+                    let gw_secret = gateway_secret;
+                    tasks.spawn(async move {
+                        // R4.8C: Acquire egress permit (deadline-aware).
+                        let remaining = req_deadline.saturating_sub(now_unix());
+                        let permit_timeout = Duration::from_secs(remaining.min(READ_TIMEOUT_SECS));
+                        let _permit = match tokio::time::timeout(
+                            permit_timeout,
+                            sem.acquire(),
+                        ).await {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "ModeAGateway semaphore closed");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    req_id = %req_id_hex,
+                                    "ModeAGateway egress permit timeout — deadline expired while waiting"
+                                );
+                                return;
+                            }
+                        };
+                        // Perform real Internet egress (holding the permit).
+                        let connector = match (cf)(&req_clone.url) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ModeAGateway connector error");
+                                return;
+                            }
+                        };
+                        let fetched = match handle_transit_request_with_connector(
+                            &req_clone, &gw_secret, &connector
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ModeAGateway egress error");
+                                return;
+                            }
+                        };
+                        tracing::info!(
+                            node_id = %hex_short(&gw_id),
+                            req_id = %req_id_hex,
+                            status = fetched.response.status,
+                            body_bytes = fetched.body.len(),
+                            "ModeAGateway egress completed"
+                        );
+                        // Construct + send the response bundle.
+                        let now = now_unix();
+                        let response_bundle = match wrap_transit_response_as_bundle(
+                            &fetched.response, &fetched.body,
+                            gw_id, bundle_source,
+                            now, req_deadline,
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ModeAGateway response bundle error");
+                                return;
+                            }
+                        };
+                        if let Err(e) = carrier.send_bundle(&response_bundle).await {
+                            tracing::warn!(error = %e, "ModeAGateway send response error");
+                            return;
                         }
-                        Err(_) => {
-                            tracing::warn!(
-                                req_id = %req_id_hex,
-                                "ModeAGateway egress permit timeout — Bundle deadline expired while waiting"
-                            );
-                            continue;
-                        }
-                    };
-                    // Perform real Internet egress.
-                    let connector = match (self.connector_factory)(&req.url) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "ModeAGateway connector error");
-                            continue;
-                        }
-                    };
-                    let fetched = match handle_transit_request_with_connector(
-                        &req, &self.gateway_secret, &connector
-                    ) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "ModeAGateway egress error");
-                            continue;
-                        }
-                    };
-                    tracing::info!(
-                        node_id = %hex_short(&self.identity.node_id),
-                        req_id = %req_id_hex,
-                        status = fetched.response.status,
-                        body_bytes = fetched.body.len(),
-                        "ModeAGateway egress completed"
-                    );
-                    let response_bundle = match wrap_transit_response_as_bundle(
-                        &fetched.response, &fetched.body,
-                        self.identity.node_id, bundle.source,
-                        now, req.deadline,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "ModeAGateway response bundle error");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = carrier.send_bundle(&response_bundle).await {
-                        tracing::warn!(error = %e, "ModeAGateway send response error");
-                        continue;
-                    }
-                    tracing::info!(
-                        node_id = %hex_short(&self.identity.node_id),
-                        req_id = %req_id_hex,
-                        "ModeAGateway response bundle sent"
-                    );
+                        tracing::info!(
+                            node_id = %hex_short(&gw_id),
+                            req_id = %req_id_hex,
+                            "ModeAGateway response bundle sent"
+                        );
+                    });
                 }
             }
         }
+        // R4.8: Drain active tasks on shutdown.
+        while let Some(res) = tasks.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "ModeAGateway task join error during drain");
+            }
+        }
         tracing::info!(
-            node_id = %hex_short(&self.identity.node_id),
-            "ModeAGateway run loop exited"
+            node_id = %hex_short(&gateway_node_id),
+            "ModeAGateway run loop exited — all tasks drained"
         );
         Ok(())
     }
