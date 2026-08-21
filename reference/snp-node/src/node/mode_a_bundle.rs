@@ -85,6 +85,12 @@ const MAX_CONCURRENT_EGRESS: usize = 8;
 /// R4.8: Maintenance interval for periodic expired-bundle pruning (seconds).
 const MAINTENANCE_INTERVAL_SECS: u64 = 30;
 
+/// R4.9.4: Forwarder poll interval. The loop sleeps for at most this long
+/// between forwarding attempts (shorter if a retry backoff elapses sooner).
+/// This is a *poll* granularity, NOT the retry cadence — the actual retry
+/// cadence is governed by `RetryScheduler` exponential backoff.
+const FORWARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// R4.8: Re-export `CancellationToken` for callers that need graceful shutdown.
 pub use tokio_util::sync::CancellationToken as ShutdownToken;
 
@@ -2062,6 +2068,10 @@ pub struct BundleForwarder {
     /// For positions > 0, this is None (the previous hop is in the route).
     source_addr: Option<String>,
     source_node_id: Option<NodeId>,
+    /// R4.9.4: Ephemeral retry intelligence (per-peer backoff + failure
+    /// scoring + terminal-bundle set). In-memory only — resets on restart.
+    /// Durable bundle custody (the `store` above) remains authoritative.
+    retry: StdMutex<crate::node::retry_policy::RetryScheduler>,
 }
 
 impl BundleForwarder {
@@ -2092,6 +2102,7 @@ impl BundleForwarder {
             position,
             source_addr: None,
             source_node_id: None,
+            retry: StdMutex::new(crate::node::retry_policy::RetryScheduler::new()),
         }
     }
 
@@ -2122,6 +2133,7 @@ impl BundleForwarder {
             position,
             source_addr: None,
             source_node_id: None,
+            retry: StdMutex::new(crate::node::retry_policy::RetryScheduler::new()),
         }
     }
 
@@ -2338,8 +2350,16 @@ impl BundleForwarder {
                     // Check for response + send back.
                     self.try_send_response_back(&client_carrier).await;
                 }
-                // Periodic retry + R4.8 maintenance.
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // R4.9.4: Adaptive retry poll. Sleep until the next eligible
+                // retry instant (or the poll interval, whichever is sooner) so
+                // a backoff never delays shutdown and the loop re-checks
+                // eligibility promptly when a backoff elapses. The retry
+                // cadence itself is governed by `RetryScheduler`; this is only
+                // a poll granularity.
+                _ = tokio::time::sleep({
+                    let retry = self.retry.lock().expect("retry scheduler poisoned");
+                    retry.next_sleep_duration(std::time::Instant::now(), FORWARD_POLL_INTERVAL)
+                }) => {
                     let now = now_unix();
                     // R4.8B: Route execution-expiry check.
                     if self.route.is_expired(now) {
@@ -2392,6 +2412,14 @@ impl BundleForwarder {
             Some(info) => info,
             None => return, // No next hop — this forwarder is the last before gateway
         };
+        // R4.9.4: Eligibility gate — if the next hop is in backoff, skip this
+        // tick. Bundles remain durably stored and are retried after backoff.
+        {
+            let retry = self.retry.lock().expect("retry scheduler poisoned");
+            if !retry.is_eligible(&next_node_id, std::time::Instant::now()) {
+                return;
+            }
+        }
         let bundles_to_forward: Vec<Bundle> = {
             let store = self.store.lock().await;
             // FORWARD DIRECTION ONLY. A bundle is forwarded to the next hop
@@ -2414,6 +2442,15 @@ impl BundleForwarder {
                     b.destination == next_node_id || b.destination == self.route.destination()
                 })
                 .cloned()
+                .collect::<Vec<Bundle>>()
+        };
+        // R4.9.4: Drop bundles that hit a terminal failure (not retried). The
+        // bundle remains in durable custody until expiry pruning.
+        let bundles_to_forward: Vec<Bundle> = {
+            let retry = self.retry.lock().expect("retry scheduler poisoned");
+            bundles_to_forward
+                .into_iter()
+                .filter(|b| !retry.is_terminal(b.bundle_id()))
                 .collect()
         };
         if bundles_to_forward.is_empty() {
@@ -2431,13 +2468,47 @@ impl BundleForwarder {
         {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "[mode-a-fwd {}] next hop {} unavailable: {} (retaining {} bundles)",
-                    hex_short(&self.identity.node_id),
-                    next_addr,
-                    e,
-                    bundles_to_forward.len()
-                );
+                // R4.9.4: Classify the connect failure.
+                let class = crate::node::retry_policy::classify_forwarding_error(&e);
+                match class {
+                    crate::node::retry_policy::FailureClass::Retryable => {
+                        let delay = {
+                            let mut retry =
+                                self.retry.lock().expect("retry scheduler poisoned");
+                            retry.record_retryable_failure(
+                                &next_node_id,
+                                std::time::Instant::now(),
+                            )
+                        };
+                        tracing::warn!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            peer_id = %hex_short(&next_node_id),
+                            retry_delay_ms = delay.as_millis() as u64,
+                            retained = bundles_to_forward.len(),
+                            error = %e,
+                            "next-hop connect failed — retryable, backoff scheduled"
+                        );
+                    }
+                    crate::node::retry_policy::FailureClass::Terminal => {
+                        // Cryptographic/identity failure: mark the pending
+                        // bundles terminal — they cannot be delivered to a
+                        // peer whose identity does not match the route.
+                        {
+                            let mut retry =
+                                self.retry.lock().expect("retry scheduler poisoned");
+                            for b in &bundles_to_forward {
+                                retry.record_terminal_failure(b.bundle_id());
+                            }
+                        }
+                        tracing::warn!(
+                            node_id = %hex_short(&self.identity.node_id),
+                            peer_id = %hex_short(&next_node_id),
+                            retained = bundles_to_forward.len(),
+                            error = %e,
+                            "next-hop connect failed — terminal, bundles will not be retried"
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -2451,12 +2522,9 @@ impl BundleForwarder {
         for bundle in bundles_to_forward {
             let bundle_id = *bundle.bundle_id();
             if let Err(e) = carrier.send_bundle(&bundle).await {
-                eprintln!(
-                    "[mode-a-fwd {}] forward error: {e}",
-                    hex_short(&self.identity.node_id)
-                );
-                let mut store = self.store.lock().await;
-                let _ = store.add(bundle);
+                // R4.9.4: classify + record failure, then retain the bundle.
+                self.handle_forward_failure(&next_node_id, bundle, &e, "send")
+                    .await;
                 return;
             }
             // Every bundle reaching this loop is a FORWARD-direction bundle
@@ -2468,6 +2536,12 @@ impl BundleForwarder {
             // Wait for custody ack.
             match carrier.recv_bundle().await {
                 Ok(_) => {
+                    // R4.9.4: genuine success — reset the peer's retry state.
+                    {
+                        let mut retry =
+                            self.retry.lock().expect("retry scheduler poisoned");
+                        retry.record_success(&next_node_id);
+                    }
                     eprintln!(
                         "[mode-a-fwd {}] bundle {} forwarded (custody acknowledged)",
                         hex_short(&self.identity.node_id),
@@ -2479,16 +2553,16 @@ impl BundleForwarder {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[mode-a-fwd {}] custody ack error: {e}",
-                        hex_short(&self.identity.node_id)
-                    );
-                    let mut store = self.store.lock().await;
-                    let _ = store.add(bundle);
+                    // R4.9.4: classify + record failure, then retain the bundle.
+                    self.handle_forward_failure(&next_node_id, bundle, &e, "custody-ack")
+                        .await;
                     return;
                 }
             }
-            // Wait for response bundle.
+            // Wait for response bundle. This is a separate channel from the
+            // forward: the bundle was already delivered (ack received). A
+            // response-recv failure does NOT penalize the peer's retry state —
+            // the response will arrive via reverse delivery.
             match carrier.recv_bundle().await {
                 Ok(response_bundle) => {
                     eprintln!(
@@ -2499,14 +2573,82 @@ impl BundleForwarder {
                     let _ = store.add(response_bundle);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[mode-a-fwd {}] response recv error: {e}",
-                        hex_short(&self.identity.node_id)
+                    tracing::debug!(
+                        node_id = %hex_short(&self.identity.node_id),
+                        peer_id = %hex_short(&next_node_id),
+                        error = %e,
+                        "response recv error — bundle already forwarded, response deferred"
                     );
                     return;
                 }
             }
         }
+    }
+
+    /// R4.9.4: Classify a per-bundle forwarding failure, record it with the
+    /// retry scheduler, and retain the bundle in durable custody.
+    ///
+    /// - Retryable (peer-attributable I/O): increments the peer's failure
+    ///   score and schedules an exponential backoff. The bundle is retained
+    ///   and retried after the backoff (subject to its own deadline).
+    /// - Terminal (cryptographic / malformed / non-peer): marks the bundle
+    ///   terminal so it is not retried. The peer's score is NOT touched — a
+    ///   terminal bundle must not poison an otherwise-healthy peer. The
+    ///   bundle stays in custody until expiry pruning.
+    async fn handle_forward_failure(
+        &self,
+        peer: &NodeId,
+        bundle: Bundle,
+        err: &ModeAError,
+        stage: &'static str,
+    ) {
+        let class = crate::node::retry_policy::classify_forwarding_error(err);
+        let bundle_id = *bundle.bundle_id();
+        let now_secs = now_unix();
+        let now_inst = std::time::Instant::now();
+        match class {
+            crate::node::retry_policy::FailureClass::Retryable => {
+                let (delay, score, fits) = {
+                    let mut retry =
+                        self.retry.lock().expect("retry scheduler poisoned");
+                    let delay = retry.record_retryable_failure(peer, now_inst);
+                    let score = retry.failure_score(peer);
+                    let fits = crate::node::retry_policy::RetryScheduler::retry_fits_before_deadline(
+                        delay, now_secs, bundle.deadline,
+                    );
+                    (delay, score, fits)
+                };
+                tracing::warn!(
+                    node_id = %hex_short(&self.identity.node_id),
+                    peer_id = %hex_short(peer),
+                    bundle_id = %bundle_id.to_hex().get(..16).unwrap_or("?"),
+                    stage = stage,
+                    failure_score = score,
+                    retry_delay_ms = delay.as_millis() as u64,
+                    fits_within_deadline = fits,
+                    error = %err,
+                    "retryable forwarding failure — backoff scheduled"
+                );
+            }
+            crate::node::retry_policy::FailureClass::Terminal => {
+                {
+                    let mut retry =
+                        self.retry.lock().expect("retry scheduler poisoned");
+                    retry.record_terminal_failure(&bundle_id);
+                }
+                tracing::warn!(
+                    node_id = %hex_short(&self.identity.node_id),
+                    peer_id = %hex_short(peer),
+                    bundle_id = %bundle_id.to_hex().get(..16).unwrap_or("?"),
+                    stage = stage,
+                    error = %err,
+                    "terminal forwarding failure — bundle will not be retried"
+                );
+            }
+        }
+        // Retain the bundle in durable custody (it stays until ack or expiry).
+        let mut store = self.store.lock().await;
+        let _ = store.add(bundle);
     }
 
     /// Check for a response bundle in the store and send it back

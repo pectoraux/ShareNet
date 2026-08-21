@@ -112,6 +112,7 @@ pub mod mode_a_discovery;
 pub mod node_advert;
 pub mod peer_directory;
 pub mod peer_lifecycle;
+pub mod retry_policy;
 pub mod route;
 pub mod route_discovery_protocol;
 pub mod route_engine;
@@ -147,6 +148,10 @@ pub use node_advert::{
 };
 pub use peer_directory::PeerDirectory;
 pub use peer_lifecycle::{PeerLifecycleManager, PeerOperationalState};
+pub use retry_policy::{
+    classify_forwarding_error, DeterministicRetryRng, FailureClass, PeerRetryState, RetryPolicy,
+    RetryRng, RetryScheduler, SystemRetryRng, BASE_DELAY, MAX_DELAY,
+};
 pub use route::RouteCommitment;
 pub use route::{Route, RouteError, RouteHop, RouteMetrics, RouteState};
 pub use route_discovery_protocol::{

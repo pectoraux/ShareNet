@@ -693,6 +693,111 @@ R4.9.3 makes peer state self-maintaining by introducing the
 
 **STOP after R4.9.3.**
 
+### R4.9.4 — Retry Intelligence
+
+R4.9.4 replaces the pre-R4.9.4 fixed 500ms retry cadence with bounded,
+jittered, failure-aware exponential backoff. Retry intelligence is an
+**operational scheduling policy** — it decides *when* the next forwarding
+attempt for a peer occurs, never *which* route a bundle uses (R5 territory).
+
+**New module** (`snp-node/src/node/retry_policy.rs`):
+- `RetryPolicy` — pure, testable exponential backoff with bounded jitter.
+- `RetryRng` trait + `SystemRetryRng` (OS `getrandom`) + `DeterministicRetryRng`
+  (tests). The RNG is abstracted so unit tests are fully reproducible.
+- `FailureClass` (`Retryable` / `Terminal`) + `classify_forwarding_error` —
+  classifies `ModeAError` against the existing error taxonomy.
+- `PeerRetryState` — `failure_count` + `next_eligible_at` (monotonic `Instant`).
+- `RetryScheduler` — per-peer ephemeral state + terminal-bundle set.
+
+**Constants** (derived from existing behaviour):
+- `BASE_DELAY = 500ms` — matches the pre-R4.9.4 cadence so the first retry is
+  no slower than before.
+- `MAX_DELAY = 30s` — bounds exponential growth.
+
+**Backoff formula:**
+```text
+backoff = min(MAX_DELAY, BASE_DELAY * 2^(failure_count - 1))
+jitter  = rng.jitter_millis(backoff / 2)     // [0, backoff/2]
+delay   = min(MAX_DELAY, backoff + jitter)    // <= MAX_DELAY, >= 0
+```
+
+**Behaviour:**
+- **Exponential backoff** — `attempt 1 → 500ms`, `2 → 1s`, `3 → 2s`, … capped
+  at `MAX_DELAY`.
+- **Bounded jitter** — `delay = backoff + [0, backoff/2]`, capped at
+  `MAX_DELAY`. Jitter is never negative and never overflows the cap.
+- **Local failure scoring** — each retryable peer-attributable failure
+  increments the peer's `failure_count`; a genuine success (custody ACK)
+  resets it to `0`. This is NOT reputation and NOT route selection.
+- **Terminal vs retryable classification** — only
+  `ModeAError::Link(AsyncLinkError::Io(_))` and `ModeAError::Transport(_)`
+  (connection refused / reset / EOF / timeout / unreachable / peer I/O) are
+  retryable. Cryptographic (handshake, AEAD), malformed (CBOR), expiry,
+  identity-substitution, downstream-gateway, and local errors are terminal.
+- **Expiry-aware retries** — `BundleStore::pending` already excludes expired
+  bundles; additionally `RetryScheduler::retry_fits_before_deadline` reports
+  whether a scheduled retry would occur before the bundle deadline (a retry
+  past the deadline is never relied upon). Bundle TTL is never extended.
+- **Cancellation-aware waiting** — the forwarder sleeps for
+  `min(poll_interval, time_until_next_eligible)` inside a `select!` with
+  `shutdown.cancelled()` as the first branch, so shutdown never waits for a
+  full backoff.
+- **Ephemeral retry state** — per-peer state is in-memory only and resets on
+  restart. Durable bundle custody (R4.6) remains authoritative; on restart a
+  fresh operational schedule is applied to the durable bundles.
+- **Successful reset** — a custody ACK from the next hop resets the peer's
+  failure score to `0` and clears any pending backoff. Reset is not triggered
+  by merely scheduling a retry, attempting a connection, or an unrelated bundle
+  succeeding.
+- **Terminal-bundle set** — a bundle that hits a terminal failure is marked
+  terminal and skipped on future forwarding ticks (it stays in durable custody
+  until expiry pruning). A terminal bundle does NOT poison the peer's score.
+
+**Failure attribution** — only peer-attributable transient failures increment
+the score: connection refused, connection reset, transport handshake I/O,
+peer unreachable, I/O failure during peer forwarding. Local disk failure, CPU
+exhaustion, malformed local state, downstream gateway failure, bundle expiry,
+intentional shutdown, cancellation, and caller-side validation failure do NOT
+increment the score.
+
+**Integration into `BundleForwarder`** (`mode_a_bundle.rs`):
+- `run_with_shutdown` — the fixed `sleep(500ms)` is replaced by an adaptive
+  `sleep(retry.next_sleep_duration(now, FORWARD_POLL_INTERVAL))`.
+- `forward_pending_bundles` — adds an eligibility gate (skip peers in backoff),
+  a terminal-bundle filter, failure classification + recording on
+  connect/send/custody-ack failure, and a success reset on custody ACK. Route
+  expiry (`route.is_expired`) and bundle expiry (`pending`/`prune_expired`)
+  remain authoritative.
+- `ModeARelay` (R4.3 legacy in-memory relay) is intentionally untouched — it
+  is used only by R4.3 conformance tests and has no shutdown/durable-store.
+
+**Preserved (frozen — NOT modified):**
+- `Bundle`, `BundleId`, `CustodyHop`, `Route`, `RouteHop`, `RoutePolicy`,
+  `TransitRequest`, `TransitResponse`, `AuthenticatedBundleCarrier`,
+  `NodeIdentity`, all wire formats, custody semantics, SNP-IK, advertisement
+  signature format, NodeId derivation.
+- `PeerLifecycleManager` (R4.9.3) — NOT redesigned; retry intelligence is
+  self-contained. The failure score is a documented hook for future peer
+  lifecycle / resource-governance integration (R4.9.5). No quarantine
+  thresholds are introduced here.
+
+**R4.9.4 tests** (`r4_9_4_retry_intelligence.rs`, 9 tests):
+- `r4_9_4_backoff_increases` — attempt 1 <= 2 <= 3 (exact doubling w/o jitter)
+- `r4_9_4_backoff_is_capped` — large attempts saturate at MAX_DELAY
+- `r4_9_4_jitter_is_bounded` — BASE_DELAY <= delay <= MAX_DELAY for all attempts
+- `r4_9_4_deterministic_rng_produces_testable_jitter` — reproducible jitter
+- `r4_9_4_success_resets_failure_state` — success resets score + backoff
+- `r4_9_4_expired_bundle_not_retried` — deadline-aware + store expiry filter
+- `r4_9_4_retryable_failure_increments_failure_score` — 0 → 1 → 2 → 3 → 0
+- `r4_9_4_terminal_failure_not_retried` — terminal marks bundle, no peer poison
+- `r4_9_4_retry_wait_respects_shutdown` — cancellation wins over backoff
+
+**Verification:** R4.9.4: 9/9 · R4.9.3: 8/8 · R4.9.2: 7/7 · R4.9.1: 9/9 ·
+R4.8: 11/11 · R4.7: 10/10+1i · R4.6: 30/30 · R4.5b: 14/14 · R4.4: 8/8 ·
+R4.3: 9/9 · conformance: 138/138 · `cargo fmt -p snp-node --check`: clean.
+
+**STOP after R4.9.4.**
+
 ---
 
 ## Traffic Class Split
