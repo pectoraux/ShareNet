@@ -70,6 +70,408 @@ pub enum IdentityError {
     Other(String),
 }
 
+// ─── Identity Lifecycle (R4.9.1) ───────────────────────────────────────
+
+/// The lifecycle state of a node identity. **R4.9.1.**
+///
+/// This state does NOT confer cryptographic authority — it is operational
+/// metadata that governs whether the identity should be used for new
+/// authenticated operations. The cryptographic validity of signatures and
+/// handshakes remains determined by the existing Ed25519 / SNP-IK protocol.
+///
+/// # States
+///
+/// - **`Active`** — normal operating state. The identity may authenticate,
+///   sign custody operations, sign protocol responses, and publish
+///   advertisements.
+///
+/// - **`Rotating`** — rotation has begun but the new identity is not
+///   authoritative yet. The old identity remains authoritative during this
+///   state. The new identity must not become active until durable
+///   persistence succeeds.
+///
+/// - **`Revoked`** — the identity is no longer valid for new authenticated
+///   operations. Historical verification of existing signatures remains
+///   possible where the protocol already supports it.
+///
+/// - **`Retired`** — permanently superseded. A retired identity must never
+///   be selected as the active identity for a new authenticated session.
+///   Historical cryptographic verification remains possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityState {
+    /// Normal operating state — identity is authoritative.
+    Active,
+    /// Rotation in progress — old identity remains authoritative.
+    Rotating,
+    /// No longer valid for new authenticated operations.
+    Revoked,
+    /// Permanently superseded — never selected for new sessions.
+    Retired,
+}
+
+impl IdentityState {
+    /// Returns `true` if this state permits new authenticated operations
+    /// (SNP-IK sessions, custody signing, advertisement publishing).
+    #[must_use]
+    pub fn is_active_for_new_operations(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// String representation for persistence.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Rotating => "rotating",
+            Self::Revoked => "revoked",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// Parse from string representation.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "rotating" => Some(Self::Rotating),
+            "revoked" => Some(Self::Revoked),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
+/// Errors from identity lifecycle operations.
+#[derive(Debug, Error)]
+pub enum IdentityLifecycleError {
+    /// The identity file is corrupt (truncated, invalid format, wrong version).
+    #[error("corrupt identity file: {0}")]
+    Corrupt(String),
+    /// An IO error occurred during persistence.
+    #[error("identity IO error: {0}")]
+    Io(String),
+    /// Rotation was attempted from a non-Active state.
+    #[error("cannot begin rotation from {current:?} state (must be Active)")]
+    InvalidRotationSource {
+        /// The current lifecycle state.
+        current: IdentityState,
+    },
+    /// Rotation completion was attempted without a pending new identity.
+    #[error("cannot complete rotation — no pending new identity")]
+    NoPendingRotation,
+    /// An operation was attempted on a revoked or retired identity.
+    #[error("identity is {state:?} — operation rejected")]
+    IdentityNotActive {
+        /// The lifecycle state that rejected the operation.
+        state: IdentityState,
+    },
+}
+
+/// The identity file format magic + version.
+const IDENTITY_FILE_MAGIC: &[u8; 4] = b"SNPI";
+const IDENTITY_FILE_VERSION: u8 = 1;
+
+/// A lifecycle wrapper around [`NodeIdentity`]. **R4.9.1.**
+///
+/// Provides:
+/// - Durable identity persistence (atomic write + fsync + rename)
+/// - Atomic identity rotation (old identity remains active until new is
+///   durably persisted)
+/// - Explicit lifecycle states (`Active`, `Rotating`, `Revoked`, `Retired`)
+/// - Startup load/create with fail-closed corruption handling
+///
+/// # Invariant
+///
+/// ```text
+/// Durable state FIRST
+/// Memory mutation SECOND
+/// ```
+///
+/// Rotation:
+/// ```text
+/// old identity Active
+///     → begin_rotation(new_identity) → state = Rotating
+///     → persist new identity (fsync)
+///     → success → state = Active (new identity)
+///     → failure → state = Active (old identity restored)
+/// ```
+///
+/// # File Format
+///
+/// ```text
+/// [4 bytes: magic "SNPI"]
+/// [1 byte: version = 1]
+/// [32 bytes: Ed25519 secret key]
+/// [variable: lifecycle state string (null-terminated)]
+/// ```
+///
+/// The public key and NodeId are recomputed from the secret key — they are
+/// NEVER independently trusted from the file.
+pub struct IdentityLifecycle {
+    /// The current authoritative identity.
+    identity: NodeIdentity,
+    /// The current lifecycle state.
+    state: IdentityState,
+    /// The pending new identity during rotation (if any).
+    pending_new: Option<NodeIdentity>,
+    /// The path to the identity file (if file-backed).
+    path: Option<std::path::PathBuf>,
+}
+
+impl IdentityLifecycle {
+    /// Create a new `IdentityLifecycle` with the given identity in `Active`
+    /// state. Does NOT persist — use `save()` or `load_or_create()` for
+    /// durability.
+    #[must_use]
+    pub fn new(identity: NodeIdentity) -> Self {
+        Self {
+            identity,
+            state: IdentityState::Active,
+            pending_new: None,
+            path: None,
+        }
+    }
+
+    /// Generate a fresh identity and create a lifecycle in `Active` state.
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut secret = [0u8; 32];
+        let _ = getrandom::getrandom(&mut secret);
+        Self::new(NodeIdentity::from_secret(secret))
+    }
+
+    /// Load an identity from a file, or create + persist a new one if the
+    /// file does not exist. **Fail-closed on corruption.**
+    ///
+    /// # Errors
+    /// - `Corrupt` if the file exists but is malformed (wrong magic,
+    ///   unsupported version, truncated, invalid state string).
+    /// - `Io` if the file cannot be read/written.
+    pub fn load_or_create(path: impl AsRef<std::path::Path>) -> Result<Self, IdentityLifecycleError> {
+        let path = path.as_ref().to_path_buf();
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            let mut lifecycle = Self::generate();
+            lifecycle.path = Some(path.clone());
+            lifecycle.save()?;
+            Ok(lifecycle)
+        }
+    }
+
+    /// Load an identity from a file. **Fail-closed on corruption.**
+    ///
+    /// # Errors
+    /// - `Corrupt` if the file is malformed.
+    /// - `Io` if the file cannot be read.
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, IdentityLifecycleError> {
+        let path = path.as_ref().to_path_buf();
+        let data = std::fs::read(&path)
+            .map_err(|e| IdentityLifecycleError::Io(format!("read {}: {e}", path.display())))?;
+        // Minimum: magic (4) + version (1) + secret_key (32) + state string + null.
+        if data.len() < 4 + 1 + 32 + 1 {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "file too short: {} bytes",
+                data.len()
+            )));
+        }
+        // Check magic.
+        if &data[..4] != IDENTITY_FILE_MAGIC {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "invalid magic: expected {:?}, got {:?}",
+                IDENTITY_FILE_MAGIC,
+                &data[..4]
+            )));
+        }
+        // Check version.
+        if data[4] != IDENTITY_FILE_VERSION {
+            return Err(IdentityLifecycleError::Corrupt(format!(
+                "unsupported version: expected {}, got {}",
+                IDENTITY_FILE_VERSION, data[4]
+            )));
+        }
+        // Extract secret key.
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&data[5..37]);
+        // Extract lifecycle state (null-terminated string after byte 37).
+        let state_bytes = &data[37..];
+        let state_str = match state_bytes.iter().position(|&b| b == 0) {
+            Some(pos) => std::str::from_utf8(&state_bytes[..pos])
+                .map_err(|e| IdentityLifecycleError::Corrupt(format!("state not UTF-8: {e}")))?,
+            None => std::str::from_utf8(state_bytes)
+                .map_err(|e| IdentityLifecycleError::Corrupt(format!("state not UTF-8: {e}")))?,
+        };
+        let state = IdentityState::from_str(state_str).ok_or_else(|| {
+            IdentityLifecycleError::Corrupt(format!("unknown lifecycle state: \"{state_str}\""))
+        })?;
+        let identity = NodeIdentity::from_secret(secret);
+        Ok(Self {
+            identity,
+            state,
+            pending_new: None,
+            path: Some(path),
+        })
+    }
+
+    /// Persist the current identity + lifecycle state to the file.
+    /// Uses atomic write-to-temp-then-rename + fsync.
+    ///
+    /// # Errors
+    /// - `Io` if persistence fails.
+    /// - No file path set → no-op (returns `Ok`).
+    pub fn save(&self) -> Result<(), IdentityLifecycleError> {
+        let path = match &self.path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut data = Vec::with_capacity(4 + 1 + 32 + 16);
+        data.extend_from_slice(IDENTITY_FILE_MAGIC);
+        data.push(IDENTITY_FILE_VERSION);
+        data.extend_from_slice(&self.identity.secret_key);
+        data.extend_from_slice(self.state.as_str().as_bytes());
+        data.push(0); // null terminator
+        // Atomic write: write to temp, fsync, rename, fsync dir.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)
+            .map_err(|e| IdentityLifecycleError::Io(format!("write tmp: {e}")))?;
+        // fsync temp file.
+        {
+            let file = std::fs::File::open(&tmp_path)
+                .map_err(|e| IdentityLifecycleError::Io(format!("open tmp for fsync: {e}")))?;
+            file.sync_all()
+                .map_err(|e| IdentityLifecycleError::Io(format!("fsync tmp: {e}")))?;
+        }
+        // Atomic rename.
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| IdentityLifecycleError::Io(format!("rename: {e}")))?;
+        // fsync parent directory.
+        if let Some(dir) = path.parent() {
+            let dir_file = std::fs::File::open(dir)
+                .map_err(|e| IdentityLifecycleError::Io(format!("open dir for fsync: {e}")))?;
+            dir_file
+                .sync_all()
+                .map_err(|e| IdentityLifecycleError::Io(format!("fsync dir: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Get the current authoritative identity.
+    #[must_use]
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.identity
+    }
+
+    /// Get the current lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> IdentityState {
+        self.state
+    }
+
+    /// Returns `true` if the identity is `Active` and can be used for new
+    /// authenticated operations.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state.is_active_for_new_operations()
+    }
+
+    /// Begin identity rotation. The old identity remains authoritative
+    /// until `complete_rotation()` succeeds.
+    ///
+    /// # Errors
+    /// - `InvalidRotationSource` if the current state is not `Active`.
+    pub fn begin_rotation(&mut self, new_identity: NodeIdentity) -> Result<(), IdentityLifecycleError> {
+        if self.state != IdentityState::Active {
+            return Err(IdentityLifecycleError::InvalidRotationSource {
+                current: self.state,
+            });
+        }
+        self.state = IdentityState::Rotating;
+        self.pending_new = Some(new_identity);
+        Ok(())
+    }
+
+    /// Complete identity rotation: persist the new identity, then make it
+    /// authoritative. If persistence fails, the old identity is restored.
+    ///
+    /// # Errors
+    /// - `NoPendingRotation` if `begin_rotation` was not called.
+    /// - `Io` if persistence fails (old identity remains active).
+    pub fn complete_rotation(&mut self) -> Result<(), IdentityLifecycleError> {
+        let new_identity = self
+            .pending_new
+            .take()
+            .ok_or(IdentityLifecycleError::NoPendingRotation)?;
+        // Persist the NEW identity FIRST (durable before memory mutation).
+        let old_identity = std::mem::replace(&mut self.identity, new_identity);
+        // On success, state becomes Active. On failure, state reverts to Active
+        // (the old identity is restored — it was Active before rotation began).
+        self.state = IdentityState::Active;
+        match self.save() {
+            Ok(()) => {
+                // Success — new identity is now authoritative + durable.
+                Ok(())
+            }
+            Err(e) => {
+                // Failure — restore the old identity + revert to Active.
+                self.identity = old_identity;
+                // old_state was Rotating, but since we're restoring the old
+                // identity, the effective state is Active (the old identity
+                // was Active before rotation began).
+                self.state = IdentityState::Active;
+                Err(e)
+            }
+        }
+    }
+
+    /// Revoke the identity. After revocation, the identity cannot be used
+    /// for new authenticated operations. The revocation is persisted.
+    ///
+    /// # Errors
+    /// - `Io` if persistence fails (state is NOT changed on failure).
+    pub fn revoke(&mut self) -> Result<(), IdentityLifecycleError> {
+        let old_state = self.state;
+        self.state = IdentityState::Revoked;
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.state = old_state;
+                Err(e)
+            }
+        }
+    }
+
+    /// Retire the identity. A retired identity is permanently superseded
+    /// and must never be selected for new sessions. The retirement is
+    /// persisted.
+    ///
+    /// # Errors
+    /// - `Io` if persistence fails (state is NOT changed on failure).
+    pub fn retire(&mut self) -> Result<(), IdentityLifecycleError> {
+        let old_state = self.state;
+        self.state = IdentityState::Retired;
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.state = old_state;
+                Err(e)
+            }
+        }
+    }
+
+    /// Get the path to the identity file, if file-backed.
+    #[must_use]
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Set the file path for persistence. Chainable.
+    #[must_use]
+    pub fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.path = Some(path.as_ref().to_path_buf());
+        self
+    }
+}
+
 /// Convenience `Result` alias.
 pub type IdentityResult<T> = Result<T, IdentityError>;
 

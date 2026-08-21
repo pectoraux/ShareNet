@@ -1,6 +1,6 @@
 # ShareNet — Architecture Implementation Status
 
-**Date:** 2026-08-19 (updated R4.8 operational hardening)
+**Date:** 2026-08-19 (updated R4.9.1 identity lifecycle)
 **HEAD:** see `git rev-parse HEAD`
 **Status:** implementation progress, NOT production-ready
 
@@ -550,6 +550,56 @@ only correctness, availability, and observability improvements.
 - `r4_8_shutdown_token_reexported` — `ShutdownToken` re-exported
 
 **STOP after R4.8.**
+
+### R4.9.1 — Identity Lifecycle Foundation
+
+R4.9.1 introduces an additive identity lifecycle layer around the existing
+`NodeIdentity` primitive. No protocol wire formats changed. `NodeIdentity`
+is unmodified.
+
+**New types in `snp-identity`:**
+- `IdentityState` enum: `Active`, `Rotating`, `Revoked`, `Retired`
+- `IdentityLifecycle` struct: wraps `NodeIdentity` + `IdentityState` +
+  durable persistence (atomic write + fsync + rename)
+- `IdentityLifecycleError` enum
+
+**Semantics:**
+- **`Active`** — identity is authoritative for new authenticated operations.
+- **`Rotating`** — rotation begun; old identity remains authoritative until
+  new is durably persisted.
+- **`Revoked`** — no longer valid for new operations (persisted).
+- **`Retired`** — permanently superseded (persisted).
+
+**Rotation atomicity:**
+```text
+old identity Active → begin_rotation → Rotating
+→ persist new identity (fsync) → success → Active (new identity)
+→ failure → Active (old identity restored)
+```
+
+**Durable state FIRST, memory mutation SECOND** — mandatory.
+
+**Startup:**
+- `load_or_create(path)` — loads existing identity or creates + persists new.
+- Corrupt identity file → **fail-closed** (NOT silently generate new).
+- Missing identity file → first initialization (create + persist).
+
+**File format:** magic "SNPI" + version 1 + 32-byte secret key + null-terminated
+state string. Public key and NodeId are recomputed from the secret key — never
+independently trusted from the file.
+
+**R4.9.1 tests** (`r4_9_1_identity_lifecycle.rs`, 9 tests):
+- `r4_9_1_identity_rotation_preserves_service` — rotation succeeds, new identity persisted
+- `r4_9_1_failed_rotation_keeps_previous_identity` — persistence failure → old identity restored
+- `r4_9_1_revoked_identity_rejected` — revoked identity cannot rotate
+- `r4_9_1_retired_identity_not_selected_for_new_sessions` — retired identity not active
+- `r4_9_1_load_or_create_initializes_and_persists` — startup load/create
+- `r4_9_1_corrupt_identity_file_fails_closed` — corrupt file rejected
+- `r4_9_1_truncated_identity_file_fails_closed`
+- `r4_9_1_wrong_magic_fails_closed`
+- `r4_9_1_unsupported_version_fails_closed`
+
+**STOP after R4.9.1.**
 
 ---
 

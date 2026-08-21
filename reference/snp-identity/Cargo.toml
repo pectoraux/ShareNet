@@ -12,6 +12,7 @@ snp-cbor.workspace = true
 snp-crypto.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+getrandom = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

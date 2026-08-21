@@ -131,6 +131,7 @@ pub use descriptor::{
 pub use discovery::{BootstrapDiscovery, DiscoveredNode, DiscoveryProvider, StaticDiscovery};
 pub use gateway::GatewayAdvertisement;
 pub use identity::{Capability, NodeIdentity};
+pub use snp_identity::{IdentityLifecycle, IdentityLifecycleError, IdentityState};
 pub use link::{
     AuthenticatedLink, AuthenticatedLinkError, Link, LinkKey, LinkMetrics, LinkState, LinkTable,
     TransportType,
